@@ -82,6 +82,7 @@
       ],
       "forbidden_cmd_regexes": [
         "mynote\\s+vault\\s+(unlock|shred)",
+        "mynote\\s+(self-)?update\\b",
         "--decrypt\\b",
         "\\b(script|expect|socat|curl|wget|nc)\\b",
         "python3?\\s+-c\\s+.*\\bpty\\b",

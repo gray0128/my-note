@@ -449,6 +449,18 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 ) STRICT;
 ```
 
+### 4.1 本地升级快照、回滚备份与 Schema 前向兼容保护（`mynote update` 配套存储）
+
+为支撑 `mynote update` 与 `mynote update --rollback` 在升级/回退二进制时绝不损坏本地 SQLite WAL 数据，桌面数据目录（Linux: `~/.local/share/mynote/`；macOS: `~/Library/Application Support/mynote/`）维护以下受控结构：
+
+- **`local_meta` 强制版本锁键**：
+  - `schema_version`（同步写入 `PRAGMA user_version`）：当前库已应用的最新迁移号；
+  - `min_reader_schema_version`：允许安全读写当前库的最低二进制可识别 Schema 版本号。若旧版二进制（如回滚后）发现自身支持的最高 Schema 版本 `< min_reader_schema_version`，立即以退出码 `8`（`INTEGRITY_ERROR: SCHEMA_TOO_NEW`）拒绝写入，防止旧代码误毁新表结构。
+- **二进制回滚槽位（`bin/mynote.prev` + `bin/mynote.prev.json`）**：
+  - 每次 `mynote update` 原子替换前保存上一版已知完好可执行文件，元数据记录 `{ version, blake3_hex, pre_upgrade_schema_version, backed_up_at_ms }`（仅保留最近 1 代，占用 `< 15 MiB`）。
+- **跨 Schema 升级前自动一致性快照（`backups/mynote-pre-schema-v<N>.db`）**：
+  - 仅在版本升级触发 `PRAGMA user_version` 递增前自动通过 `VACUUM INTO` 生成单文件快照（权限 `0600`，最多保留最近 2 代），为跨大版本回滚提供零丢失兜底。
+
 ---
 
 ## 5. 云端 Cloudflare DO SQLite 完整 DDL Schema（`cloud-cf`）
