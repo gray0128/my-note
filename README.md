@@ -20,14 +20,18 @@
   - 根因复盘（Heynote + iCloud 丢数机制）、11 款竞品深度调研与 6 项核心约束剖析
   - 整体架构蓝图、Block-First 数据模型、三层格式化、Markdown/Pele 渲染与 CLI L0–L3 帮助规范
   - Cargo Workspace 目录规划、重切后的 **M0 → M3** 演进路线图与已冻结的架构决策基线（ADR 摘要）
+- [核心数据结构、存储 Schema 与二进制线格式规范 (`docs/data-structures.md`)](./docs/data-structures.md)
+  - 强类型 ULID、定长可排序 `Hlc` 与 Base62 `FractionalIndex` 编码规范，以及 `mynote-core` Sans-I/O 领域类型定义
+  - 256B 双射阶梯填充算法与 `MNS1`（同步盲信封）、`MNV1`（保险库密文）、`MNK1`（密钥同步）、`MNP1`（头体分离快照）精确字节布局
+  - 桌面本地 SQLite `STRICT` 完整 DDL（含 `block_conflicts` 物化表与 `CHECK` 硬约束）、Cloudflare DO SQLite 完整 DDL 与移动端 PWA IndexedDB Schema
+- [全链路接口与跨边界契约规范 (`docs/interface-contracts.md`)](./docs/interface-contracts.md)
+  - 全局错误码注册表（Rust 错误码 ↔ CLI 退出码 `0–8` ↔ HTTP 状态码 ↔ Agent 自愈 `hint`）
+  - CLI 全子命令矩阵、JSON 信封 DTO、`--help-json` 反射 Schema 与 Layer 2 `formatters.toml` 零字节熔断契约
+  - 本地 Daemon REST/WS/Unix Socket NDJSON 协议、云端 Worker/DO/R2 请求响应 Schema，以及 `mynote-wasm` TypeScript FFI（含 `WasmVaultSession` 不透明句柄）
 - [同步协议与确定性物化规范 (`docs/sync-protocol.md`)](./docs/sync-protocol.md)
-  - 5 列盲存储线格式、256B 对齐填充与 `FULL_ZSTD` / `SPAN_PATCH`（`blake3` 校验）混合确定性载荷
-  - 防「空 `UPDATE`」类型门禁、外部管道零字节熔断与新设备引导隔离
-  - 字段级因果拆分、`(hlc, op_id)` 纯函数冲突分支投影、R2 多代快照与 DO 活跃水位滑动窗口 GC、`epoch` 并集对账状态机及 M1 确定性属性模拟测试门禁
+  - 5 列盲存储线格式、防「空 `UPDATE`」类型门禁、字段级因果拆分、`(hlc, op_id)` 纯函数冲突投影、R2 多代快照与 DO 活跃水位滑动窗口 GC、`epoch` 并集对账状态机及 M1 确定性属性模拟测试门禁
 - [安全架构与威胁模型规范 (`docs/threat-model.md`)](./docs/threat-model.md)
-  - 6 类敌手诚实信任矩阵（被动存储泄露 vs PWA 代码分发 vs 浏览器跨源 vs 同 UID 被注入 Agent）
-  - 密钥存放全表、LUKS 式 `vault_key_slots` 多槽位包裹、可变 `vault_keys` 真删除碎纸与独立瞬态加密剪贴板
-  - 「先写后锁」本地 `wal_checkpoint(TRUNCATE)` + 云端 `purge_op_ids` 即时擦除、本地 Daemon 鉴权、严格 CSP 与二维码 `#fragment` 配对/吊销/轮换预案
+  - 6 类敌手诚实信任矩阵、LUKS 式 `vault_key_slots` 多槽位包裹、可变 `vault_keys` 碎纸墓碑同步、「先写后锁」本地 `wal_checkpoint(TRUNCATE)` + 云端 `purge_op_ids` 即时擦除、本地 Daemon 鉴权、严格 CSP 与二维码 `#fragment` 配对/轮换预案
 - [Cloudflare 技术栈云端架构专项评估 (`docs/cloudflare-cloud-architecture.md`)](./docs/cloudflare-cloud-architecture.md)
   - Cloudflare 组件选型（SQLite DO + WebSocket Hibernation + R2 + Workers Static Assets）与 2026 配额精算
   - 7 大 Cloudflare 专属工程暗坑（Access `res.ok` 丢数、PITR `epoch` 并集对账、DO SQL 单语句 100 绑定参数与二级索引双倍行写、休眠计费等）与反锁定逃生舱设计

@@ -1,6 +1,6 @@
 # 基于 Cloudflare 技术栈的自部署云端架构：深度评估与设计方案
 
-> 本文档是 [总架构设计方案 (`architecture-proposal.md`)](./architecture-proposal.md) 的云端专项设计，并与 [同步协议规范 (`sync-protocol.md`)](./sync-protocol.md)、[安全与威胁模型规范 (`threat-model.md`)](./threat-model.md) 配套执行。结合已确定的核心取舍——**云端自部署在 Cloudflare 技术栈，且不考虑云端 MCP 与本地 MCP（Agent 统一走本地 CLI + Skill）**——本方案聚焦于构建一个**存储层 100% 零知识端到端加密（E2EE）、零运维、亚秒级推送、个人成本 \$0/月**的极简同步中继与 PWA 托管架构。
+> 本文档是 [总架构设计方案 (`architecture-proposal.md`)](./architecture-proposal.md) 的云端专项设计，并与 [数据结构规范 (`data-structures.md`)](./data-structures.md)、[全链路接口契约 (`interface-contracts.md`)](./interface-contracts.md)、[同步协议规范 (`sync-protocol.md`)](./sync-protocol.md)、[安全与威胁模型规范 (`threat-model.md`)](./threat-model.md) 配套执行。结合已确定的核心取舍——**云端自部署在 Cloudflare 技术栈，且不考虑云端 MCP 与本地 MCP（Agent 统一走本地 CLI + Skill）**——本方案聚焦于构建一个**存储层 100% 零知识端到端加密（E2EE）、零运维、亚秒级推送、个人成本 \$0/月**的极简同步中继与 PWA 托管架构。
 
 ---
 

@@ -22,8 +22,10 @@
 8. [已最终拍板的架构决策基线（ADR 摘要）](#8-已最终拍板的架构决策基线adr-摘要)
 
 > **配套核心工程规范**：
-> - [同步协议与确定性物化规范 (`sync-protocol.md`)](./sync-protocol.md)（盲信封格式、`FULL_ZSTD`/`SPAN_PATCH` 载荷、字段级因果合并、R2 多代快照与 DO 滑动窗口 GC、`epoch` 对账状态机与属性模拟测试门禁）
-> - [安全架构与威胁模型规范 (`threat-model.md`)](./threat-model.md)（密钥存放全表、`vault_key_slots` 多槽位包裹、可变 `vault_keys` 碎纸、事后加锁擦除、Daemon 本地鉴权与客户端内存级 Vault 解密）
+> - [核心数据结构、存储 Schema 与二进制线格式规范 (`data-structures.md`)](./data-structures.md)（ULID/定长 HLC/FractionalIndex、Rust Sans-I/O 类型、4 类加密信封字节布局、SQLite `STRICT` 完整 DDL 与 PWA IndexedDB Schema）
+> - [全链路接口与跨边界契约规范 (`interface-contracts.md`)](./interface-contracts.md)（统一错误码表、CLI 全子命令 JSON 信封、本地 Daemon REST/WS/UDS 契约、云端 Sync API 与 `mynote-wasm` FFI 契约）
+> - [同步协议与确定性物化规范 (`sync-protocol.md`)](./sync-protocol.md)
+> - [安全架构与威胁模型规范 (`threat-model.md`)](./threat-model.md)
 > - [Cloudflare 技术栈云端架构专项评估 (`cloudflare-cloud-architecture.md`)](./cloudflare-cloud-architecture.md)
 
 ---
@@ -277,58 +279,71 @@ flowchart TD
 
 ### 5.1 数据模型：Block-First 而非文本分隔符
 
-彻底放弃 Heynote 的「整文件文本分隔符」，将 **Block** 提升为最小同步、格式化、加密与检索单元（完整线格式与状态机见 [`sync-protocol.md`](./sync-protocol.md)）。
+彻底放弃 Heynote 的「整文件文本分隔符」，将 **Block** 提升为最小同步、格式化、加密与检索单元（完整 SQLite `STRICT` DDL 与字节布局见 [`data-structures.md`](./data-structures.md)）。
 
 ```mermaid
 erDiagram
     BUFFERS ||--o{ BLOCKS : contains
+    BLOCKS ||--o{ BLOCK_CONFLICTS : materializes_siblings
     BLOCKS ||--o{ SYNC_OPS : has_history
     VAULT_KEY_SLOTS ||--o{ VAULT_KEYS : unwraps_vkek_for
     VAULT_KEYS ||--o{ BLOCKS : encrypts_locked
     BUFFERS {
-        text id PK "ULID"
+        text id PK "26B ULID"
         text name "Buffer 名称 (如 scratch, work)"
-        int sort_order "侧栏排序"
-        text hlc "最后更新混合逻辑时钟"
-        int deleted_at "软删除时间戳 (NULL=有效)"
+        text position "Fractional Indexing 排序键 (LWW)"
+        text hlc "定长可排序混合逻辑时钟"
+        int deleted_at_ms "软删除时间戳 (NULL=有效)"
     }
     BLOCKS {
-        text id PK "ULID"
+        text id PK "26B ULID (保留内置 rowid 对齐 FTS5)"
         text buffer_id FK "所属 Buffer (LWW)"
         text position "Fractional Indexing + 4B 抖动后缀 (LWW)"
         text lang "语言模式 (markdown/json/sql/mermaid/... LWW)"
-        int is_locked "0=普通块, 1=Vault 加密块 (Lock-Wins 单调)"
+        int is_locked "0=普通块, 1=Vault 加密块 (CHECK 强约束)"
         text kid FK "加密块关联的 BDEK ID (is_locked=1)"
         text public_hint "可选公开提示 (如 Prod API Key)"
         text content "物化明文主分支 (is_locked=1 时恒为 NULL)"
-        blob ciphertext "Tier 2 密文体 (不含 wrapped_dek)"
+        blob ciphertext "MNV1 密文体 (不含 wrapped_dek)"
         text head_op_id "当前主分支操作 ID"
-        text conflict_heads_json "未收敛并发分支叶子列表 (纯函数投影)"
-        text hlc "混合逻辑时钟"
-        int deleted_at "软删除 Tombstone (遇并发 UPDATE 自动复活)"
+        int conflict_count "未收敛并发分支数"
+        text content_hlc "正文主分支最新 HLC"
+        int deleted_at_ms "软删除 Tombstone (遇并发 UPDATE 自动复活)"
+    }
+    BLOCK_CONFLICTS {
+        text block_id PK "所属主块 ID"
+        text head_op_id PK "并发分支极大元 OpId"
+        text hlc "分支 HLC"
+        text actor "来源标识"
+        int is_locked "0 | 1"
+        text content "明文冲突体 (毫秒级直读渲染)"
+        blob ciphertext "密文冲突体"
     }
     VAULT_KEY_SLOTS {
-        text slot_id PK "passphrase | recovery | prf:<rp>:<cred>"
+        text slot_id PK "passphrase | recovery | prf:<hash>"
         int vk_epoch "VKEK 世代号"
+        text kdf_params "Argon2id 或 WebAuthn PRF 参数 JSON"
         blob wrapped_vkek "包裹后的随机 256-bit VKEK"
     }
     VAULT_KEYS {
-        text kid PK "每加密块独立密钥 ID (支持物理 DELETE)"
+        text kid PK "每加密块独立密钥 ID"
+        int key_seq "单调密钥水位序号"
+        text state "ACTIVE | SHREDDED (销毁时抹空密钥)"
         int vk_epoch "所属 VKEK 世代"
-        blob wrapped_dek "由 VKEK 包裹的 BDEK"
+        blob wrapped_dek "ACTIVE 时非空, SHREDDED 时恒为 NULL"
     }
     SYNC_OPS {
-        text op_id PK "ULID"
+        text op_id PK "26B ULID"
         int server_seq "当前 epoch 下云端序号 (NULL=未上传)"
         text device_id "产生变更的设备 ID"
-        text entity_type "本地解包索引: buffer | block"
-        text entity_id "本地解包索引: 目标 ID"
-        text parent_op_ids_json "因果前置 op_id 数组"
+        text entity_type "buffer | block"
+        text entity_id "目标 ID"
+        text parent_op_ids "因果前置 op_id JSON 数组"
         text op_type "CREATE | UPDATE | SET_META | LOCK | UNLOCK | RESOLVE | DELETE"
-        text hlc "Hybrid Logical Clock"
-        text payload_encoding "FULL_ZSTD | SPAN_PATCH"
-        blob payload "本地压缩载荷 (云端封装进 5 列盲信封)"
-        int created_at "时间戳"
+        text hlc "定长 Canonical HLC"
+        text payload_encoding "NONE | META | FULL_ZSTD | SPAN_PATCH | LOCKED"
+        blob payload "本地压缩载荷 (事后加锁擦除后置 NULL)"
+        int created_at_ms "时间戳"
     }
 ```
 
@@ -528,9 +543,9 @@ flowchart LR
      }
      ```
    - 当检测到 `!isatty(stdout)`（处于管道或 Agent Shell 执行中）时，自动关闭 ANSI 颜色码与交互式分页器（pager）。
-2. **语义化稳定退出码（消除离线假失败重试）+ 可执行错误提示（`hint`）**：
+2. **语义化稳定退出码（消除离线假失败重试）+ 可执行错误提示（`hint`，全表见 [`interface-contracts.md` §1](./interface-contracts.md#1-全局错误码注册表与跨层映射契约)）**：
    - **常规本地写命令离线成功一律返回 `0`**（通过 `meta.sync_state = "pending_offline"` 表达待同步，避免触发 Shell `set -e` 中断或诱导 Agent 误判失败反复重试产生重复块）；
-   - `0` 成功 | `2` 参数或空管道错误 | `3` 目标不存在 | `4` 乐观锁冲突（`HEAD_MISMATCH`）| `5` 加密块受限（`BLOCK_LOCKED`）| `6` 显式联网命令离线失败（仅限 `sync push/pull`、`clip push --wait-sync`）| `7` 格式化语法错误。
+   - `0` 成功 | `2` 参数或空管道错误 | `3` 目标不存在 | `4` 乐观锁/CAS 冲突 | `5` 加密块受限/密钥已销毁/未授权 | `6` 显式联网命令离线失败 | `7` 格式化语法错误 | `8` 密文或哈希完整性校验失败。
    - 错误返回必带下一步动作建议，让 Agent 无需盲猜就能自愈：
      ```json
      {

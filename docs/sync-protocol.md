@@ -1,6 +1,6 @@
 # 同步协议与确定性物化规范 (`sync-protocol.md`)
 
-> 本文档是 [总架构设计方案 (`architecture-proposal.md`)](./architecture-proposal.md) 与 [Cloudflare 云端专项架构 (`cloudflare-cloud-architecture.md`)](./cloudflare-cloud-architecture.md) 的形式化同步协议子规范，旨在将「永不静默丢数（Anti-Wipe by Construction）」收敛为无歧义的线格式、因果合并规则、存储回收机制与确定性模拟测试契约。
+> 本文档是 [总架构设计方案 (`architecture-proposal.md`)](./architecture-proposal.md) 与 [Cloudflare 云端专项架构 (`cloudflare-cloud-architecture.md`)](./cloudflare-cloud-architecture.md) 的形式化同步协议子规范，并与 [数据结构规范 (`data-structures.md`)](./data-structures.md)、[全链路接口契约 (`interface-contracts.md`)](./interface-contracts.md) 配套执行，将「永不静默丢数（Anti-Wipe by Construction）」收敛为无歧义的线格式、因果合并规则、存储回收机制与确定性模拟测试契约。
 
 ---
 
@@ -22,7 +22,7 @@
 ### 1.1 协议级五大防丢不变量
 
 1. **只追加与显式因果前置**：对已有实体的变更必须显式声明因果父操作集合 `parent_op_ids`；不存在无因果前置的静默覆盖。
-2. **引导前写隔离（Bootstrap Gate）**：当本地设备 `bootstrap_completed == false` 时，严禁对任何远端已有实体发出 `UPDATE / MOVE / LOCK / UNLOCK / DELETE / RESOLVE` 操作；未完成首次引导前用户在本地新建的草稿仅允许以全新 ULID 发出 `CREATE`。
+2. **引导前写隔离（Bootstrap Gate）**：当本地设备 `bootstrap_completed == false` 时，严禁对任何远端已有实体发出 `UPDATE / SET_META / LOCK / UNLOCK / DELETE / RESOLVE` 操作；未完成首次引导前用户在本地新建的草稿仅允许以全新 ULID 发出 `CREATE`。
 3. **非明文态编译期写阻断**：处于「未水化」「解密失败」或「保险库锁定」内存态的块，在类型系统层面不具备构造正文 `UPDATE` 操作的入口。
 4. **纯函数冲突物化**：多端离线并发编辑同一块正文时，主分支与冲突兄弟（Conflict Siblings）是操作集合的**纯函数确定性投影**，绝不自动派生新的冲突创建操作，避免多设备雪崩式重复建块。
 5. **快照只做加速，GC 受水位与多代快照双重约束**：客户端生成的盲快照存入 R2 且保留多世代历史；Durable Object（DO）热日志仅在低于所有活跃设备已拉取水位且已被已验证快照与冷备覆盖后才执行滑动窗口回收。
@@ -38,8 +38,8 @@ pub fn step(
 ) -> Result<(Vec<StoreMutation>, Vec<SyncCommand>), ProtocolError>;
 ```
 
-- **桌面端（`mynote-store`）**：使用 `rusqlite`（`WAL` + `FTS5` + `secure_delete`），在单个本地 SQLite 事务内原子落盘 `Vec<StoreMutation>`。
-- **移动端 PWA（`web/` + `mynote-wasm`）**：**不引入 `sqlite-wasm + OPFS`**（避免额外增加 ~400 KB gzip WASM 体积、Dedicated Worker 强制异步桥接开销以及 iOS Safari 下多标签页 OPFS `SyncAccessHandle` 独占锁冲突）。个人 Scratchpad 规模（通常数百至数千块、几 MB 数据）直接在浏览器端使用 **3 张极简 IndexedDB 对象表（`buffers`、`blocks`、`sync_ops`）** 持久化，内存检索耗时 `< 2 ms`。
+- **桌面端（`mynote-store`）**：使用 `rusqlite`（`STRICT` 表 + `WAL` + `FTS5` + `secure_delete`），在单个本地 SQLite 事务内原子落盘 `Vec<StoreMutation>`（完整 DDL 见 [`data-structures.md` §4](./data-structures.md#4-桌面端本地-sqlite-完整-ddl-schemamynote-store)）。
+- **移动端 PWA（`web/` + `mynote-wasm`）**：**不引入 `sqlite-wasm + OPFS`**（避免额外增加 ~400 KB gzip WASM 体积、Dedicated Worker 强制异步桥接开销以及 iOS Safari 下多标签页 OPFS `SyncAccessHandle` 独占锁冲突）。个人 Scratchpad 规模直接在浏览器端使用极简 IndexedDB 对象表（`buffers`、`blocks`、`block_conflicts`、`sync_ops`、`vault_store`、`device_keystore`）持久化，内存检索耗时 `< 2 ms`。
 
 ---
 
@@ -55,34 +55,33 @@ CREATE TABLE IF NOT EXISTS ops (
     op_id      TEXT NOT NULL UNIQUE,        -- ULID，幂等去重键（产生 1 行二级索引写入）
     device_id  TEXT NOT NULL,               -- 发送设备 ID
     created_at INTEGER NOT NULL,            -- 服务端接收毫秒时间戳（用于 30 天滑动窗口 GC）
-    envelope   BLOB                         -- SMK 加密信封；事后加锁触发墓碑擦除时置为 NULL
+    envelope   BLOB                         -- MNS1 加密信封；事后加锁触发墓碑擦除时置为 NULL
 );
 ```
 
 > [!IMPORTANT]
-> **严禁在 DO `ops` 表上添加多余二级索引**：Cloudflare DO SQLite 按「主表写入行 + 每个被更新二级索引行」计费。上述结构中 `seq` 复用 `rowid`，仅有 `UNIQUE(op_id)` 一个二级索引，确保每条操作严格只消耗 **2 rows written**；且单次批量推送（上限 500 条）必须在 `ctx.storage.transactionSync()` 内通过单行预编译语句循环插入，严格规避 DO SQL **单语句最多 100 个绑定参数**的硬限制。
+> **严禁在 DO `ops` 表上添加多余二级索引**：Cloudflare DO SQLite 按「主表写入行 + 每个被更新二级索引行」计费。上述结构中 `seq` 复用 `rowid`，仅有 `UNIQUE(op_id)` 一个二级索引，确保每条操作严格只消耗 **2 rows written**；且单次批量推送（上限 500 条，含同事务原子提交可变密钥变更 `key_mutations[]` 与 `purge_op_ids[]`）必须在 `ctx.storage.transactionSync()` 内通过单行预编译语句循环执行，严格规避 DO SQL **单语句最多 100 个绑定参数**的硬限制。
 
-### 2.2 Tier 1 同步盲信封结构（Envelope v1）
+### 2.2 Tier 1 同步盲信封结构（`MNS1` Envelope v1）
 
-序列化为紧凑二进制（MessagePack / CBOR）后，先执行 **256 字节阶梯对齐填充（Bucket Padding）** 消除短密文长度侧信道，再以 `Sync Master Key (SMK)` 执行 `XChaCha20-Poly1305` 加密：
+序列化为具名字段 MessagePack（`rmp_serde::to_vec_named`）后，执行双射 **256 字节阶梯对齐填充**（末尾 1 字节编码补零长度，精确布局见 [`data-structures.md` §3](./data-structures.md#3-密码学信封快照与归档包字节布局wire-layout-v1)），再以 `Sync Master Key (SMK)` 执行 `XChaCha20-Poly1305` 加密：
 
 - **AEAD 算法**：`XChaCha20-Poly1305`（24 字节随机 Nonce + 16 字节认证 Tag）
-- **关联认证数据（AAD）**：`"mynote-sync-v1" || smk_kid || op_id || device_id`（防止服务端跨操作或跨设备调包密文）
-- **信封外层头（明文可见，置于 `envelope` 前缀）**：` envelope_version (u8 = 1) || smk_kid (16B) || nonce (24B) || aead_ciphertext `
+- **关联认证数据（AAD）**：`"MNS1" || [0x01] || smk_kid (16B) || op_id_bytes (16B) || device_id.as_bytes()`
+- **信封外层头**：`magic "MNS1" (4B) || version (1B = 1) || smk_kid (16B) || nonce (24B) || aead_ciphertext`
 
-解密并去除填充后的内部结构（`InnerOpV1`）：
+解密并去除填充后的内部结构（`InnerOpV1` 逻辑示意）：
 
 ```json
 {
   "v": 1,
   "entity_type": "block",
-  "entity_id": "01JXYZ...",
+  "entity_id": "01JDF8Z9X4K7M2N5P8Q1R3S6T9",
   "op_type": "UPDATE",
-  "parent_op_ids": ["01JABC..."],
-  "hlc": "2026-11-24T12:00:00.123Z-0001-devA",
+  "parent_op_ids": ["01JDF8Y0000000000000000002"],
+  "hlc": "001795521600123-00001-dev_01jdf8z9x4k7m2n5",
   "actor": "human",
-  "payload_encoding": "FULL_ZSTD",
-  "payload": "<bytes>"
+  "body": { "k": "BlockFullZstd", "d": { "zstd_content": "<bytes>", "content_blake3": "<32B>" } }
 }
 ```
 
