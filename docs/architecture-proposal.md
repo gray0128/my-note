@@ -1,6 +1,6 @@
 # 轻量级多端可靠同步开发者笔记软件：深度调研与架构方案
 
-> **定位**：面向开发者的高频临时记录 / Scratchpad 工具，继承 Heynote「多语言分块 + 一键格式化」的顺手体验，从架构根源消除同步丢数问题，原生适配 **macOS**、**Omarchy（Arch + Hyprland）** 与 **移动端**，并兼顾**块级加密**与 **AI Agent / MCP 生态**。
+> **定位**：面向开发者的高频临时记录 / Scratchpad 工具，继承 Heynote「多语言分块 + 一键格式化」的顺手体验，从架构根源消除同步丢数问题，原生适配 **macOS**、**Omarchy（Arch + Hyprland）** 与 **移动端**，并兼顾**块级加密**、**Markdown/Mermaid 渲染**与 **CLI + Skill（Agent 友好）**。
 
 ---
 
@@ -15,7 +15,7 @@
    - [5.2 同步引擎：不可变操作日志（Anti-Wipe by Construction）](#52-同步引擎不可变操作日志anti-wipe-by-construction)
    - [5.3 格式化引擎：三层混合管线](#53-格式化引擎三层混合管线)
    - [5.4 安全与块级加密模型](#54-安全与块级加密模型)
-   - [5.5 本地 Agent 与未来云端 MCP / Open API 设计](#55-本地-agent-与未来云端-mcp--open-api-设计)
+   - [5.5 Agent 友好设计：CLI + Skill 与四级渐进披露帮助体系](#55-agent-友好设计cli--skill-与四级渐进披露帮助体系)
    - [5.6 Markdown 与 Mermaid 图渲染设计（轻量、离线与防 XSS）](#56-markdown-与-mermaid-图渲染设计轻量离线与防-xss)
 6. [多端形态与技术栈选型对比](#6-多端形态与技术栈选型对比)
 7. [分阶段演进路线图（MVP → V1 → V2）](#7-分阶段演进路线图mvp--v1--v2)
@@ -95,17 +95,17 @@ Heynote（Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js）将每个 Buffe
 
 ### 2.2 竞品横向对比矩阵
 
-| 产品 | 轻量度 | 同步可靠性 | 移动端 | Omarchy/Wayland 体验 | 内容格式化 | 块级加密 | 本地 Agent 友好 | 云端/MCP 潜力 |
+| 产品 | 轻量度 | 同步可靠性 | 移动端 | Omarchy/Wayland 体验 | 内容格式化 | 块级加密 | 本地 Agent / CLI 友好 | 云端架构与零知识 |
 | --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Heynote | 中下 (Electron) | 差 (依赖网盘) | ❌ | 一般 (全局热键坑) | ✅ 强 | ❌ | 良 (纯文本) | ❌ |
-| Benchpad | 良 | ✅ 强 (Yjs CRDT) | ✅ | 良 (Web) | ❌ | ❌ | ❌ (闭源) | ❌ |
-| Memos | ✅ 极轻 (Go) | 中 (在线中心化) | ✅ Web/三方 | ✅ 良 | ❌ | ❌ | 良 (API) | ✅ 强 |
-| SilverBullet | 良 | 良 (文件级同步) | ✅ PWA | ✅ 良 | 弱 | ❌ | ✅ 强 (服务端md) | 良 |
-| Standard Notes | 差 (重服务端) | 良 (Item 级) | ✅ | 一般 | 弱 | 整篇锁定 | ❌ 极差 | ❌ (E2EE阻塞) |
-| Notesnook | 中 | 良 | ✅ | 一般 | 弱 | 整篇 Vault | ❌ 差 | ❌ (E2EE阻塞) |
-| Obsidian | 中下 | 良 (付费/自建) | ✅ | 一般 | 插件 | 插件 | ✅ 极强 | 良 (本地MCP) |
-| Atuin (参考引擎) | ✅ 极轻 (Rust) | ✅ 极强 (OpLog) | ❌ | ✅ 极佳 | N/A | 全量 E2EE | ✅ 极强 (CLI/DB) | 良 |
-| **目标方案 (my-note)** | **✅ 单二进制 <15MB** | **✅ 追加日志+可选CRDT** | **✅ PWA起步** | **✅ 原生契合** | **✅ 三层混合** | **✅ 原生块级Vault** | **✅ CLI+SQLite+MCP** | **✅ 可控分层** |
+| Heynote | 中下 (Electron) | 差 (依赖网盘) | ❌ | 一般 (全局热键坑) | ✅ 强 | ❌ | 良 (纯文本) | ❌ 无内置云端 |
+| Benchpad | 良 | ✅ 强 (Yjs CRDT) | ✅ | 良 (Web) | ❌ | ❌ | ❌ (闭源) | 闭源 SaaS |
+| Memos | ✅ 极轻 (Go) | 中 (在线中心化) | ✅ Web/三方 | ✅ 良 | ❌ | ❌ | 良 (API) | 自托管 (非 E2EE) |
+| SilverBullet | 良 | 良 (文件级同步) | ✅ PWA | ✅ 良 | 弱 | ❌ | ✅ 强 (服务端md) | 自托管 (非 E2EE) |
+| Standard Notes | 差 (重服务端) | 良 (Item 级) | ✅ | 一般 | 弱 | 整篇锁定 | ❌ 极差 | 重自托管 (E2EE) |
+| Notesnook | 中 | 良 | ✅ | 一般 | 弱 | 整篇 Vault | ❌ 差 | 托管/自建 (E2EE) |
+| Obsidian | 中下 | 良 (付费/自建) | ✅ | 一般 | 插件 | 插件 | ✅ 极强 | 付费 Sync (E2EE) |
+| Atuin (参考引擎) | ✅ 极轻 (Rust) | ✅ 极强 (OpLog) | ❌ | ✅ 极佳 | N/A | 全量 E2EE | ✅ 极强 (CLI/DB) | 极简自建 (E2EE) |
+| **目标方案 (my-note)** | **✅ 单二进制 <15MB** | **✅ 追加日志+可选CRDT** | **✅ PWA起步** | **✅ 原生契合** | **✅ 三层混合** | **✅ 原生块级Vault** | **✅ CLI+Skill (渐进披露)** | **✅ CF 零知识 \$0** |
 
 ---
 
@@ -178,56 +178,44 @@ Heynote（Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js）将每个 Buffe
 
 ### 约束 5：对本地 Agent 友好
 
-- **真实诉求**：让本地运行的代码助手（Claude Code、Codex、OpenCode、Cursor、自写脚本）能顺手读取你刚贴在 Scratchpad 里的报错日志/API 响应，或者把分析结果、代码片段直接写进你的 Scratchpad。
+- **真实诉求**：让本地运行的代码助手（Claude Code、Codex、OpenCode、Cursor、自写脚本）能顺手读取你刚贴在 Scratchpad 里的报错日志/API 响应，或者把分析结果、代码片段、Mermaid 图直接写进你的 Scratchpad。
 - **架构挑战 5A — 「纯文本文件友好」与「可靠同步引擎」的冲突**：
-  - 本地 Agent 最喜欢用 `rg`/`cat` 读纯文件，但如果允许外部进程直接修改同步目录里的原始文本文件，就会回到 Heynote 的竞态老路（部分写入、监听死循环、破坏结构）。
-  - **解法：SQLite 为唯一权威数据源 + 三层 Agent 接入面**：
-    1. **一等公民 CLI（支持 `--json` 与 Unix 管道）**：如 `mynote add --lang json < resp.json`、`mynote search "timeout" --json`、`mynote get <id>`。CLI 直接通过本地 SQLite WAL（或 Unix Socket 连接 Daemon）做原子读写，写完立刻进入同步队列。
-    2. **内置本地 MCP Server（`mynote mcp`）**：通过 `stdio` 或 `localhost` Streamable HTTP 直接暴露结构化工具给各类 Agent 客户端；同时配套提供一份极轻的 **`SKILL.md`**，因为 2026 年的工程实践表明，对于简单 CLI 工具，用 Skill 调用 CLI 比挂载臃肿的 MCP Schema 节省大量 Context Token。
-    3. **可选的只读纯文本镜像（Read-Only Mirror）**：后台单向导出所有**未锁定**块为 `~/.local/share/mynote/mirror/<buffer>.md`，供 `rg`/fzf/编辑器只读检索；严禁反写，且加密块只输出 `[LOCKED BLOCK: <id>]` 占位符。
+  - 本地 Agent 习惯用 `rg`/`cat` 读纯文件，但如果允许外部进程直接修改同步目录里的原始文本文件，就会回到 Heynote 的竞态老路（部分写入、监听死循环、破坏结构）。
+  - **已确认解法：SQLite 为唯一权威数据源 + 「CLI + Skill（渐进披露帮助）」为主入口（明确放弃本地 MCP）**：
+    1. **一等公民 CLI + 极轻 `SKILL.md`**：不引入任何 MCP 协议栈与常驻 Schema 上下文负担。通过完备的 CLI（`--json` / `--jsonl`、Unix 管道、稳定退出码、错误提示 `hint`、乐观锁）配合 **四级渐进披露帮助体系（L0 `SKILL.md` → L1 总览 → L2 子命令帮助 → L3 专题/机读 Schema）**，让 Agent 按需查帮助、零浪费 Context Token，直接读写本地 SQLite WAL（并立即触发同步）。
+    2. **可选的只读纯文本镜像（Read-Only Mirror）**：后台单向导出所有**未锁定**块为 `~/.local/share/mynote/mirror/<buffer>.md`，供 `rg`/fzf/编辑器只读检索；严禁反写，且加密块只输出 `[LOCKED BLOCK: <id>]` 占位符。
 - **架构挑战 5B — 「Agent 友好」与「安全（约束 4）」的直接冲突**：
-  - Prompt Injection 已成为本地 Agent 的现实威胁：如果 Agent 读取外部网页/仓库代码后被注入指令，可能会尝试读取你的笔记并外传。
-  - **强制安全红线**：**本地 CLI / Local MCP 默认完全隔离所有加密块（Locked Blocks）**——查询时不返回密文、不可解密、不可检索。只有在用户显式在终端交互输入口令/生物识别（如 `mynote unlock --once <id>`）或授予短时只读令牌时才放行，且永不向 Agent 暴露密钥本身。
+  - Prompt Injection 已成为本地 Agent 的现实威胁：如果 Agent 读取外部网页/仓库代码后被注入指令，可能会尝试调用 CLI 读取你的笔记并外传。
+  - **强制安全红线**：**CLI 默认完全隔离所有加密块（Locked Blocks）**——查询时不返回明文/密文、不可检索、非 TTY 环境下拒绝交互解锁。只有在用户本人于交互终端显式输入口令/生物识别时才允许查看，且永不向 Agent 暴露任何密钥材料。
 
 ---
 
-### 约束 6：考虑有云端存在，后续支持 MCP 或开放接口供 Agent 使用
+### 约束 6：云端定位收敛（明确放弃云端 MCP / 开放接口，回归纯粹零知识同步中继）
 
-> [!WARNING]
-> **这是整个需求集合中最大的架构级悖论，必须在动工前做明确抉择！**
+> [!NOTE]
+> **已拍板架构收敛**：原方案曾分析「云端零知识 E2EE ⚔️ 云端 MCP / Open API」的根本悖论。经过权衡，已明确决定 **不考虑云端 MCP，本地也不考虑 MCP，Agent 交互统一收口到「本地 CLI + Skill」**。
 
-- **核心悖论：云端零知识 E2EE（约束 4） ⚔️ 云端托管 MCP / Open API（约束 6）**：
-  - 如果云端是**全量零知识加密**的，云端服务器手里只有一堆无法解密的随机字节——那么**云端根本不可能提供「云端搜索」「云端 MCP 读取笔记」「给远端 ChatGPT/Claude Web 开放 REST API」**的能力！
-  - 反之，如果云端能解密你的普通笔记以提供云端 MCP，那云端就不再对普通笔记零知识。
-
-- **三种清晰的破局模式（建议你从中选定其一）**：
-
-| 模式 | 普通块云端形态 | 加密块云端形态 | 云端 MCP / Open API 实现方式 | 适用场景与取舍 |
-| --- | --- | --- | --- | --- |
-| **模式 A（推荐默认）：全量 E2EE 哑云端 + 可信边缘 MCP 网关** | 客户端 E2EE 密文（云端零知识） | Vault Key 二次 E2EE（双重加密） | 本地跑 `mynote mcp`；需要远端访问时，通过 **Tailscale / Cloudflare Tunnel** 暴露你本机（或你自己信任的个人 VPS 上运行的一个持 `SMK` 的同步节点）的 MCP/HTTP API，且**该节点依然没有 `Vault Key`** | **安全性最高**：公有云/第三方中继零知识；远端 Agent 也能通过你自己的边缘网关访问普通笔记，同时绝对碰不到加密块。缺点是远端 MCP 依赖你的个人节点在线。 |
-| **模式 B（最务实自托管）：双层信任模型** | 自托管服务端明文存储（TLS + 盘加密） | **客户端 Vault Key 端到端加密**（服务端永远看不到明文） | 云端同步服本身直接内置 **Remote MCP（Streamable HTTP + OAuth2/Token）与 Open REST API**，24/7 在线，手机与云端 Agent 随时直连；API 自动过滤或仅返回加密块占位符 | **工程最简洁、云端 MCP 体验最好**：前提是云端部署在你自己掌控的 VPS / 自建服务器上（信任自己机器存放临时普通笔记，而把真正的秘密放进加密块）。 |
-| **模式 C（混合分区）：默认 E2EE + 显式 Agent 共享区** | 默认 E2EE；用户手动标记的 Buffer 使用独立 `Agent Key` | Vault Key 二次 E2EE | 云端只对明确标记为 `agent-accessible` 的 Buffer 持有只读/读写派生密钥，提供受限云端 MCP | 兼顾零知识与云端 MCP，但密钥管理与用户心智模型较复杂，不建议 MVP 阶段引入。 |
-
-**架构师建议**：
-- 如果你打算**自建一台个人轻量云主机（或家用服务器/Fly.io）**，**模式 A（边缘节点持 SMK 跑 MCP）** 与 **模式 B（普通块服务端可读 + 加密块严格客户端 E2EE）** 在实际信任边界上非常接近，但 **模式 A 的优势在于你可以随时把底层同步中继换成任意第三方对象存储或公共中继，无需信任托管商**；而 **模式 B 的优势在于开发成本最低、移动端无需浏览器端做全量解密也能享受服务端搜索和 24/7 云端 MCP**。
-- **好消息是**：只要我们在协议层把「同步信封」设计为可声明 `encryption: none | sync-e2ee | vault-e2ee`，**底层的 Block 数据模型与同步协议对模式 A 和模式 B 完全兼容**！
+这一决定直接带来**巨大的架构简化与安全性跃升**：
+1. **彻底消除 E2EE 悖论**：云端不再需要解密任何普通块，**Cloudflare 云端 100% 为零知识端到端加密（E2EE）盲同步中继**——DO SQLite 与 R2 中只存密文，彻底消除对云服务商的信任顾虑。
+2. **云端代码量骤减 ~70%**：无需构建云端 OAuth 2.1 授权服、云端物化视图/FTS5、远端 MCP 路由或内网穿透隧道；整个 Cloudflare 后端仅需约 **250–300 行 TypeScript**（SQLite Durable Object + WebSocket Hibernation + R2 + Workers Static Assets），个人成本稳定在 **\$0/月**。
+3. **客户端更轻更纯**：桌面 Rust 单二进制同样无需引入 MCP SDK 与额外传输层，体积更小、面更窄、更稳固。
 
 > [!TIP]
-> **Cloudflare 云端专项重评**：如果你倾向将云端架构部署在 **Cloudflare 技术栈（Workers + SQLite Durable Objects + R2 + Workers Static Assets）**，其信任边界、组件选型、成本预算、Remote MCP（`createMcpHandler` vs `cloudflared`）以及专属工程暗坑已单独整理至 [Cloudflare 技术栈云端架构专项评估 (`cloudflare-cloud-architecture.md`)](./cloudflare-cloud-architecture.md)。
+> 关于 Cloudflare 技术栈的详细组件选型、成本精算、6 大专属工程暗坑与反锁定逃生舱设计，请直接参阅 [Cloudflare 技术栈云端架构专项评估 (`cloudflare-cloud-architecture.md`)](./cloudflare-cloud-architecture.md)。
 
 ---
 
 ## 4. 推荐系统架构设计蓝图
 
-综合以上调研与权衡，推荐采用 **「Local-First 单体核心 + 嵌入式 Web/PWA + 极简追加日志同步服」** 架构。
+综合以上调研与决策，推荐采用 **「Local-First 单体核心（CLI + Skill + 内嵌 Web） + 移动端 PWA + Cloudflare 全量零知识追加日志同步服」** 架构。
 
 ### 4.1 整体架构图
 
 ```mermaid
 flowchart TD
     subgraph Desktop["桌面端 (macOS / Omarchy Arch+Hyprland)"]
-        CLI["CLI / 管道 / Skill (mynote)"]
-        MCP_L["Local MCP Server (stdio / localhost HTTP)"]
+        Agent["本地 AI Agent (Claude Code / Codex / OpenCode)"]
+        CLI["mynote CLI + SKILL.md (四级渐进披露帮助 / --json / 管道)"]
         UI_D["桌面 UI: Omarchy WebApp (Hyprland Scratchpad) / macOS WKWebView"]
         Daemon["mynote 单体二进制 Daemon (Rust, <20MB RAM)"]
         DB_L[("本地 SQLite (WAL + FTS5 + OpLog)")]
@@ -235,8 +223,8 @@ flowchart TD
         ExtFmt["外部格式化管道 (biome / gofmt / ruff / jq)"]
         Keyring["OS Keychain / Secret Service"]
 
+        Agent -->|"Shell + SKILL.md"| CLI
         CLI --> Daemon
-        MCP_L --> Daemon
         UI_D <-->|"localhost HTTP + WebSocket"| Daemon
         Daemon --> DB_L
         Daemon -->|"单向投影 (跳过加密块)"| Mirror
@@ -252,16 +240,16 @@ flowchart TD
         PWA <--> Bio
     end
 
-    subgraph Cloud["云端极简同步服 (单二进制 / Serverless)"]
-        SyncAPI["Append-Only Sync Relay (HTTP + WebSocket)"]
-        CloudDB[("SQLite / Postgres / D1 (OpLog + Snapshots)")]
-        RemoteMCP["可选 Remote MCP / Open API (模式 A 边缘节点 或 模式 B)"]
+    subgraph Cloud["Cloudflare 零知识云端 (单 Worker + SQLite DO + R2 + Static Assets)"]
+        SyncAPI["Append-Only Blind Sync Relay (HTTP + WS Hibernation)"]
+        CloudDB[("DO SQLite (盲加密 OpLog + 30天 PITR)")]
+        R2[("R2 (加密附件 + 每日冷备)")]
         SyncAPI --> CloudDB
-        RemoteMCP --> CloudDB
+        SyncAPI --> R2
     end
 
-    Daemon <-->|"WSS / HTTPS 增量 OpLog (E2EE 密文)"| SyncAPI
-    PWA <-->|"WSS / HTTPS 增量 OpLog (E2EE 密文)"| SyncAPI
+    Daemon <-->|"HTTPS push/pull + WSS (E2EE 密文)"| SyncAPI
+    PWA <-->|"HTTPS push/pull + WSS (E2EE 密文)"| SyncAPI
 ```
 
 ### 4.2 为什么这套架构最契合你的全部目标？
@@ -270,9 +258,9 @@ flowchart TD
    - 前端基于 **CodeMirror 6 + 极简响应式框架（SolidJS / Svelte 5 / Preact）**，打包后通过 `rust-embed` 内嵌进单体二进制。
    - **Omarchy**：后台 systemd user service 运行 `mynote daemon`，Hyprland 绑定快捷键（如 `SUPER + N`）拉起 `omarchy-launch-webapp http://127.0.0.1:port` 放入 Special Workspace，享受原生 Wayland 渲染、瞬时切换、零 WebKitGTK 崩溃。
    - **macOS**：`launchd` 运行同一 `mynote daemon`，前端可用 Safari/Chrome App Mode，或在 V1 包一层 ~3MB 的极薄原生 Swift `WKWebView` 壳以支持全局快捷键（如 `Cmd+Shift+H`）与菜单栏常驻。
-   - **移动端**：直接访问云端同步服托管的**同一份 PWA 静态资源**，借助 Service Worker + IndexedDB/OPFS 实现离线可编辑与联网自动同步；核心加解密与轻量格式化通过同一份 Rust 代码编译出的 **WASM** 复用，逻辑零重复。
-2. **零数据丢失架构**：本地 SQLite WAL + 不可变 OpLog + 软删除 + 冲突保留，彻底告别 iCloud Drive。
-3. **Agent 一等公民**：CLI、Local MCP、SQLite 只读镜像全具备，且对加密块实施硬隔离。
+   - **移动端**：直接访问 Cloudflare Workers Static Assets 免费托管的**同一份 PWA 静态资源**，借助 Service Worker + IndexedDB/OPFS 实现离线可编辑与联网自动同步；核心加解密与轻量格式化通过同一份 Rust 代码编译出的 **WASM** 复用，逻辑零重复。
+2. **零数据丢失 + 100% 零知识云端**：本地 SQLite WAL + 不可变 OpLog + 软删除 + 冲突保留，Cloudflare 端全程只存盲密文且自带 30 天 PITR + 每日 R2 冷备。
+3. **极致的 Agent 友好（零 MCP 负担）**：完备的 `CLI + SKILL.md` + 四级渐进披露帮助 + 确定性 `--json` 契约，对加密块实施硬隔离。
 
 ---
 
@@ -439,59 +427,115 @@ flowchart TD
 
 ---
 
-### 5.5 本地 Agent 与未来云端 MCP / Open API 设计
+### 5.5 Agent 友好设计：CLI + Skill 与四级渐进披露帮助体系
 
-设计原则：**把软件做成「AI Agent 的高速工作记忆草稿纸」，同时守住隐私红线**。
+> **设计决策**：**不实现本地 MCP，也不实现云端 MCP**。所有本地 AI Agent（Claude Code、Codex、OpenCode、Cursor 等）与人类开发者共享同一套**高完备度 CLI + 极轻 `SKILL.md`**，把 Token 占用、维护复杂度与攻击面同时压到最低。
 
-#### 1. 本地 Agent 三大入口（按推荐优先级）
+#### 1. 为什么「CLI + Skill」比 MCP 更适合本工具？
+- **零常驻上下文税**：传统 MCP 每次会话都会预先注入大量 JSON Tool Schema，而极轻的 `SKILL.md` 仅占 ~150–250 tokens，其余命令参数由 Agent 按需调用 `--help` 渐进读取。
+- **天然 Unix 可组合性**：直接与 `curl`、`jq`、`rg`、`pbcopy`/`wl-copy`、Shell 管道无缝衔接，人类和 Agent 用的是同一套心智模型。
+- **二进制更轻更纯**：Rust 核心无需引入 MCP SDK 与额外的 `stdio`/SSE 传输协议栈。
 
-1. **Composable CLI（首选，Token 成本最低）**
-   ```bash
-   # 管道写入：把 curl 或报错日志直接存成一个新块，自动识别/格式化 JSON
-   curl -s https://api.example.com/v1/status | mynote add --buffer debug --lang json --format
+#### 2. 四级渐进披露帮助体系（Progressive Disclosure Help）
 
-   # 结构化搜索（供 Agent 或 fzf 调用）
-   mynote search "connection refused" --limit 10 --json
+帮助信息严格按 **「先路由、后参数、按需展开专题与机读 Schema」** 分为 4 级，绝不在顶层一次性倾倒几千字说明：
 
-   # 读写指定块（原子事务，自动触发同步）
-   mynote block get 01JXYZ... --raw
-   mynote block append 01JXYZ... --stdin <<< "已排查：是 DNS 缓存问题"
+```mermaid
+flowchart LR
+    L0["Level 0: SKILL.md (~200 tokens) - 定位、黄金规则与发现入口"] --> L1["Level 1: mynote --help (~250 tokens) - 分组命令总览与核心示例"]
+    L1 --> L2["Level 2: mynote <cmd> --help (~300 tokens) - 参数、默认值、IO 与退出码"]
+    L2 --> L3A["Level 3a: mynote help <topic> - 专题深度指南"]
+    L2 --> L3B["Level 3b: mynote <cmd> --help-json - 机读参数与输出 Schema"]
+```
 
-   # 输出最近 5 个块作为上下文喂给 LLM
-   mynote recent -n 5 --format markdown
-   ```
-   - 配套随安装包附带一份标准的 **`SKILL.md`**，让 Claude Code / OpenCode 等 Agent 直接通过轻量命令行完成读写，免去常驻 MCP Schema 消耗数千 Token。
+- **Level 0 — 极简 `SKILL.md`（常驻 Agent 技能目录，严格控制在 `< 250 tokens`）**：
+  - 只写 4 件事：① `mynote` 是什么（本地多语言分块草稿本）；② 渐进发现入口（`mynote --help`、`mynote <cmd> --help`、`mynote help agent`）；③ 4 条 Agent 黄金法则（程序化调用必加 `--json`；更新已有块必带 `--expected-head`；绝不尝试解密加密块；列表查询注意 `--limit`）；④ 3 条最高频命令速查。
+  - **反模式禁止**：严禁把全部子命令和几十个 Flag 写死在 `SKILL.md` 中（既浪费 Token，又容易与 CLI 实际版本漂移）。
 
-2. **内置本地 MCP Server（`mynote mcp`）**
-   - 直接内建在单二进制中，支持 `stdio`（主流本地 Agent 零配置接入）和 `localhost` Streamable HTTP。
-   - 精简高内聚的工具集（控制工具数量，避免污染上下文）：
-     - `list_buffers()` — 列出所有 Buffer 概览
-     - `search_blocks(query, buffer?, lang?, limit?)` — 基于 SQLite FTS5 毫秒级全文检索（自动跳过加密块）
-     - `get_block(block_id)` — 获取指定普通块内容与元信息
-     - `create_block(buffer, content, lang?, auto_format?)` — 新增块
-     - `update_block(block_id, content, expected_head_op_id)` — **乐观锁防覆盖更新**（防止 Agent 覆盖你刚刚手敲的内容！）
-     - `format_block(block_id)` — 调用格式化管线
-   - **MCP Resources**：暴露 `mynote://buffers/{name}` 和 `mynote://recent`，支持 Agent 订阅或按 URI 引用。
+- **Level 1 — 顶层命令路由（`mynote -h` / `mynote --help`，控制在 25–35 行）**：
+  ```text
+  mynote — Local-first block scratchpad with E2EE sync & formatting
 
-3. **可选只读纯文本镜像（Read-Only Mirror）**
-   - 开启后将非加密块异步投影为 `~/.local/share/mynote/mirror/<buffer>.md`，支持外部 `rg` / 编辑器只读搜索；加密块统一投影为 `<!-- LOCKED BLOCK: 01JXYZ... (hint: prod key) -->`。
+  CAPTURE & BLOCKS:
+    add         Create a new block (supports stdin pipe & --format)
+    block       Read, update, append, move, or delete a specific block
+    buf         List, create, or rename buffers
 
-#### 2. 面向 Agent 的安全防火墙（必做！）
+  QUERY & CLIPBOARD:
+    ls          List recent blocks (summary-first, token-budget safe)
+    search      Full-text search across unlocked blocks (FTS5)
+    clip        Instant cross-device clipboard push/pull (0ms fast-flush)
 
-- **默认拒绝加密块**：CLI、Local MCP、Cloud API 在默认作用域下**对加密块完全不可见（返回 `redacted: true` 与 `public_hint`）**，防止 Prompt Injection 诱导 Agent 窃取敏感块。
-- **写操作可回溯（Audit & Undo）**：Agent 写入的每个 `sync_ops` 携带 `actor = "agent:<client_name>"`，在 UI 中清晰标注来源，并支持一键撤销 Agent 的误改。
-- **乐观锁保护**：Agent 修改已有块时必须携带 `expected_head_op_id`，若你在期间改过该块，拒绝静默覆盖。
+  TRANSFORM & OPS:
+    format      Format a block or stdin (json/sql/yaml/xml/md + external CLIs)
+    sync        Inspect sync status, force push/pull, view conflicts
+    vault       Lock/unlock sensitive blocks (TTY-only for decryption)
+    help        Deep topics: formatting, locking, conflict, agent
 
-#### 3. 未来云端开放接口与 Remote MCP（Phase 2–3）
+  GLOBAL FLAGS:
+    --json        Structured JSON output envelope {ok, data, error, meta}
+    --jsonl       Line-delimited JSON stream for list/search
+    --quiet       Suppress non-data stderr notices
+    --help-json   Machine-readable command & flag schema
 
-- 提供标准化的 **OpenAPI (REST)** 与 **MCP Streamable HTTP**，认证采用 **细粒度 Scoped Token / OAuth 2.1**（支持 `read:buffer:<name>`、`write:inbox` 等最小权限作用域，严禁签发全局无限制密钥）。
-- 具体部署遵循你在第 3 节中选定的 **模式 A（个人可信边缘网关解封 SMK，仍无 Vault Key）** 或 **模式 B（自托管服务端直接提供）**。
+  NEXT STEP:
+    Run 'mynote <cmd> --help' for flags & examples.
+    Run 'mynote help agent' for AI agent integration contract & exit codes.
+  ```
+
+- **Level 2 — 子命令精准参考（`mynote <cmd> --help`）**：
+  - 仅在 Agent 确定要调用某个子命令时按需加载，固定包含 5 个结构化区块：**SYNOPSIS / FLAGS（含类型与默认值）/ STDIN & STDOUT 契约 / EXIT CODES / 2–3 个可直接复制的 EXAMPLES**。
+
+- **Level 3 — 深度专题与机读 Schema（按需按主题展开）**：
+  - `mynote help <topic>`：内置离线文档专题（如 `mynote help agent`、`mynote help formatting`、`mynote help conflict`、`mynote help locking`），覆盖边界场景与冲突恢复配方；
+  - `mynote <cmd> --help-json`（基于 `clap` 元数据自动生成，永不漂移）：输出该命令所有参数的名称、类型、枚举值、是否必填、退出码表以及返回 JSON 结构，供需要严格 Schema 的自动化脚本/Agent 零歧义解析。
+
+#### 3. Agent-Native CLI 工程契约（比 `--help` 更关键的 6 条硬规范）
+
+1. **统一结构化输出信封（`--json`）与 TTY 自适应**：
+   - 带 `--json` 时，stdout 永远是合法单条 JSON（日志/警告只走 stderr）：
+     ```json
+     {
+       "ok": true,
+       "data": { "id": "01JXYZ...", "buffer": "scratch", "lang": "json", "head_op_id": "01JABC..." },
+       "meta": { "local_seq": 108, "sync_state": "synced", "redacted_count": 1 }
+     }
+     ```
+   - 当检测到 `!isatty(stdout)`（处于管道或 Agent Shell 执行中）时，自动关闭 ANSI 颜色码与交互式分页器（pager）。
+2. **语义化稳定退出码 + 可执行错误提示（`hint`）**：
+   - `0` 成功 | `2` 参数错误 | `3` 目标不存在 | `4` 乐观锁冲突（`HEAD_MISMATCH`）| `5` 加密块受限（`BLOCK_LOCKED`）| `6` 云端离线（本地写入仍成功）| `7` 格式化语法错误。
+   - 错误返回必带下一步动作建议，让 Agent 无需盲猜就能自愈：
+     ```json
+     {
+       "ok": false,
+       "error": {
+         "code": "HEAD_MISMATCH",
+         "message": "Block 01JXYZ was modified concurrently (expected 01JAA1, actual 01JBB9)",
+         "hint": "Run 'mynote block get 01JXYZ --json' to inspect latest content, then retry with --expected-head 01JBB9"
+       }
+     }
+     ```
+3. **非交互快速失败（Never Hang）**：
+   - 在非 TTY 环境下或传入 `--non-interactive` / `--json` 时，**绝不允许阻塞等待用户输入密码或 `y/N` 确认**；缺少必填确认或需要解锁 Vault 时立即以明确退出码（`2` / `5`）返回。
+4. **防误覆写与幂等保障**：
+   - `mynote block update <id> --expected-head <op_id>`：强制乐观锁，防止 Agent 静默覆盖用户刚刚手敲的内容；
+   - `mynote add --idempotency-key <key>`：支持 Agent 重试不产生重复块；
+   - 批量/破坏性命令（`block delete`、`format --all`）统一支持 `--dry-run`。
+5. **Context / Token 预算保护（防撑爆上下文）**：
+   - `mynote ls` 与 `mynote search` 默认返回**摘要视图**（`id`、`buffer`、`lang`、`updated_at`、`byte_size`、`preview` 截断前 240 字符，`--limit 20`），避免某个 300KB 的 JSON 响应块瞬间撑爆 Agent 上下文；完整正文需按 `id` 显式调用 `mynote block get <id> --raw` 或 `--max-chars <N>` 读取。
+6. **加密块硬防火墙与操作审计**：
+   - 普通/Agent 调用 `ls`、`search`、`block get` 时，加密块统一返回 `{ id, is_locked: true, public_hint, redacted: true }`，**严禁输出明文或可离线暴力破解的密文信封**；
+   - `mynote vault unlock` 仅允许在真实交互终端（TTY）执行，杜绝 Prompt Injection 诱导非交互 Agent 窃密；
+   - 支持通过环境变量 `MYNOTE_ACTOR="agent:claude-code"`（`SKILL.md` 中引导设置）自动在 `sync_ops.actor` 记录写入来源，UI 中高亮标识并支持一键时间旅行撤销。
+
+#### 4. 可选只读纯文本镜像（补充零门槛检索）
+- 开启后后台将**非加密块**单向投影为 `~/.local/share/mynote/mirror/<buffer>.md`，供 `rg` / `fzf` / 外部编辑器只读检索；加密块统一投影为 `<!-- LOCKED BLOCK: 01JXYZ... (hint: prod key) -->`，严禁外部直接反写。
 
 ---
 
 ### 5.6 Markdown 与 Mermaid 图渲染设计（轻量、离线与防 XSS）
 
-新增对 **Markdown** 与 **Mermaid 图** 的原生支持，不仅高度契合个人临时记录，更是 **AI Agent 输出的最佳载体**（Agent 经由 CLI / MCP 写入架构图、时序图或 Markdown 清单，多端立刻可见）。但这项能力直接撞上了**「足够轻量（约束 3）」**与**「足够安全（约束 4）」**两条红线，必须做专项设计：
+新增对 **Markdown** 与 **Mermaid 图** 的原生支持，不仅高度契合个人临时记录，更是 **AI Agent 输出的最佳载体**（Agent 经由 `mynote add --lang mermaid` 或 Markdown 块写入架构图、时序图与任务清单，多端立刻可见）。但这项能力直接撞上了**「足够轻量（约束 3）」**与**「足够安全（约束 4）」**两条红线，必须做专项设计：
 
 #### 1. 必须提前应对的三项核心挑战
 
@@ -503,7 +547,7 @@ flowchart TD
      - **轻量替代观察**：2026 年社区已出现面向 Obsidian 等场景的零依赖轻量 Mermaid-to-SVG 渲染器（如 `Pele`，~230 KB gzip，基于 CSS 变量换肤，渲染耗时 `< 1ms`）。MVP 可先用官方 `mermaid`（懒加载，确保 100% 语法兼容），待轻量引擎全图表类型稳定后可无痛切换。
 
 2. **挑战 M2：Markdown / Mermaid 渲染引发的 XSS 与数据外泄风险（严重安全红线！）**
-   - 2026 年已有多个真实 CVE / 安全通告指出：**当 AI Agent / MCP 生成的 Markdown 或 Mermaid 源码被直接渲染进主页面 DOM 时**：
+   - 2026 年已有多个真实 CVE / 安全通告指出：**当外部粘贴或 AI Agent 生成的 Markdown / Mermaid 源码被直接渲染进主页面 DOM 时**：
      - 若 Mermaid 配置了 `securityLevel: 'loose'` 或启用 `click` 指令，会直接导致 **Stored XSS**——由于页面运行在 `localhost`（可调用本地 Daemon）或在内存中持有刚解锁的 Vault 明文，一次 XSS 足以窃取全部笔记！
      - 即使在 `securityLevel: 'strict'` 下，恶意模型生成的 Mermaid 标签或 Markdown 仍可能利用外部图片/CSS URL 触发 **跨站请求外泄（Off-Origin Image Request）**。
    - **强制安全防御栈**：
@@ -511,12 +555,21 @@ flowchart TD
      - Markdown 渲染默认**禁止执行/直出原始 HTML**，输出经 `DOMPurify` 严格白名单净化；
      - 前端配置严格 **CSP**：`script-src 'self' 'wasm-unsafe-eval'; img-src 'self' data: blob:;`（禁止第三方外链图片自动静默加载，需要时手动点击放行），彻底封堵 Prompt Injection → 渲染层 XSS/外带通道。
 
-3. **挑战 M3：桌面与移动端的差异化交互体验**
-   - **Markdown 块（`lang = "markdown"`）**：基于 CodeMirror 6 采用 **Obsidian 风格的轻量 Live Preview（所写即所得混合模式）**（参考 `codemirror-live-markdown` / SilverBullet 方案）——**光标所在行显示原始 Markdown 语法（避免富文本光标跳动），非激活行自动渲染标题字号、加粗、行内代码、可点击复选框（`- [ ]` ↔ `- [x]`）、GFM 表格，并在 ```` ```mermaid ```` 围栏下方直接内嵌渲染 SVG 图表**；同时保留一键切换「纯源码 / 纯预览」的快捷键。
+3. **挑战 M3：Markdown 源码/预览双模切换与「预览态极致复制体验」（已确定方案）**
+   - **为什么放弃混合 Live Preview、改用「源码模式 ↔ 预览模式」切换？**
+     - 在 Obsidian 式混合 Live Preview 中，拖选跨行文本时会不断把隐藏的 `**` / `###` / 代码围栏重新弹开，反而干扰复制；而清晰的**双模切换（快捷键 `Cmd/Ctrl+E` 或块头切换按钮，宽屏可选分栏）**既让源码编辑零光标跳动，又让预览态变成极其顺手的阅读与复制界面（手机端预览态点击文字也不会误弹虚拟键盘！）。
+   - **预览模式（Preview Mode）的复制体验专项打磨**：
+     - **双格式剪贴板（Dual-Format Copy）**：预览态直接划选复制或点击「复制渲染内容」时，同时写入 `ClipboardItem` 的 `text/html`（去除冗余背景色/样式的干净语义 HTML）与 `text/plain`——粘贴到飞书、Notion、Slack、微信、Google Docs 保留标题/列表/加粗/表格排版，粘贴到终端/纯文本框自动回落为干净纯文本。
+     - **细粒度一键复制按钮（所见即所拷）**：
+       - 预览态下每个 **代码围栏（` ```lang `）** 右上角悬浮一键 **Copy Code**（自动剥离反引号，只拷贝纯代码）；
+       - 每个内嵌或独立的 **Mermaid 图** 提供一键 **Copy PNG（可直接贴聊天/文档）** / **Copy SVG** / **Copy Mermaid 源码**；
+       - 每个 **GFM 表格** 提供一键 **Copy TSV（直贴 Excel / 飞书表格）** / **Copy Markdown**；
+       - 块头提供明确复制入口：**复制渲染态（默认）** 与 **复制原始 Markdown**；
+       - 任务清单复选框（`- [ ]` ↔ `- [x]`）在预览态下依然可直接点击勾选并原子回写源码。
    - **独立 Mermaid 块（`lang = "mermaid"`）**：
-     - 编辑器接入 `codemirror-lang-mermaid` 语法高亮；
-     - **桌面端（macOS / Omarchy）**：支持左右分栏或上下预览，防抖 300ms 实时重绘；**语法输入中途报错时保留上一帧有效 SVG 并在底部显示轻提示**，不闪烁白屏；内置一键 **Copy SVG / Export PNG** 与缩放平移（Pan/Zoom）；
-     - **移动端（iOS / Android PWA）**：窄屏自动切换为 **「编辑 / 预览」Tab 切换** + 双指捏合缩放查看大图；
+     - 源码态接入 `codemirror-lang-mermaid` 语法高亮；
+     - **桌面端（macOS / Omarchy）**：支持源码/预览切换及左右分栏实时重绘（防抖 300ms）；**语法输入中途报错时保留上一帧有效 SVG 并在底部显示轻提示**，不闪烁白屏；内置缩放平移（Pan/Zoom）与一键 **Copy PNG / Copy SVG**；
+     - **移动端（iOS / Android PWA）**：窄屏默认展示预览态（方便直接查看与复制），一键切源码编辑，支持双指捏合缩放；
      - **主题同步**：SVG 颜色随系统深浅色（及 Omarchy 主题色 CSS 变量）自动联动，绝不出现黑底黑字。
    - **Markdown 格式化增强（复用 Layer 1 Rust/WASM 管线）**：一键触发 GFM 表格列对齐、标题/列表缩进规整、冗余空行清理。
 
@@ -524,17 +577,17 @@ flowchart TD
 
 ## 6. 多端形态与技术栈选型对比
 
-### 6.1 核心语言选型：Rust vs Go
+### 6.1 核心语言选型：Rust vs Go（云端 Worker 固定为 TypeScript）
 
 | 维度 | **Rust（推荐）** | **Go（务实备选）** |
 | --- | --- | --- |
 | 单体二进制与内存 | 极佳（8–15MB，空闲 ~10–15MB RAM，无 GC 抖动） | 极佳（12–20MB，空闲 ~15–25MB RAM） |
 | **WASM 复用（关键加分项）** | **极强**：同一套密码学（`chacha20poly1305`/`argon2`）、同步状态机、JSON/SQL/YAML/Markdown 格式化器可直接编译成几百 KB 的 WASM 给移动端 PWA 复用，**零双端重复实现** | 较弱：Go WASM 运行时体积较大（通常数 MB），TinyGo 对完整标准库/密码学生态支持有限 |
 | 密码学与内存安全 | 原生 `zeroize` 自动清零敏感密钥内存，无 GC 副本残留风险 | GC 拷贝可能导致密钥在堆中短时残留，难以彻底擦除 |
-| 生态成熟度 | `axum` + `rusqlite`/`sqlx` + `rust-embed` + `rmcp`（官方 Rust MCP SDK）+ `loro`（原生 Rust！） | `echo`/`chi` + `modernc.org/sqlite` + `embed` + `mcp-go` |
+| CLI 与生态成熟度 | `clap`（原生支持分组帮助 + 反射导出 `--help-json`）+ `axum` + `rusqlite` + `rust-embed` + `loro`（原生 Rust） | `cobra` + `chi`/`echo` + `modernc.org/sqlite` + `embed` |
 | 开发迭代速度 | 中等（编译慢、借用检查前期学习曲线） | **极快**（上手与重构成本最低） |
 
-> **选型建议**：优先 **Rust** 作为本地核心与 WASM 共享层（云端若部署在 Cloudflare Workers，则云端同步服直接使用 **TypeScript**，详见 [Cloudflare 专项评估](./cloudflare-cloud-architecture.md)）；如果非常熟悉 Go 且希望快速出原型，可选 **Go 守护进程 + TypeScript 共享移动端与云端层**。
+> **选型建议**：优先 **Rust** 作为本地单体核心与 WASM 共享层（去掉 MCP 依赖后依赖树更轻）；云端同步中继固定使用 **TypeScript（Cloudflare Workers + SQLite DO）**，详见 [Cloudflare 专项评估](./cloudflare-cloud-architecture.md)。如果非常熟悉 Go 且希望快速出原型，可选 **Go 守护进程/CLI + TypeScript 共享移动端与云端层**。
 
 ### 6.2 桌面端 UI 形态对比（重点考量 macOS + Omarchy）
 
@@ -548,33 +601,32 @@ flowchart TD
 ### 6.3 前端编辑器选型
 
 - 强烈推荐 **CodeMirror 6**：
-  - Heynote 与 Obsidian 已经验证了它是开发者 Scratchpad 与 Markdown Live Preview 的最佳编辑器内核；
+  - Heynote 已经验证了它是开发者 Scratchpad 源码编辑的最佳内核；
   - 高度模块化（按需懒加载语言高亮包与 Mermaid 渲染 Chunk，核心 gzip 仅 ~150–200KB）；
-  - 原生支持移动端触控与输入法（IME）、多光标、折叠、Vim/Emacs 键位模式、自定义行内 Widget（Markdown Live Preview、行内 Mermaid SVG 预览、Math 块实时计算结果、加密块锁态卡片）。
+  - 原生支持移动端触控与输入法（IME）、多光标、折叠、Vim/Emacs 键位模式、自定义行内 Widget（如 Math 块实时计算结果、加密块锁态卡片）；配合独立的 Markdown 预览渲染层（`markdown-it`/`marked` + `DOMPurify` + 懒加载 Mermaid），实现丝滑的「源码 ↔ 预览」切换与预览态高便利复制。
 
 ---
 
 ## 7. 分阶段演进路线图（MVP → V1 → V2）
 
-遵循「先彻底解决核心痛点（防丢 + 多端 + 格式化 + Markdown/Mermaid + CLI），再叠加加密与云端生态」的渐进策略：
+遵循「先彻底解决核心痛点（防丢 + 格式化 + Markdown/Mermaid + 完备 CLI/Skill），再叠加 Cloudflare 零知识同步与块级加密」的渐进策略：
 
-### Phase 0：MVP（2–3 周）— 替代 Heynote 日常使用
+### Phase 0：MVP（2 周）— 桌面端先替代 Heynote
 - [ ] **核心单二进制（`mynote`）**：SQLite WAL + FTS5 + Block-First 数据模型 + Fractional Indexing。
-- [ ] **内嵌 Web UI**：CodeMirror 6 多语言分块流、Heynote 同款快捷键（`Cmd/Ctrl+Enter` 建块、`Cmd/Ctrl+L` 切语言、`Cmd/Ctrl+P` 切 Buffer、全局搜索）。
-- [ ] **Markdown 与 Mermaid 原生支持**：Markdown Live Preview（含可点击任务清单、GFM 表格）、独立/内嵌 Mermaid 懒加载离线 SVG 渲染（严格防 XSS 沙箱 + 主题同步 + Pan/Zoom）。
+- [ ] **内嵌 Web UI**：CodeMirror 6 多语言分块流、Heynote 同款快捷键（`Cmd/Ctrl+Enter` 建块、`Cmd/Ctrl+L` 切语言、`Cmd/Ctrl+P` 切 Buffer、`Cmd/Ctrl+E` 切预览/源码、全局搜索、块顶一键 Copy）。
+- [ ] **Markdown 双模与 Mermaid 原生支持**：Markdown 源码/预览模式切换（宽屏可选分栏）、预览态极致复制（双格式富文本/纯文本复制、代码块一键 Copy、GFM 表格一键 TSV、复选框可点）、独立/内嵌 Mermaid 懒加载离线 SVG 渲染（严格防 XSS 沙箱 + 主题同步 + Pan/Zoom + Copy PNG/SVG）。
 - [ ] **Layer 1 + Layer 2 格式化**：内置 JSON（含脏 JSON 解包）/ YAML / SQL / XML / Markdown 表格格式化 + 本地外部 CLI 管道（`formatters.toml`）。
-- [ ] **基础 CLI**：`add / ls / search / get / update / format`，支持 stdin/stdout 管道与 `--json`。
+- [ ] **Agent 友好 CLI + Skill 体系**：`add / ls / search / block / buf / format / help`，完整落地 **四级渐进披露帮助（L0 `SKILL.md` → L1 总览 → L2 子命令 → L3 专题与 `--help-json`）**、统一 `--json` 信封、稳定退出码、错误 `hint`、乐观锁 `--expected-head` 与 Token 摘要截断。
 - [ ] **Omarchy & macOS 集成脚本**：提供 Hyprland Special Workspace 绑定示例与 systemd / launchd 守护配置。
 
-### Phase 1：V1（2–3 周）— Cloudflare 可靠多端同步 + 块级加密 + 本地 MCP
-- [ ] **Cloudflare 云端同步服（`cloud-cf/`）**：TypeScript Worker + SQLite Durable Object（Append-Only OpLog + WebSocket Hibernation + `epoch` 校验 + 每日 R2 冷备 Alarm）+ Workers Static Assets 一键部署 PWA（详见 [Cloudflare 专项评估](./cloudflare-cloud-architecture.md)）。
-- [ ] **端到端加密（Tier 1 Sync E2EE）与块级 Vault 加密（Tier 2 Block Lock）**：Argon2id + XChaCha20-Poly1305 + Recovery Key + 自动回锁。
-- [ ] **移动端 Local-First PWA**：离线 IndexedDB/OPFS 缓存 + Rust WASM 加解密/格式化 + 顶部同步状态指示 + WebAuthn PRF 生物识别解锁 + 窄屏 Markdown/Mermaid 切换预览。
-- [ ] **本地 MCP Server (`mynote mcp`) & `SKILL.md`**：内置工具集、乐观锁防覆盖、加密块硬隔离与操作审计。
-- [ ] **时间旅行（Revision History）**：任意块支持查看历史版本与一键恢复。
+### Phase 1：V1（2 周）— Cloudflare 全量零知识同步 + 跨端剪贴板 + 块级加密 + 移动端 PWA
+- [ ] **Cloudflare 盲加密同步服（`cloud-cf/`）**：约 250–300 行 TypeScript Worker + SQLite Durable Object（Append-Only OpLog + WebSocket Hibernation + `epoch` 校验 + 每日 R2 冷备 Alarm）+ Workers Static Assets 一键部署 PWA（详见 [Cloudflare 专项评估](./cloudflare-cloud-architecture.md)）。
+- [ ] **端到端加密（Tier 1 Sync E2EE）与块级 Vault 加密（Tier 2 Block Lock）**：Argon2id + XChaCha20-Poly1305 + Recovery Key + 空闲自动回锁 + 加密块对 CLI/Agent 的硬隔离与 Crypto-Shredding。
+- [ ] **跨设备复制粘贴快车道**：粘贴 `0–100ms` 快刷 + `<=16KB` WS 顺风车（跳号回退 HTTP `pull`）+ `mynote clip push/pull` 对接 `pbcopy`/`wl-copy`。
+- [ ] **移动端 Local-First PWA**：离线 IndexedDB/OPFS 缓存 + Rust WASM 加解密/格式化 + 切前台即拉 + 顶部诚实同步状态灯 + WebAuthn PRF 生物识别解锁 + 移动端默认预览态一键复制。
+- [ ] **时间旅行（Revision History）**：任意块支持查看历史版本与一键恢复（含按 `actor` 撤销 Agent 修改）。
 
-### Phase 2：V2（按需演进）— 极致打磨与开放生态
-- [ ] **云端 Open API & Remote MCP**：按选定模式启用 **CF 模式 A（`cloudflared` 边缘节点 MCP）** 或 **CF 模式 B（Worker 内置无状态 `createMcpHandler` + OAuth 2.1）**。
+### Phase 2：V2（按需演进）— 极致打磨
 - [ ] **macOS 极薄原生壳（可选）**：3MB Swift `WKWebView` 菜单栏应用，补齐 macOS 全局快捷键唤出与原生 Touch ID 解锁。
 - [ ] **单块字符级 CRDT 升级（可选）**：为非加密块接入 Loro/Yjs，实现 Mac 与手机同时编辑同一块也能无冲突实时合并。
 - [ ] **扩展能力**：Math/单位计算块、R2 加密图片粘贴（SHA-256 内容寻址附件）、只读 Markdown 镜像、终端 TUI 快速查看器（`ratatui`）。
@@ -583,15 +635,10 @@ flowchart TD
 
 ## 8. 编码前待确认的关键架构决策
 
-在正式初始化代码仓库和编写 Schema 之前，建议先拍板以下 **4 个核心决策点**：
+经过前面的收敛，**云端栈（Cloudflare 100% 零知识 E2EE 哑中继）**、**Agent 范式（纯 CLI + Skill，不做本地/云端 MCP）** 与 **Markdown 交互（源码/预览切换 + 预览态极致复制）** 均已明确拍板。正式初始化代码仓库前，仅剩以下 **2 项实现级选择**待确认：
 
-1. **Cloudflare 云端信任模型（决定加密与远端 MCP 边界）**：
-   - **CF 模式 A（推荐起步，隐私优先）**：DO SQLite / R2 全量客户端 E2EE 密文（Cloudflare 零知识）；远端 MCP 通过 `cloudflared` 暴露本机/边缘可信节点（仅含 `SMK`，绝无 `Vault Key`）。
-   - **CF 模式 B（24/7 云端原生 MCP 优先）**：普通块明文存于你个人 CF 账号的 DO SQLite（开箱支持 Worker 无状态 `createMcpHandler` + OAuth 2.1 + 边缘搜索），仅「加密块」采用客户端 `Vault Key` 端到端加密。
-2. **本地核心实现语言（云端 Worker 推荐固定为 TypeScript）**：
-   - **选项 A（Rust）**：单二进制极致轻量 + WASM 复用到移动端 PWA（加密与格式化零重复）+ `zeroize` 内存擦除。
+1. **本地核心实现语言（云端 Worker 固定为 TypeScript）**：
+   - **选项 A（Rust，推荐）**：单二进制极致轻量 + `clap` 原生渐进帮助/`--help-json` + WASM 复用到移动端 PWA（加密与格式化零重复）+ `zeroize` 内存擦除。
    - **选项 B（Go）**：本地守护进程与 CLI 迭代最快，但移动端 PWA 的加密与格式化逻辑需在 TypeScript 侧单独维护。
-3. **移动端形态的短期验收标准**：
+2. **移动端形态的短期验收标准**：
    - 先用 **Cloudflare Workers Static Assets 托管的 Local-First PWA** 快速覆盖 iOS/Android（\$0 运维、0 应用商店审核成本），是否能接受 iOS 上「无系统级 Share Sheet、需手动添加到主屏幕」的限制？
-4. **Markdown 编辑交互倾向**：
-   - **混合 Live Preview（Obsidian 风格，当前行源码/其余行实时渲染 + 行内 Mermaid SVG）** 还是 **极简源码模式 + 一键/分栏预览**？（前者体验最惊艳，后者 MVP 开发周期可缩短约 4–5 天）。
