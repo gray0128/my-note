@@ -94,6 +94,7 @@ Plane A 的任何单项失败均视为 **P0 阻断性缺陷**，不允许使用�
 | **`SEC-04`** | 256B 双射填充无碰撞无泄露 | `proptest` 遍历 `0 B` 至 `512 KiB` 随机长度字节流（含全 `0x00`、全 `0x80` 边界值）往返 `pad_256 -> unpad_256` | `100%` 精确还原原始字节，且所有密文负载长度均为 `256` 的整数倍 |
 | **`SEC-05`** | 本地 Daemon 跨源与票据重放防御 | 构造 `Host: attacker.com`（DNS Rebinding）、缺失/伪造 `Origin` 的 HTTP `PATCH` 与 `/v1/local/ws` 握手、二次重放已消费的 `exchange?ticket=` | 全部返回 `401` 或 `403`，零状态变更 |
 | **`SEC-06`** | Markdown / `Pele` 零 XSS 零外带 | 输入 OWASP XSS 向量库、恶意 `![img](https://evil.test/leak)`、含伪造 `<foreignObject>` 与 `<script>` 的 Mermaid 文本，经渲染管线与无头浏览器 CSP 沙盒加载 | 渲染 DOM 中 `<script>`、`<iframe>`、`<foreignObject>`、`on*` 属性数为 `0`；外部网络请求数为 `0` |
+| **`SEC-07`** | `mynote update` 离线验签、防降级与包管理器护栏 | 注入伪造 `Ed25519` 签名清单、篡改 1B 的 `.tar.zst`（监测是否在 `zstd` 解压前即拦截）、重放旧版本号清单、模拟 `/opt/homebrew/Cellar` 与 `/usr/bin` 托管路径，以及完整执行升级 + Daemon 热交接 + `--rollback` 回退 | 坏签名/篡改包/降级包 `100%` 返回退出码 `8` 且 `zstd` 调用次数为 `0`；托管路径返回 `2`（`PACKAGE_MANAGER_MANAGED`）；`--rollback` 秒级恢复旧版且零丢块 |
 
 ### 2.3 Suite A3 — 格式化器与 Heynote 导入属性/差分评测（Property & Differential Suite）
 
@@ -129,7 +130,7 @@ Plane A 的任何单项失败均视为 **P0 阻断性缺陷**，不允许使用�
 | **桌面单体二进制体积** | Linux `x86_64` / macOS `aarch64` `cargo build --release`（strip 后，含内嵌 Web UI） | **`< 15 MiB`** |
 | **WASM 与前端首屏包体积** | `mynote-wasm`（`wasm-opt -Oz` + gzip）与 `web/` 首屏核心 JS/CSS（gzip，不含按需懒加载的 `~230 KB` `Pele` chunk） | WASM **`< 350 KiB`**；首屏 JS/CSS **`< 220 KiB`** |
 | **无头 Daemon 常驻内存** | 导入 5,000 个块后静置后台 Daemon（无浏览器连接），采样 RSS | **`< 20 MiB`** |
-| **CLI 冷启动本地读写延迟** | 在 10,000 块 SQLite WAL 库上（无论 Daemon 是否存活）连跑 200 次 `mynote add` 与 `mynote ls --json` | **P95 `< 15 ms`** |
+| **CLI 冷启动本地读写延迟与零后台探活** | 在 10,000 块 SQLite WAL 库上连跑 200 次 `mynote add` 与 `mynote ls --json`，并抓包监测外网连接 | **P95 `< 15 ms`**，且非显式联网命令外发 DNS/TCP 包数 **`== 0`**（严禁静默检查更新拖慢 CLI） |
 
 ---
 

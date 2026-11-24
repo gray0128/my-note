@@ -23,17 +23,18 @@
 | *(成功)* | `0` | `200 / 201` | — | 含断网/无 Daemon 时本地落盘成功的常规写命令（`meta.sync_state = "pending_offline"`） |
 | `INVALID_ARGUMENT` | `2` | `400` | `false` | 参数缺失/格式非法；提示运行 `mynote <cmd> --help` |
 | `EMPTY_STDIN_REFUSED` | `2` | `400` | `false` | 非交互 `stdin` 为 0 字节但目标块非空；`hint: "Pass --allow-empty to clear content, or use 'mynote block delete <id>'"` |
-| `INTERACTION_REQUIRED` | `2` | `400` | `false` | 非 TTY / `--non-interactive` 下请求了需人工确认的操作 |
-| `NOT_FOUND` | `3` | `404` | `false` | 指定 `BufferId`、`BlockId`、`SnapshotId` 或瞬态剪贴板不存在/已焚毁 |
+| `INTERACTION_REQUIRED` | `2` | `400` | `false` | 非 TTY / `--non-interactive` 下请求了需人工确认的操作（如未带 `--yes` 执行 `mynote update`） |
+| `PACKAGE_MANAGER_MANAGED` | `2` | `400` | `false` | 当前二进制由系统包管理器托管；`hint` 按探测渠道精确给出 `'brew upgrade mynote'` 或 `'paru -Syu mynote-bin'` |
+| `NOT_FOUND` | `3` | `404` | `false` | 指定 `BufferId`、`BlockId`、`SnapshotId`、目标发布版本号或本地可回滚备份 `mynote.prev` 不存在 |
 | `HEAD_MISMATCH` | `4` | `409` | `true` | `--expected-head` 与当前 `head_op_id` 不一致；响应 `details.actual_head` 并提示先 `block get` 再重试 |
 | `CAS_MISMATCH` | `4` | `409` | `true` | 上传快照 `prev_snapshot_id` 过期或 `covers_seq` 未递增；拉取最新元数据后重试 |
 | `BLOCK_LOCKED` | `5` | `423` | `false` | 未解锁访问 `is_locked = 1` 的加密块或非 TTY 请求解锁 |
 | `VAULT_KEY_SHREDDED` | `5` | `410` | `false` | 目标加密块的 `kid` 已被物理销毁（Crypto-Shredded），永久不可恢复 |
 | `AUTH_REQUIRED` / `DEVICE_REVOKED` | `5` | `401 / 403` | `false` | 本地 Cookie / Origin 校验失败，或云端 `device_token` 无效/已被吊销 |
-| `SYNC_OFFLINE` | `6` | `502 / 503` | `true` | **仅用于显式联网阻塞命令**（`sync push/pull`、`clip push --wait-sync`）无法连通云端 |
-| `RATE_LIMITED` | `6` | `429` | `true` | 云端限流或配额保护；按 `Retry-After` 退避 |
+| `SYNC_OFFLINE` | `6` | `502 / 503` | `true` | **仅用于显式联网阻塞命令**（`sync push/pull`、`clip push --wait-sync`、`update`）无法连通远端 |
+| `RATE_LIMITED` | `6` | `429` | `true` | 云端或发布源限流；按 `Retry-After` 退避 |
 | `FORMAT_SYNTAX_ERROR` | `7` | `422` | `false` | Layer 1/2 格式化输入语法错误或外部命令返回 0 字节/超时；原块保持未修改 |
-| `INTEGRITY_ERROR` | `8` | `422 / 500` | `false` | AEAD 解密失败、`SPAN_PATCH` / 快照 `BLAKE3` 失配或时钟漂移超 5 分钟 |
+| `INTEGRITY_ERROR` | `8` | `422 / 500` | `false` | AEAD 解密失败、快照/`SPAN_PATCH` `BLAKE3` 失配、`update` 发布包 Ed25519 签名/哈希/防降级校验失败，或本地库 `min_reader_schema_version` 高于旧版二进制（`SCHEMA_TOO_NEW`） |
 
 ---
 
@@ -108,6 +109,7 @@ interface CliEnvelope<T> {
 | `mynote sync <status\|push\|pull\|rotate-smk>` | 显式触发同步对账或轮换 `SMK` | 断网返回退出码 `6` |
 | `mynote device <add\|ls\|revoke>` | `add --name <label>` 终端输出 60 秒 `#pair=` 二维码 | 管理鉴权 |
 | `mynote import heynote <path>` | `--buf <name>`、`--dry-run` | 文件哈希防重复提示 |
+| `mynote update`（别名 `self-update`） | `--check`（纯只读查询）、`--version <semver>`、`--rollback`（秒级回退上一版）、`--yes`、`--no-restart-daemon`、`--dry-run`（生产构建**严禁暴露自定义 `--url` 参数**防注入劫持） | 离线签名校验 + 同文件系统原子 `rename`；包管理器托管环境返回 `2`（`PACKAGE_MANAGER_MANAGED`） |
 
 ### 2.4 `--help-json` 机读反射契约与 Layer 2 `formatters.toml` 规范
 
@@ -115,6 +117,63 @@ interface CliEnvelope<T> {
 - `~/.config/mynote/formatters.toml` 契约：
   - 子进程在无网络/受限环境变量下通过 `stdin` 喂入原块 UTF-8 字节，在 `timeout_ms`（默认 `2000 ms`）内等待退出；
   - **熔断条件**：`exit_code != 0`、超时杀死、输出非合法 UTF-8，或 **`input.len() > 0 && stdout.is_empty()`** 时一律返回 `FORMAT_SYNTAX_ERROR`（退出码 `7`），绝不写回数据库。
+
+### 2.5 CLI 自升级、包管理器探测与原子回滚协议（`mynote update`）
+
+为保证日常 CLI 命令维持 `< 15 ms` 零网络开销，**`mynote` 绝不在后台静默联网检查更新或上报遥测**，仅在用户显式运行 `mynote update`（或 `mynote self-update`）时按以下严格契约执行：
+
+1. **安装渠道自动探测与包管理器防冲突护栏（Provenance Guard）**：
+   - 启动时解析 `std::env::current_exe()?.canonicalize()` 并结合编译期注入常量 `MYNOTE_BUILD_CHANNEL`（`"standalone" | "homebrew" | "aur" | "nix"`）：
+     - **`homebrew`**（路径位于 `/opt/homebrew/Cellar/` 或 `/usr/local/Cellar/`）：`--check` 正常展示远端新版本；执行升级时拒绝覆盖只读 Cellar 文件，返回退出码 `2`（`PACKAGE_MANAGER_MANAGED`），`hint: "Installed via Homebrew; run 'brew upgrade mynote'"`；
+     - **`aur` / `pacman`**（Omarchy / Arch 下路径位于 `/usr/bin/mynote` 或系统 `root` 属主目录）：拒绝提权或破坏 `pacman -Qkk` 校验库，返回退出码 `2`，`hint: "Installed via pacman/AUR; run 'paru -Syu mynote-bin' or 'yay -Syu mynote-bin'"`；
+     - **`nix`**（路径位于 `/nix/store/`）：返回退出码 `2`，`hint: "Installed via Nix; run 'nix profile upgrade mynote' or update your flake"`；
+     - **`standalone`**（用户态可写独立二进制，如 `~/.local/bin/mynote`）：无需 `sudo`，执行原生离线签名验证与原子自替换。
+
+2. **离线公钥签名清单（`release-manifest.json` + `.sig`）契约**：
+   - 官方 GitHub Releases 每次发版同步产出 `release-manifest.json` 与脱离 CI 在线的维护者硬件密钥签名文件 `release-manifest.json.sig`（`Ed25519` 原始 64B 签名，签名域前缀 `"mynote-release-v1\0" || canonical_manifest_bytes`）：
+     ```json
+     {
+       "schema_version": 1,
+       "version": "0.2.0",
+       "published_at_ms": 1798000000000,
+       "min_downgrade_version": "0.1.0",
+       "min_reader_schema_version": 1,
+       "targets": {
+         "aarch64-apple-darwin": {
+           "url": "https://github.com/gray0128/my-note/releases/download/v0.2.0/mynote-v0.2.0-aarch64-apple-darwin.tar.zst",
+           "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+           "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+           "byte_size": 9437184
+         },
+         "x86_64-unknown-linux-musl": { "...": "..." },
+         "aarch64-unknown-linux-musl": { "...": "..." }
+       }
+     }
+     ```
+   - **先验签哈希、后解压自检原则（防解压器内存漏洞与降级攻击）**：
+     1. 用编译期焊死在二进制 `.rodata` 段的 `Ed25519` 公钥验证 `release-manifest.json.sig`；
+     2. 默认强制校验 `manifest.version > current_version` 且 `published_at_ms >= COMPILED_BUILD_TIMESTAMP_MS`（若已经是最新版则退出码 `0` 返回 `up_to_date: true`；若显式指定旧版 `--version` 但未传 `--allow-downgrade`，返回退出码 `8` `INTEGRITY_ERROR` 防中间人冻结/降级投毒）；
+     3. 通过 `rustls`（仅允许硬编码发布域名白名单，上限 `32 MiB`）流式下载归档至与目标可执行文件**同一挂载分区**的临时文件 `<exe_dir>/.mynote.stage.<pid>.<rand>`，**在调用 `zstd` 解压前**强制比对精确 `byte_size`、`SHA-256` 与 `BLAKE3`；
+     4. 解包提取单文件二进制后赋予 `0755`，在清空环境变量的受限子进程内执行 `<stage_bin> --version --json`（超时 `2000 ms`），确认新二进制在当前宿主机 CPU/内核上可正常冷启动且输出版本号与清单严格一致。
+
+3. **同文件系统 POSIX 原子替换、一键 `--rollback` 与守护进程热交接**：
+   - **备份上一已知完好版本**：将当前可执行文件硬链接/原子拷贝至 `~/.local/share/mynote/bin/mynote.prev`，同步写入元数据 `mynote.prev.json`（含 `version`、`blake3`、升级前 SQLite `user_version`）；
+   - **跨 Schema 迁移前自动数据库快照**：若新版本包含 SQLite `PRAGMA user_version` 升级，新进程首次打开数据库执行迁移前，必须在独占写事务前通过 `VACUUM INTO` 生成权限 `0600` 的只读快照 `~/.local/share/mynote/backups/mynote-pre-schema-v<old>.db`；
+   - **POSIX 原子替换**：`fsync(stage_bin)` → `rename(stage_bin_path, current_exe_path)` → `fsync(exe_parent_dir)`（Linux/macOS 下 `rename(2)` 原子替换目录项而不破坏旧 `mynote daemon` 正在映射执行的 inode，彻底杜绝 `ETXTBSY`）；
+   - **本地 Daemon 优雅排空重启**：若检测到 `daemon.sock` 存活且未传 `--no-restart-daemon`，发送 `prepare_restart` 指令排空出站队列并通知前端 WebSocket 平滑重连，随后按托管方式触发重启（Linux `systemctl --user restart mynote` / macOS `launchctl kickstart -k gui/$UID/com.mynote.daemon` / 独立守护进程自 `execv`）；
+   - **秒级回滚（`mynote update --rollback`）**：校验 `mynote.prev` 的 `BLAKE3` 与当前数据库 `local_meta.min_reader_schema_version` 兼容性后原子换回旧二进制并重启 Daemon（若回滚跨越了不向后兼容的数据库 Schema 升级，唯有确认升级后无未同步新笔记或已将新库另存为 `.post-rollback-saved.db` 后才恢复升级前数据库备份，保证**回滚零丢数**）。
+   - **`mynote update [--check|--rollback] --json` 响应 `data` 结构**：
+     ```json
+     {
+       "action": "check" | "upgrade" | "rollback" | "noop_up_to_date",
+       "current_version": "0.1.0",
+       "target_version": "0.2.0",
+       "install_method": "standalone" | "homebrew" | "aur" | "nix",
+       "binary_path": "/home/dev/.local/bin/mynote",
+       "rollback_available": true,
+       "daemon_restarted": true
+     }
+     ```
 
 ---
 
@@ -152,9 +211,12 @@ interface CliEnvelope<T> {
   - `{ "type": "blocks_changed", "upserted": BlockDto[], "deleted_ids": string[] }`
   - `{ "type": "buffers_changed", "upserted": BufferDto[], "deleted_ids": string[] }`
   - `{ "type": "sync_status", "state": "synced" | "syncing" | "pending_offline" | "conflict_present", "last_seq": number }`
+  - `{ "type": "daemon_restarting", "new_version": string }`（`mynote update` 热交接前广播，前端保持未保存编辑状态并执行无抖动指数退避重连与静态资源刷新）
 - **Unix Domain Socket（`0600`，NDJSON 单行请求-响应）**：
   - CLI 写入后非阻塞通知：`{"cmd":"poke","fast_flush":false}\n` → Daemon 立即返回 `{"ok":true}\n`；
-  - CLI 显式等待同步（`sync push` / `clip push --wait-sync`）：`{"cmd":"sync_now","wait":true}\n` → Daemon 完成本轮 HTTP `push/pull` 后返回 `{"ok":true,"head_seq":120}\n` 或 `{"ok":false,"code":"SYNC_OFFLINE"}\n`。
+  - CLI 显式等待同步（`sync push` / `clip push --wait-sync`）：`{"cmd":"sync_now","wait":true}\n` → Daemon 完成本轮 HTTP `push/pull` 后返回 `{"ok":true,"head_seq":120}\n` 或 `{"ok":false,"code":"SYNC_OFFLINE"}\n`；
+  - CLI 升级/健康探针：`{"cmd":"ping"}\n` → `{"ok":true,"version":"0.2.0","pid":4821}\n`；
+  - CLI 自升级排空准备：`{"cmd":"prepare_restart","new_version":"0.2.0","drain_timeout_ms":3000}\n` → Daemon 广播 `daemon_restarting`、刷完在途同步批并执行 `PRAGMA wal_checkpoint(PASSIVE)` 后返回 `{"ok":true,"supervisor":"systemd"|"launchd"|"self"}\n`。
 
 ---
 
