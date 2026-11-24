@@ -1,6 +1,6 @@
 # 安全架构与威胁模型规范 (`threat-model.md`)
 
-> 本文档是 [总架构设计方案 (`architecture-proposal.md`)](./architecture-proposal.md) 的安全与密码学专项规范，明确界定 `my-note` 在多端同步、块级保险库（Vault）、移动端浏览器 PWA、本地守护进程及同用户 AI Agent 交互场景下的**真实信任边界、密钥存放表、销毁语义与攻击面防护**，杜绝夸大或模糊的安全承诺。
+> 本文档是 [总架构设计方案 (`architecture-proposal.md`)](./architecture-proposal.md) 的安全与密码学专项规范，并与 [数据结构规范 (`data-structures.md`)](./data-structures.md)、[全链路接口契约 (`interface-contracts.md`)](./interface-contracts.md) 配套执行，明确界定 `my-note` 在多端同步、块级保险库（Vault）、移动端浏览器 PWA、本地守护进程及同用户 AI Agent 交互场景下的**真实信任边界、密钥存放表、销毁语义与攻击面防护**，杜绝夸大或模糊的安全承诺。
 
 ---
 
@@ -79,12 +79,12 @@ flowchart TD
 
 ### 3.1 修正「不可变日志内嵌 `wrapped_dek`」的结构矛盾
 
-若将 `wrapped_dek` 直接放进不可变追加日志 `sync_ops` 中，删除块后历史日志里依然留有 `wrapped_dek`，所谓「删除密钥实现加密碎纸（Crypto-Shredding）」便成了空话。修正后的物理分离设计如下：
+若将 `wrapped_dek` 直接放进不可变追加日志 `sync_ops` 中，删除块后历史日志里依然留有 `wrapped_dek`，所谓「删除密钥实现加密碎纸（Crypto-Shredding）」便成了空话。修正后的物理分离与全端同步销毁设计如下（精确 DDL 见 [`data-structures.md` §4–§5](./data-structures.md#4-桌面端本地-sqlite-完整-ddl-schemamynote-store)）：
 
-1. **`sync_ops` 中绝不出现 `wrapped_dek`**：加密块的 `LOCK` / `UPDATE` 操作载荷仅包含 `{ "kid": "01JKEY...", "nonce": "<24B>", "tier2_ct": "<bytes>" }`（其中 `AAD = "mynote-vault-v1" || entity_id || op_id || kid`）。
-2. **独立可变表 `vault_keys`**：
-   - 本地与云端 DO 单独维护可变表 `vault_keys(kid TEXT PRIMARY KEY, vk_epoch INTEGER, wrapped_dek BLOB, updated_at INTEGER)`（云端外层同样经 `SMK` 认证加密保护）。
-   - 当用户对某个加密块执行「永久销毁（Shred）」时，客户端与云端对 `vault_keys` 执行物理 `DELETE FROM vault_keys WHERE kid = ?`（仅保留短周期防乱序复活的空墓碑 ID，不含任何密钥字节）。一旦 `BDEK` 被物理删除，即便 `sync_ops` 或历史冷备中仍留有 `tier2_ct`，没有 `BDEK` 也无法解密。
+1. **`sync_ops` 中绝不出现 `wrapped_dek`**：加密块的 `LOCK` / `UPDATE` 操作载荷仅包含 `MNV1` 密文体（头含 `kid` 与 `nonce`，`AAD = "MNV1" || [0x01] || block_id || op_id || kid`）。
+2. **带单调 `key_seq` 水位的可变密钥表 `vault_keys`（原子可见与跨端同步销毁）**：
+   - 本地与云端 DO 维护可变密钥记录表（云端外层经 `MNK1` 信封认证加密），与 `ops` 在同一 `push` 事务内原子提交，彻底消除「拉到了 `LOCK` 操作却尚未拉到 `kid`」的竞态窗口；
+   - 当用户对某个加密块执行「永久销毁（Shred）」时，记录状态翻转为 `state = 'SHREDDED'`、物理将 `wrapped_dek` 与 `nonce` 覆写为 `NULL`，并递增 `key_seq`——**不仅立即擦除了本机与云端活跃库的密钥字节，其他离线设备重连增量拉取 `key_since` 时收到 `SHREDDED` 零材料墓碑也会自动将本地库中的该 `kid` 物理抹空**！
 3. **修改 Vault 口令 vs 轮换 `VKEK` 的精确语义**：
    - **常规改口令（便捷更换）**：更新 Slot 0 的包裹密文并删除不再信任的旧槽位。对于尚未泄露过旧口令的场景，无需重写业务块。
    - **怀疑旧口令已泄露（强制撤销）**：生成全新 `VKEK_v2`（`vk_epoch + 1`），用新口令包裹，同时将当前存活块的 `BDEK` 轮换重加密并清除旧密钥记录。
@@ -126,8 +126,7 @@ flowchart TD
 1. **严格绑定环回地址与校验 `Host` 头**：仅绑定 `127.0.0.1:<port>`（不绑 `0.0.0.0`）；中间件首先检查 `Host` 请求头必须精确等于 `127.0.0.1:<port>` 或 `localhost:<port>`，任何外部域名（DNS Rebinding 特征）一律在解析路由前直接返回 `403 Forbidden`。
 2. **`Origin` 白名单强制校验（含 WebSocket Upgrade）**：所有状态变更请求、API 读取与 `/v1/local/ws` 握手请求必须携带 `Origin` 头，且精确匹配 `http://127.0.0.1:<port>`（或 `http://localhost:<port>`）。
 3. **一次性启动票据换取 `HttpOnly` 随机 Session Cookie**：
-   - Daemon 每次启动在内存中生成 256-bit 随机 `daemon_session_secret`，并将短期引导凭证写入本地 `0600` 权限目录（`$XDG_RUNTIME_DIR/mynote/ui-bootstrap`）；
-   - `mynote open` / `omarchy-launch-webapp` 通过一次性短效置换端点 `/v1/local/auth/exchange` 换取 `Set-Cookie: mynote_session=<token>; HttpOnly; SameSite=Strict; Path=/` 后立即重定向至干净根路径 `/`（避免长效 Token 残留在浏览器历史记录或命令行参数 `ps aux` 中）；
+   - `mynote open` 生成单次短效（10 秒）`ticket`，通过 `/v1/local/auth/exchange?ticket=<ticket>` 换取 `Set-Cookie: mynote_local_session=<token>; HttpOnly; SameSite=Strict; Path=/` 后立即 `303` 重定向至干净根路径 `/`（避免长效凭证残留在浏览器历史记录或命令行参数 `ps aux` 中）；
    - 所有 `/v1/local/*` HTTP API 与 WebSocket 握手均强制校验该 Cookie。
 
 ### 5.2 同用户 UID 下本地 AI Agent 的真实安全边界
@@ -141,9 +140,9 @@ flowchart TD
   - `mynote vault unlock` / `mynote block get --decrypt` 强制直接打开 `/dev/tty` 读取口令并检测交互环境；
   - `MYNOTE_ACTOR` 仅用于 UI 展示「此修改来自 `agent:claude-code`」及支持按来源一键批量回滚，绝不作为权限校验凭据。
 - **真正的密码学硬防线（防彻底沦陷的同 UID 恶意脚本窃取敏感块）**：
-  - **加密块静态全密文**：本地 SQLite `blocks` 表与 `sync_ops` 表中只有 `XChaCha20-Poly1305` 密文，FTS5 与只读镜像完全不含加密块正文；
-  - **常驻 Daemon 零明文（关键设计！）**：Tier 2 Vault 的口令派生（`Argon2id`）、WebAuthn PRF 调用、`VKEK` 解包与正文加解密 **100% 在当前前端页面的 WASM 内存（或人类亲手敲口令的那一次短生命周期 CLI 进程内存）中完成**。后台常驻的 `mynote daemon` 从头到尾只搬运 `tier2_ct` 密文字节流。
-  - **结果**：哪怕你此刻正在浏览器窗口中解锁查看某个加密块，同一秒后台被网页 Prompt Injection 劫持的 Agent 即使读穿了本地 SQLite 和 Daemon Cookie，它从 Daemon 拿到的依然只有无法解开的密文信封！（在 Linux 默认开启 Yama `ptrace_scope=1` 与 macOS SIP/Hardened Runtime 下，普通同 UID 进程亦无法跨进程 `ptrace` 注入读取浏览器渲染器内存。）
+  - **加密块静态全密文**：本地 SQLite `blocks` 表（含数据库级 `CHECK` 硬约束）与 `sync_ops` 表中只有密文，FTS5 与只读镜像完全不含加密块正文；
+  - **常驻 Daemon 零明文 + WASM 线性内存不透明句柄（`WasmVaultSession`）**：Tier 2 口令派生、`VKEK` 解包与正文加解密 **100% 在当前前端页面的 `mynote-wasm` 线性内存（以不透明句柄 `WasmVaultSession` 封装，裸 `VKEK` 绝不进入无法确定性清零的 JS GC 堆！）或人类亲手敲口令的单次短生命周期 CLI 进程内存中完成**；且处于解锁编辑态的加密块**严禁外发给 Layer 2 外部 CLI 格式化子进程**（仅允许调用内置 WASM Layer 1 纯内存格式化）。后台常驻的 `mynote daemon` 从头到尾只搬运 `MNV1` 密文字节流。
+  - **结果**：哪怕你此刻正在浏览器窗口中解锁查看某个加密块，同一秒后台被网页 Prompt Injection 劫持的 Agent 即使读穿了本地 SQLite 和 Daemon Cookie，它从 Daemon 拿到的依然只有无法解开的密文信封！
 
 ---
 
