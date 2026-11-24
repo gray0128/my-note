@@ -19,7 +19,7 @@
    - [5.6 Markdown 与 Mermaid 图渲染设计（轻量、离线与防 XSS）](#56-markdown-与-mermaid-图渲染设计轻量离线与防-xss)
 6. [多端形态与技术栈选型对比](#6-多端形态与技术栈选型对比)
 7. [分阶段演进路线图（MVP → V1 → V2）](#7-分阶段演进路线图mvp--v1--v2)
-8. [编码前待确认的关键架构决策](#8-编码前待确认的关键架构决策)
+8. [已最终拍板的架构决策基线（ADR 摘要）](#8-已最终拍板的架构决策基线adr-摘要)
 
 ---
 
@@ -577,17 +577,30 @@ flowchart LR
 
 ## 6. 多端形态与技术栈选型对比
 
-### 6.1 核心语言选型：Rust vs Go（云端 Worker 固定为 TypeScript）
+### 6.1 核心语言选型：已确认 Rust（本地核心 + WASM）+ TypeScript（前端 & Cloudflare Worker）
 
-| 维度 | **Rust（推荐）** | **Go（务实备选）** |
+| 维度 | **Rust（已确认）** | Go（已放弃的备选） |
 | --- | --- | --- |
 | 单体二进制与内存 | 极佳（8–15MB，空闲 ~10–15MB RAM，无 GC 抖动） | 极佳（12–20MB，空闲 ~15–25MB RAM） |
 | **WASM 复用（关键加分项）** | **极强**：同一套密码学（`chacha20poly1305`/`argon2`）、同步状态机、JSON/SQL/YAML/Markdown 格式化器可直接编译成几百 KB 的 WASM 给移动端 PWA 复用，**零双端重复实现** | 较弱：Go WASM 运行时体积较大（通常数 MB），TinyGo 对完整标准库/密码学生态支持有限 |
 | 密码学与内存安全 | 原生 `zeroize` 自动清零敏感密钥内存，无 GC 副本残留风险 | GC 拷贝可能导致密钥在堆中短时残留，难以彻底擦除 |
 | CLI 与生态成熟度 | `clap`（原生支持分组帮助 + 反射导出 `--help-json`）+ `axum` + `rusqlite` + `rust-embed` + `loro`（原生 Rust） | `cobra` + `chi`/`echo` + `modernc.org/sqlite` + `embed` |
-| 开发迭代速度 | 中等（编译慢、借用检查前期学习曲线） | **极快**（上手与重构成本最低） |
 
-> **选型建议**：优先 **Rust** 作为本地单体核心与 WASM 共享层（去掉 MCP 依赖后依赖树更轻）；云端同步中继固定使用 **TypeScript（Cloudflare Workers + SQLite DO）**，详见 [Cloudflare 专项评估](./cloudflare-cloud-architecture.md)。如果非常熟悉 Go 且希望快速出原型，可选 **Go 守护进程/CLI + TypeScript 共享移动端与云端层**。
+**推荐 Monorepo / Cargo Workspace 目录规划**：
+```text
+my-note/
+├── Cargo.toml                 # Rust workspace root
+├── crates/
+│   ├── mynote-core/           # 纯平台无关领域核 (Block模型 / HLC / Fractional Index / 加解密 / Layer1格式化器 / 同步状态机)
+│   ├── mynote-wasm/           # wasm-bindgen 封装 (直接复用 mynote-core 供移动端 PWA 使用)
+│   ├── mynote-store/          # SQLite WAL + FTS5 + 迁移 + OpLog 持久化 (rusqlite)
+│   └── mynote-cli/            # 单体二进制入口 (CLI + 四级渐进帮助 + 本地 Daemon + rust-embed WebUI)
+├── web/                       # TypeScript + CodeMirror 6 + Markdown/Mermaid 预览层 + mynote-wasm
+├── cloud-cf/                  # Cloudflare Worker (TypeScript + SQLite DO + WebSocket Hibernation + R2 + Static Assets)
+├── skill/
+│   └── SKILL.md               # 随版本同步的极轻 Agent Skill (<250 tokens)
+└── docs/                      # 架构与协议设计文档
+```
 
 ### 6.2 桌面端 UI 形态对比（重点考量 macOS + Omarchy）
 
@@ -633,12 +646,15 @@ flowchart LR
 
 ---
 
-## 8. 编码前待确认的关键架构决策
+## 8. 已最终拍板的架构决策基线（ADR 摘要）
 
-经过前面的收敛，**云端栈（Cloudflare 100% 零知识 E2EE 哑中继）**、**Agent 范式（纯 CLI + Skill，不做本地/云端 MCP）** 与 **Markdown 交互（源码/预览切换 + 预览态极致复制）** 均已明确拍板。正式初始化代码仓库前，仅剩以下 **2 项实现级选择**待确认：
+截至当前，所有前置架构决策已全部收敛并冻结，后续编码实现严格以本基线为准：
 
-1. **本地核心实现语言（云端 Worker 固定为 TypeScript）**：
-   - **选项 A（Rust，推荐）**：单二进制极致轻量 + `clap` 原生渐进帮助/`--help-json` + WASM 复用到移动端 PWA（加密与格式化零重复）+ `zeroize` 内存擦除。
-   - **选项 B（Go）**：本地守护进程与 CLI 迭代最快，但移动端 PWA 的加密与格式化逻辑需在 TypeScript 侧单独维护。
-2. **移动端形态的短期验收标准**：
-   - 先用 **Cloudflare Workers Static Assets 托管的 Local-First PWA** 快速覆盖 iOS/Android（\$0 运维、0 应用商店审核成本），是否能接受 iOS 上「无系统级 Share Sheet、需手动添加到主屏幕」的限制？
+| 决策项 | 最终结论 | 核心收益与边界约束 |
+| --- | --- | --- |
+| **本地核心与 WASM 共享层** | **Rust**（单二进制 + `wasm-bindgen`） | `<15MB` 单体、`<20MB` 常驻内存、`zeroize` 内存擦除、`clap` 自动生成渐进帮助与 `--help-json`，且加解密与 Layer 1 格式化器零重复复用到移动端 PWA |
+| **云端基础设施与信任模型** | **Cloudflare 100% 零知识 E2EE 盲同步中继** | 单 Worker（~250–300 行 TypeScript）+ SQLite Durable Object（30 天 PITR）+ WebSocket Hibernation + R2 冷备 + Workers Static Assets；个人稳定 \$0/月；保留 5 接口逃生舱随时可迁回 VPS |
+| **同步协议与实时性** | **Block-First + Append-Only OpLog + 粘贴快车道** | 彻底告别网盘同步；新设备先拉后推 + 冲突保留兄弟块（永不静默丢数）；`paste`/`clip` 0–100ms 快刷 + `<=16KB` WS 顺风车（跳号即回退 HTTP `pull`），Mac ↔ Omarchy 目标延迟 150–350ms |
+| **移动端与桌面形态** | **桌面本地 Daemon + 内嵌 Web UI；移动端 Local-First PWA** | Omarchy 原生融入 Hyprland Special Workspace（零 WebKitGTK 坑）；移动端经 CF Static Assets 免费托管 + IndexedDB/OPFS 离线缓存 + 前台即拉，接受 iOS 暂不支持系统级 Share Sheet、需手动添加到主屏幕 |
+| **Agent 集成范式** | **纯 CLI + 极轻 `SKILL.md` + 四级渐进披露帮助（L0–L3）** | **明确不做本地 MCP 与云端 MCP**；零常驻上下文税、统一 `--json` 信封、稳定退出码与 `hint`、乐观锁 `--expected-head`、加密块硬防火墙 |
+| **Markdown 与 Mermaid 体验** | **源码 ↔ 预览双模切换 + 预览态极致复制 + 防 XSS 沙箱** | `Cmd/Ctrl+E` 切换（宽屏可选分栏，移动端默认预览不误弹键盘）；预览态支持双格式富文本/纯文本复制、代码块/Mermaid PNG & SVG/GFM 表格 TSV 一键复制；Mermaid 懒加载离线渲染 + 严格沙箱与 CSP |
