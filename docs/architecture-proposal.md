@@ -631,7 +631,8 @@ my-note/
 ├── cloud-cf/                  # Cloudflare Worker (~300行 TS + SQLite DO + WS Hibernation + R2 + Static Assets)
 ├── skill/
 │   └── SKILL.md               # 随版本同步的极轻 Agent Skill (<250 tokens)
-└── docs/                      # 架构蓝图、同步协议规范 (sync-protocol.md) 与威胁模型 (threat-model.md)
+├── evals/                     # 不可变评测与爬山底座 (climb-spec.toml / JSON Schemas / DST回归种子 / Agent沙盒题库)
+└── docs/                      # 架构蓝图、数据结构、接口契约、同步协议、威胁模型与评测执行规范 (eval-framework.md)
 ```
 
 ### 6.2 桌面端 UI 形态对比（重点考量 macOS + Omarchy）

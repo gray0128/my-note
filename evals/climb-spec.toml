@@ -1,0 +1,52 @@
+# Declarative Hill-Climbing Specification for my-note
+# Governed by docs/eval-framework.md §6 & §8
+
+schema_version = 1
+
+[targets]
+# ONLY cheap-to-iterate, directly attributable surfaces may be mutated by automated hill-climbing.
+mutable_allowlist = [
+  "skill/SKILL.md",
+  "crates/mynote-cli/src/help_topics.rs",
+  "crates/mynote-cli/src/error_hints.rs",
+  "crates/mynote-store/src/fts_config.rs",
+]
+
+# Physical hard blocks — any diff touching these immediately aborts and reverts the trial.
+immutable_denylist = [
+  "evals/**",
+  "crates/mynote-core/src/crypto/**",
+  "crates/mynote-core/src/sync/**",
+  "cloud-cf/**",
+]
+
+[constraints]
+skill_md_max_tokens = 250
+skill_tokenizers = ["o200k_base", "anthropic_claude"]
+top_level_help_max_lines = 36
+cli_p95_latency_ms_max = 15
+forbid_case_literal_leakage = true
+require_single_failure_mode_per_commit = true
+
+[splits]
+dev_dir = "evals/cases/dev"
+test_dir = "evals/cases/test"
+expose_test_transcripts_to_climber = false
+replicates_k = 3
+
+[acceptance_gate]
+# Keep a candidate commit ONLY when ALL conditions below hold simultaneously:
+require_plane_a_pass_rate = 1.0
+require_suite_b5_security_pass_rate = 1.0
+max_critical_mcnemar_regressions = 0
+# Candidate must either strictly improve pass^3 on BOTH dev and test,
+# OR hold pass^3 non-decreasing while cutting median tokens per success by >= 10%.
+min_token_reduction_for_tiebreak = 0.10
+max_token_inflation_ratio = 0.15
+
+[loop_policy]
+max_iterations = 20
+# After 3 consecutive reverted iterations, force a read-only taxonomy reflection turn.
+stall_reflection_after_reverts = 3
+three_strike_human_escalation = true
+journal_path = "evals/reports/climb-journal.jsonl"

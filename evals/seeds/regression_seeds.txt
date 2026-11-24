@@ -1,0 +1,9 @@
+# SimCluster Deterministic Simulation Regression Seeds (u64 hex)
+# Format: <hex_u64_seed> # <invariant_id> <brief_scenario_note>
+# Every seed in this file MUST pass 100% in Tier 0 (<10s) and Tier 1 CI gates.
+
+0x0000000000000001 # INV-SYNC-1 baseline 3-device partition & heal smoke seed
+0x0000000000c0ffee # INV-SYNC-2 concurrent SPAN_PATCH + DELETE causal retention seed
+0x00000000deadbeef # INV-SYNC-3 DO PITR epoch rollback set-union non-truncation seed
+0x00000000bad5ec01 # INV-SYNC-4 atomic LOCK + vault_key_records visibility seed
+0x00000000f00dcafe # INV-SYNC-5 corrupted R2 snapshot K fallback to K-1 seed

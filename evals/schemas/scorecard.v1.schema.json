@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gray0128/my-note/evals/schemas/scorecard.v1.schema.json",
+  "title": "MyNoteReleaseScorecardV1",
+  "description": "One-Page 4-Number Release Scorecard & Paired McNemar Comparison Schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "git_commit",
+    "evals_base_commit",
+    "generated_at",
+    "metric_1_reliability",
+    "metric_2_grader_trust",
+    "metric_3_detection_floor",
+    "metric_4_paired_regressions"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "git_commit": { "type": "string" },
+    "evals_base_commit": { "type": "string" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "metric_1_reliability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plane_a_pass_rate",
+        "dst_seeds_executed",
+        "plane_b_pass_pow_3",
+        "plane_b_ci_95",
+        "suite_b5_security_pass_rate",
+        "median_tokens_per_success"
+      ],
+      "properties": {
+        "plane_a_pass_rate": { "const": 1.0 },
+        "dst_seeds_executed": { "type": "integer", "minimum": 500 },
+        "plane_b_pass_pow_3": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "plane_b_ci_95": {
+          "type": "array",
+          "prefixItems": [{ "type": "number" }, { "type": "number" }],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "suite_b5_security_pass_rate": { "const": 1.0 },
+        "median_tokens_per_success": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "metric_2_grader_trust": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deterministic_assertion_share",
+        "binary_judge_cohens_kappa",
+        "double_run_agreement_rate",
+        "pinned_judge_model",
+        "pinned_judge_prompt_sha256"
+      ],
+      "properties": {
+        "deterministic_assertion_share": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "binary_judge_cohens_kappa": { "type": ["number", "null"], "minimum": 0.6, "maximum": 1.0 },
+        "double_run_agreement_rate": { "type": "number", "minimum": 0.98, "maximum": 1.0 },
+        "pinned_judge_model": { "type": ["string", "null"] },
+        "pinned_judge_prompt_sha256": { "type": ["string", "null"] }
+      }
+    },
+    "metric_3_detection_floor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["test_case_count_n", "alpha", "power", "min_detectable_delta"],
+      "properties": {
+        "test_case_count_n": { "type": "integer", "minimum": 1 },
+        "alpha": { "const": 0.05 },
+        "power": { "const": 0.8 },
+        "min_detectable_delta": { "type": "number", "minimum": 0.0, "maximum": 1.0 }
+      }
+    },
+    "metric_4_paired_regressions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseline_commit",
+        "n_both_pass",
+        "n_both_fail",
+        "n_improved",
+        "n_regressed",
+        "mcnemar_exact_p_value",
+        "regressed_case_ids",
+        "improved_case_ids"
+      ],
+      "properties": {
+        "baseline_commit": { "type": "string" },
+        "n_both_pass": { "type": "integer", "minimum": 0 },
+        "n_both_fail": { "type": "integer", "minimum": 0 },
+        "n_improved": { "type": "integer", "minimum": 0 },
+        "n_regressed": { "type": "integer", "minimum": 0 },
+        "mcnemar_exact_p_value": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "regressed_case_ids": { "type": "array", "items": { "type": "string" } },
+        "improved_case_ids": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
