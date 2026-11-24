@@ -18,8 +18,13 @@
    - [5.5 Agent 友好设计：CLI + Skill 与四级渐进披露帮助体系](#55-agent-友好设计cli--skill-与四级渐进披露帮助体系)
    - [5.6 Markdown 与 Mermaid 图渲染设计（轻量、离线与防 XSS）](#56-markdown-与-mermaid-图渲染设计轻量离线与防-xss)
 6. [多端形态与技术栈选型对比](#6-多端形态与技术栈选型对比)
-7. [分阶段演进路线图（MVP → V1 → V2）](#7-分阶段演进路线图mvp--v1--v2)
+7. [分阶段演进路线图（M0 → M3）](#7-分阶段演进路线图m0--m3)
 8. [已最终拍板的架构决策基线（ADR 摘要）](#8-已最终拍板的架构决策基线adr-摘要)
+
+> **配套核心工程规范**：
+> - [同步协议与确定性物化规范 (`sync-protocol.md`)](./sync-protocol.md)（盲信封格式、`FULL_ZSTD`/`SPAN_PATCH` 载荷、字段级因果合并、R2 多代快照与 DO 滑动窗口 GC、`epoch` 对账状态机与属性模拟测试门禁）
+> - [安全架构与威胁模型规范 (`threat-model.md`)](./threat-model.md)（密钥存放全表、`vault_key_slots` 多槽位包裹、可变 `vault_keys` 碎纸、事后加锁擦除、Daemon 本地鉴权与客户端内存级 Vault 解密）
+> - [Cloudflare 技术栈云端架构专项评估 (`cloudflare-cloud-architecture.md`)](./cloudflare-cloud-architecture.md)
 
 ---
 
@@ -46,12 +51,12 @@ Heynote（Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js）将每个 Buffe
 
 ### 1.3 由此推导出的系统不变量（Anti-Wipe Invariants）
 
-我们自研系统的第一性原则必须从机制上杜绝上述事故：
+我们自研系统的第一性原则必须从机制上杜绝上述事故（形式化定义见 [`sync-protocol.md`](./sync-protocol.md)）：
 
 - **不变量 1（禁止第三方网盘直写）**：同步必须发生在**应用层协议**，绝不把正在活跃写入的数据库或 Buffer 文件托管给 iCloud Drive / Dropbox / OneDrive。
-- **不变量 2（不可变操作日志 + 软删除）**：所有修改以**追加操作（Append-Only OpLog）**记录；删除只能是携带因果前置版本（`parent_op_id`）的显式 Tombstone，**空状态初始化永远不会产生删除操作**。
-- **不变量 3（新设备强制先拉后推）**：未完成首次同步引导（bootstrap）的空客户端禁止向上游推送破坏性状态。
-- **不变量 4（保留历史快照，支持时间旅行）**：本地与云端均保留可回溯的版本日志，即便手误 `Cmd+A` 删除整块内容，也可秒级找回。
+- **不变量 2（不可变操作日志 + 防空 `UPDATE` 类型隔离）**：所有修改以携带因果前置版本（`parent_op_ids`）的**追加操作（Append-Only OpLog）**记录；未水化（`Unhydrated`）或解密失败（`DecryptFailed`）态在编译期严禁生成 `UPDATE`，外部格式化器与 CLI 非交互空管道自动熔断，杜绝把异常空态当成有效编辑写回。
+- **不变量 3（新设备强制引导门禁 Bootstrap Gate）**：未完成首次同步引导（`bootstrap_completed == false`）的客户端严禁对任何远端已有实体发出修改或删除操作（`UPDATE / SET_META / LOCK / DELETE`）；离线未引导期间新建的内容仅允许作为全新 ULID 独立块追加。
+- **不变量 4（多代快照与历史回溯分离）**：快照仅做冷启动加速且在 R2 滚动保留多世代，永不单点覆写历史日志；即便人工手误清空整块内容，也可通过 OpLog 秒级找回。
 
 ---
 
@@ -65,9 +70,9 @@ Heynote（Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js）将每个 Buffe
 
 | 产品 | 形态与技术栈 | 存储与同步实现 | 关键优缺点与启示 |
 | --- | --- | --- | --- |
-| **Heynote** (开源) | Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js | 磁盘 `.txt` 文件 + `∞∞∞lang` 文本分隔符；无内置同步 | **优点**：分块多语言、一键格式化、数学计算、极低心智负担。<br>**痛点**：Electron 内存重（180–250MB）；无移动端；无加密；分隔符混在正文里导致 Vim `dd` / 全局替换会破坏块边界；Wayland 下全局快捷键失效。 |
+| **Heynote** (开源) | Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js | 磁盘 `.txt` 文件 + `∞∞∞lang` 文本分隔符；无内置同步 | **优点**：分块多语言、一键格式化、数学计算、极低心智负担。<br>**痛点**：Electron 内存重（180–250MB）；无移动端；无加密；分隔符混在正文里导致 `deleteLine` / Vim `dd` / 全局替换会破坏块边界（Issue #24/#43/#51）；Wayland 下全局快捷键失效。 |
 | **Tot / Drafts** (商业) | 原生 Swift（仅 Apple 生态） | 本地库 + **Apple CloudKit**（结构化记录同步，非 iCloud Drive 文件） | **启示**：用 CloudKit 结构化同步比 iCloud Drive 文件可靠得多，但 Tot 官方知识库仍承认 iCloud 偶发同步混乱/丢字；且**彻底锁死在苹果生态，无法支持 Omarchy（Linux）与 Android**。 |
-| **Benchpad** (商业) | Mac / Win / iOS / Android / Web | 离线优先 + **Yjs 字符级 CRDT** + 托管同步服务 | **启示**：作为 2026 年专门对标 Heynote 的商业竞品，证明「Scratchpad + CRDT 跨桌面/手机同步」体验极顺滑；但闭源、SaaS 绑定、无代码格式化、无块级加密、无本地 Agent/CLI。 |
+| **[Benchpad](https://benchpad.app)** (商业) | Mac / Win / Linux / iOS / Android / Web | 本地 IndexedDB + **Yjs 字符级 CRDT** + 托管同步服务 | **启示**：专门对标 Heynote 的跨端竞品（固定 3 个永久 Markdown Pad + `/code` 代码围栏），证明「Scratchpad + 离线优先同步」体验极顺滑；但非任意多语言分块流、闭源 SaaS、无代码格式化、无块级加密、无本地 Agent/CLI。 |
 
 #### 范式 B：轻量自托管单二进制笔记
 
@@ -148,31 +153,34 @@ Heynote（Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js）将每个 Buffe
 ### 约束 3：足够轻量
 
 - **真实诉求**：替代 Electron（动辄 200MB+ 内存、2–3 秒冷启），做到「随时唤出、零存在感、低资源消耗、部署极简」。
-- **架构挑战 3A — 必须用量化预算约束架构，避免功能蔓延**：
-  - 单体二进制体积：`< 15 MB`（内嵌编译后的前端静态资源）
-  - 桌面后台守护进程常驻内存：`< 20 MB`（对比 Electron 约 180–250 MB）
-  - CLI 单次命令耗时：`< 15 ms`（保证 Agent 和 Shell 管道高频调用无卡顿）
+- **架构挑战 3A — 必须用诚实、对等的量化预算约束架构，避免功能蔓延**：
+  - 单体二进制体积：`< 15 MB`（内嵌编译后的前端静态资源，不打包重型运行时）
+  - 桌面内存双态披露（公平对比 Electron 常驻 180–250 MB）：
+    - **无头后台守护态（未打开窗口，仅维持 CLI、剪贴板监听与后台同步）**：`< 15–20 MB`（Electron 即使关窗驻留托盘仍占百兆以上）；
+    - **打开 Web UI 窗口态**：复用系统已驻留浏览器主进程时渲染器增量约 `40–80 MB`（冷起独立浏览器 App Mode 进程组约 `120–200 MB`），**关闭窗口即 100% 释放回系统**。
+  - CLI 单次命令耗时：`< 15 ms`（直写本地 SQLite WAL，Daemon 未启动亦零阻塞完成）
   - 界面唤出延迟：`< 100 ms`（Hyprland Special Workspace / macOS 驻留窗口瞬时切出）
-  - 云端同步服：单二进制 + SQLite（或 Cloudflare Workers + D1），内存 `< 30 MB`，月成本 \$0–\$5
+  - 云端同步服：Cloudflare Workers + SQLite Durable Object + R2（或逃生舱单二进制 + SQLite），个人月成本 **\$0**（可选 \$5 Paid）
 - **架构挑战 3B — 同步引擎不要过度设计成「重型分布式系统」**：
   - 不要引入 CouchDB、Anytype 多节点、RabbitMQ/Redis 或复杂 P2P NAT 穿透。
-  - **关键反思：单人多端 Scratchpad 是否一定要在 MVP 就上全套字符级 CRDT？**
+  - **关键反思：单人多端 Scratchpad 是否一定要在 M0/M1 就上全套字符级 CRDT？**
     - 相比 Heynote 单文件把 50 个笔记块绑在一起，**一旦把同步粒度拆到「块（Block）级」**，两台设备离线并发修改**不同块**时天然零冲突！
-    - 只有极少数情况你会同时离线改**同一个块**。如果用「不可变追加日志 + 因果父指针（`parent_op_id`）」，同一块并发修改时自动保留双版本分支（Conflict Sibling）并高亮提示合并，**零丢数且复杂度只有 CRDT 的 1/5**；而且由于传输层本身就是 Append-Only Stream，**V2 可无缝把单个非加密块的 payload 升级为 Loro/Yjs 增量流**，完全不推翻协议！
+    - 只有极少数情况你会同时离线改**同一个块**。采用「不可变追加日志 + 字段级因果拆分 + 内生 `(hlc, op_id)` 纯函数冲突分支投影」，同一块并发修改正文时确定性展示主块与冲突兄弟（Conflict Sibling）供一键合并，**零丢数且复杂度只有 CRDT 的 1/5**；未来按需在单块内嵌入 Loro/Yjs 增量流亦无需推翻传输层。
 
 ---
 
 ### 约束 4：足够安全，支持加密某一块内容
 
 - **真实诉求**：临时记事本经常顺手粘贴 Token、环境变量、服务器密码、私密想法；不希望它们明文落盘，也不希望被云端或误操作泄露，但又不想每次看普通笔记都输密码。
-- **架构挑战 4A — 「加密某一块内容」与「云端零知识 E2EE」是两套不同的安全边界，必须分清**：
-  - **边界 1（云端传输与云端存储零知识 —— Account/Sync E2EE）**：普通笔记离开设备前用设备持有的 `Sync Master Key (SMK)` 自动加密，日常使用**无感**（由 OS Keychain / Secret Service 自动解封），但云端永远看不到明文。
-  - **边界 2（本地静态 + 防偷窥 + 防 Agent 泄露 —— Block-Level Vault Encryption）**：被标记为「加密」的单个块，用独立的 `Vault Key (VK)`（独立口令 / Touch ID / WebAuthn PRF 派生）二次加密。**即使本地 SQLite 文件被拷贝、屏幕被旁人瞥见、或本地 AI Agent 扫描全部笔记，加密块依然是不可读的密文！**
-- **架构挑战 4B — 加密块周边最容易被忽略的 4 个泄露点**：
-  1. **全文索引泄露（FTS5 / 搜索缓存）**：若先建了 SQLite FTS5 索引再加密，明文依然残留在 FTS 倒排表里！加密块**必须严禁写入 FTS 索引**（或锁定瞬间清除对应索引项）。
-  2. **元数据泄露**：如果只加密正文不加密标题/标签/语言，攻击者仍能看到 `title="prod-db-root-pwd"`。加密块应将 `{content, title, lang, tags}` 一并封装进 AEAD 密文，仅保留 `block_id`、`is_locked=true` 与可选的公开提示词（`hint`）。
-  3. **内存与剪贴板残留**：解锁后的明文块必须有空闲自动回锁（如 5 分钟或锁屏时触发），密钥材料在 Rust 中使用 `zeroize` 擦除，复制加密块内容时可选 30 秒清空剪贴板。
-  4. **密钥遗忘即永久丢失**：零知识加密没有「找回密码」。必须在初始化时强制生成可打印/可备份的 **24 词助记词 / Recovery Key**。
+- **架构挑战 4A — 「加密某一块内容」与「云端存储零知识 E2EE」是两套不同的安全边界，必须分清**：
+  - **边界 1（云端传输与云端被动存储零知识 —— Tier 1 Sync E2EE）**：普通笔记与业务元数据离开设备前做 256B 阶梯填充并用 `Sync Master Key (SMK)` 自动加密，日常使用**无感**（桌面由 OS Keychain / Secret Service 自动解封，PWA 由不可导出 WebCrypto 密钥包裹存入 IndexedDB），云端数据库与备份永远看不到明文。
+  - **边界 2（本地静态 + 防偷窥 + 防同 UID Agent 泄露 —— Tier 2 Block-Level Vault）**：被标记为「加密」的单个块由独立随机 `BDEK` 加密（`BDEK` 存于可变表 `vault_keys`，主密钥 `VKEK` 由口令、恢复词及各端 WebAuthn PRF 多槽位包裹），且**解锁与加解密 100% 在当前交互客户端内存（Web UI WASM 或单次 CLI 进程）完成，后台常驻 Daemon 永不持有 `VKEK` 与加密块明文**！
+- **架构挑战 4B — 加密块周边最容易被忽略的 5 个泄露点**：
+  1. **「先写后锁」历史残留（WAL / FTS5 / 云端旧记录）**：先粘贴明文再点锁定时，必须在同一事务内清空本地历史 op 明文、清理并 `merge` FTS5 倒排表、立即执行 `PRAGMA wal_checkpoint(TRUNCATE)` 截断清零 `.db-wal` 残留帧，同时向云端发送 `purge_op_ids[]` 原地将旧 `ops.envelope` 置 `NULL`！
+  2. **元数据侧信道泄露**：加密块将正文与敏感属性一并封入密文，云端同步层进一步将 `entity_id`、`op_type`、`hlc` 全部封入 5 列盲信封并做 256B 对齐填充。
+  3. **不可变日志阻碍销毁**：`wrapped_dek` 绝不写入不可变 `sync_ops`，而是抽离至支持物理 `DELETE` 的可变表 `vault_keys`；一次性跨端传密（`clip push --ephemeral`）走独立短 TTL 瞬态槽位，不入主日志与 R2 冷备。
+  4. **内存与剪贴板残留**：客户端内存中的解锁态空闲 5 分钟或切后台立即 `zeroize` 清零回锁，复制加密块内容时默认 30 秒清空系统剪贴板。
+  5. **密钥遗忘即永久丢失**：初始化时强制生成可打印备份的 **24 词助记恢复词（Recovery Key）**。
 
 ---
 
@@ -182,11 +190,11 @@ Heynote（Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js）将每个 Buffe
 - **架构挑战 5A — 「纯文本文件友好」与「可靠同步引擎」的冲突**：
   - 本地 Agent 习惯用 `rg`/`cat` 读纯文件，但如果允许外部进程直接修改同步目录里的原始文本文件，就会回到 Heynote 的竞态老路（部分写入、监听死循环、破坏结构）。
   - **已确认解法：SQLite 为唯一权威数据源 + 「CLI + Skill（渐进披露帮助）」为主入口（明确放弃本地 MCP）**：
-    1. **一等公民 CLI + 极轻 `SKILL.md`**：不引入任何 MCP 协议栈与常驻 Schema 上下文负担。通过完备的 CLI（`--json` / `--jsonl`、Unix 管道、稳定退出码、错误提示 `hint`、乐观锁）配合 **四级渐进披露帮助体系（L0 `SKILL.md` → L1 总览 → L2 子命令帮助 → L3 专题/机读 Schema）**，让 Agent 按需查帮助、零浪费 Context Token，直接读写本地 SQLite WAL（并立即触发同步）。
-    2. **可选的只读纯文本镜像（Read-Only Mirror）**：后台单向导出所有**未锁定**块为 `~/.local/share/mynote/mirror/<buffer>.md`，供 `rg`/fzf/编辑器只读检索；严禁反写，且加密块只输出 `[LOCKED BLOCK: <id>]` 占位符。
-- **架构挑战 5B — 「Agent 友好」与「安全（约束 4）」的直接冲突**：
-  - Prompt Injection 已成为本地 Agent 的现实威胁：如果 Agent 读取外部网页/仓库代码后被注入指令，可能会尝试调用 CLI 读取你的笔记并外传。
-  - **强制安全红线**：**CLI 默认完全隔离所有加密块（Locked Blocks）**——查询时不返回明文/密文、不可检索、非 TTY 环境下拒绝交互解锁。只有在用户本人于交互终端显式输入口令/生物识别时才允许查看，且永不向 Agent 暴露任何密钥材料。
+    1. **一等公民 CLI + 极轻 `SKILL.md`**：不引入任何 MCP 协议栈与常驻 Schema 上下文负担。通过完备的 CLI（`--json` / `--jsonl`、Unix 管道、稳定退出码、错误提示 `hint`、乐观锁）配合 **四级渐进披露帮助体系（L0 `SKILL.md` → L1 总览 → L2 子命令帮助 → L3 专题/机读 Schema）**，直接读写本地 SQLite WAL（`busy_timeout=5s`，Daemon 未运行亦照常毫秒级完成），并通过非阻塞 Unix Socket 唤醒 Daemon 即时同步。
+    2. **可选的只读纯文本镜像（Read-Only Mirror）**：后台单向导出所有**未锁定**块为 `~/.local/share/mynote/mirror/<buffer>.md`，供 `rg`/fzf/编辑器只读检索；严禁反写，且加密块只输出 `<!-- LOCKED BLOCK: <id> -->` 占位符。
+- **架构挑战 5B — 「Agent 友好」与「安全（约束 4）」的真实权限边界**：
+  - Prompt Injection 已成为本地 Agent 的现实威胁。必须坦诚：**同用户 UID 下运行的 Agent 具备读取本地普通文件与伪造 PTY（`script`/`expect`）的系统能力**，因此 CLI 的 TTY 检测与 `MYNOTE_ACTOR` 仅定位为防误触/防浅层注入的**体验与审计护栏**。
+  - **真正的密码学硬防线**：加密块在本地磁盘只有密文，且常驻 Daemon 不持有 `VKEK` 与明文——只要人类不亲手把 Vault 口令喂给被劫持的 Agent，同 UID Agent 即便读穿本地文件与 Daemon Cookie 也无法解开任何加密块（详见 [`threat-model.md` 第 5 节](./threat-model.md#5-本地-daemon-鉴权加固与同-uid-agent-隔离边界)）。
 
 ---
 
@@ -195,19 +203,19 @@ Heynote（Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js）将每个 Buffe
 > [!NOTE]
 > **已拍板架构收敛**：原方案曾分析「云端零知识 E2EE ⚔️ 云端 MCP / Open API」的根本悖论。经过权衡，已明确决定 **不考虑云端 MCP，本地也不考虑 MCP，Agent 交互统一收口到「本地 CLI + Skill」**。
 
-这一决定直接带来**巨大的架构简化与安全性跃升**：
-1. **彻底消除 E2EE 悖论**：云端不再需要解密任何普通块，**Cloudflare 云端 100% 为零知识端到端加密（E2EE）盲同步中继**——DO SQLite 与 R2 中只存密文，彻底消除对云服务商的信任顾虑。
-2. **云端代码量骤减 ~70%**：无需构建云端 OAuth 2.1 授权服、云端物化视图/FTS5、远端 MCP 路由或内网穿透隧道；整个 Cloudflare 后端仅需约 **250–300 行 TypeScript**（SQLite Durable Object + WebSocket Hibernation + R2 + Workers Static Assets），个人成本稳定在 **\$0/月**。
+这一决定直接带来**巨大的架构简化与清晰的信任边界**：
+1. **对被动存储 100% 零知识 + 诚实的代码分发边界**：DO SQLite 与 R2 只存盲密文；桌面端严格运行本地内嵌资源（100% 免疫云端篡改），移动端 PWA 前端由自有 Cloudflare 账号下发（要求开启硬件 FIDO2 2FA + 最小权限部署 Token）。
+2. **云端代码量骤减 ~70%**：无需构建云端 OAuth 2.1 授权服、云端物化视图/FTS5、远端 MCP 路由或内网穿透隧道；整个 Cloudflare 后端仅需约 **300–350 行 TypeScript**，个人成本稳定在 **\$0/月**。
 3. **客户端更轻更纯**：桌面 Rust 单二进制同样无需引入 MCP SDK 与额外传输层，体积更小、面更窄、更稳固。
 
 > [!TIP]
-> 关于 Cloudflare 技术栈的详细组件选型、成本精算、6 大专属工程暗坑与反锁定逃生舱设计，请直接参阅 [Cloudflare 技术栈云端架构专项评估 (`cloudflare-cloud-architecture.md`)](./cloudflare-cloud-architecture.md)。
+> 详细云端配额精算、同步状态机与威胁模型请参阅：[Cloudflare 云端架构评估 (`cloudflare-cloud-architecture.md`)](./cloudflare-cloud-architecture.md)、[同步协议规范 (`sync-protocol.md`)](./sync-protocol.md) 与 [威胁模型规范 (`threat-model.md`)](./threat-model.md)。
 
 ---
 
 ## 4. 推荐系统架构设计蓝图
 
-综合以上调研与决策，推荐采用 **「Local-First 单体核心（CLI + Skill + 内嵌 Web） + 移动端 PWA + Cloudflare 全量零知识追加日志同步服」** 架构。
+综合以上调研与决策，推荐采用 **「Local-First Sans-I/O 核心（CLI + Skill + 内嵌 Web） + 移动端 PWA + Cloudflare 存储零知识追加日志同步服」** 架构。
 
 ### 4.1 整体架构图
 
@@ -215,52 +223,53 @@ Heynote（Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js）将每个 Buffe
 flowchart TD
     subgraph Desktop["桌面端 (macOS / Omarchy Arch+Hyprland)"]
         Agent["本地 AI Agent (Claude Code / Codex / OpenCode)"]
-        CLI["mynote CLI + SKILL.md (四级渐进披露帮助 / --json / 管道)"]
-        UI_D["桌面 UI: Omarchy WebApp (Hyprland Scratchpad) / macOS WKWebView"]
-        Daemon["mynote 单体二进制 Daemon (Rust, <20MB RAM)"]
-        DB_L[("本地 SQLite (WAL + FTS5 + OpLog)")]
-        Mirror["可选只读镜像 (~/.mynote/mirror/*.md)"]
+        CLI["mynote CLI + SKILL.md (四级渐进帮助 / --json / 管道)"]
+        UI_D["桌面本地内嵌 UI (按块虚拟化 CM6 + 本地 WASM 解密)"]
+        Daemon["mynote 单体二进制 Daemon (Rust, 无头 <20MB RAM, Tier2 零明文)"]
+        DB_L[("本地 SQLite (WAL + FTS5 + secure_delete)")]
+        Mirror["可选只读镜像 (~/.local/share/mynote/mirror/*.md)"]
         ExtFmt["外部格式化管道 (biome / gofmt / ruff / jq)"]
-        Keyring["OS Keychain / Secret Service"]
+        Keyring["OS Keychain / Secret Service (存 SMK)"]
 
         Agent -->|"Shell + SKILL.md"| CLI
-        CLI --> Daemon
-        UI_D <-->|"localhost HTTP + WebSocket"| Daemon
-        Daemon --> DB_L
+        CLI -->|"直写 WAL"| DB_L
+        CLI -.->|"0600 Unix Socket 异步唤醒"| Daemon
+        UI_D <-->|"127.0.0.1 HTTP/WS (Host+Origin+HttpOnly Cookie)"| Daemon
+        Daemon <--> DB_L
         Daemon -->|"单向投影 (跳过加密块)"| Mirror
         Daemon --> ExtFmt
         Daemon <--> Keyring
     end
 
     subgraph Mobile["移动端 (iOS / Android)"]
-        PWA["Local-First PWA (同套前端 + CodeMirror 6 + Rust WASM)"]
-        IDB[("IndexedDB / OPFS 本地缓存 + Outbox")]
-        Bio["WebAuthn PRF / Passphrase"]
+        PWA["Local-First PWA (同套前端 + CM6 + Pele + mynote-wasm)"]
+        IDB[("极简 IndexedDB (buffers / blocks / sync_ops)")]
+        Bio["WebAuthn PRF (平台 Passkey) / 主口令"]
         PWA <--> IDB
         PWA <--> Bio
     end
 
-    subgraph Cloud["Cloudflare 零知识云端 (单 Worker + SQLite DO + R2 + Static Assets)"]
-        SyncAPI["Append-Only Blind Sync Relay (HTTP + WS Hibernation)"]
-        CloudDB[("DO SQLite (盲加密 OpLog + 30天 PITR)")]
-        R2[("R2 (加密附件 + 每日冷备)")]
+    subgraph Cloud["Cloudflare 个人单租户云端 (单 Worker + SQLite DO + R2 + Static Assets)"]
+        SyncAPI["Blind Sync Relay (HTTP + WS Hibernation + 短TTL剪贴板)"]
+        CloudDB[("DO SQLite (5列盲 ops + vault_keys + devices, 30天窗口)")]
+        R2[("R2 (K=5 多代快照 + 每日归档冷备 + 加密附件)")]
         SyncAPI --> CloudDB
         SyncAPI --> R2
     end
 
-    Daemon <-->|"HTTPS push/pull + WSS (E2EE 密文)"| SyncAPI
-    PWA <-->|"HTTPS push/pull + WSS (E2EE 密文)"| SyncAPI
+    Daemon <-->|"HTTPS push/pull + WSS (256B 填充盲密文)"| SyncAPI
+    PWA <-->|"HTTPS push/pull + WSS (256B 填充盲密文)"| SyncAPI
 ```
 
 ### 4.2 为什么这套架构最契合你的全部目标？
 
-1. **一套前端覆盖三端，彻底规避 WebKitGTK 坑**：
-   - 前端基于 **CodeMirror 6 + 极简响应式框架（SolidJS / Svelte 5 / Preact）**，打包后通过 `rust-embed` 内嵌进单体二进制。
-   - **Omarchy**：后台 systemd user service 运行 `mynote daemon`，Hyprland 绑定快捷键（如 `SUPER + N`）拉起 `omarchy-launch-webapp http://127.0.0.1:port` 放入 Special Workspace，享受原生 Wayland 渲染、瞬时切换、零 WebKitGTK 崩溃。
-   - **macOS**：`launchd` 运行同一 `mynote daemon`，前端可用 Safari/Chrome App Mode，或在 V1 包一层 ~3MB 的极薄原生 Swift `WKWebView` 壳以支持全局快捷键（如 `Cmd+Shift+H`）与菜单栏常驻。
-   - **移动端**：直接访问 Cloudflare Workers Static Assets 免费托管的**同一份 PWA 静态资源**，借助 Service Worker + IndexedDB/OPFS 实现离线可编辑与联网自动同步；核心加解密与轻量格式化通过同一份 Rust 代码编译出的 **WASM** 复用，逻辑零重复。
-2. **零数据丢失 + 100% 零知识云端**：本地 SQLite WAL + 不可变 OpLog + 软删除 + 冲突保留，Cloudflare 端全程只存盲密文且自带 30 天 PITR + 每日 R2 冷备。
-3. **极致的 Agent 友好（零 MCP 负担）**：完备的 `CLI + SKILL.md` + 四级渐进披露帮助 + 确定性 `--json` 契约，对加密块实施硬隔离。
+1. **一套前端覆盖三端，彻底规避 WebKitGTK 坑且桌面端零远端代码风险**：
+   - 前端基于 **按块虚拟化 CodeMirror 6 + Pele 纯 SVG + 极简响应式框架（SolidJS / Svelte 5 / Preact）**，打包后通过 `rust-embed` 内嵌进桌面单体二进制（永不加载远端代码）。
+   - **Omarchy**：后台 systemd user service 运行 `mynote daemon`，Hyprland 绑定快捷键拉起本地鉴权会话放入 Special Workspace，享受原生 Wayland 渲染、瞬时切换、零 WebKitGTK 崩溃。
+   - **macOS**：`launchd` 运行同一 `mynote daemon`，前端可用浏览器 App Mode，或包一层 ~3MB 的极薄原生 Swift `WKWebView` 壳支持全局热键与菜单栏常驻。
+   - **移动端**：访问自有域名 Cloudflare Workers Static Assets 托管的**同一份 PWA**，使用 Service Worker + 极简 IndexedDB（零 `sqlite-wasm` 体积负担与文件锁冲突）实现离线编辑；同步状态机、加解密与轻量格式化通过 `mynote-wasm` 100% 复用。
+2. **形式化防丢 + 双层零知识隔离**：本地 SQLite WAL + 防空 `UPDATE` 类型门禁 + `(hlc, op_id)` 确定性冲突投影 + R2 多代快照与活跃水位 GC，配合客户端内存级 Tier 2 解密。
+3. **极致的 Agent 友好（零 MCP 负担）**：完备的 `CLI + SKILL.md` + 四级渐进披露帮助 + 离线友好的稳定退出码契约。
 
 ---
 
@@ -268,97 +277,110 @@ flowchart TD
 
 ### 5.1 数据模型：Block-First 而非文本分隔符
 
-彻底放弃 Heynote 的「整文件文本分隔符」，将 **Block** 提升为最小同步、格式化、加密与检索单元。
+彻底放弃 Heynote 的「整文件文本分隔符」，将 **Block** 提升为最小同步、格式化、加密与检索单元（完整线格式与状态机见 [`sync-protocol.md`](./sync-protocol.md)）。
 
 ```mermaid
 erDiagram
     BUFFERS ||--o{ BLOCKS : contains
     BLOCKS ||--o{ SYNC_OPS : has_history
+    VAULT_KEY_SLOTS ||--o{ VAULT_KEYS : unwraps_vkek_for
+    VAULT_KEYS ||--o{ BLOCKS : encrypts_locked
     BUFFERS {
-        text id PK "ULID / UUIDv7"
+        text id PK "ULID"
         text name "Buffer 名称 (如 scratch, work)"
         int sort_order "侧栏排序"
         text hlc "最后更新混合逻辑时钟"
         int deleted_at "软删除时间戳 (NULL=有效)"
     }
     BLOCKS {
-        text id PK "ULID / UUIDv7"
-        text buffer_id FK "所属 Buffer"
-        text position "Fractional Indexing 排序键 (如 a0, a0V)"
-        text lang "语言模式 (markdown/json/sql/math/...)"
-        int is_locked "0=普通块, 1=Vault 加密块"
+        text id PK "ULID"
+        text buffer_id FK "所属 Buffer (LWW)"
+        text position "Fractional Indexing + 4B 抖动后缀 (LWW)"
+        text lang "语言模式 (markdown/json/sql/mermaid/... LWW)"
+        int is_locked "0=普通块, 1=Vault 加密块 (Lock-Wins 单调)"
+        text kid FK "加密块关联的 BDEK ID (is_locked=1)"
         text public_hint "可选公开提示 (如 Prod API Key)"
-        text content "明文内容 (is_locked=1 时恒为 NULL)"
-        blob ciphertext "AEAD 密文信封 (is_locked=1 时非空)"
-        text head_op_id "当前最新操作 ID"
-        text conflict_of "若发生并发冲突，指向主块 ID"
+        text content "物化明文主分支 (is_locked=1 时恒为 NULL)"
+        blob ciphertext "Tier 2 密文体 (不含 wrapped_dek)"
+        text head_op_id "当前主分支操作 ID"
+        text conflict_heads_json "未收敛并发分支叶子列表 (纯函数投影)"
         text hlc "混合逻辑时钟"
-        int deleted_at "软删除 Tombstone"
+        int deleted_at "软删除 Tombstone (遇并发 UPDATE 自动复活)"
+    }
+    VAULT_KEY_SLOTS {
+        text slot_id PK "passphrase | recovery | prf:<rp>:<cred>"
+        int vk_epoch "VKEK 世代号"
+        blob wrapped_vkek "包裹后的随机 256-bit VKEK"
+    }
+    VAULT_KEYS {
+        text kid PK "每加密块独立密钥 ID (支持物理 DELETE)"
+        int vk_epoch "所属 VKEK 世代"
+        blob wrapped_dek "由 VKEK 包裹的 BDEK"
     }
     SYNC_OPS {
         text op_id PK "ULID"
-        int server_seq "云端分配的单调序号 (NULL=未上传)"
+        int server_seq "当前 epoch 下云端序号 (NULL=未上传)"
         text device_id "产生变更的设备 ID"
-        text entity_type "buffer | block"
-        text entity_id "目标 ID"
-        text parent_op_id "因果前置 op_id"
-        text op_type "CREATE | UPDATE | MOVE | LOCK | DELETE"
+        text entity_type "本地解包索引: buffer | block"
+        text entity_id "本地解包索引: 目标 ID"
+        text parent_op_ids_json "因果前置 op_id 数组"
+        text op_type "CREATE | UPDATE | SET_META | LOCK | UNLOCK | RESOLVE | DELETE"
         text hlc "Hybrid Logical Clock"
-        blob payload "业务载荷 (E2EE 模式下整体加密)"
-        int created_at "本地时间戳"
+        text payload_encoding "FULL_ZSTD | SPAN_PATCH"
+        blob payload "本地压缩载荷 (云端封装进 5 列盲信封)"
+        int created_at "时间戳"
     }
 ```
 
 **关键设计细节**：
-- **Fractional Indexing（分数索引，如 LexoRank / Figma 同款）**：支持在任意两个块之间 `Cmd+Enter` 插入新块、拖拽重排，**只需修改被移动那一个块的 `position` 字段**，不会引发整表重排或同步风暴。
-- **物理隔离明文与密文列**：当 `is_locked = 1` 时，`content` 列强制清空并从 `blocks_fts`（SQLite FTS5 虚表）中删除对应记录，仅保留 `ciphertext` 列，从 Schema 层杜绝索引泄漏。
-- **视觉上依然保持 Heynote 连续流**：前端将同一 Buffer 下的 Blocks 按 `position` 连续渲染，每个 Block 挂载独立轻量的 CodeMirror 6 实例（或虚拟列表按需激活），上下方向键跨块无缝移动，快捷键与 Heynote 保持肌肉记忆一致。
+- **Fractional Indexing 防碰撞与重平衡**：插入时附带 4 字符随机抖动后缀，查询排序强制 `ORDER BY position COLLATE BINARY ASC, id ASC`（以 ULID 破除离线同位插入平局）；单键长度超过 64 字节时自动对局部相邻窗口重平衡。
+- **物理隔离明文、密文与「先写后锁」残留擦除**：当块转为 `is_locked = 1` 时，同一事务内清空 `content`、抹除本地历史 `sync_ops` 明文、删除并 `merge` `blocks_fts` 倒排段，随后立即执行 `PRAGMA wal_checkpoint(TRUNCATE)` 截断清零 `.db-wal` 残留帧，并向云端发送 `purge_op_ids[]` 原地将旧 `ops.envelope` 置 `NULL`。
+- **为什么前端坚持「按块独立/虚拟化挂载 CodeMirror 6」而非「单 CM6 文档」？**
+  - Heynote 采用单 CM6 文档 + 分隔符装饰是因为它只有纯源码态，即便如此也在 `deleteLine` 吞块与 Vim 操作符破坏分隔符上饱受困扰（Heynote Issue #24/#43/#51）；
+  - 本项目核心包含**单块独立 Markdown/Mermaid 原生 DOM 预览态（支持直接划选复制干净富文本）、左右分栏、锁定态加密卡片与块级独立 Undo**——若强塞进单 CM6 文档 Block Widget，会引发 CM6 选区复制拦截、视口高度估算跳动与混合语法树复杂度失控；
+  - 参考 JupyterLab 4 成熟方案：**仅对视口内处于源码编辑态的块挂载轻量 `EditorView`**，并通过 `< 150` 行交互桥接实现**首尾行上下方向键 / Vim `j`/`k` 跨块无缝跳转、两段式 `Cmd+A`（首按选当前块、连按第 2 次选全 Buffer）以及顶层全局跨块搜索替换**，兼得连续流手感与架构整洁度。
 
 ---
 
 ### 5.2 同步引擎：不可变操作日志（Anti-Wipe by Construction）
 
-借鉴 **Atuin Sync v2（追加记录日志）**、**Evolu（HLC + E2EE）** 与 **Loro Durable Streams（哑线性流 + 快照）** 的最佳实践，设计一套极简但工业级可靠的同步协议。
+借鉴 **Atuin Sync v2（追加记录日志）**、**Evolu（HLC + E2EE）** 与 **Loro Durable Streams（哑线性流 + 快照）** 的最佳实践，构建形式化防丢同步协议（详见 [`sync-protocol.md`](./sync-protocol.md)）。
 
 #### 同步时序流程
 
 ```mermaid
 sequenceDiagram
     participant C1 as 客户端 A (macOS/Omarchy)
-    participant S as 云端同步服 (Append-Only Relay)
+    participant S as 云端同步服 (5列盲日志 Relay)
     participant C2 as 客户端 B (移动端 PWA)
 
-    Note over C1: 本地编辑块 B1: 原子写入 SQLite + sync_ops，用 SMK 加密 payload
-    C1->>S: POST /v1/sync/push (ops[], last_seen_seq=104)
-    S->>S: 校验幂等 op_id -> 分配单调 server_seq=105 -> 落盘
-    S-->>C1: 200 OK { acked: [{op_id, server_seq: 105}] }
-    S-->>C2: WebSocket Push: { new_seq: 105 }
+    Note over C1: 本地编辑合并: FULL_ZSTD / SPAN_PATCH -> 256B填充 -> SMK 盲信封加密
+    C1->>S: POST /v1/sync/push { epoch, ops[], purge_op_ids[] }
+    S->>S: transactionSync 校验幂等 op_id -> 分配单调 seq=105 -> 落盘
+    S-->>C1: 200 OK { ok: true, epoch, acked: [{op_id, seq: 105}] }
+    S-->>C2: WebSocket Hibernation Push: { type: "op", epoch, seq: 105, op }
+    Note over C2: 若 seq == local_seq + 1 且 epoch 一致则直接落盘；若跳号则回退 HTTP pull
     C2->>S: GET /v1/sync/pull?since=104&limit=200
-    S-->>C2: 200 OK { ops: [seq 105], head_seq: 105 }
-    Note over C2: 解密并校验 parent_op_id: 一致则应用，并发分叉则保留 Conflict Sibling
+    S-->>C2: 200 OK { ok: true, epoch, ops: [seq 105], head_seq: 105 }
+    Note over C2: 解密并按字段级因果合并: 正文并发分叉按 (hlc, op_id) 纯函数投影主块与 Conflict Sibling
 ```
 
 #### 为什么该协议不可能重演「无故清空」？
 
-1. **单调序列号拉取（Cursor-based Catch-up）**：每个设备只需持久化一个整数 `last_synced_seq`，断网三天或重装系统后从 `0`（或最新 Compact Snapshot）重放即可得到完全一致的状态。
-2. **严格的因果冲突检测（非墙钟覆盖）**：
-   - 每个修改操作携带 `parent_op_id`。
-   - 如果设备 A 和设备 B 都在离线状态下改了**同一个块**（基于同一 `parent_op_id` 产生了两个不同 `op_id`），后到达的更新**绝不静默覆盖**，而是自动在原块下方生成一个标记为 `Conflict` 的兄弟块（`conflict_of = block_id`），提供一键 Diff / 保留左 / 保留右 / 合并操作。
-   - **宁可多留一份可见副本，绝不悄悄吞掉任何一个字符。**
-3. **新设备防空覆盖保护**：空客户端的 `last_synced_seq = 0`，协议层强制要求先完成 `bootstrap pull` 才能发出任何 `DELETE` 类操作。
-4. **快照压缩（Compaction）**：当操作日志超过一定阈值（如 2000 条）时，客户端在本地生成压缩快照并加密上传（类似 Atuin 2026 年引入的客户端 Packfile 机制），防止长期使用后新设备首次同步变慢。
-5. **平滑演进到字符级 CRDT（V2 可选）**：由于传输协议本身只关心不透明的 `payload` 字节流，未来若希望同一块也能多人/多端并发字符级无冲突合并，只需新增 `op_type = CRDT_DELTA` 并嵌入 **Loro** 或 **Yjs** 增量字节，服务端代码**一行都不用改**！
+1. **混合确定性压缩载荷（`FULL_ZSTD` + `SPAN_PATCH`）与本地合并**：`< 4 KB` 块、所有加密块及每 20 步检查点均采用 100% 自包含的 `FULL_ZSTD`；仅 `>= 4 KB` 明文块连续编辑采用带 `base_blake3` 与 `post_blake3` 硬校验的精确字节区间补丁 `SPAN_PATCH`（拒绝模糊 `diff-match-patch`），配合出站前本地合并，既杜绝链式拼错，又消除 300 KB 大块写放大。
+2. **纯函数冲突视图 + 字段级因果拆分**：
+   - `position`、`lang`、`buffer_id` 走独立 LWW-Register，并发移动与改字互不干扰；`DELETE` 遇并发 `UPDATE` 自动复活（Update-Wins）；`LOCK` 遇并发明文 `UPDATE` 强制保持锁定（Lock-Wins）；
+   - 正文并发分叉**不自动派生新 `CREATE` 操作**（避免 $N$ 台设备生成 $N$ 份重复冲突块），而是各端按内生不可变的 **`(hlc, op_id)` 字典序** 纯函数投影出主块与冲突兄弟列表，直至用户点击合并发出多父指针 `RESOLVE` 操作收敛分支。
+3. **防空 `UPDATE` 类型门禁与引导隔离**：未完成首次引导前禁推已有实体变更；`DecryptFailed` / `Unhydrated` 编译期禁止构造 `UPDATE`；外部格式化器与 CLI 非交互 0 字节管道自动熔断。
+4. **R2 多世代快照（`K=5`）与 DO 活跃水位滑动窗口 GC 解耦**：快照只存 R2（带 `prev_snapshot_id` CAS 与 `state_blake3` 自检），永不单点覆写；DO SQLite 仅在低于所有活跃设备已拉取水位且满 30 天（或达 700 MB）并归档 R2 后才回收旧行，确保单 DO 常态仅占 `~15–25 MB`，永不触碰免费版 1 GB `SQLITE_FULL`。
+5. **`epoch` 并集对账状态机**：PITR 回滚或迁移自建服导致 `epoch` 变化时，客户端将本地与远端按 `op_id` 求**集合并集**（严禁先清空本地表！），按 `(hlc, op_id)` 重新物化后补推缺失项。
 
 #### 跨设备复制粘贴场景的专项优化（低延迟 × 高可靠）
 
-针对「把内容贴进笔记，立刻去另一台设备复制」的高频痛点，在**严格不牺牲可靠性**的前提下增加四项轻量增强：
-
-1. **粘贴快车道（Fast-Flush）**：普通输入防抖 `400–500ms` 合并推送；触发 **粘贴（`paste`）、失焦（`blur`）或剪贴板命令** 时缩短至 `0–100ms` 立即走 HTTP `push`，并由 Cloudflare Durable Object 通过 **WebSocket Hibernation** 亚秒级广播到其他在线设备（`< 16KB` 小块可随 WS 帧顺风车直达；若检测跳号则自动回退 HTTP `pull`，绝不丢消息）。
-2. **一键复制与桌面极速剪贴板 CLI**：
-   - 每个块顶部提供移动端友好的一键 **Copy 按钮**，桌面端支持 `Cmd/Ctrl+Shift+C` 一键复制当前整块（免去手动全选）；
-   - CLI 提供 `mynote clip push`（读取 `pbpaste` / `wl-paste` 0ms 推送，支持 `--lock` 直接加密传输）与 `mynote clip pull`（将最新块写入 `pbcopy` / `wl-copy`），在 Omarchy Hyprland 与 macOS 上绑快捷键即可变身**跨平台端到端加密剪贴板**。
-3. **移动端前台唤醒即拉**：受 iOS Safari 后台挂起机制限制，手机端 PWA 锁屏后无法保持后台 WS；因此在 `visibilitychange` / `pageshow` 回到前台瞬间立即并发执行 HTTP `pull` 与 WS 重连，保证打开 App 约 `300ms` 内呈现最新粘贴内容。
-4. **敏感内容中转的加密碎纸（Crypto-Shredding）**：跨设备常传临时 Token/验证码；对临时加密块支持标记「一次性中转 / 过期销毁」，销毁时直接删除该块的 `Block DEK`——即便底层的 Append-Only OpLog 或 R2 冷备仍留有历史密文，也因密钥永久销毁而在数学上彻底不可恢复，同时点击复制加密块后可选 30 秒自动清空本地剪贴板。
+1. **粘贴快车道（Fast-Flush）**：普通输入防抖 `400–500ms` 本地合并；触发 **粘贴（`paste`）、失焦（`blur`）或剪贴板命令** 时 `0–100ms` 立即走 HTTP `push` + `<= 16KB` WebSocket Hibernation 顺风车直达（跳号自动回退 HTTP `pull`）。
+2. **一键复制与桌面极速剪贴板 CLI**：块顶一键 Copy（桌面 `Cmd/Ctrl+Shift+C`）；CLI `mynote clip push/pull` 对接 `pbpaste`/`pbcopy` 与 `wl-paste`/`wl-copy`（Daemon 未运行时 CLI 自动进程内直推）。
+3. **移动端前台唤醒即拉**：PWA 在 `visibilitychange` / `pageshow` 回到前台瞬间并发执行 HTTP `pull` 与 WS 重连，`~300ms` 内呈现最新粘贴内容。
+4. **独立瞬态加密剪贴板（`mynote clip push --lock --ephemeral`）**：跨设备传临时验证码/Token 走 DO 专用短 TTL 瞬态槽位（阅后即焚，**不写入持久化 `sync_ops` 主日志，也不进入每日 R2 冷备与长期归档**），复制后 30 秒自动清空本地剪贴板。
 
 ---
 
@@ -375,10 +397,10 @@ flowchart LR
     Env -->|"移动端 / 浏览器"| L3["Layer 3: 懒加载 WASM/JS (Biome WASM / Prettier, SW 缓存)"]
 ```
 
-**开发者专属高频加分项（比 Heynote 更进一步）**：
-- **脏 JSON 急救模式**：开发中经常从日志里复制带双层转义的 JSON（`"{\"code\":200,\"data\":\"...\"}"`）或单引号/尾逗号对象，内置一键 `Unescape & Format JSON`。
-- **结构化转换动作**：JSON ↔ YAML ↔ TOML 互转、Base64 编解码、URL Query 转 JSON、JWT 载荷预览、Unix 时间戳转本地时间——全部纯本地离线执行。
-- **Math 计算块**：内置轻量表达式求值器（类似 Heynote Math Mode，支持 `prev` 引用上一行结果与常用单位换算）。
+**开发者专属高频加分项与防空护栏**：
+- **脏 JSON 急救模式**：内置一键 `Unescape & Format JSON`，解包日志双层转义字符串与尾逗号。
+- **结构化转换动作**：JSON ↔ YAML ↔ TOML 互转、Base64 编解码、URL Query 转 JSON、JWT 载荷预览、Unix 时间戳转换——纯本地离线执行。
+- **零字节异常熔断**：Layer 2 外部 CLI 子进程若对非空输入返回 `0 bytes`、退出码非 `0` 或超时，**无条件丢弃输出并保留原文本报错**，严防异常格式化脚本清空笔记块。
 - **外部格式化器配置示例（`~/.config/mynote/formatters.toml`）**：
   ```toml
   [formatters.typescript]
@@ -396,34 +418,35 @@ flowchart LR
 
 ### 5.4 安全与块级加密模型
 
-采用成熟、经审计的现代密码学原语组合（对标 Standard Notes Protocol 004 & Notesnook，零自造算法）：
+采用成熟现代密码学原语组合，并将密钥包裹、存储位置与销毁边界形式化收敛于 [`threat-model.md`](./threat-model.md)：
 
-- **KDF**：`Argon2id`（推荐参数：内存 64 MiB、迭代 3、并行度 1；移动端按设备能力自适应但保持高下限）
-- **子密钥派生**：`HKDF-SHA256`
-- **对称认证加密（AEAD）**：`XChaCha20-Poly1305`（**192-bit 超长随机 Nonce**，彻底消除 AES-GCM 96-bit Nonce 随机碰撞风险，且在无 AES-NI 的移动端/WASM 环境下性能极佳且抗时序侧信道）
-- **关联认证数据（AAD）**：每次加密强制绑定 `version || entity_id || op_id || key_id`，防止恶意服务端篡改、重放或调包不同块的密文。
+- **KDF**：`Argon2id`（桌面默认 64 MiB / t=3 / p=1；移动端 WASM 下限 32 MiB / t=3 / p=1）+ `HKDF-SHA256`
+- **对称认证加密（AEAD）**：`XChaCha20-Poly1305`（192-bit 随机 Nonce）+ 256B 阶梯填充
+- **关联认证数据（AAD）**：Tier 1 绑定 `"mynote-sync-v1" || smk_kid || op_id || device_id`；Tier 2 绑定 `"mynote-vault-v1" || entity_id || op_id || kid`
 
-#### 双层密钥体系
+#### 双层密钥与 LUKS 式多槽位包裹体系
 
 ```mermaid
 flowchart TD
-    subgraph Tier1["Tier 1: 同步零知识层 (日常无感)"]
-        RecKey["24 词 Recovery Key / 主口令"] -->|"Argon2id / HKDF"| SMK["Sync Master Key (SMK)"]
-        SMK -->|"存入 OS Keychain / Secret Service"| AutoEnc["自动加密所有出站同步 OpLog"]
+    subgraph Tier1["Tier 1: 同步存储零知识层 (日常无感)"]
+        PairOrRec["URL #fragment 扫码配对 / 24 词恢复词"] -->|"HKDF / 直传"| SMK["Sync Master Key (SMK, 支持 smk_kid 轮换)"]
+        SMK -->|"桌面 Keychain / PWA WebCrypto 包裹"| AutoEnc["256B 填充加密 5 列盲同步信封 & R2 快照"]
     end
 
-    subgraph Tier2["Tier 2: 块级保险库层 (敏感块显式锁定)"]
-        VaultPass["Vault 独立口令 / Touch ID / WebAuthn PRF"] -->|"Argon2id"| VKEK["Vault Key-Encrypting Key (VKEK)"]
-        VKEK -->|"解包"| BDEK["每块独立随机 Block DEK (256-bit)"]
-        BDEK -->|"XChaCha20-Poly1305 + AAD"| LockedBlob["加密块密文信封 (本地磁盘 & 云端均为密文)"]
+    subgraph Tier2["Tier 2: 块级保险库层 (100% 客户端内存解密, Daemon 零明文)"]
+        S0["Slot 0: Vault 主口令 (Argon2id)"] -->|"包裹"| VKEK["随机 256-bit 主保险库密钥 (VKEK)"]
+        S1["Slot 1: 24 词恢复码 (HKDF)"] -->|"包裹"| VKEK
+        S2["Slot 2..N: 各域名/设备平台 Passkey PRF"] -->|"包裹"| VKEK
+        VKEK -->|"解包可变表 vault_keys (支持物理 DELETE)"| BDEK["每块独立随机 Block DEK (kid)"]
+        BDEK -->|"XChaCha20-Poly1305 + AAD"| LockedBlob["加密块密文体 (sync_ops 仅存 kid, 不含 wrapped_dek)"]
     end
 ```
 
-**块级加密设计亮点**：
-1. **信封加密（Envelope Encryption）**：每个加密块有独立随机的 `Block DEK`，由 `VKEK` 包裹保存。修改 Vault 口令时只需重新包裹 `DEK`，无需重加密历史操作日志。
-2. **本地与云端一致的静态密文**：加密块在本地 SQLite 中也只存密文信封（结构自描述，如 `{"v":1,"alg":"xchacha20poly1305","kid":"...","nonce":"...","wrapped_dek":"...","ct":"..."}`），永不进入 FTS5，永不写入纯文本镜像。
-3. **移动端便捷解锁**：优先支持 **WebAuthn PRF 扩展**（iOS Safari 18+ / 现代 Chromium / YubiKey 均已支持通过 Passkey 生物识别派生确定性对称密钥），降级支持 Vault 口令输入；解锁态仅存在内存中，空闲 5 分钟或切后台立即 `zeroize` 清零回锁。
-4. **紧急恢复机制**：首次初始化 Vault / 同步账户时生成人类可读的 **Recovery Key**，避免忘密码导致数据永久丢失。
+**块级加密核心机制**：
+1. **可变密钥表分离（真 Crypto-Shredding）**：`wrapped_dek` 绝不进入不可变 `sync_ops`，而是独立存于可变表 `vault_keys`；销毁加密块时物理删除对应 `kid` 行（并在威胁模型中诚实说明常规块受云端底层 30 天 PITR 约束，一次性传密请用 `--ephemeral` 瞬态槽位）。
+2. **LUKS 式多槽位包裹（跨 RP / 跨设备生物识别）**：针对 `localhost` 与线上 PWA 域名 RP ID 不同、各设备 Passkey 不同的客观约束，随机主密钥 `VKEK` 由 `vault_key_slots` 多槽位独立包裹（注：iOS Safari 18+ PRF 支持内置 Face ID Passkey，不支持外接硬件 YubiKey，后者自动回退主口令）。
+3. **常驻 Daemon 零明文 + 本地严格鉴权**：Tier 2 解密仅发生在当前 Web UI WASM 或单次 CLI 进程内存中，空闲 5 分钟或切后台即 `zeroize`；Daemon 本地接口强制校验 `Host` + `Origin` + `HttpOnly` 随机 Session Cookie。
+4. **零服务器泄露扫码配对与丢失止损**：`mynote device add` 通过不发往服务端的 URL `#fragment` 二维码传发密钥；设备遗失支持秒级 `revoke` 并轮换 `smk_kid`。
 
 ---
 
@@ -460,16 +483,18 @@ flowchart LR
     add         Create a new block (supports stdin pipe & --format)
     block       Read, update, append, move, or delete a specific block
     buf         List, create, or rename buffers
+    import      Import existing Heynote buffers (∞∞∞ delimiter migration)
 
   QUERY & CLIPBOARD:
     ls          List recent blocks (summary-first, token-budget safe)
     search      Full-text search across unlocked blocks (FTS5)
-    clip        Instant cross-device clipboard push/pull (0ms fast-flush)
+    clip        Instant cross-device clipboard push/pull (--ephemeral supported)
 
   TRANSFORM & OPS:
     format      Format a block or stdin (json/sql/yaml/xml/md + external CLIs)
-    sync        Inspect sync status, force push/pull, view conflicts
-    vault       Lock/unlock sensitive blocks (TTY-only for decryption)
+    sync        Inspect sync status, force push/pull, rotate-smk, view conflicts
+    vault       Lock/unlock/shred sensitive blocks (client-side decryption)
+    device      Pair new device (QR #fragment), list, or revoke lost devices
     help        Deep topics: formatting, locking, conflict, agent
 
   GLOBAL FLAGS:
@@ -492,18 +517,20 @@ flowchart LR
 
 #### 3. Agent-Native CLI 工程契约（比 `--help` 更关键的 6 条硬规范）
 
-1. **统一结构化输出信封（`--json`）与 TTY 自适应**：
+1. **直写本地 SQLite WAL + 统一结构化输出信封（`--json`）**：
+   - CLI 直接读写本地 SQLite WAL（`busy_timeout=5s`），写后通过非阻塞 Unix Socket 唤醒 Daemon 同步；**即使后台 Daemon 未启动，CLI 依然 `< 5–15ms` 完成且零报错**。
    - 带 `--json` 时，stdout 永远是合法单条 JSON（日志/警告只走 stderr）：
      ```json
      {
        "ok": true,
        "data": { "id": "01JXYZ...", "buffer": "scratch", "lang": "json", "head_op_id": "01JABC..." },
-       "meta": { "local_seq": 108, "sync_state": "synced", "redacted_count": 1 }
+       "meta": { "local_seq": 108, "sync_state": "pending_offline", "redacted_count": 1 }
      }
      ```
    - 当检测到 `!isatty(stdout)`（处于管道或 Agent Shell 执行中）时，自动关闭 ANSI 颜色码与交互式分页器（pager）。
-2. **语义化稳定退出码 + 可执行错误提示（`hint`）**：
-   - `0` 成功 | `2` 参数错误 | `3` 目标不存在 | `4` 乐观锁冲突（`HEAD_MISMATCH`）| `5` 加密块受限（`BLOCK_LOCKED`）| `6` 云端离线（本地写入仍成功）| `7` 格式化语法错误。
+2. **语义化稳定退出码（消除离线假失败重试）+ 可执行错误提示（`hint`）**：
+   - **常规本地写命令离线成功一律返回 `0`**（通过 `meta.sync_state = "pending_offline"` 表达待同步，避免触发 Shell `set -e` 中断或诱导 Agent 误判失败反复重试产生重复块）；
+   - `0` 成功 | `2` 参数或空管道错误 | `3` 目标不存在 | `4` 乐观锁冲突（`HEAD_MISMATCH`）| `5` 加密块受限（`BLOCK_LOCKED`）| `6` 显式联网命令离线失败（仅限 `sync push/pull`、`clip push --wait-sync`）| `7` 格式化语法错误。
    - 错误返回必带下一步动作建议，让 Agent 无需盲猜就能自愈：
      ```json
      {
@@ -517,16 +544,15 @@ flowchart LR
      ```
 3. **非交互快速失败（Never Hang）**：
    - 在非 TTY 环境下或传入 `--non-interactive` / `--json` 时，**绝不允许阻塞等待用户输入密码或 `y/N` 确认**；缺少必填确认或需要解锁 Vault 时立即以明确退出码（`2` / `5`）返回。
-4. **防误覆写与幂等保障**：
+4. **防误覆写、防空管道覆盖与幂等保障**：
    - `mynote block update <id> --expected-head <op_id>`：强制乐观锁，防止 Agent 静默覆盖用户刚刚手敲的内容；
-   - `mynote add --idempotency-key <key>`：支持 Agent 重试不产生重复块；
-   - 批量/破坏性命令（`block delete`、`format --all`）统一支持 `--dry-run`。
+   - **空管道熔断**：`block update` 从非交互 `stdin` 收到 `0 bytes` 而目标块非空时默认报错（退出码 `2`），需显式传 `--allow-empty` 才允许清空，彻底防住前置管道命令报错把块清零；
+   - `mynote add --idempotency-key <key>`：支持 Agent 重试不产生重复块；破坏性命令统一支持 `--dry-run`。
 5. **Context / Token 预算保护（防撑爆上下文）**：
    - `mynote ls` 与 `mynote search` 默认返回**摘要视图**（`id`、`buffer`、`lang`、`updated_at`、`byte_size`、`preview` 截断前 240 字符，`--limit 20`），避免某个 300KB 的 JSON 响应块瞬间撑爆 Agent 上下文；完整正文需按 `id` 显式调用 `mynote block get <id> --raw` 或 `--max-chars <N>` 读取。
-6. **加密块硬防火墙与操作审计**：
-   - 普通/Agent 调用 `ls`、`search`、`block get` 时，加密块统一返回 `{ id, is_locked: true, public_hint, redacted: true }`，**严禁输出明文或可离线暴力破解的密文信封**；
-   - `mynote vault unlock` 仅允许在真实交互终端（TTY）执行，杜绝 Prompt Injection 诱导非交互 Agent 窃密；
-   - 支持通过环境变量 `MYNOTE_ACTOR="agent:claude-code"`（`SKILL.md` 中引导设置）自动在 `sync_ops.actor` 记录写入来源，UI 中高亮标识并支持一键时间旅行撤销。
+6. **加密块密码学隔离与诚实的护栏定位**：
+   - 普通/Agent 调用 `ls`、`search`、`block get` 时，加密块统一返回 `{ id, is_locked: true, public_hint, redacted: true }`；
+   - **诚实说明**：`/dev/tty` 交互检测（防浅层非交互窃密）与环境变量 `MYNOTE_ACTOR="agent:claude-code"`（自我声明的审计归因标签，便于在 UI 中高亮与一键回滚）属于**体验与协作护栏，而非对抗同 UID 恶意代码的安全边界**；真正的硬边界来自密码学本身（本地磁盘全密文 + 常驻 Daemon 零明文 + 口令仅由人类掌握）。
 
 #### 4. 可选只读纯文本镜像（补充零门槛检索）
 - 开启后后台将**非加密块**单向投影为 `~/.local/share/mynote/mirror/<buffer>.md`，供 `rg` / `fzf` / 外部编辑器只读检索；加密块统一投影为 `<!-- LOCKED BLOCK: 01JXYZ... (hint: prod key) -->`，严禁外部直接反写。
@@ -535,126 +561,118 @@ flowchart LR
 
 ### 5.6 Markdown 与 Mermaid 图渲染设计（轻量、离线与防 XSS）
 
-新增对 **Markdown** 与 **Mermaid 图** 的原生支持，不仅高度契合个人临时记录，更是 **AI Agent 输出的最佳载体**（Agent 经由 `mynote add --lang mermaid` 或 Markdown 块写入架构图、时序图与任务清单，多端立刻可见）。但这项能力直接撞上了**「足够轻量（约束 3）」**与**「足够安全（约束 4）」**两条红线，必须做专项设计：
+新增对 **Markdown** 与 **Mermaid 图** 的原生支持，不仅高度契合个人临时记录，更是 **AI Agent 输出的最佳载体**（Agent 经由 `mynote add --lang mermaid` 或 Markdown 块写入架构图、时序图与任务清单，多端立刻可见）。针对「足够轻量（约束 3）」与「足够安全（约束 4）」两条红线，采取以下定稿设计：
 
-#### 1. 必须提前应对的三项核心挑战
+#### 1. 三项核心工程决策
 
-1. **挑战 M1：Mermaid.js 体积膨胀 ⚔️ 足够轻量**
-   - 官方 `mermaid.js`（v11/v12）完整打包后的体积约 **1.6 MB gzip（未压缩超 3 MB）**，如果直接打进首屏主包，会直接拖慢冷启动并令前端包膨胀数倍。
-   - **解法（动态懒加载 + 可插拔渲染器抽象）**：
-     - 抽象极简的 `DiagramRenderer` 接口，**首屏主包完全不含 Mermaid 代码（冷启动 0ms 开销）**；仅当视图中首次出现 `lang = "mermaid"` 块或 Markdown 内的 ```` ```mermaid ```` 代码围栏时，才通过动态 `import()` 懒加载独立 Chunk；
-     - 桌面端该 Chunk 随前端资源通过 `rust-embed` 压缩内嵌在单二进制中（全离线可用，仍远低于 `< 15MB` 预算）；移动端通过 Cloudflare Workers Static Assets（免费无限流量）配合 Service Worker 永久离线缓存；
-     - **轻量替代观察**：2026 年社区已出现面向 Obsidian 等场景的零依赖轻量 Mermaid-to-SVG 渲染器（如 `Pele`，~230 KB gzip，基于 CSS 变量换肤，渲染耗时 `< 1ms`）。MVP 可先用官方 `mermaid`（懒加载，确保 100% 语法兼容），待轻量引擎全图表类型稳定后可无痛切换。
+1. **挑战 M1：摒弃 1.6 MB 重型 `mermaid.js`，默认采用零依赖纯 SVG 引擎 `Pele`**
+   - 官方 `mermaid.js` 打包后约 **1.6 MB gzip（未压缩超 3 MB）**，还会向 SVG 注入 `<foreignObject>` HTML 子树（导致 Safari 将 SVG 绘制到 `<canvas>` 调用 `toBlob()` 时触发 Tainted Canvas 安全异常，令 **Copy PNG** 功能直接失效！）。
+   - **已敲定方案（默认内置 [Obsidian `Pele`](https://github.com/obsidianmd/pele) + 保留可插拔 `DiagramRenderer` 接口）**：
+     - 采用 Obsidian 团队开源的 **[Pele](https://pele.run)**（MIT 协议，支持 Mermaid 12.1 内置图表类型，异步按需懒加载 Chunk 仅 `~230 KB`）；
+     - **四大决定性收益**：① 零运行时依赖、同步亚毫秒级直出纯 SVG；② **完全不产生 `<foreignObject>` 标签**，在 macOS / iOS Safari 上画入 Canvas 导出高分屏 PNG 100% 原生无污染；③ 原生通过 CSS 变量响应深浅色与 Omarchy 主题，无需重绘或放开危险内联样式；④ 不打包 1.6 MB 的 `mermaid.js`，桌面单二进制保持极致小巧，同时保留 `DiagramRenderer` 接口便于未来按需扩展。
 
-2. **挑战 M2：Markdown / Mermaid 渲染引发的 XSS 与数据外泄风险（严重安全红线！）**
-   - 2026 年已有多个真实 CVE / 安全通告指出：**当外部粘贴或 AI Agent 生成的 Markdown / Mermaid 源码被直接渲染进主页面 DOM 时**：
-     - 若 Mermaid 配置了 `securityLevel: 'loose'` 或启用 `click` 指令，会直接导致 **Stored XSS**——由于页面运行在 `localhost`（可调用本地 Daemon）或在内存中持有刚解锁的 Vault 明文，一次 XSS 足以窃取全部笔记！
-     - 即使在 `securityLevel: 'strict'` 下，恶意模型生成的 Mermaid 标签或 Markdown 仍可能利用外部图片/CSS URL 触发 **跨站请求外泄（Off-Origin Image Request）**。
-   - **强制安全防御栈**：
-     - Mermaid 严格启用 `securityLevel: 'sandbox'`（或 `strict` + 清洗后嵌入无脚本权限的 `<iframe sandbox="">`）；
-     - Markdown 渲染默认**禁止执行/直出原始 HTML**，输出经 `DOMPurify` 严格白名单净化；
-     - 前端配置严格 **CSP**：`script-src 'self' 'wasm-unsafe-eval'; img-src 'self' data: blob:;`（禁止第三方外链图片自动静默加载，需要时手动点击放行），彻底封堵 Prompt Injection → 渲染层 XSS/外带通道。
+2. **挑战 M2：Markdown / Mermaid 渲染防 XSS 与防外带通道（严格 CSP）**
+   - 页面运行在本地鉴权上下文或持有内存态密钥，一次 Stored XSS 足以窃取全部笔记。
+   - **强制安全防御栈**（详见 [`threat-model.md` 第 6 节](./threat-model.md#6-渲染层防-xss--防外带通道与严格-csp-策略)）：
+     - Markdown 默认**禁止原始 HTML 解析**，输出经 `DOMPurify` 严格白名单净化；`Pele` 生成的纯 SVG 同样经 `DOMPurify` SVG Profile 二次校验；
+     - 全端强制下发严格 **CSP**：`default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://<sync-domain> wss://<sync-domain>;`——锁死 `style-src 'self'` 并禁止第三方外链图片静默请求，彻底封堵 Prompt Injection 渲染层 XSS 与信标外泄通道。
 
-3. **挑战 M3：Markdown 源码/预览双模切换与「预览态极致复制体验」（已确定方案）**
+3. **挑战 M3：Markdown 源码/预览双模切换与「预览态极致复制体验」**
    - **为什么放弃混合 Live Preview、改用「源码模式 ↔ 预览模式」切换？**
-     - 在 Obsidian 式混合 Live Preview 中，拖选跨行文本时会不断把隐藏的 `**` / `###` / 代码围栏重新弹开，反而干扰复制；而清晰的**双模切换（快捷键 `Cmd/Ctrl+E` 或块头切换按钮，宽屏可选分栏）**既让源码编辑零光标跳动，又让预览态变成极其顺手的阅读与复制界面（手机端预览态点击文字也不会误弹虚拟键盘！）。
+     - 在混合 Live Preview 中，拖选跨行文本会不断弹开隐藏的 `**` / `###` 标记干扰复制；而清晰的**双模切换（快捷键 `Cmd/Ctrl+E` 或块头切换按钮，宽屏可选分栏）**既让源码编辑零光标跳动，又让预览态变成纯粹的阅读与复制界面（手机端预览态点击文字也不会误弹虚拟键盘！）。
    - **预览模式（Preview Mode）的复制体验专项打磨**：
-     - **双格式剪贴板（Dual-Format Copy）**：预览态直接划选复制或点击「复制渲染内容」时，同时写入 `ClipboardItem` 的 `text/html`（去除冗余背景色/样式的干净语义 HTML）与 `text/plain`——粘贴到飞书、Notion、Slack、微信、Google Docs 保留标题/列表/加粗/表格排版，粘贴到终端/纯文本框自动回落为干净纯文本。
+     - **双格式剪贴板（Dual-Format Copy）**：划选复制或点击「复制渲染内容」时，同时写入 `ClipboardItem` 的干净语义 `text/html` 与 `text/plain`——贴入飞书、Notion、Slack、Google Docs 保留排版，贴入终端自动回落纯文本。
      - **细粒度一键复制按钮（所见即所拷）**：
-       - 预览态下每个 **代码围栏（` ```lang `）** 右上角悬浮一键 **Copy Code**（自动剥离反引号，只拷贝纯代码）；
-       - 每个内嵌或独立的 **Mermaid 图** 提供一键 **Copy PNG（可直接贴聊天/文档）** / **Copy SVG** / **Copy Mermaid 源码**；
-       - 每个 **GFM 表格** 提供一键 **Copy TSV（直贴 Excel / 飞书表格）** / **Copy Markdown**；
-       - 块头提供明确复制入口：**复制渲染态（默认）** 与 **复制原始 Markdown**；
-       - 任务清单复选框（`- [ ]` ↔ `- [x]`）在预览态下依然可直接点击勾选并原子回写源码。
-   - **独立 Mermaid 块（`lang = "mermaid"`）**：
-     - 源码态接入 `codemirror-lang-mermaid` 语法高亮；
-     - **桌面端（macOS / Omarchy）**：支持源码/预览切换及左右分栏实时重绘（防抖 300ms）；**语法输入中途报错时保留上一帧有效 SVG 并在底部显示轻提示**，不闪烁白屏；内置缩放平移（Pan/Zoom）与一键 **Copy PNG / Copy SVG**；
-     - **移动端（iOS / Android PWA）**：窄屏默认展示预览态（方便直接查看与复制），一键切源码编辑，支持双指捏合缩放；
-     - **主题同步**：SVG 颜色随系统深浅色（及 Omarchy 主题色 CSS 变量）自动联动，绝不出现黑底黑字。
+       - 代码围栏右上角悬浮一键 **Copy Code**（自动剥离反引号）；
+       - 内嵌或独立 **Mermaid 图** 提供一键 **Copy PNG（Safari/Chromium 全兼容）** / **Copy SVG** / **Copy 源码**；
+       - **GFM 表格** 提供一键 **Copy TSV（直贴 Excel / 飞书表格）** / **Copy Markdown**；
+       - 任务清单复选框（`- [ ]` ↔ `- [x]`）支持预览态直接点击勾选并原子回写源码。
+   - **独立 Mermaid 块（`lang = "mermaid"`）**：源码态高亮、宽屏左右分栏实时重绘（语法输入中途报错时保留上一帧有效 SVG 不闪白屏）、内置缩放平移（Pan/Zoom）及移动端默认预览态双指缩放。
    - **Markdown 格式化增强（复用 Layer 1 Rust/WASM 管线）**：一键触发 GFM 表格列对齐、标题/列表缩进规整、冗余空行清理。
 
 ---
 
 ## 6. 多端形态与技术栈选型对比
 
-### 6.1 核心语言选型：已确认 Rust（本地核心 + WASM）+ TypeScript（前端 & Cloudflare Worker）
+### 6.1 核心语言选型：已确认 Rust（Sans-I/O 核心 + WASM）+ TypeScript（前端 & Cloudflare Worker）
 
 | 维度 | **Rust（已确认）** | Go（已放弃的备选） |
 | --- | --- | --- |
-| 单体二进制与内存 | 极佳（8–15MB，空闲 ~10–15MB RAM，无 GC 抖动） | 极佳（12–20MB，空闲 ~15–25MB RAM） |
-| **WASM 复用（关键加分项）** | **极强**：同一套密码学（`chacha20poly1305`/`argon2`）、同步状态机、JSON/SQL/YAML/Markdown 格式化器可直接编译成几百 KB 的 WASM 给移动端 PWA 复用，**零双端重复实现** | 较弱：Go WASM 运行时体积较大（通常数 MB），TinyGo 对完整标准库/密码学生态支持有限 |
+| 单体二进制与内存 | 极佳（8–15MB，无头常驻 ~12–20MB RAM，无 GC 抖动） | 极佳（12–20MB，空闲 ~15–25MB RAM） |
+| **Sans-I/O & WASM 复用** | **极强**：`mynote-core` 纯同步状态机零异步存储依赖，同一套协议合并、密码学（`chacha20poly1305`/`argon2`/`blake3`）与 Layer 1 格式化器编译成几百 KB WASM 给移动端 PWA 复用 | 较弱：Go WASM 运行时体积较大（通常数 MB），TinyGo 对完整标准库/密码学生态支持有限 |
 | 密码学与内存安全 | 原生 `zeroize` 自动清零敏感密钥内存，无 GC 副本残留风险 | GC 拷贝可能导致密钥在堆中短时残留，难以彻底擦除 |
-| CLI 与生态成熟度 | `clap`（原生支持分组帮助 + 反射导出 `--help-json`）+ `axum` + `rusqlite` + `rust-embed` + `loro`（原生 Rust） | `cobra` + `chi`/`echo` + `modernc.org/sqlite` + `embed` |
+| CLI 与生态成熟度 | `clap`（分组帮助 + `--help-json`）+ `axum` + `rusqlite` + `zstd` + `rust-embed` | `cobra` + `chi`/`echo` + `modernc.org/sqlite` + `embed` |
 
 **推荐 Monorepo / Cargo Workspace 目录规划**：
 ```text
 my-note/
 ├── Cargo.toml                 # Rust workspace root
 ├── crates/
-│   ├── mynote-core/           # 纯平台无关领域核 (Block模型 / HLC / Fractional Index / 加解密 / Layer1格式化器 / 同步状态机)
-│   ├── mynote-wasm/           # wasm-bindgen 封装 (直接复用 mynote-core 供移动端 PWA 使用)
-│   ├── mynote-store/          # SQLite WAL + FTS5 + 迁移 + OpLog 持久化 (rusqlite)
-│   └── mynote-cli/            # 单体二进制入口 (CLI + 四级渐进帮助 + 本地 Daemon + rust-embed WebUI)
-├── web/                       # TypeScript + CodeMirror 6 + Markdown/Mermaid 预览层 + mynote-wasm
-├── cloud-cf/                  # Cloudflare Worker (TypeScript + SQLite DO + WebSocket Hibernation + R2 + Static Assets)
+│   ├── mynote-core/           # Sans-I/O 纯领域核 (Block模型 / HLC / Fractional Index / 加解密 / 格式化 / 同步状态机 / 确定性模拟器)
+│   ├── mynote-wasm/           # wasm-bindgen 封装 (复用 mynote-core 供 Web UI Tier2 解密与移动端 PWA 使用)
+│   ├── mynote-store/          # 桌面端 SQLite WAL + FTS5 + secure_delete 持久化适配 (rusqlite)
+│   └── mynote-cli/            # 单体二进制入口 (CLI + Heynote导入 + 守护进程 Daemon + rust-embed 本地 WebUI)
+├── web/                       # TypeScript + 按块虚拟化 CM6 + Markdown/Pele 预览层 + 极简 IndexedDB (PWA)
+├── cloud-cf/                  # Cloudflare Worker (~300行 TS + SQLite DO + WS Hibernation + R2 + Static Assets)
 ├── skill/
 │   └── SKILL.md               # 随版本同步的极轻 Agent Skill (<250 tokens)
-└── docs/                      # 架构与协议设计文档
+└── docs/                      # 架构蓝图、同步协议规范 (sync-protocol.md) 与威胁模型 (threat-model.md)
 ```
 
 ### 6.2 桌面端 UI 形态对比（重点考量 macOS + Omarchy）
 
-| 方案 | macOS 体验 | Omarchy (Arch + Hyprland) 体验 | 移动端复用 | 轻量度 | 综合评价 |
-| --- | --- | --- | :---: | :---: | --- |
-| **方案 1：本地 Daemon + 内嵌 Web/PWA（推荐起步）** | 良（浏览器 App Mode；V1 可加极薄 3MB Swift WKWebView 壳补全局热键） | **极佳**（`omarchy-launch-webapp` + Hyprland Special Workspace `SUPER+N` 完美融入） | **100% 复用** | **极轻**（复用系统浏览器引擎，后台 <15MB） | **性价比之王**，零跨平台渲染坑，最贴合 Omarchy 哲学 |
-| **方案 2：Tauri v2（macOS + Linux + Mobile）** | 极佳（WKWebView，包小） | **较差（高风险）**（WebKitGTK 在 Wayland/Hyprland 下图形/缩放/快捷键坑多） | 中（支持 iOS/Android，但移动端调试构建复杂） | 轻（但 Linux 需依赖系统 webkit2gtk） | 表面诱人，但在 Omarchy 环境下踩坑成本高 |
-| **方案 3：原生 Rust GUI（GPUI / egui / Slint）** | 极佳（极致丝滑） | 极佳（原生 Wayland） | **0% 复用**（移动端需重写全部编辑器与格式化 UI） | 极轻 | 缺少 CodeMirror 6 级别的现成多语言代码编辑器与 Mermaid 渲染，自研成本是黑洞 |
-| **方案 4：Electron** | 良（同 Heynote） | 一般（Wayland 需 flag，全局热键受限） | 0% | **重（违背约束 3）** | 直接淘汰 |
+| 方案 | macOS 体验 | Omarchy (Arch + Hyprland) 体验 | 移动端复用 | 真实资源开销（双态口径） | 综合评价 |
+| --- | --- | --- | :---: | --- | --- |
+| **方案 1：本地 Daemon + 内嵌 Web UI（推荐）** | 良（浏览器 App Mode；可选加 3MB Swift WKWebView 壳补全局热键） | **极佳**（`omarchy-launch-webapp` + Hyprland Special Workspace `SUPER+N` 完美融入） | **100% 复用** | **关窗后台 `<20MB`；开窗复用浏览器增量 `~40–80MB`（独立实例 `120–200MB`，关窗即释放）** | **性价比之王**，零跨平台渲染坑，桌面零远端代码风险 |
+| **方案 2：Tauri v2（macOS + Linux + Mobile）** | 极佳（WKWebView，包小） | **较差（高风险）**（WebKitGTK 在 Wayland/Hyprland 下图形/缩放/快捷键坑多） | 中（移动端调试构建重） | 轻（但 Linux 强依赖系统 webkit2gtk） | 表面诱人，但在 Omarchy 环境下踩坑成本高 |
+| **方案 3：原生 Rust GUI（GPUI / egui / Slint）** | 极佳（极致丝滑） | 极佳（原生 Wayland） | **0% 复用**（移动端需重写全部编辑器与 UI） | 极轻 | 缺少 CodeMirror 6 级多语言代码编辑与图表生态，自研成本黑洞 |
+| **方案 4：Electron** | 良（同 Heynote） | 一般（Wayland 需 flag，全局热键受限） | 0% | **重（即使关窗驻留后台仍占 `150–250MB` + 200MB 磁盘包）** | 直接淘汰 |
 
 ### 6.3 前端编辑器选型
 
-- 强烈推荐 **CodeMirror 6**：
-  - Heynote 已经验证了它是开发者 Scratchpad 源码编辑的最佳内核；
-  - 高度模块化（按需懒加载语言高亮包与 Mermaid 渲染 Chunk，核心 gzip 仅 ~150–200KB）；
-  - 原生支持移动端触控与输入法（IME）、多光标、折叠、Vim/Emacs 键位模式、自定义行内 Widget（如 Math 块实时计算结果、加密块锁态卡片）；配合独立的 Markdown 预览渲染层（`markdown-it`/`marked` + `DOMPurify` + 懒加载 Mermaid），实现丝滑的「源码 ↔ 预览」切换与预览态高便利复制。
+- 强烈推荐 **CodeMirror 6（按可编辑块虚拟化挂载）**：
+  - 模块化核心 gzip 仅 `~150–200KB`，原生支持移动端触控/IME、多光标、折叠与 Vim/Emacs 模式；
+  - 仅对视口内处于源码态的块挂载 `EditorView`（预览态 Markdown/Pele 图表与加密锁卡直接渲染轻量原生 DOM），辅以跨块上下方向键跳转、两段式 `Cmd+A` 与顶层全局搜索替换，彻底规避单文档混合多语言与预览 Widget 选区冲突。
 
 ---
 
-## 7. 分阶段演进路线图（MVP → V1 → V2）
+## 7. 分阶段演进路线图（M0 → M3）
 
-遵循「先彻底解决核心痛点（防丢 + 格式化 + Markdown/Mermaid + 完备 CLI/Skill），再叠加 Cloudflare 零知识同步与块级加密」的渐进策略：
+遵循「风险前置、迁移先行、形式化模拟测试卡住同步质量」的务实节奏，切分为四个独立可验收里程碑：
 
-### Phase 0：MVP（2 周）— 桌面端先替代 Heynote
-- [ ] **核心单二进制（`mynote`）**：SQLite WAL + FTS5 + Block-First 数据模型 + Fractional Indexing。
-- [ ] **内嵌 Web UI**：CodeMirror 6 多语言分块流、Heynote 同款快捷键（`Cmd/Ctrl+Enter` 建块、`Cmd/Ctrl+L` 切语言、`Cmd/Ctrl+P` 切 Buffer、`Cmd/Ctrl+E` 切预览/源码、全局搜索、块顶一键 Copy）。
-- [ ] **Markdown 双模与 Mermaid 原生支持**：Markdown 源码/预览模式切换（宽屏可选分栏）、预览态极致复制（双格式富文本/纯文本复制、代码块一键 Copy、GFM 表格一键 TSV、复选框可点）、独立/内嵌 Mermaid 懒加载离线 SVG 渲染（严格防 XSS 沙箱 + 主题同步 + Pan/Zoom + Copy PNG/SVG）。
-- [ ] **Layer 1 + Layer 2 格式化**：内置 JSON（含脏 JSON 解包）/ YAML / SQL / XML / Markdown 表格格式化 + 本地外部 CLI 管道（`formatters.toml`）。
-- [ ] **Agent 友好 CLI + Skill 体系**：`add / ls / search / block / buf / format / help`，完整落地 **四级渐进披露帮助（L0 `SKILL.md` → L1 总览 → L2 子命令 → L3 专题与 `--help-json`）**、统一 `--json` 信封、稳定退出码、错误 `hint`、乐观锁 `--expected-head` 与 Token 摘要截断。
-- [ ] **Omarchy & macOS 集成脚本**：提供 Hyprland Special Workspace 绑定示例与 systemd / launchd 守护配置。
+### M0：桌面本地闭环、CLI 体系与 Heynote 无痛迁移
+- [ ] **Sans-I/O 核心与本地存储（`mynote-core` + `mynote-store`）**：SQLite WAL + FTS5 + `secure_delete` + Block-First 数据模型 + 带防碰撞抖动与重平衡的 Fractional Indexing + 防空 `UPDATE` 类型门禁。
+- [ ] **Heynote 存量迁移工具**：`mynote import heynote <path>`，一键无损解析 Heynote 1.x/2.x 的 `∞∞∞lang` 文本文件切块导入。
+- [ ] **Agent 友好 CLI + Skill（L0–L3）**：`add / ls / search / block / buf / format / import / help`，直写 SQLite WAL + Unix Socket 唤醒、统一 `--json` 信封、离线友好的稳定退出码、空管道熔断与 `--expected-head` 乐观锁。
+- [ ] **桌面内嵌基础 UI + 格式化管线**：按块虚拟化 CM6、跨块光标/Vim 跳转、两段式 `Cmd+A`、Layer 1/2 格式化器、本地 Daemon `Host + Origin + HttpOnly Cookie` 鉴权，跑通 macOS 与 Omarchy Special Workspace。
 
-### Phase 1：V1（2 周）— Cloudflare 全量零知识同步 + 跨端剪贴板 + 块级加密 + 移动端 PWA
-- [ ] **Cloudflare 盲加密同步服（`cloud-cf/`）**：约 250–300 行 TypeScript Worker + SQLite Durable Object（Append-Only OpLog + WebSocket Hibernation + `epoch` 校验 + 每日 R2 冷备 Alarm）+ Workers Static Assets 一键部署 PWA（详见 [Cloudflare 专项评估](./cloudflare-cloud-architecture.md)）。
-- [ ] **端到端加密（Tier 1 Sync E2EE）与块级 Vault 加密（Tier 2 Block Lock）**：Argon2id + XChaCha20-Poly1305 + Recovery Key + 空闲自动回锁 + 加密块对 CLI/Agent 的硬隔离与 Crypto-Shredding。
-- [ ] **跨设备复制粘贴快车道**：粘贴 `0–100ms` 快刷 + `<=16KB` WS 顺风车（跳号回退 HTTP `pull`）+ `mynote clip push/pull` 对接 `pbcopy`/`wl-copy`。
-- [ ] **移动端 Local-First PWA**：离线 IndexedDB/OPFS 缓存 + Rust WASM 加解密/格式化 + 切前台即拉 + 顶部诚实同步状态灯 + WebAuthn PRF 生物识别解锁 + 移动端默认预览态一键复制。
-- [ ] **时间旅行（Revision History）**：任意块支持查看历史版本与一键恢复（含按 `actor` 撤销 Agent 修改）。
+### M1：Cloudflare 存储零知识同步底座与确定性模拟测试门禁
+- [ ] **Tier 1 `SMK` 盲信封同步协议**：从第一条云端消息起即内置 `XChaCha20-Poly1305` + 256B 对齐填充（绝不先上明文同步）、`FULL_ZSTD` / `SPAN_PATCH`（`blake3` 硬校验）混合载荷与本地出站合并。
+- [ ] **Cloudflare 同步中继（`cloud-cf/`）**：5 列盲 `ops` 表（`transactionSync` 规避 100 绑定参数限制）+ WebSocket Hibernation 小包顺风车 + R2 `K=5` 多代快照（CAS 防并发）+ 活跃设备水位 30 天滑动窗口 GC + `epoch` 并集对账状态机。
+- [ ] **跨端极速剪贴板**：粘贴 `0–100ms` 快刷 + `mynote clip push/pull` 对接 `pbcopy`/`wl-copy`。
+- [ ] **M1 准出硬门槛 —— 确定性故障模拟测试套件（`SimCluster` + `proptest`）**：自动化注入随机分区、乱序、并发编辑/删除、PITR `epoch` 回滚、快照截断追赶与损坏密文，100% 验证全端比特级收敛且零字符静默丢失。
 
-### Phase 2：V2（按需演进）— 极致打磨
-- [ ] **macOS 极薄原生壳（可选）**：3MB Swift `WKWebView` 菜单栏应用，补齐 macOS 全局快捷键唤出与原生 Touch ID 解锁。
-- [ ] **单块字符级 CRDT 升级（可选）**：为非加密块接入 Loro/Yjs，实现 Mac 与手机同时编辑同一块也能无冲突实时合并。
-- [ ] **扩展能力**：Math/单位计算块、R2 加密图片粘贴（SHA-256 内容寻址附件）、只读 Markdown 镜像、终端 TUI 快速查看器（`ratatui`）。
+### M2：Tier 2 块级保险库（Vault）与移动端 Local-First PWA
+- [ ] **Tier 2 客户端内存级保险库**：Web UI WASM / 单次 CLI 进程内加解密（常驻 Daemon 零明文）、LUKS 式 `vault_key_slots` 多槽位包裹（主口令 + 24 词恢复码 + 各端/各域名平台 Passkey PRF）、可变 `vault_keys` 表物理删除碎纸。
+- [ ] **事后加锁擦除与瞬态剪贴板**：`LOCK` 触发本地 `wal_checkpoint(TRUNCATE)` + FTS5 `merge` + 云端 `purge_op_ids[]` 原地墓碑置空、粘贴密钥特征非阻塞提示条、独立短 TTL 瞬态加密剪贴板（`--ephemeral`）。
+- [ ] **移动端 PWA 与设备管理**：CF Workers Static Assets 部署、`mynote-wasm` + 极简 IndexedDB（配不可导出 WebCrypto 包裹密钥）、`mynote device add/revoke`（URL `#fragment` 零泄露扫码配对）与 `rotate-smk` 密钥轮换。
+
+### M3：Markdown / Pele 极致复制体验与高阶打磨
+- [ ] **Markdown 双模与极致复制**：`Cmd/Ctrl+E` 源码/预览切换（宽屏分栏、移动端默认预览防误弹键盘）、双格式富文本/纯文本复制、代码块一键 Copy、GFM 表格一键 TSV、可勾选任务复选框。
+- [ ] **默认内置 Obsidian `Pele` 纯 SVG 引擎**：零 `<foreignObject>` 离线亚毫秒渲染、CSS 变量主题联动、Pan/Zoom、Safari/Chromium 全兼容一键 **Copy PNG / Copy SVG**。
+- [ ] **时间旅行与高阶外设**：按版本/按 `actor` 一键回滚历史、可选只读 Markdown 镜像（`~/.local/share/mynote/mirror/`）；后续按需扩展 R2 加密图片附件、macOS 3MB `WKWebView` 菜单栏壳与单块可选 CRDT。
 
 ---
 
 ## 8. 已最终拍板的架构决策基线（ADR 摘要）
 
-截至当前，所有前置架构决策已全部收敛并冻结，后续编码实现严格以本基线为准：
+经架构审查收敛后，核心选型与配套规范已全部对齐定稿（编码实现严格以本基线及两份子规范 [`sync-protocol.md`](./sync-protocol.md)、[`threat-model.md`](./threat-model.md) 为准）：
 
-| 决策项 | 最终结论 | 核心收益与边界约束 |
+| 决策项 | 最终结论 | 核心收益与精确边界约束 |
 | --- | --- | --- |
-| **本地核心与 WASM 共享层** | **Rust**（单二进制 + `wasm-bindgen`） | `<15MB` 单体、`<20MB` 常驻内存、`zeroize` 内存擦除、`clap` 自动生成渐进帮助与 `--help-json`，且加解密与 Layer 1 格式化器零重复复用到移动端 PWA |
-| **云端基础设施与信任模型** | **Cloudflare 100% 零知识 E2EE 盲同步中继** | 单 Worker（~250–300 行 TypeScript）+ SQLite Durable Object（30 天 PITR）+ WebSocket Hibernation + R2 冷备 + Workers Static Assets；个人稳定 \$0/月；保留 5 接口逃生舱随时可迁回 VPS |
-| **同步协议与实时性** | **Block-First + Append-Only OpLog + 粘贴快车道** | 彻底告别网盘同步；新设备先拉后推 + 冲突保留兄弟块（永不静默丢数）；`paste`/`clip` 0–100ms 快刷 + `<=16KB` WS 顺风车（跳号即回退 HTTP `pull`），Mac ↔ Omarchy 目标延迟 150–350ms |
-| **移动端与桌面形态** | **桌面本地 Daemon + 内嵌 Web UI；移动端 Local-First PWA** | Omarchy 原生融入 Hyprland Special Workspace（零 WebKitGTK 坑）；移动端经 CF Static Assets 免费托管 + IndexedDB/OPFS 离线缓存 + 前台即拉，接受 iOS 暂不支持系统级 Share Sheet、需手动添加到主屏幕 |
-| **Agent 集成范式** | **纯 CLI + 极轻 `SKILL.md` + 四级渐进披露帮助（L0–L3）** | **明确不做本地 MCP 与云端 MCP**；零常驻上下文税、统一 `--json` 信封、稳定退出码与 `hint`、乐观锁 `--expected-head`、加密块硬防火墙 |
-| **Markdown 与 Mermaid 体验** | **源码 ↔ 预览双模切换 + 预览态极致复制 + 防 XSS 沙箱** | `Cmd/Ctrl+E` 切换（宽屏可选分栏，移动端默认预览不误弹键盘）；预览态支持双格式富文本/纯文本复制、代码块/Mermaid PNG & SVG/GFM 表格 TSV 一键复制；Mermaid 懒加载离线渲染 + 严格沙箱与 CSP |
+| **核心状态机与跨端存储** | **Rust Sans-I/O 核心 + 桌面 `rusqlite` + 移动极简 IndexedDB** | `mynote-core` 零异步存储依赖编译进 WASM；桌面无头 `<20MB` RAM，移动端零 `sqlite-wasm` 体积膨胀与 OPFS 多标签页锁冲突 |
+| **云端基础设施与信任边界** | **Cloudflare 5 列盲日志 DO + R2 多代快照 + Static Assets** | 对被动存储/冷备 100% 零知识（含 256B 填充隐藏元数据）；桌面永不加载远端代码，移动 PWA 代码分发信任开启硬件 FIDO2 2FA 的自有 CF 账号 |
+| **防丢同步协议与配额控制** | **`FULL_ZSTD`/`SPAN_PATCH` + `(hlc, op_id)` 冲突投影 + 滑动窗口 GC** | 纯函数派生冲突视图与字段级因果（跨 `epoch` 不翻转）；R2 `K=5` 快照与 DO 30 天水位 GC 解耦，单 DO 常驻 `~20MB` 彻底根除 1GB `SQLITE_FULL`；配确定性模拟测试门禁 |
+| **双层加密与本地安全隔离** | **可变 `vault_keys` + `vault_key_slots` + 客户端内存解密** | 消除不可变日志残留 `wrapped_dek` 矛盾；事后加锁同步截断 WAL 并置空云端旧记录；常驻 Daemon 零 Tier 2 明文 + `Host/Origin/HttpOnly` 鉴权，阻断同 UID 被劫持 Agent 窃密 |
+| **多块编辑器与图表渲染** | **按块虚拟化 CodeMirror 6 + Markdown 双模 + `Pele` 纯 SVG** | 兼容原生富文本预览划选复制与块级独立 Undo，配跨块光标跳转与两段式 `Cmd+A`；内置 MIT 开源 `Pele` 消除 1.6MB 体积与 Safari `<foreignObject>` Copy PNG 污染 |
+| **Agent 集成范式** | **纯 CLI（直写 WAL + Socket 唤醒）+ 极轻 `SKILL.md`（L0–L3）** | **明确不做本地与云端 MCP**；Daemon 未起亦 `<15ms` 可用，离线本地写成功统一返回退出码 `0`（防误重试），空管道默认熔断防误清空 |
