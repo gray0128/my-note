@@ -18,7 +18,7 @@
 
 ## 1. 安全目标、敌手画像与诚实信任矩阵
 
-任何端到端加密（E2EE）系统若不区分「被动存储泄露」与「主动代码分发篡改」，都会产生虚假安全感。下表列出本系统面对的 6 类现实威胁及其**精确防护保证与已知物理限制**：
+任何端到端加密（E2EE）系统若不区分「被动存储泄露」与「主动代码分发篡改」，都会产生虚假安全感。下表列出本系统面对的 7 类现实威胁及其**精确防护保证与已知物理限制**：
 
 | 敌手 / 威胁场景 | Tier 1 普通块保护能力 | Tier 2 保险库加密块保护能力 | 核心防御机制与诚实边界声明 |
 | --- | --- | --- | --- |
@@ -28,6 +28,7 @@
 | **T4：外部粘贴或模型生成的恶意 Markdown / Mermaid 内容**（Stored XSS / 外链图片信标泄密） | **✅ 完全阻断** | **✅ 完全阻断** | Markdown 禁原始 HTML + `DOMPurify` 白名单净化；Mermaid 默认使用零 DOM 依赖、纯 SVG 输出的 `Pele` 渲染器；全端启用锁死 `style-src` 与 `img-src` 的严格 CSP。 |
 | **T5：被 Prompt Injection 劫持的本地同 UID AI Agent** | **⚠️ 可读取普通块**（符合设计预期，依赖乐观锁与审计回滚防破坏） | **✅ 密码学级硬隔离（即使 Web UI 正处于解锁态也无法窃取！）** | 同 UID 进程可读本地文件、可读 Daemon 凭据、可用 `script`/`expect` 伪造 PTY——因此 **`isatty` 与 `MYNOTE_ACTOR` 只是体验与审计护栏，绝非安全边界**。真正的硬隔离在于：**Tier 2 解密 100% 在当前交互客户端内存（Web UI WASM / 人类终端单次 CLI）执行，后台常驻 Daemon 永不持有 `VKEK` 与加密块明文**；Agent 不知道口令/PRF，面对本地 SQLite 与 Daemon 均只有密文。 |
 | **T6：手机丢失或退役硬盘物理取证** | **✅ 吊销 Token + 轮换 `SMK` 保护后续笔记** | **✅ 静态密文 + 口令/PRF 未解锁不可读** | 丢失设备立即吊销 `device_token` 并轮换 `smk_kid`；底层 SSD 闪存磨损均衡层的物理块残留依赖操作系统全盘加密（macOS `FileVault` / Linux `LUKS`）。 |
+| **T7：GitHub 发布资产被篡改或中间人降级投毒（`mynote update`）** | **✅ 离线硬件签名阻断** | **✅ 离线硬件签名阻断** | 二进制 `.rodata` 硬编码离线维护者 `Ed25519` 发布公钥（主备双钥），强制先验签 `release-manifest.json.sig` 并校验归档 `SHA-256` + `BLAKE3` + 单调版本号/构建时间戳后再调用 `zstd` 解包；生产构建禁自定义 `--url`。 |
 
 ---
 
@@ -38,7 +39,8 @@
 - **口令密钥派生（KDF）**：`Argon2id`（桌面默认：`m = 64 MiB, t = 3, p = 1`；移动端 WASM 自适应下限不低于 `m = 32 MiB, t = 3, p = 1`，带 16 字节随机 Salt）
 - **确定性子密钥扩展**：`HKDF-SHA256`
 - **认证加密（AEAD）**：`XChaCha20-Poly1305`（256-bit 密钥、192-bit CSPRNG 随机 Nonce、128-bit Tag），Rust 侧全程包裹于 `zeroize::Zeroizing<[u8; 32]>`
-- **内容与状态哈希**：`BLAKE3`
+- **发布清单数字签名**：`Ed25519`（纯 Rust `ed25519-dalek` 严格非延展性校验，用于 `mynote update` 离线发布签名验证）
+- **内容与状态哈希**：`BLAKE3`（运行态/同步校验）+ `SHA-256`（外部发布包跨工具审计兼容）
 
 ### 2.2 密钥角色与多端存放位置全表
 
@@ -48,6 +50,7 @@
 | **`VKEK` (`vk_epoch`)**<br>Vault Key-Encrypting Key | 随机生成的 256-bit 主保险库密钥，用于包裹每个加密块的 `BDEK` | **不落盘明文**：仅以多槽位包裹密文存于 `vault_key_slots` 表；仅在 Web UI WASM 或单次 CLI 进程解锁期间驻留内存，5 分钟空闲/失焦即 `zeroize` | 同左（仅在用户触发口令或 Face ID WebAuthn PRF 解锁期间驻留页面 WASM 内存，切后台 `visibilitychange` 立即 `zeroize`） | **❌ 永不接触（零明文、零 VKEK）** | 仅同步被口令/恢复词包裹的密文槽位 |
 | **`BDEK` (`kid`)**<br>Block Data Encryption Key | 每个加密块独立随机生成的 256-bit 内容加密密钥 | 由 `VKEK` 包裹后存于可变表 `vault_keys` | 同左 | 仅透传密文行 | 仅存包裹后密文行（支持真删除） |
 | **`Device Token`** | 云端 Worker / DO 接入鉴权（每设备独立） | OS Keychain / `0600` 凭据文件 | IndexedDB（同包裹保护） | 持有 | 仅存 `SHA-256(token)` 哈希于 `devices` 表 |
+| **`Release PubKey`**<br>Ed25519 发布验签公钥 | `mynote update` 升级包真伪与防降级验证 | 编译期硬编码于二进制只读 `.rodata` 段（主钥 + 冷备轮换钥）；**私钥物理离线保存在维护者硬件密钥中，绝不进入 CI 或云端** | 不适用 | 只读常量 | **❌ 永不接触** |
 
 > [!NOTE]
 > **关于 PWA 中 WebCrypto `extractable: false` 包裹密钥的诚实边界说明**：
@@ -192,3 +195,19 @@ flowchart TD
    在任一存留设备上运行 `mynote device revoke <device_id>`，云端 DO 立即标记该设备 `revoked_at` 并断开其活跃 WebSocket，阻断一切后续同步请求。
 2. **第 2 步（前向隔离 —— 轮换 `SMK`）**：
    运行 `mynote sync rotate-smk` 生成新一代 `SMK_v2`（`smk_kid` 更新），通过安全渠道分发给剩余受信任设备。此后所有新笔记与新快照均由 `SMK_v2` 加密，即使攻击者提取了丢失设备的离线存储或拦截后续流量，也无法解密失窃时间点之后的任何新增内容。（若历史普通块中也含有需防范失窃设备离线读取的内容，可进一步更换云端同步密钥并重加密生成新 `epoch` 快照。）
+
+### 7.3 CLI 自升级供应链防线与主备发布密钥轮换（`mynote update`）
+
+为确保 `mynote update` 不会破坏第 1 节 **T2「桌面端对远端代码投毒 100% 免疫」** 的核心承诺，自升级通道实施四层密码学与系统级护栏：
+
+1. **离线硬件签名，绝不信任单纯的 HTTPS 或 CI Token**：
+   - 即使攻击者窃取了 GitHub Release 上传权限或劫持了 CDN，只要没有维护者物理离线持有的 `Ed25519` 发布私钥，便无法伪造通过 `.rodata` 内置公钥校验的 `release-manifest.json.sig`；
+   - 严格执行**「先验签 + 校对压缩包 `SHA-256` / `BLAKE3`，最后才调用 `zstd` 解压」**顺序，使未经认证的网络字节流永远接触不到解压器与 `tar` 解析器。
+2. **主备双公钥固定（Dual-Pinned Keys）防单点锁死**：
+   - 二进制内同时硬编码两把独立的 `Ed25519` 公钥：`PRIMARY_RELEASE_PUBKEY`（日常发版硬件密钥）与 `BACKUP_COLD_PUBKEY`（异地冷存备份密钥）；
+   - 一旦主发版硬件密钥损坏或疑似失窃，可用冷备私钥签署一版紧急撤换包（移除旧主钥并注入新主钥），无需依赖旧主钥即可安全完成信任根轮换。
+3. **单调版本与构建时间戳防降级（Anti-Downgrade & Freeze Guard）**：
+   - 默认拒绝任何 `manifest.version <= current_version` 或 `published_at_ms < COMPILED_BUILD_TIMESTAMP_MS` 的清单，阻断攻击者重放含有历史已知漏洞的旧版合法签名包。
+4. **封死 Prompt Injection 诱导加载任意 URL 向量**：
+   - 生产构建（Release Profile）物理移除自定义 `--manifest-url` / `--mirror` 命令行开关，并要求非交互环境显式传入 `--yes`，且在 Agent 技能规范中禁止 AI 助手擅自触发二进制升级或回滚。
+

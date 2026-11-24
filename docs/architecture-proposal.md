@@ -510,6 +510,7 @@ flowchart LR
     sync        Inspect sync status, force push/pull, rotate-smk, view conflicts
     vault       Lock/unlock/shred sensitive blocks (client-side decryption)
     device      Pair new device (QR #fragment), list, or revoke lost devices
+    update      Check, verify (Ed25519), upgrade, or rollback mynote binary
     help        Deep topics: formatting, locking, conflict, agent
 
   GLOBAL FLAGS:
