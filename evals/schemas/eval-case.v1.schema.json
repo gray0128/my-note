@@ -1,0 +1,213 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gray0128/my-note/evals/schemas/eval-case.v1.schema.json",
+  "title": "MyNoteEvalCaseV1",
+  "description": "Schema for Plane B Agent + SKILL.md + CLI evaluation cases in my-note.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "suite",
+    "split",
+    "should_trigger_skill",
+    "failure_modes_targeted",
+    "task",
+    "fixture",
+    "reference_solution",
+    "graders",
+    "budgets"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "id": {
+      "type": "string",
+      "pattern": "^B[1-5]-[0-9]{3}-[a-z0-9-]+$"
+    },
+    "suite": {
+      "type": "string",
+      "enum": [
+        "B1_DISCOVERY_AND_PIPES",
+        "B2_CONCURRENCY_SELF_HEALING",
+        "B3_OFFLINE_AND_PIPE_RESILIENCE",
+        "B4_SKILL_TRIGGER_CALIBRATION",
+        "B5_ADVERSARIAL_VAULT_REDTEAM"
+      ]
+    },
+    "split": {
+      "type": "string",
+      "enum": ["dev", "test", "canary"]
+    },
+    "should_trigger_skill": { "type": "boolean" },
+    "rationale": {
+      "type": "string",
+      "minLength": 20,
+      "description": "Explicit engineering rationale explaining why this case tests a genuine workflow or boundary."
+    },
+    "failure_modes_targeted": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "enum": [
+          "F1_FLAG_HALLUCINATION",
+          "F2_OPTIMISTIC_LOCK_BYPASS",
+          "F3_OFFLINE_DUPLICATE_RETRY",
+          "F4_CONTEXT_BLOWUP",
+          "F5_PIPE_DESTRUCTION",
+          "F6_SKILL_TRIGGER_MISFIRE",
+          "F7_VAULT_INJECTION_COMPLIANCE"
+        ]
+      }
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prompt", "perturbations"],
+      "properties": {
+        "prompt": { "type": "string", "minLength": 10 },
+        "perturbations": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "type": "string", "minLength": 10 },
+          "description": "Semantically equivalent prompt variants used across k=3 replicates to measure pass^3."
+        }
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["daemon_running", "cloud_online", "buffers", "blocks"],
+      "properties": {
+        "daemon_running": { "type": "boolean" },
+        "cloud_online": { "type": "boolean" },
+        "workspace_files": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "buffers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "name", "position"],
+            "properties": {
+              "id": { "type": "string" },
+              "name": { "type": "string" },
+              "position": { "type": "string" }
+            }
+          }
+        },
+        "blocks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "buffer_name", "position", "lang", "is_locked", "head_op_id"],
+            "properties": {
+              "id": { "type": "string" },
+              "buffer_name": { "type": "string" },
+              "position": { "type": "string" },
+              "lang": { "type": "string" },
+              "is_locked": { "type": "boolean" },
+              "public_hint": { "type": ["string", "null"] },
+              "content": { "type": ["string", "null"] },
+              "head_op_id": { "type": "string" }
+            }
+          }
+        },
+        "fault_injection": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["trigger_after_cmd_regex", "action"],
+          "properties": {
+            "trigger_after_cmd_regex": { "type": "string" },
+            "action": {
+              "type": "string",
+              "enum": [
+                "CONCURRENT_HUMAN_APPEND",
+                "DROP_DAEMON",
+                "UPSTREAM_PIPE_ZERO_BYTES"
+              ]
+            },
+            "target_block_id": { "type": "string" },
+            "injected_text": { "type": "string" }
+          }
+        }
+      }
+    },
+    "reference_solution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["script_lines", "expected_exit_code"],
+      "properties": {
+        "script_lines": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "expected_exit_code": { "type": "integer", "minimum": 0, "maximum": 8 }
+      }
+    },
+    "graders": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deterministic"],
+      "properties": {
+        "deterministic": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sqlite_assertions", "forbidden_cmd_regexes"],
+          "properties": {
+            "sqlite_assertions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["description", "sql_scalar_bool"],
+                "properties": {
+                  "description": { "type": "string" },
+                  "sql_scalar_bool": {
+                    "type": "string",
+                    "description": "Read-only SQLite query against post-trial mynote.db that MUST return integer 1."
+                  }
+                }
+              }
+            },
+            "forbidden_cmd_regexes": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "max_mynote_write_ops": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "binary_claims": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["claim_id", "yes_no_question", "expected_answer", "min_calibrated_kappa"],
+            "properties": {
+              "claim_id": { "type": "string" },
+              "yes_no_question": { "type": "string" },
+              "expected_answer": { "type": "string", "enum": ["YES", "NO"] },
+              "min_calibrated_kappa": { "type": "number", "minimum": 0.6, "maximum": 1.0 }
+            }
+          }
+        }
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_turns", "max_total_tokens"],
+      "properties": {
+        "max_turns": { "type": "integer", "minimum": 1, "maximum": 30 },
+        "max_total_tokens": { "type": "integer", "minimum": 200, "maximum": 50000 }
+      }
+    }
+  }
+}
