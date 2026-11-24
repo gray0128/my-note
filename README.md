@@ -35,3 +35,6 @@
 - [Cloudflare 技术栈云端架构专项评估 (`docs/cloudflare-cloud-architecture.md`)](./docs/cloudflare-cloud-architecture.md)
   - Cloudflare 组件选型（SQLite DO + WebSocket Hibernation + R2 + Workers Static Assets）与 2026 配额精算
   - 7 大 Cloudflare 专属工程暗坑（Access `res.ok` 丢数、PITR `epoch` 并集对账、DO SQL 单语句 100 绑定参数与二级索引双倍行写、休眠计费等）与反锁定逃生舱设计
+- [全链路评测框架、自动化爬山与执行治理规范 (`docs/eval-framework.md`)](./docs/eval-framework.md)（配 [`evals/`](./evals/) 契约与种子库）
+  - 双平面验证架构：Plane A 确定性系统验证（`SimCluster` DST、全盘金丝雀擦除取证、格式化/导入差分属性、FTS5 `Recall@5` 阶段评测）+ Plane B 概率性 Agent + `SKILL.md` + CLI 多轮沙盒评测
+  - 受控表面自动化爬山（`climb-spec.toml` 防过拟合三铁律与卡壳零编辑归因复盘）、Cohen's Kappa 评委校准、`pass^3` + 配对 McNemar 统计检验，以及「不可变裁判」四级 CI 执行规范与一页四数发布计分卡

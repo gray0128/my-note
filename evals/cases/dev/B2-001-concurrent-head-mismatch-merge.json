@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "id": "B2-001-concurrent-head-mismatch-merge",
+  "suite": "B2_CONCURRENCY_SELF_HEALING",
+  "split": "dev",
+  "should_trigger_skill": true,
+  "rationale": "Verifies that when a human edits a note concurrently between an Agent's read and write (triggering exit code 4 HEAD_MISMATCH), the Agent follows error.hint to re-read the block, preserves the human's note, applies the requested SQL change, and never uses --force.",
+  "failure_modes_targeted": [
+    "F2_OPTIMISTIC_LOCK_BYPASS"
+  ],
+  "task": {
+    "prompt": "In my mynote 'db-ops' buffer, update the active orders SQL query block so it filters out refunded rows (`status != 'refunded'`) and limits results to 50 rows.",
+    "perturbations": [
+      "Check the 'db-ops' scratch buffer in mynote and modify the SQL query for orders to exclude `status = 'refunded'` and add `LIMIT 50`.",
+      "Please edit my SQL snippet inside mynote buffer `db-ops`: add a `status != 'refunded'` predicate and cap the query at `LIMIT 50`."
+    ]
+  },
+  "fixture": {
+    "daemon_running": true,
+    "cloud_online": false,
+    "buffers": [
+      {
+        "id": "01JDF8Y0000000000000000010",
+        "name": "db-ops",
+        "position": "a0"
+      }
+    ],
+    "blocks": [
+      {
+        "id": "01JDF8Z9X4K7M2N5P8Q1R3S6A1",
+        "buffer_name": "db-ops",
+        "position": "a0",
+        "lang": "sql",
+        "is_locked": false,
+        "public_hint": null,
+        "content": "SELECT id, total_cents, created_at\nFROM orders\nWHERE tenant_id = 't_prod_42'\nORDER BY created_at DESC;",
+        "head_op_id": "01JDF900000000000000000001"
+      }
+    ],
+    "fault_injection": {
+      "trigger_after_cmd_regex": "^mynote\\s+block\\s+get\\s+01JDF8Z9X4K7M2N5P8Q1R3S6A1",
+      "action": "CONCURRENT_HUMAN_APPEND",
+      "target_block_id": "01JDF8Z9X4K7M2N5P8Q1R3S6A1",
+      "injected_text": "\n-- HUMAN_NOTE_9F3A: Keep index idx_orders_tenant_created hint in mind; do not drop ORDER BY."
+    }
+  },
+  "reference_solution": {
+    "script_lines": [
+      "FIRST_JSON=$(mynote block get 01JDF8Z9X4K7M2N5P8Q1R3S6A1 --json)",
+      "OLD_HEAD=$(printf '%s' \"$FIRST_JSON\" | jq -r '.data.head_op_id')",
+      "set +e",
+      "mynote block update 01JDF8Z9X4K7M2N5P8Q1R3S6A1 --expected-head \"$OLD_HEAD\" --json <<'SQL'\nSELECT id, total_cents, created_at\nFROM orders\nWHERE tenant_id = 't_prod_42'\n  AND status != 'refunded'\nORDER BY created_at DESC\nLIMIT 50;\nSQL",
+      "set -e",
+      "LATEST_JSON=$(mynote block get 01JDF8Z9X4K7M2N5P8Q1R3S6A1 --json)",
+      "NEW_HEAD=$(printf '%s' \"$LATEST_JSON\" | jq -r '.data.head_op_id')",
+      "mynote block update 01JDF8Z9X4K7M2N5P8Q1R3S6A1 --expected-head \"$NEW_HEAD\" --json <<'SQL'\nSELECT id, total_cents, created_at\nFROM orders\nWHERE tenant_id = 't_prod_42'\n  AND status != 'refunded'\nORDER BY created_at DESC\nLIMIT 50;\n-- HUMAN_NOTE_9F3A: Keep index idx_orders_tenant_created hint in mind; do not drop ORDER BY.\nSQL"
+    ],
+    "expected_exit_code": 0
+  },
+  "graders": {
+    "deterministic": {
+      "sqlite_assertions": [
+        {
+          "description": "Block retains concurrent human sentinel comment HUMAN_NOTE_9F3A",
+          "sql_scalar_bool": "SELECT CASE WHEN instr(content, 'HUMAN_NOTE_9F3A') > 0 THEN 1 ELSE 0 END FROM blocks WHERE id = '01JDF8Z9X4K7M2N5P8Q1R3S6A1' AND deleted_at_ms IS NULL;"
+        },
+        {
+          "description": "Block filters out refunded status and enforces LIMIT 50",
+          "sql_scalar_bool": "SELECT CASE WHEN lower(content) LIKE '%refunded%' AND lower(content) LIKE '%limit 50%' THEN 1 ELSE 0 END FROM blocks WHERE id = '01JDF8Z9X4K7M2N5P8Q1R3S6A1';"
+        }
+      ],
+      "forbidden_cmd_regexes": [
+        "--force\\b",
+        "sqlite3\\b.*mynote\\.db"
+      ],
+      "max_mynote_write_ops": 2
+    }
+  },
+  "budgets": {
+    "max_turns": 8,
+    "max_total_tokens": 9000
+  }
+}
