@@ -42,9 +42,9 @@ jobs:
           fi
 
   web-checks:
-    name: Web UI (TypeScript + Vite + Vitest)
+    name: WASM + Desktop Web UI + Mobile Read-Only PWA
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,6 +52,13 @@ jobs:
       - name: Pin evals/ to PR base commit on non-[eval-only] PRs
         if: github.event_name == 'pull_request' && !startsWith(github.event.pull_request.title, '[eval-only]')
         run: rm -rf evals/ && git checkout "${{ github.event.pull_request.base.sha }}" -- evals/
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.130
       - uses: pnpm/action-setup@v4
         with:
           version: "12"
@@ -60,17 +67,32 @@ jobs:
           node-version: "22"
           cache: "pnpm"
           cache-dependency-path: web/pnpm-lock.yaml
+      - name: Build Desktop & PWA WASM packages (with instantiation smoke check)
+        run: ./scripts/build-wasm.sh
       - name: Install web dependencies
         run: pnpm --dir web install --frozen-lockfile
-      - name: Typecheck web UI
+      - name: Typecheck web UI & Mobile PWA
         run: pnpm --dir web typecheck
-      - name: Test web UI
+      - name: Test web UI (including real WASM M2 Vault & SEC-03 unit audit)
         run: pnpm --dir web test
-      - name: Build web UI
-        run: pnpm --dir web build
+      - name: Build Desktop Web UI (web/dist) and Mobile Read-Only PWA (web/dist-pwa)
+        run: pnpm --dir web build && pnpm --dir web build:pwa
+      - name: Upload Desktop Web UI dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 1
+      - name: Upload Mobile Read-Only PWA dist-pwa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist-pwa
+          path: web/dist-pwa
+          retention-days: 1
 
   cloud-cf-checks:
-    name: Cloudflare Relay (workerd contract + shared scenarios)
+    name: Cloudflare Relay (workerd contract + shared scenarios + PWA CSP)
+    needs: [web-checks]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -80,6 +102,11 @@ jobs:
       - name: Pin evals/ to PR base commit on non-[eval-only] PRs
         if: github.event_name == 'pull_request' && !startsWith(github.event.pull_request.title, '[eval-only]')
         run: rm -rf evals/ && git checkout "${{ github.event.pull_request.base.sha }}" -- evals/
+      - name: Download Mobile Read-Only PWA assets
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist-pwa
+          path: web/dist-pwa
       - uses: pnpm/action-setup@v4
         with:
           version: "12"
@@ -90,13 +117,13 @@ jobs:
           cache-dependency-path: cloud-cf/pnpm-lock.yaml
       - name: Install cloud-cf dependencies
         run: pnpm --dir cloud-cf install --frozen-lockfile
-      - name: Enforce M1 LOC budget (< 500 lines in cloud-cf/src/)
+      - name: Enforce M2 LOC budget (<= 700 lines in cloud-cf/src/)
         shell: bash
         run: |
           LOC=$(find cloud-cf/src -type f \( -name '*.ts' -o -name '*.mts' -o -name '*.js' -o -name '*.mjs' \) -print0 | xargs -0 cat | wc -l | awk '{print $1}')
           echo "cloud-cf/src total lines = ${LOC}"
-          if [ "$LOC" -ge 500 ]; then
-            echo "ERROR: cloud-cf/src/ exceeded M1 < 500 LOC target ($LOC lines)"
+          if [ "$LOC" -gt 700 ]; then
+            echo "ERROR: cloud-cf/src/ exceeded M2 <= 700 LOC target ($LOC lines)"
             exit 1
           fi
       - name: Typecheck cloud-cf
@@ -106,6 +133,7 @@ jobs:
 
   rust-checks:
     name: Rust (${{ matrix.os }})
+    needs: [web-checks]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -119,16 +147,11 @@ jobs:
       - name: Pin evals/ to PR base commit on non-[eval-only] PRs
         if: github.event_name == 'pull_request' && !startsWith(github.event.pull_request.title, '[eval-only]')
         run: rm -rf evals/ && git checkout "${{ github.event.pull_request.base.sha }}" -- evals/
-      - uses: pnpm/action-setup@v4
+      - name: Download embedded Desktop Web UI assets
+        uses: actions/download-artifact@v4
         with:
-          version: "12"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: "pnpm"
-          cache-dependency-path: web/pnpm-lock.yaml
-      - name: Build embedded web UI assets
-        run: pnpm --dir web install --frozen-lockfile && pnpm --dir web build
+          name: web-dist
+          path: web/dist
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -138,9 +161,61 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test workspace (including 500-seed DST + INV-RECOVERY + SEC-05)
+      - name: Test workspace (including 500-seed M1/M2 DST + INV-RECOVERY + INV-SHRED-BOUND + SEC-01/04/05)
         env:
           MYNOTE_DST_SEEDS: "500"
         run: cargo test --workspace
-      - name: Verify wasm32-unknown-unknown compilation
-        run: cargo check -p mynote-core -p mynote-wasm --target wasm32-unknown-unknown
+      - name: Verify wasm32-unknown-unknown compilation (core + desktop & pwa WASM features)
+        run: |
+          cargo check -p mynote-core --target wasm32-unknown-unknown
+          cargo check -p mynote-wasm --target wasm32-unknown-unknown --no-default-features --features desktop
+          cargo check -p mynote-wasm --target wasm32-unknown-unknown --no-default-features --features pwa
+
+  m2-e2e-security:
+    name: M2 Security Audits (CLI PTY Vault + Chromium SEC-03 + WebKit SEC-08)
+    needs: [web-checks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Pin evals/ to PR base commit on non-[eval-only] PRs
+        if: github.event_name == 'pull_request' && !startsWith(github.event.pull_request.title, '[eval-only]')
+        run: rm -rf evals/ && git checkout "${{ github.event.pull_request.base.sha }}" -- evals/
+      - name: Download embedded Desktop Web UI & Mobile PWA assets
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist-pwa
+          path: web/dist-pwa
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build mynote binary
+        run: cargo build --bin mynote
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: cloud-cf/pnpm-lock.yaml
+      - name: Install cloud-cf dependencies (for local wrangler dev)
+        run: pnpm --dir cloud-cf install --frozen-lockfile
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright (Chromium & WebKit)
+        run: |
+          pip install playwright
+          python3 -m playwright install --with-deps chromium webkit
+      - name: Run CLI PTY Vault & Shred Guard E2E
+        run: python3 tests/e2e/test_m2_cli_pty_vault_shred.py
+      - name: Run SEC-03 Desktop Daemon + Chromium WASM Audit
+        run: python3 tests/e2e/test_m2_sec03_desktop_chromium.py
+      - name: Run SEC-08 Mobile Read-Only PWA + wrangler dev + WebKit Audit
+        run: python3 tests/e2e/test_m2_sec08_mobile_webkit.py
