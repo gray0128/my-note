@@ -1,0 +1,19 @@
+[package]
+name = "mynote-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mynote"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+clap.workspace = true
+getrandom.workspace = true
+mynote-core = { path = "../mynote-core" }
+mynote-store = { path = "../mynote-store" }
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true

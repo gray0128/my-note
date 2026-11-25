@@ -53,13 +53,14 @@
 - **编译期非明文写阻断**：`Unhydrated` / `KeyUnavailable` / `DecryptFailed` / `Sealed` 状态在 Rust 类型签名层面严禁构造明文 `UPDATE`。
 - **Bootstrap Gate**：桌面 `bootstrap_completed == false` 时，严禁对远端已有实体发出 `UPDATE / SET_META / LOCK / UNLOCK / DELETE / RESOLVE`。
 - **完整因果图求叶子**：必须在完整已解密 `MNS1` 因果图 `G(b)` 上计算极大元叶子集 `L(b)`，再检查各叶子 BDEK 状态——绝不能先过滤不可读节点再算叶子（否则中间版本碎纸会导致旧祖先复活）。
-- **跨 `epoch` 集合并集对账**：检测到 `epoch` 变更或 `head_seq < local_seq` 时按 `op_id` 求集合并集，**严禁先 `DELETE FROM blocks` / `DELETE FROM sync_ops` 清表**。
+- **跨 `epoch` 集合并集对账**：检测到 `epoch` 变更或 `head_seq < local_seq` 时按 `op_id` 求集合并集，**严禁先 `DELETE FROM blocks` / `DELETE FROM sync_ops` 清表**；拉取水位 `last_seq` **只允许由连续的 `PullResponse` 推进**，绝不能被 `PushAcked` 跳进（否则会永久跳过并发远端 op）。
 - **HLC 不拒收**：绝不因时钟偏差拒收或钳制远端 op；偏差超过 5 分钟仅本地发 `CLOCK_SKEW` 告警。
 - **零字节熔断**：非交互空 `stdin` 更新非空块默认返回 `EMPTY_STDIN_REFUSED`（退出码 `2`）；外部格式化器 0 字节 / 非零退出 / 超时返回 `FORMAT_SYNTAX_ERROR`（退出码 `7`）且零写库。
 
 ### 3.2 M1 不可逆线格式红线（D2′，Day-1 定型）
 - **每实体独立 BDEK**：自 M1 第一天起，每个 Block 与每个 Buffer 各自生成随机 32B `BDEK` 与 `key_id`，正文与 Buffer 名称加密为 `MNB1`；op 信封只带 `key_id`，**不带密钥或 `wrapped_dek`**；密钥记录以 `MNR1` 存于独立密钥表 `block_keys`。
 - **`op_id` 生成归属（修正 F-01）**：`op_id` 必须由**执行正文加密的 `mynote-core` 实例**在加密前生成并绑定进 `MNB1` / `MNS1` AAD。Tier 2 写入由 `WasmVaultSession` 生成 `(op_id, key_id)` 随请求提交，Daemon 必须原样复用，绝不重新生成。
+- **跨设备 PITR 救援保留作者 `device_id`**：`MNS1` AAD 绑定了原始 `device_id`，因此 `POST /v1/sync/push` 必须保留每条 op 的原始作者 `op.device_id`（而非无条件覆盖为本次推送者的认证 `device_id`），否则 B 设备在 DO PITR 后代为补推 A 设备的 op 会令第三台设备及离线归档恢复 AEAD 解密失败。
 - **无 BDEK 的 op**：`SET_META` 与 `DELETE` 在外层 JSON / SQL `key_id` 列统一为 `null`，仅在拼装 `MNS1` AAD 时填 16B 全零。
 - **统一 24 词恢复包**：唯一一份 24 词 → Root Seed → X25519 恢复密钥对；日常设备只存**恢复公钥**，可无感封装追加新 `SMK` 代际；**旧 `SMK` 代际永久保留**，确保永久 op 归档始终可解。
 
