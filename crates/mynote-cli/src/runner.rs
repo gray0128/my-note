@@ -215,7 +215,7 @@ fn execute(cli: Cli, mode: OutputMode, started: Instant) -> i32 {
         Commands::Open => {
             let msg = serde_json::json!({
                 "status": "daemon_not_running",
-                "hint": "Start the local daemon or macOS Tauri shell to open http://localhost:<port>"
+                "hint": "Start the local mynote daemon to open http://localhost:<port> in your browser"
             });
             match mode {
                 OutputMode::Json | OutputMode::Jsonl => emit_json(msg, empty_meta(started)),

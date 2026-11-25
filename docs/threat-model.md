@@ -29,7 +29,7 @@
 | 敌手 / 威胁场景 | Tier 1 普通块 | Tier 2 保险库加密块 | 核心防御机制与诚实边界声明 |
 | --- | --- | --- | --- |
 | **T1：云端被动存储泄露**（DO SQLite 磁盘与 PITR、R2 归档 / 快照外泄、网络抓包） | **✅ 内容零知识**（元数据可见，见 §1.2） | **✅ 内容零知识** | 每个块的全部版本都由该块独立的数据密钥 **BDEK** 经 `XChaCha20-Poly1305` 加密并填充后出站；BDEK 本身只以被 `SMK`（Tier 1）或 `VKEK`（Tier 2）包裹的形式存入密钥表。信封与密钥记录格式见 [`data-structures.md`](./data-structures.md)。 |
-| **T2：Cloudflare 账户或部署流水线被攻破**（主动篡改 Worker 代码、PWA 静态资源，删除或扣留云端数据） | **✅ 桌面端机密性不受影响**<br>**⚠️ 手机端不防** | **✅ 桌面端机密性不受影响**<br>**⚠️ 手机端不防**（D7） | 桌面 UI 只加载本地二进制 / 本地 Tauri 壳内嵌的前端资源，**不执行云端下发的代码**。手机 PWA 的代码由 Cloudflare 下发：被篡改的 JS 可读取手机已持有的 `SMK`，并在你下一次输入 Vault 口令时截获它（§8.4）。可用性：攻击者可删除 DO 与 R2 中的数据，此时依赖各桌面的本地库与本地备份（§3.5）。缓解：CF 账户强 2FA（建议硬件 FIDO2）、只从 CI 用最小权限 Token 部署、Service Worker 固定版本并在 UI 显示版本号。 |
+| **T2：Cloudflare 账户或部署流水线被攻破**（主动篡改 Worker 代码、PWA 静态资源，删除或扣留云端数据） | **✅ 桌面端机密性不受影响**<br>**⚠️ 手机端不防** | **✅ 桌面端机密性不受影响**<br>**⚠️ 手机端不防**（D7） | 桌面 UI 只加载本地 `mynote` 二进制内嵌的前端资源，**不执行云端下发的代码**。手机 PWA 的代码由 Cloudflare 下发：被篡改的 JS 可读取手机已持有的 `SMK`，并在你下一次输入 Vault 口令时截获它（§8.4）。可用性：攻击者可删除 DO 与 R2 中的数据，此时依赖各桌面的本地库与本地备份（§3.5）。缓解：CF 账户强 2FA（建议硬件 FIDO2）、只从 CI 用最小权限 Token 部署、Service Worker 固定版本并在 UI 显示版本号。 |
 | **T3：浏览器中打开的外部恶意网页**（CSRF / DNS Rebinding / 跨源 WebSocket 探测本地端口） | **✅ 阻断** | **✅ 阻断** | 本地 Daemon 只接受统一入口 `http://localhost:<port>`：校验 `Host` 精确匹配、`Origin` 严格白名单，以及一次性票据换取的 `HttpOnly; SameSite=Strict` 256-bit 随机 Session Cookie（HTTP 与 WS 握手同等校验），见 §5.1。 |
 | **T4：外部粘贴或模型生成的恶意 Markdown / Mermaid 内容**（Stored XSS / 外链图片信标泄密） | **✅ 阻断** | **✅ 阻断** | Markdown 禁原始 HTML + `DOMPurify` 白名单净化；Mermaid 默认使用纯 SVG 输出的 `Pele` 渲染器；全端启用锁死 `style-src` 与 `img-src` 的严格 CSP，见 §6。 |
 | **T5：被 Prompt Injection 劫持的本地同 UID AI Agent（读取）** | **⚠️ 可读取普通块**（符合设计预期） | **⚠️ 防被动读取；不防持久化篡改** | 同 UID 进程可读本地文件、可读 Daemon 凭据与 Secret Service 中的 `SMK`、可用 `script` / `expect` 伪造 PTY——因此 **`isatty` 与 `MYNOTE_ACTOR` 只是体验与审计护栏，不是安全边界**。Tier 2 保证的是「**某一时刻的被动读取**」拿不到明文：常驻 Daemon、本地 SQLite、WAL、FTS、备份与镜像中只有密文。**不防**能持久化篡改执行环境的攻击者（替换用户可写的二进制、shell alias、`formatters.toml`、浏览器 profile / 扩展），它可以等你下一次输入口令。缓解：二进制由包管理器安装到用户不可写的位置；Agent 跑在沙箱 / 容器 / 独立 UID 下（§5.2）。 |
@@ -216,7 +216,7 @@ $$
 由于浏览器内的 `WebSocket` 握手不受 CORS 预检保护，且攻击者可通过 DNS Rebinding 将恶意域名解析至环回地址读取 HTTP 响应，本地 Web 服务必须执行三层硬校验：
 
 1. **只监听环回地址，只认一个入口**：仅绑定环回接口（`127.0.0.1` 与 `::1`，不绑 `0.0.0.0`）；本地 UI 的唯一入口是 **`http://localhost:<port>`**。中间件首先检查 `Host` 请求头必须精确等于 `localhost:<port>`，其他任何值（DNS Rebinding 特征、`127.0.0.1:<port>`）一律在解析路由前返回 `403 Forbidden`。不使用 `127.0.0.1` 作为入口，是因为两者的 Cookie 互不相通，且 WebAuthn 的 RP ID 不能是 IP 地址。
-2. **`Origin` 白名单强制校验（含 WebSocket Upgrade）**：所有状态变更请求、API 读取与 `/v1/local/ws` 握手请求必须携带 `Origin` 头，且精确匹配 `http://localhost:<port>`。若 macOS Tauri 壳以自定义协议加载前端，其精确 Origin 一并加入白名单（以 [`interface-contracts.md`](./interface-contracts.md) 为准）。
+2. **`Origin` 白名单强制校验（含 WebSocket Upgrade）**：所有状态变更请求、API 读取与 `/v1/local/ws` 握手请求必须携带 `Origin` 头，且精确匹配唯一白名单项 `http://localhost:<port>`（详见 [`interface-contracts.md`](./interface-contracts.md) §3.1）。
 3. **一次性启动票据换取 `HttpOnly` 随机 Session Cookie**：
    - `mynote open` 生成单次短效（10 秒）`ticket`，通过 `http://localhost:<port>/v1/local/auth/exchange?ticket=<ticket>` 换取 `Set-Cookie: mynote_local_session=<token>; HttpOnly; SameSite=Strict; Path=/` 后立即 `303` 重定向至干净根路径 `/`（避免长效凭证残留在浏览器历史记录或命令行参数 `ps aux` 中）；
    - 所有 `/v1/local/*` HTTP API 与 WebSocket 握手均强制校验该 Cookie。
@@ -236,7 +236,7 @@ $$
   - **加密块静态全密文**：本地 SQLite 块表（含数据库级 `CHECK` 约束）与 op 日志中只有密文，FTS5、只读镜像与本地备份不含加密块正文；
   - **常驻 Daemon 零明文**：Tier 2 口令派生、`VKEK` 解包与正文加解密只在当前前端页面的 `mynote-wasm` 线性内存（以不透明句柄 `WasmVaultSession` 封装，裸 `VKEK` 不进入无法确定性清零的 JS GC 堆）或人类亲手敲口令的单次短生命周期 CLI 进程内存中完成；处于解锁态的加密块**不外发给 Layer 2 外部 CLI 格式化子进程**（仅允许内置 WASM Layer 1 纯内存格式化）。常驻 Daemon 只搬运 Tier 2 的密文与包裹密钥；
   - **结果**：Agent 在某一时刻读穿本地 SQLite、WAL、备份和 Daemon，拿到的仍只有它解不开的密文。
-- **不防的情形（操作系统权限模型决定，不是实现问题）**：能**持久化篡改执行环境**的同 UID 攻击者——替换用户可写的 `mynote` 二进制或 Tauri 应用、在 shell rc 里加 alias、修改 `formatters.toml`、修改浏览器 profile 或安装恶意扩展——然后等你下一次输入 Vault 口令。对它，任何用户态密码学都无能为力。同理，它能以你的身份发起 §3.6 中的破坏性操作，只受服务端强制宽限期约束。
+- **不防的情形（操作系统权限模型决定，不是实现问题）**：能**持久化篡改执行环境**的同 UID 攻击者——替换用户可写的 `mynote` 二进制、在 shell rc 里加 alias、修改 `formatters.toml`、修改浏览器 profile 或安装恶意扩展——然后等你下一次输入 Vault 口令。对它，任何用户态密码学都无能为力。同理，它能以你的身份发起 §3.6 中的破坏性操作，只受服务端强制宽限期约束。
 
 **缓解措施**：
 

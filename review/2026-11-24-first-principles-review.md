@@ -643,23 +643,19 @@ flowchart LR
 | **新增**：回收站 + 撤销 | — | ✅ M1 | D2′ |
 | `vault shred` → 通用加密碎纸执行器（DO alarm）+ 服务端强制宽限期 + 批量阈值 + 换钥 | ❌ | ✅ M2（与 Vault 一起） | D2′ |
 | **新增**：INV-KEY-LIVENESS / INV-SHRED-BOUND / INV-GRACE | — | ✅ 随对应功能进入门禁 | D2′ |
-| macOS 原生壳（Tauri）+ 全局热键 | （F-11：原规范放在 M3「按需」） | ✅ M1 必备 | D5 |
+| macOS 原生壳（Tauri）+ 全局热键 | （F-11：原规范放在 M3「按需」） | ❌ 已于 2026-11-25 修订移除（双桌面统一纯 CLI + Daemon + HTML） | D5′ |
 | Plane B 统计评测 + 自动爬山 | ⏸ | ❌ 移出路线图，由 CLI 黄金测试替代 | D6 |
 | **新增**：属性测试、CLI 黄金测试、双平台 CI | — | ✅ M1 | D6 |
 | 手机端 Argon2id + Vault 解锁 | （原未规划） | ✅ M2，单套 KDF 参数、仅内存会话 | D7 |
 
 `purge_op_ids`、`MNK1`、`key_seq`、INV-SYNC-4、Lock-Wins 特例、分数索引重平衡：维持 ❌。`vault_keys` 与碎纸以「通用密钥表 + 受控碎纸」的形式回归（D2′），语义已与归档一致。
 
-### 9.8 D5「macOS 全局热键是 M1 必备项」的推论
+### 9.8 D5 → D5′（2026-11-25 修订：移除 macOS Tauri 壳，双桌面统一纯 CLI + Daemon + HTML）
 
-- **M1 必须带 macOS 原生壳**：建议用 Tauri（macOS 上是 WKWebView，没有 WebKitGTK 的问题），配合全局快捷键插件。窗口常驻、隐藏；按下热键时只做「显示 + 聚焦」，不重新加载页面，这样才有希望满足 100 ms 预算。
-- **Omarchy 不需要原生壳**：Hyprland 的按键绑定直接唤出或聚焦 Chromium webapp 窗口即可，成本很低。两端加载同一份前端资源。
-- **S0 中的 macOS 壳 spike 从「可选」变为「必做」**，需要回答：
-  - 热键到窗口可输入的延迟实测（目标 < 100 ms）；
-  - 是否需要「辅助功能」等系统权限（全局快捷键通常不需要，需验证）；
-  - 壳与 Daemon 的关系：壳内嵌 Daemon（单进程）还是拉起独立 Daemon。无论哪种，CLI 都必须能在 UI 未打开时独立工作，且 SQLite 只有一个写入方；
-  - 登录自启、签名与公证（个人自用可以先不公证，但要记录 Gatekeeper 的处理方式）。
-- **F-11 的热键部分由此关闭**；编辑器形态（单文档 vs 按块挂载）仍由 S0 spike 决定。
+> **2026-11-25 真机实测后修订（D5′，取代原 D5）**：在真实 macOS 上构建并运行 Tauri v2 薄壳后，确认仅为了内置一条全局热键引入 Tauri 壳会增加 450+ crate 依赖、remote origin ACL / `AppManifest` 维护、`.app` 打包、Gatekeeper 解除及跨二进制 Keychain ACL 复杂度。最终拍板 **放弃 macOS Tauri 薄壳（移除 `shell-macos/`）**：macOS 与 Omarchy 100% 统一为单一 `mynote` 二进制（CLI + Daemon + 内嵌 HTML），通过本地浏览器 / Web App 访问唯一入口 `http://localhost:<port>`（详见 [`docs/spikes/s0-2-macos-tauri-shell.md`](../docs/spikes/s0-2-macos-tauri-shell.md)）；macOS 切窗热键交由外部桌面工具（Raycast / Hammerspoon / Karabiner）或 `mynote open`。
+
+原 2026-11-24 D5 备选记录（已作废，仅留档）：
+- ~~M1 带 macOS Tauri 原生壳 + 全局快捷键插件（目标 < 100 ms）；Omarchy 用 Hyprland 绑定 Chromium webapp。~~
 
 ### 9.9 D6「评测框架只为保障实现质量」的推论
 
@@ -759,6 +755,9 @@ DO GC、R2 多代快照、瞬态剪贴板、自动爬山已从待办中移除；
    - **零设备灾难恢复**：不设云端 `/v1/archive/*` 路由或额外恢复鉴权密钥对；若仅设备全失而 DO 健在，凭部署级 `BOOTSTRAP_TOKEN` 重新接入并配合 24 词直接从 DO 全量拉回；若连同 DO 一并损毁，手工从 R2 导出目录后用纯离线 `mynote restore --from-archive <local-dir>` 恢复（接受 `< 24h` 每日归档窗口误差）；
    - **加密附件 `blobs/`**：移入「按数据触发的待办（⏸）」，未来引入时每附件使用独立随机 `BlobKey` 存入 `BlockPlaintextV1`，避免块换钥时损坏存活附件；
    - **M1 / M2 切分**：M1 只落定「每实体独立 BDEK 线格式 + `block_keys` + 纯软删回收站」，`shred_marks` 状态机、竞态校验、批量阈值与 DO alarm 整套归入 M2（M2 上线时对 M1 回收站存量块一次性豁免阈值补建标记）。
+6. **2026-11-25 真机实测补充拍板（D5′ 与 S0-3）**：
+   - **D5′（双桌面形态统一）**：在真实 macOS 试用 Tauri v2 脚手架后明确移除 macOS Tauri 薄壳（`shell-macos/` 与 `spikes/s0-2-macos-tauri-spike/`），macOS 与 Omarchy 彻底统一为纯 `mynote` 单二进制（CLI + Daemon + 内嵌 HTML），统一走 `http://localhost:<port>`（详见 [`docs/spikes/s0-2-macos-tauri-shell.md`](../docs/spikes/s0-2-macos-tauri-shell.md)）。
+   - **S0-3（iPhone 真机 Argon2id 定值）**：真机 iPhone（iOS 18.7 / Safari 27.2，添加到主屏幕的 Standalone PWA）实测 7 组参数全部零 OOM，原暂定 `(65536, 3, 1)` 实测 `4812 ms` 否决；拍板 `VaultHeaderV1` 唯一默认 KDF 为 **`(m_kib=32768, t=2, p=1)`**（实测中位 `1553 ms` [已测]，详见 [`docs/spikes/s0-3-wasm-argon2.md`](../docs/spikes/s0-3-wasm-argon2.md)）。结合 S0-2 与 S0-3 闭环，`ADR-06` 升级为 `Accepted`。
 
 ---
 

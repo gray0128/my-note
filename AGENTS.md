@@ -11,7 +11,7 @@
 所有设计与实现取舍按**不可逆程度**排序：
 
 1. **G1 永不静默丢数**：覆盖同步 bug、**丢钥匙**、误操作、平台存储驱逐与逻辑 bug 扩散。
-2. **G2 随手即记、随叫随到**：桌面全局热键唤出 `< 100 ms` [目标]，CLI 本地读写 `< 15 ms` [目标]。
+2. **G2 随手即记、随叫随到**：CLI 本地读写 `< 15 ms` [目标]；双桌面统一纯 CLI + Daemon + 内嵌 HTML（`http://localhost:<port>`），Omarchy 由 Hyprland 键绑定唤出 Chromium webapp，macOS 由浏览器 / Web App（配合系统切窗工具）或 `mynote open` 直达（D5′）。
 3. **G3 多端可得**：双桌面实时 E2EE 同步；手机只读 + 一键复制 + 可解锁 Vault（D1、D7）。
 4. **G4 秘密不落明文、不以明文进云端**：Tier 1 云端盲存储零知识 + Tier 2 客户端内存级 Vault（诚实边界见 `docs/threat-model.md`）。
 5. **G5 Agent 可读写**：纯本地 CLI（`--json`、稳定退出码、乐观锁）+ 极轻 `skill/SKILL.md`（`< 250 tokens`），不做 MCP。
@@ -29,7 +29,7 @@
 
 | 关注域 | 唯一权威文档 | 关键内容 |
 | --- | --- | --- |
-| **已拍板决策（最高优先级）** | [`review/2026-11-24-first-principles-review.md`](review/2026-11-24-first-principles-review.md) §9 | 决策 D1–D7（含 D2′）及 PR #31 补充拍板；**与旧文档冲突时一律以 §9 为准** |
+| **已拍板决策（最高优先级）** | [`review/2026-11-24-first-principles-review.md`](review/2026-11-24-first-principles-review.md) §9 | 决策 D1–D7（含 D2′、D5′）及 PR #31 / 2026-11-25 补充拍板；**与旧文档冲突时一律以 §9 为准** |
 | **总览、ADR 与路线图** | [`docs/architecture-proposal.md`](docs/architecture-proposal.md) | 目标、非目标、Monorepo 布局、S0 → M3 路线图、ADR-01～ADR-10 状态 |
 | **数据结构与线格式** | [`docs/data-structures.md`](docs/data-structures.md) | ULID、定长 HLC、FractionalIndex、`InnerOpV1`、信封布局、**全项目唯一 AAD 定义（§3.3）**、全端 DDL |
 | **同步协议与物化语义** | [`docs/sync-protocol.md`](docs/sync-protocol.md) | 路径 γ 多叶子并列、完整因果图 `G(b)`、密钥表 2P-Set、删除/碎纸协议、跨 `epoch` 并集对账、手机状态快照 |
@@ -84,6 +84,7 @@
 - **D2′ / F-04 / F-05**：`purge_op_ids`、可变 `vault_keys` / `MNK1` / `key_seq` / `INV-SYNC-4`、`vault_key_slots` 多槽位、Vault 第二套恢复码、云端 `/v1/archive/*` 路由。
 - **D3 / F-02 / F-03 / F-18**：`SPAN_PATCH` / delta 链、Loro/Yjs CRDT、HLC 漂移拒收、Lock-Wins 特例、分数索引重平衡。
 - **D4**：DO 滑动窗口 GC、R2 K=5 多代快照 + CAS、「\$0/月免费额度」约束。
+- **D5′（2026-11-25 修订）**：macOS Tauri 薄壳（`shell-macos/`）、Tauri 自定义协议 `tauri://localhost` / Bearer 鉴权分支与独立 `.app` 打包（双桌面统一纯 CLI + Daemon + 内嵌 HTML）。
 - **D6 / F-13 / F-14 / ADR-08**：本地与云端 MCP、`mynote update` 自升级、WebAuthn PRF、`--help-json`、加密图片附件 `blobs/`、WebSocket 携带 op 顺风车、Plane B 统计评测、自动爬山与 LLM 评委（`evals/archive/` 仅供存档参考）。
 
 ---
@@ -99,7 +100,6 @@ my-note/
 │   ├── mynote-wasm/           # wasm-bindgen 封装（桌面 Tier 2 + 手机只读 PWA）
 │   ├── mynote-store/          # 桌面 SQLite STRICT/WAL/FTS5/镜像/VACUUM INTO 备份
 │   └── mynote-cli/            # 单体二进制入口（CLI + Heynote 导入 + Daemon + 内嵌前端）
-├── shell-macos/               # macOS Tauri v2 薄壳 + 全局热键
 ├── web/                       # TypeScript 前端（桌面 CM6 + 手机只读 PWA）
 ├── cloud-cf/                  # Cloudflare Worker 极薄盲同步中继（M1 < 500 行 TS）
 ├── skill/SKILL.md             # Agent Skill（严格 < 250 tokens）
@@ -112,7 +112,7 @@ my-note/
 └── review/                    # 架构审查与决策记录
 ```
 
-- **Spike 隔离规则**：S0 阶段的原型与压测脚本放入 `spikes/`，**不得混入** `crates/`、`web/`、`cloud-cf/`、`shell-macos/` 等正式业务目录；待 S0 全部闭环后可按需清理或归档 `spikes/`。
+- **Spike 隔离规则**：S0 阶段的原型与压测脚本放入 `spikes/`，**不得混入** `crates/`、`web/`、`cloud-cf/` 等正式业务目录；待 S0 全部闭环后可按需清理或归档 `spikes/`。
 - **数字诚实标签（F-16）**：在文档、报告与 PR 说明中，所有性能、体积、延迟、成本与行数数字必须标注 `[保证]` / `[目标]` / `[估算]` / `[已测]`。
 - **ADR 状态升级规则**：只有拿到对应目标环境的真实测量证据后，才可将 `docs/architecture-proposal.md` §8 中的 ADR 由 `Proposed` 改为 `Accepted`；Linux / `workerd` 模拟数据必须如实标注环境，不得冒充 macOS / iPhone 真机或真实 Cloudflare 账号实测。
 
@@ -121,8 +121,8 @@ my-note/
 ## 6. 开发顺序与标准验证命令
 
 ### 里程碑推进顺序
-1. **S0（技术 Spike，可与 M1 纯领域核并行）**：`#32` CM6 形态 → `#33` macOS Tauri 热键与 Keychain ACL → `#34` WASM 体积与 iPhone Argon2id → `#35` CF Paid 最小中继 / DO Alarm / R2 生命周期。
-2. **M1（替换 Heynote + iCloud）**：`#3` Workspace + `mynote-core` → `#4` Layer 1 格式化 & `#10` M1 线格式/恢复环 → `#5` `mynote-store` & `#11` Sans-I/O 同步状态机 → `#6` Heynote 导入 → `#7` CLI + `SKILL.md` + 黄金测试 → `#8` Daemon + `shell-macos` & `#13` `cloud-cf` → `#9` 桌面 Web UI → `#14` 端到端闭环 → `#12` DST + `INV-RECOVERY` + 共用场景。
+1. **S0（技术 Spike，可与 M1 纯领域核并行）**：`#32` CM6 形态（已闭环）→ `#33` macOS 形态评估（D5′ 拍板移除 Tauri 壳，已闭环）→ `#34` WASM 体积与 iPhone Argon2id（实测拍板 `(32768, 2, 1)`，已闭环）→ `#35` CF Paid 最小中继 / DO Alarm / R2 生命周期。
+2. **M1（替换 Heynote + iCloud）**：`#3` Workspace + `mynote-core` → `#4` Layer 1 格式化 & `#10` M1 线格式/恢复环 → `#5` `mynote-store` & `#11` Sans-I/O 同步状态机 → `#6` Heynote 导入 → `#7` CLI + `SKILL.md` + 黄金测试 → `#8` Daemon & `#13` `cloud-cf` → `#9` 桌面 Web UI → `#14` 端到端闭环 → `#12` DST + `INV-RECOVERY` + 共用场景。
 3. **M2**：手机只读 PWA + Tier 2 Vault + 受控加密碎纸（`INV-SHRED-BOUND`、`INV-GRACE`、`SEC-01/03/08`）。
 4. **M3**：Markdown 双模 + Pele 纯 SVG + Layer 2 外部格式化 + 时间旅行（`SEC-06`）。
 

@@ -144,7 +144,7 @@ interface CliEnvelope<T> {
 | `mynote device <bootstrap\|add\|refresh\|claim\|ls\|revoke>` | `bootstrap --url <server> [--revoke-existing]`：首台桌面引导（或全设备丢失后重连健在的 DO），从 TTY 读 `BOOTSTRAP_TOKEN` 注册本机生成的 `device_token`。`add --name <label> [--scope read\|read-write]`：桌面自行生成新 `device_token` 与一次性密钥 `K_pair`，把 `SHA-256(token)` 与 `K_pair` 加密的 `{ smks, device_token, device_id, sync_url }` 暂存服务端（TTL 10 分钟，首次领取即删）。`refresh <device_id>`：SMK 轮换后为另一台未吊销存留设备生成 10 分钟一次性密钥刷新码（只封 `{ smks }`，免翻 24 词）。`claim`：在目标桌面读取配对码 / 刷新码完成接入或刷新。`bootstrap/add/refresh/claim` 只允许 TTY，配对码永不写入 `--json` 输出。`ls` 列出设备；`revoke <device_id>` 成功后 `hint` 建议执行 `mynote keyring rotate` | 联网管理鉴权，断网返回 `6` | M1（`read` 范围 M2） |
 | `mynote import heynote <path>` | `--buf <name>`、`--dry-run` | 文件哈希防重复提示 | M1 |
 | `mynote restore --from-archive <local-dir>` | **纯离线灾难恢复**（INV-RECOVERY）：从本地目录（从 R2 下载的 `archives/ops/` + `archives/keys/latest.mnks`）配合 TTY 输入的 24 词恢复包，重建全部已归档且**未删除**数据。`--to <empty-data-dir>`（**永不覆盖**非空数据目录）、`--key-snapshot <path\|latest>`、`--dry-run`。零网络请求，不为极端场景维护云端归档 API。响应 `data`：`{ restored_blocks, skipped_shredded, archive_segments, key_snapshot_at_ms, data_dir }` | 非 TTY 返回 `INTERACTION_REQUIRED` | M1 |
-| `mynote open` | 打开本地 UI：Omarchy 上用浏览器打开 `http://localhost:<port>`（一次性 ticket，见 §3.1）；macOS 上显示并聚焦 Tauri 壳窗口 | — | M1 |
+| `mynote open` | 打开本地 UI：macOS 与 Omarchy 统一生成一次性 ticket（见 §3.1）并用系统默认浏览器 / Web App 打开 `http://localhost:<port>` | — | M1 |
 
 ### 2.4 帮助体系与 Layer 2 `formatters.toml` 规范
 
@@ -160,7 +160,7 @@ interface CliEnvelope<T> {
 - **安装位置与 F-07**：Homebrew / AUR 把二进制装到用户不可写的位置，这也是 T5 缓解措施之一。`cargo install` 装在用户可写的 `~/.cargo/bin`，只建议开发期使用。Tier 2 对同 UID 攻击者的真实边界见 [`threat-model.md`](./threat-model.md)。
 - **Schema 迁移前自动备份（保留）**：新版本首次打开数据库、需要升级 `PRAGMA user_version` 时，必须在独占写事务**之前**通过 `VACUUM INTO` 生成权限 `0600` 的快照 `~/.local/share/mynote/backups/mynote-pre-schema-v<old>.db`，再执行迁移。
 - **降级**：旧二进制打开较新的库时返回 `INTEGRITY_ERROR`（`SCHEMA_TOO_NEW`，退出码 `8`），不做任何写入。回退步骤是用包管理器装回旧版本，再手动换回上面的迁移前备份（步骤写进 `mynote help upgrade`）。
-- **升级后的 Daemon 重启**：交给托管方（`brew services` / `systemctl --user` / Tauri 壳）。前端在 `/v1/local/ws` 断开后按指数退避重连。CLI 通过 UDS `ping` 发现 Daemon 版本与自身不一致时，只在 `stderr` 告警。
+- **升级后的 Daemon 重启**：交给系统托管方（macOS `launchd` / `brew services`，Omarchy `systemctl --user`）。前端在 `/v1/local/ws` 断开后按指数退避重连。CLI 通过 UDS `ping` 发现 Daemon 版本与自身不一致时，只在 `stderr` 告警。
 
 ### 2.6 CLI 黄金测试需稳定的输出契约
 
@@ -186,11 +186,11 @@ interface CliEnvelope<T> {
 
 ## 3. 本地桌面 Daemon 契约（HTTP + WebSocket + Unix Socket IPC）
 
-### 3.0 进程模型：Daemon、macOS Tauri 壳与 CLI
+### 3.0 进程模型：Daemon 与 CLI
 
-- **两端共用一份前端**：macOS 用 Tauri 壳（WKWebView）加载 `http://localhost:<port>`，窗口常驻隐藏，全局热键只做「显示 + 聚焦」，目标 < 100 ms [目标]。Omarchy 用 Hyprland 键绑定唤出或聚焦加载同一地址的 Chromium webapp。
-- **壳与 Daemon 的关系待 S0 决定**：壳内嵌 Daemon（单进程）、壳拉起独立 Daemon、或由 launchd / systemd 托管 Daemon，三选一（[review §9.8](../review/2026-11-24-first-principles-review.md)）。无论选哪种，下列契约不变：
-  1. **CLI 在 UI 未打开时独立工作**：关闭窗口或退出壳不影响 CLI 读写。CLI 离线写入成功返回 `0`（`pending_offline`），之后由 Daemon 补推。
+- **双桌面统一形态（D5′）**：macOS 与 Omarchy 均运行同一个 `mynote` 单体二进制（CLI + 内嵌 Web UI 的 Daemon），不引入原生 GUI / Tauri 薄壳。macOS 由 `launchd` LaunchAgent（或 `brew services`）托管 Daemon、通过浏览器 / Web App（可配合 Raycast / Hammerspoon / Karabiner 切窗）打开 `http://localhost:<port>`；Omarchy 由 `systemd --user` 托管 Daemon、通过 Hyprland 键绑定唤出 Chromium webapp 加载同一地址。
+- 核心运行契约：
+  1. **CLI 在 UI 未打开时独立工作**：关闭浏览器窗口不影响 CLI 读写。CLI 离线写入成功返回 `0`（`pending_offline`），之后由 Daemon 补推。
   2. **SQLite 单写入方**：任一时刻最多一个 Daemon 实例（`<data_dir>/daemon.lock` 独占文件锁），第二个实例启动即退出并提示。CLI 写入路径：**Daemon 运行时**，写命令经 UDS 的 `apply` 帧转交 Daemon 执行（载荷与 §3.2 的 REST DTO 相同，由 Daemon 生成 `op_id` 与 HLC）；**Daemon 未运行时**，CLI 以短事务直接写本地 SQLite，此时它就是唯一写入方（协议见 [`sync-protocol.md`](./sync-protocol.md) §7）。
   3. 读路径始终可以由 CLI 直接打开 SQLite（WAL 并发读）完成。
 
@@ -198,16 +198,10 @@ interface CliEnvelope<T> {
 
 1. **Host / Origin 白名单（请求头强拦截）**：
    - Daemon 只监听回环地址（`127.0.0.1` 与 `::1`，因为 `localhost` 可能先解析到 IPv6）。但 **`Host` 白名单只有一项：`localhost:<port>`**。其他任何 `Host`，包括 `127.0.0.1:<port>`、`[::1]:<port>` 以及 DNS 重绑定域名，**一律 `403`**，`hint` 指向 `http://localhost:<port>`。统一入口是为了让 Cookie 只有一个作用域，并为将来的 WebAuthn RP ID 留出可能（F-15）。
-   - **`Origin` 白名单**：
-     - `http://localhost:<port>`：Omarchy Chromium webapp、浏览器，以及采用方案 A 的 Tauri 壳。
-     - `tauri://localhost`：仅当 S0 选定方案 B 时加入。
-     - 其他 `Origin`（含 `http://127.0.0.1:<port>`、`null`）一律 `403`。
-   - **Tauri 壳的 Origin**（S0 二选一）：
-     - **方案 A（首选）**：WKWebView 直接导航到 `http://localhost:<port>`，Origin 与浏览器完全相同，沿用下文的 Cookie 会话，无需 CORS。
-     - **方案 B**：前端资源经自定义协议加载（macOS 上为 `tauri://localhost`），对 Daemon 是跨站请求，`SameSite=Strict` Cookie 不会随请求发送。因此：白名单加入该 Origin；CORS 只对它返回 `Access-Control-Allow-Origin: tauri://localhost`（不用 `*`）；鉴权改为壳经 UDS `open_ticket` 换取的 `Authorization: Bearer <session_token>`，只存在壳进程内存中。
-   - 除首次 `GET /v1/local/auth/exchange` 外，所有 `/v1/local/*` 请求与 WebSocket 握手必须携带 `Cookie: mynote_local_session=<64hex>`（方案 B 的壳用上述 Bearer 会话），且所有非 `GET` 请求及 `/v1/local/ws` 必须携带白名单内的 `Origin`。
+   - **`Origin` 白名单只有一项：`http://localhost:<port>`**（覆盖 macOS 与 Omarchy 的浏览器 / Web App）；其他任何 `Origin`（含 `http://127.0.0.1:<port>`、`null`）一律 `403`，无需开启跨站 CORS 或 Bearer 分支。
+   - 除首次 `GET /v1/local/auth/exchange` 外，所有 `/v1/local/*` 请求与 WebSocket 握手必须携带 `Cookie: mynote_local_session=<64hex>`，且所有非 `GET` 请求及 `/v1/local/ws` 必须携带 `Origin: http://localhost:<port>`。
 2. **一次性会话置换**：
-   - `mynote open`（或 Tauri 壳启动时经 UDS `open_ticket` 申请）生成单次有效（有效期 10 秒）的随机 `ticket` 写入 Daemon 内存表，拉起浏览器 / 壳窗口访问 `http://localhost:<port>/v1/local/auth/exchange?ticket=<ticket>`；
+   - `mynote open` 生成单次有效（有效期 10 秒）的随机 `ticket` 写入 Daemon 内存表，拉起浏览器访问 `http://localhost:<port>/v1/local/auth/exchange?ticket=<ticket>`；
    - Daemon 校验并立即销毁 `ticket`，返回 `303 See Other`、`Location: /` 与 `Set-Cookie: mynote_local_session=<session_token>; HttpOnly; SameSite=Strict; Path=/`。
 
 ### 3.2 本地 REST API 端点契约（Daemon 对 Tier 2 严格零明文！）

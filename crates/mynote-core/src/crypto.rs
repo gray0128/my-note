@@ -373,6 +373,12 @@ pub fn decrypt_mnw1(
 
 // ---------- (5) Unified 24-Word Recovery Bundle, MNRS Sealed Box, RecoveryKeyringV1, VaultHeaderV1 ----------
 
+/// Default Argon2id parameters for `VaultHeaderV1`, calibrated on iPhone standalone PWA
+/// (`docs/spikes/s0-3-wasm-argon2.md`: 1553 ms median, 33.19 MiB peak linear memory).
+pub const DEFAULT_ARGON2_M_KIB: u32 = 32_768;
+pub const DEFAULT_ARGON2_T: u32 = 2;
+pub const DEFAULT_ARGON2_P: u32 = 1;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KdfParamsV1 {
     pub alg: String,
@@ -380,6 +386,18 @@ pub struct KdfParamsV1 {
     pub t: u32,
     pub p: u32,
     pub salt: [u8; 16],
+}
+
+impl KdfParamsV1 {
+    pub fn argon2id_default(salt: [u8; 16]) -> Self {
+        Self {
+            alg: "argon2id".to_string(),
+            m_kib: DEFAULT_ARGON2_M_KIB,
+            t: DEFAULT_ARGON2_T,
+            p: DEFAULT_ARGON2_P,
+            salt,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1041,5 +1059,15 @@ mod tests {
         assert_eq!(*smks[1].1, smk2);
         assert_eq!(smks[2].0, smk3_kid);
         assert_eq!(*smks[2].1, smk3);
+    }
+
+    #[test]
+    fn default_argon2id_params_match_s03_iphone_wasm_vector() {
+        let salt: [u8; 16] = core::array::from_fn(|i| (i + 1) as u8);
+        let kdf = KdfParamsV1::argon2id_default(salt);
+        assert_eq!(kdf.alg, "argon2id");
+        assert_eq!((kdf.m_kib, kdf.t, kdf.p), (32_768, 2, 1));
+        let key = derive_passphrase_key(b"correct-horse-battery-staple-2026", &kdf).unwrap();
+        assert_eq!(&key[..6], &[0x41, 0x67, 0x18, 0x33, 0x32, 0x87]);
     }
 }

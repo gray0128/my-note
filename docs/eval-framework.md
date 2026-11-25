@@ -278,8 +278,8 @@ my-note/
 | 里程碑 | 必须绿灯的门禁 | 非 CI 的准出条件 |
 | --- | --- | --- |
 | **S0 技术 spike** | 无门禁；spike 代码不进主干。产出性能基线，用于把 §10.1 的 [目标] 改为 [已测] | — |
-| **M1 替换 Heynote + iCloud** | 属性测试；DST（INV-SYNC-1/2/3/5、INV-KEY-LIVENESS）；真实 Worker 契约测试（push / pull / epoch / 令牌范围 / WS 唤醒 / 密钥表 / 归档）；INV-RECOVERY；`SEC-04`、`SEC-05`；Layer 1 格式化幂等与 Heynote 导入差分；CLI 黄金测试；双平台 CI | 热键唤出 < 100 ms [目标]（实测）；Mac 与 Omarchy 日常使用 4 周零丢数；Heynote 卸载 |
-| **M2 手机只读 + Vault + 碎纸** | 新增：INV-GRACE；INV-SHRED-BOUND；`SEC-01`（换钥语义）；`SEC-03`；`SEC-08`（手机 IndexedDB / Cache Storage）；INV-SYNC-7；DST 加入碎纸 / 撤销 / 到期与离线编辑交错 | iPhone 真机 Vault 解锁约 1–2 s [目标]（实测）；手机自动上锁人工验证 |
+| **M1 替换 Heynote + iCloud** | 属性测试；DST（INV-SYNC-1/2/3/5、INV-KEY-LIVENESS）；真实 Worker 契约测试（push / pull / epoch / 令牌范围 / WS 唤醒 / 密钥表 / 归档）；INV-RECOVERY；`SEC-04`、`SEC-05`；Layer 1 格式化幂等与 Heynote 导入差分；CLI 黄金测试；双平台 CI | 双桌面纯 CLI + Daemon + HTML（`http://localhost:<port>`）日常流畅可用（D5′）；Mac 与 Omarchy 日常使用 4 周零丢数；Heynote 卸载 |
+| **M2 手机只读 + Vault + 碎纸** | 新增：INV-GRACE；INV-SHRED-BOUND；`SEC-01`（换钥语义）；`SEC-03`；`SEC-08`（手机 IndexedDB / Cache Storage）；INV-SYNC-7；DST 加入碎纸 / 撤销 / 到期与离线编辑交错 | iPhone 真机 Vault 解锁约 1–2 s（S0-3 已测 `(32768, 2, 1)` = `1553 ms` [已测]）；手机自动上锁人工验证 |
 | **M3 渲染与打磨** | 新增：`SEC-06`；Layer 2 外部格式化熔断 | — |
 
 ### 10.1 观测指标（不阻断）

@@ -333,7 +333,7 @@ stateDiagram-v2
 
 ## 7. CLI 与本地 Daemon 共享 WAL 协作协议
 
-桌面端采用 **「SQLite WAL 为唯一共享真相、同一时刻只有一个写入方、Unix Domain Socket 转交写请求与唤醒同步」** 的模型，确保无论 Daemon（或内嵌 Daemon 的 macOS Tauri 壳）是否运行，CLI 都能独立完成读写（D5）。接口细节以 [`interface-contracts.md`](./interface-contracts.md) 为准。
+桌面端采用 **「SQLite WAL 为唯一共享真相、同一时刻只有一个写入方、Unix Domain Socket 转交写请求与唤醒同步」** 的模型，确保无论本地 `mynote daemon` 是否运行，CLI 都能独立完成读写（D5′）。接口细节以 [`interface-contracts.md`](./interface-contracts.md) 为准。
 
 1. **单写入方**：
    - 所有本地数据库连接初始化统一执行：

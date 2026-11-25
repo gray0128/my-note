@@ -453,9 +453,9 @@ pub struct RetiredVkekV1 { pub vkek_kid: VkekKid, pub wrapped_vkek: Vec<u8>, pub
 
 pub struct KdfParamsV1 {
     pub alg: String,                   // "argon2id"
-    pub m_kib: u32,                    // 内存参数：S0 在 iPhone 上实测后定值，暂定 65_536 [估算]
-    pub t: u32,                        // 迭代次数：暂定 3 [估算]
-    pub p: u32,                        // 并行度：1
+    pub m_kib: u32,                    // 内存参数：32_768 (32 MiB，S0-3 iPhone 主屏 PWA 实测 1553 ms 定值 [已测])
+    pub t: u32,                        // 迭代次数：2 [已测]
+    pub p: u32,                        // 并行度：1 [已测]
     pub salt: [u8; 16],
 }
 ```
@@ -477,7 +477,7 @@ pub struct KdfParamsV1 {
 - **SMK 代际永久保留**：R2 op 归档永久保留且其中的 `MNS1` 由当时的 SMK 加密，删除旧 SMK 等于让归档不可读，因此 `smk_entries` 只追加，设备 Keychain 中的 SMK 代际也不删除。所谓「旧代际保留 `T_snap`」只适用于**用旧代际封装的历史密钥表快照**（R2 `archives/keys/history/`、本地自动备份）：轮换时全部 `MNR1` 以新 `wrap_gen` 重新封装，旧封装副本随 `T_snap` 生命周期自然淘汰。VKEK 只用于包裹 BDEK，因此退役的 VKEK 可在 `T_snap` 后移除。
 - **轮换与存留设备密钥刷新** = 生成新 SMK（或 VKEK）→ 用恢复公钥封装后追加（VKEK 则写入新 Vault 头部，旧的移入 `retired`）→ `keyring_gen + 1` → 以新代际重新封装全部 `MNR1`（VKEK 轮换需在 Vault 会话内重新包裹 Tier 2 的 `MNW1`）并随 `/v1/keys` 上传更新 `key_material`。**不需要重新抄写 24 词**，轮换后运行 `mynote recovery drill` 确认恢复包有效。其他未吊销的存留设备通过两条低复杂度路径之一获取新 `SMK` 代际（不引入设备级长期公钥树）：(1) 在已轮换桌面上执行 `mynote device refresh <device_id>` 生成复用 `pairing_tickets` 的 10 分钟一次性刷新码，在存留设备上 `claim` 领取；(2) 单机/异地时直接在存留桌面上执行 `mynote keyring unlock` 输入一次 24 词解封 `RecoveryKeyringV1`。
 - **Vault 口令变更**只重新生成 `salt` 与 `wrapped_vkek`，VKEK 不变，不触碰密钥表。Vault 不再有第二套 24 词恢复码：忘记口令时用统一恢复包解开 `sealed_vkek`，再设新口令。
-- KDF 参数只有一套，按最弱设备（iPhone）定，参数和盐存于 Vault 头部；目标单次解锁约 1–2 s [目标]，以 S0 实测为准。
+- KDF 参数只有一套，按最弱设备（iPhone）定，参数和盐存于 Vault 头部；S0-3 iPhone 主屏 PWA 真机已实测定型为 `(m_kib=32768, t=2, p=1)`（中位 `1553 ms` [已测]，稳落 `1–2 s` 目标区间，详见 [`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md)）。
 - 服务端可以截断或替换 `smk_entries` 列表（单条封装本身有 AEAD 认证，伪造的条目只会解封失败）。缓解：每台桌面在本地 `key_material` 保留完整副本并在同步时比对条目数，R2 密钥表快照中也有副本；INV-RECOVERY 演练覆盖。
 - `RecoveryKeyringV1` 与 `VaultHeaderV1` 存放在 DO `key_material`、本地 `key_material`，随 `/v1/keys` 同步（仅接受更大的 `gen`），并随每日密钥表快照进入 R2。手机只缓存 `VaultHeaderV1`。
 
