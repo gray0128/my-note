@@ -1,9 +1,11 @@
 # SimCluster Deterministic Simulation Regression Seeds (u64 hex)
 # Format: <hex_u64_seed> # <invariant_id> <brief_scenario_note>
-# Every seed in this file MUST pass 100% in Tier 0 (<10s) and Tier 1 CI gates.
+# Every seed in this file MUST pass in Tier 0 (<10s) and Tier 1 CI gates.
+# 2026-11-24 修订：依据第一性原理审查 §9（../../review/2026-11-24-first-principles-review.md）D2′/D3/D4，
+# 依赖已移除机制的种子以 `# RETIRED` 注释保留（不再回放），其余场景描述按路径 γ（全量载荷）更新。
 
 0x0000000000000001 # INV-SYNC-1 baseline 3-device partition & heal smoke seed
-0x0000000000c0ffee # INV-SYNC-2 concurrent SPAN_PATCH + DELETE causal retention seed
+0x0000000000c0ffee # INV-SYNC-2 concurrent full-payload UPDATE + DELETE causal retention (Update-Wins) seed
 0x00000000deadbeef # INV-SYNC-3 DO PITR epoch rollback set-union non-truncation seed
-0x00000000bad5ec01 # INV-SYNC-4 atomic LOCK + vault_key_records visibility seed
-0x00000000f00dcafe # INV-SYNC-5 corrupted R2 snapshot K fallback to K-1 seed
+# RETIRED 0x00000000bad5ec01 # INV-SYNC-4 atomic LOCK + vault_key_records visibility seed — INV-SYNC-4 已删除（D2′：LOCK = 换钥，密钥表 2P-Set 取代 vault_keys），review §9.3
+# RETIRED 0x00000000f00dcafe # INV-SYNC-5 corrupted R2 snapshot K fallback to K-1 seed — R2 K=5 多代快照 + CAS 已删除（D1/D4），review §9.7
