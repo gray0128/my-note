@@ -289,7 +289,7 @@ my-note/
 | 指标 | 测量方法 | 值 |
 | --- | --- | --- |
 | 桌面单体二进制体积 | Linux `x86_64` / macOS `aarch64` release 构建（strip 后，含内嵌 Web UI） | < 15 MiB [目标] |
-| WASM 与首屏包体积 | `mynote-wasm`（`wasm-opt -Oz` + gzip）与 `web/` 首屏 JS/CSS（gzip，不含懒加载的 `Pele` chunk） | WASM < 350 KiB [目标]；首屏 < 220 KiB [目标] |
+| WASM 与首屏包体积 | `mynote-wasm`（`wasm-opt -Oz` + gzip）与 `web/` 首屏 JS/CSS（gzip，不含懒加载的 `Pele` chunk） | WASM 目标 < 350 KiB（S0-3 基线：手机只读 `71.5 KiB` / 桌面全功能含 Layer 1 `260.4 KiB` [已测]，详见 [`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md)）；首屏 < 220 KiB [目标] |
 | 无头 Daemon 常驻内存 | 导入 5,000 块后静置，采样 RSS | < 20 MiB [目标] |
 | CLI 本地读写延迟 | 10,000 块 WAL 库上连跑 200 次 `add` 与 `ls --json` | P95 < 15 ms [目标] |
 | DO 行写数 | DST 统计（INV-SYNC-6） | ≤ 10 行 / op [目标] |

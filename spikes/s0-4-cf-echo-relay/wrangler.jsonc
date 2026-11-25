@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mynote-s0-4-echo-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-15",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SYNC_DO",
+        "class_name": "SyncEchoDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["SyncEchoDO"]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ARCHIVE_BUCKET",
+      "bucket_name": "mynote-s0-4-spike-archive"
+    }
+  ],
+  "vars": {
+    "T_GRACE_MIN_MS": "86400000",
+    "DAILY_ARCHIVE_INTERVAL_MS": "86400000"
+  }
+}

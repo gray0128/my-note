@@ -1,0 +1,49 @@
+[package]
+name = "s0-3-wasm-argon2"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = []
+# Compare precomputed-tables impact on x25519-dalek
+x25519-precomp = ["x25519-dalek/precomputed-tables"]
+# Compression options
+comp-ruzstd-decode = ["dep:ruzstd"]
+comp-ruzstd-rw = ["dep:ruzstd"]
+comp-miniz-rw = ["dep:miniz_oxide"]
+comp-zstd-c = ["dep:zstd"]
+# Layer 1 formatters overhead check (Desktop WASM)
+fmt-layer1 = ["dep:serde_json", "dep:toml", "dep:serde_yaml_ng", "dep:sqlformat", "dep:quick-xml"]
+
+[dependencies]
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
+argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "zeroize"] }
+hkdf = "0.13.0"
+sha2 = { version = "0.11.1", default-features = false }
+blake3 = { version = "1.8.7", default-features = false, features = ["pure"] }
+x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets", "zeroize"] }
+rmp-serde = "1.3.1"
+serde = { version = "1.0", features = ["derive"] }
+zeroize = { version = "1.9.2", features = ["derive"] }
+
+# Optional compression backends
+ruzstd = { version = "0.9.1", optional = true }
+miniz_oxide = { version = "0.9.1", optional = true }
+zstd = { version = "0.14.5", optional = true }
+
+# Optional Layer 1 formatters
+serde_json = { version = "1.0", optional = true }
+toml = { version = "0.8", optional = true }
+serde_yaml_ng = { version = "0.10", optional = true }
+sqlformat = { version = "0.3", optional = true }
+quick-xml = { version = "0.37", optional = true }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

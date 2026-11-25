@@ -733,12 +733,12 @@ flowchart LR
 ```
 
 ### S0：技术 spike（约 1–1.5 周 [估算]，每项限时）
-- [ ] **编辑器形态**：单 CM6 文档 + 原子化块边界装饰 vs 按块挂载 `EditorView`（F-11）。
-- [ ] **macOS Tauri 壳 + 全局热键 + Keychain 跨二进制 ACL 验证（必做，D5）**：热键到窗口可输入的延迟实测（目标 < 100 ms）；是否需要「辅助功能」等系统权限；壳与 Daemon 的关系（壳内嵌 Daemon 单进程，或拉起独立 Daemon——无论哪种，CLI 都必须能在 UI 未打开时独立工作，且 SQLite 只有一个写入方）；**实测 Tauri `.app` 与 Homebrew CLI 两个不同代码签名身份访问同一 macOS Keychain 条目（`SMK`）是否触发重复密码授权弹窗**（决定 Keychain 是否只由单一签名主体读写、CLI 经 `daemon.sock` 请求）；登录自启、签名与公证（个人自用可先不公证，但记录 Gatekeeper 的处理方式）。
-- [ ] **WASM**：桌面 WASM 体积；**iPhone 上 Argon2id WASM 的耗时与内存（D7）**，目标单次解锁约 1–2 s [目标]。
-- [ ] **CF Paid echo 中继**（约 100 行 [估算]）：令牌范围、WebSocket Hibernation、Spend Management 告警；顺带验证 DO alarm 定时置空密钥、R2 生命周期规则（D2′）。
+- [x] **编辑器形态（S0-1）**：完成候选 A vs 候选 B 双原型 Chromium 实测，选定**候选 A（视口虚拟化 + 按源码块挂载 `EditorView`）**，详见 [`docs/spikes/s0-1-editor-architecture.md`](./spikes/s0-1-editor-architecture.md)。
+- [ ] **macOS Tauri 壳 + 全局热键 + Keychain 跨二进制 ACL 验证（S0-2，必做，D5）**：可运行脚手架与预研结论已就绪（[`docs/spikes/s0-2-macos-tauri-shell.md`](./spikes/s0-2-macos-tauri-shell.md)），待 macOS 真机回填热键毫秒数与 Keychain 弹窗观测。
+- [ ] **WASM（S0-3）**：桌面/手机 WASM 体积基线与纯 Rust `ruzstd` 帧互通已实测达标（手机 `71.5 KiB` / 桌面全功能 `260.4 KiB` gzip，详见 [`docs/spikes/s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md)）；**iPhone 真机 Argon2id 耗时与内存（D7）**待在真机打开 `bench.html` 回填最终参数。
+- [ ] **CF Paid echo 中继（S0-4）**：真实 `workerd` 验证全部通过（`297 LOC` TS、令牌范围、WS Hibernation、150-op 批次、DO Alarm 复用与 R2 双轨归档，详见 [`docs/spikes/s0-4-cloudflare-relay.md`](./spikes/s0-4-cloudflare-relay.md)）；真实 CF Paid 账号的 Spend Management 告警与 R2 30 天前缀生命周期待控制台核验回填。
 - 「γ vs β（Loro）」spike 已取消（D3）。
-- **产出**：每项一页结论；§8 中对应 ADR 据此由 Proposed 改为 Accepted 或 Rejected。
+- **产出**：4 份一页报告位于 `docs/spikes/s0-*.md`；§8 中已获完整实测证据的 ADR 已升级为 `Accepted`。
 
 ### M1：替换 Heynote + iCloud
 - [ ] **core**：块、全量载荷 op、在完整因果图 `G(b)` 上求叶子、多叶子并列 + 手动合并、字段 LWW、Update-Wins（[`sync-protocol.md`](./sync-protocol.md)）。
@@ -783,17 +783,17 @@ flowchart LR
 <a id="8-已最终拍板的架构决策基线adr-摘要"></a>
 
 > [!NOTE]
-> **状态：Proposed（2026-11-24）**。此前「已最终拍板 / 冻结」的表述作废。每条决策在 S0 spike 或对应里程碑给出证据后逐条改为 **Accepted**（或 Rejected 并回到本表修订）。实现细节以各专题文档为准：线格式 / AAD / 表结构 → [`data-structures.md`](./data-structures.md)；同步协议 → [`sync-protocol.md`](./sync-protocol.md)；安全承诺 → [`threat-model.md`](./threat-model.md)；云端实现 → [`cloudflare-cloud-architecture.md`](./cloudflare-cloud-architecture.md)；本地 API / CLI → [`interface-contracts.md`](./interface-contracts.md)；测试门禁 → [`eval-framework.md`](./eval-framework.md)。
+> **状态：按实测证据逐条转为 Accepted（2026-11-24）**。每条决策在 S0 spike 或对应里程碑给出实测证据后逐条改为 **Accepted**（或 Rejected 并回到本表修订）。实现细节以各专题文档为准：线格式 / AAD / 表结构 → [`data-structures.md`](./data-structures.md)；同步协议 → [`sync-protocol.md`](./sync-protocol.md)；安全承诺 → [`threat-model.md`](./threat-model.md)；云端实现 → [`cloudflare-cloud-architecture.md`](./cloudflare-cloud-architecture.md)；本地 API / CLI → [`interface-contracts.md`](./interface-contracts.md)；测试门禁 → [`eval-framework.md`](./eval-framework.md)。
 
-| # | 决策项 | 结论 | 依据 | 状态（待补证据） |
+| # | 决策项 | 结论 | 依据 | 状态（证据链接） |
 | --- | --- | --- | --- | --- |
-| ADR-01 | **核心状态机与存储** | Rust Sans-I/O `mynote-core`；桌面 `rusqlite`（SQLite 单写入方）；手机 IndexedDB 仅作只读缓存 | §6.1、D1 | Proposed（S0：桌面 WASM 体积） |
-| ADR-02 | **云端基础设施** | Cloudflare **Workers Paid**（约 \$5/月 [估算]）：单 Worker + SQLite DO + R2 + Static Assets；服务端极薄（幂等追加、分配 seq、按 seq 分页、epoch、令牌范围、WebSocket 唤醒、密钥表 / `key_material` / 碎纸标记存储 + 宽限期 / 批量阈值校验 + alarm 置空、每日归档，不暴露云端归档 HTTP 路由）；配置支出告警 | D4、F-12 | Proposed（S0：echo 中继） |
+| ADR-01 | **核心状态机与存储** | Rust Sans-I/O `mynote-core`（WASM 侧采用纯 Rust `ruzstd` + 关闭 `x25519` 预计算表）；桌面 `rusqlite`（SQLite 单写入方）；手机 IndexedDB 仅作只读缓存 | §6.1、D1 | **Accepted**（[`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md)：手机 `71.5 KiB` / 桌面全功能 `260.4 KiB` gzip [已测]） |
+| ADR-02 | **云端基础设施** | Cloudflare **Workers Paid**（约 \$5/月 [估算]）：单 Worker + SQLite DO + R2 + Static Assets；服务端极薄（幂等追加、分配 seq、按 seq 分页、epoch、令牌范围、WebSocket 唤醒、密钥表 / `key_material` / 碎纸标记存储 + 宽限期 / 批量阈值校验 + alarm 置空、每日归档，不暴露云端归档 HTTP 路由）；配置支出告警 | D4、F-12 | Proposed（[`s0-4-cloudflare-relay.md`](./spikes/s0-4-cloudflare-relay.md)：`workerd` 3/3 绿灯、`297 LOC` [已测]；待真实 CF 账号补测 Spend Management） |
 | ADR-03 | **同步协议（路径 γ）** | 全量载荷 op；在完整因果图 `G(b)` 上求叶子，冲突 = 同块多存活叶子，并列展示 + 手动合并；HLC 只决定展示顺序；字段 LWW；Update-Wins；无 `SPAN_PATCH` / Lock-Wins / GC / 快照 CAS | D3 | Proposed（M1：DST + 属性测试 + 4 周实测） |
-| ADR-04 | **加密与密钥** | 每块 BDEK，信封只带 `key_id`；独立密钥表 `block_keys` + `key_material` + `shred_marks`（2P-Set）；统一恢复包 → Root Seed → X25519 恢复密钥对（设备只存公钥，SMK 代际 / VKEK 封装追加，旧 SMK 代际永久保留）；AAD 只在 `data-structures.md` 定义 | D2′、F-01、F-05 | Proposed（M1 线格式定型前评审；INV-RECOVERY、INV-KEY-LIVENESS） |
-| ADR-05 | **删除语义** | 删除优先、有界时延：M1 软删回收站，M2 启用服务端强制宽限期（`T_grace` = 7 天）+ 加密碎纸（仅服务端 `executed` 触发本地删钥）；彻底不可恢复上界约 37 天；op 密文永久保留 | D2′、Q7–Q9 | Proposed（S0：DO alarm、R2 生命周期；M2：INV-SHRED-BOUND、INV-GRACE） |
-| ADR-06 | **平台形态** | macOS：Tauri 壳 + 全局热键（M1 必备）；Omarchy：Hyprland 绑定 Chromium webapp；手机：只读 PWA + Vault 解锁；本地 UI 统一 `http://localhost:<port>` | D1、D5、D7、F-15 | Proposed（S0：热键 < 100 ms、Keychain ACL、iPhone Argon2id） |
-| ADR-07 | **编辑器与渲染** | CodeMirror 6（单文档 vs 按块挂载由 S0 决定）+ Markdown 双模 + `Pele` 纯 SVG | F-11 | Proposed（S0：编辑器 spike） |
+| ADR-04 | **加密与密钥** | 每块 BDEK，信封只带 `key_id`；独立密钥表 `block_keys` + `key_material` + `shred_marks`（2P-Set）；统一恢复包 → Root Seed → X25519 恢复密钥对（设备只存公钥，SMK 代际 / VKEK 封装追加，旧 SMK 代际永久保留）；AAD 只在 `data-structures.md` 定义 | D2′、F-01、F-05 | Proposed（[`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md) 已验 `ruzstd`↔`zstd` 帧兼容；待 M1 INV-RECOVERY / INV-KEY-LIVENESS） |
+| ADR-05 | **删除语义** | 删除优先、有界时延：M1 软删回收站，M2 启用服务端强制宽限期（`T_grace` = 7 天）+ 加密碎纸（仅服务端 `executed` 触发本地删钥）；彻底不可恢复上界约 37 天；op 密文永久保留 | D2′、Q7–Q9 | Proposed（[`s0-4-cloudflare-relay.md`](./spikes/s0-4-cloudflare-relay.md)：DO alarm 置空 `workerd` [已测]；待真账号 R2 生命周期 & M2 INV-SHRED-BOUND / INV-GRACE） |
+| ADR-06 | **平台形态** | macOS：Tauri 壳 + 全局热键（M1 必备）；Omarchy：Hyprland 绑定 Chromium webapp；手机：只读 PWA + Vault 解锁；本地 UI 统一 `http://localhost:<port>` | D1、D5、D7、F-15 | Proposed（待真机补测：[`s0-2-macos-tauri-shell.md`](./spikes/s0-2-macos-tauri-shell.md) 热键/Keychain、[`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md) iPhone Argon2id） |
+| ADR-07 | **编辑器与渲染** | CodeMirror 6 **候选 A：视口虚拟化 + 按源码块独立挂载 `EditorView`** + Markdown 双模 + `Pele` 纯 SVG | F-11 | **Accepted**（[`s0-1-editor-architecture.md`](./spikes/s0-1-editor-architecture.md)：200 块虚拟化挂载 `31.7 ms`、打字 P50 `7.30 ms`、`266 LOC`，Vim `dG` 物理隔离 [已测]） |
 | ADR-08 | **Agent 集成** | 纯 CLI（Daemon 运行时 UDS `apply` / 未起时直写 WAL）+ 极轻 `SKILL.md`（L0–L3a，`--help-json` 推迟）；不做本地与云端 MCP；CLI 只能把块删进回收站 | §5.5、D2′ | Proposed（M1：CLI 黄金测试） |
 | ADR-09 | **分发与升级** | Homebrew tap / AUR / `cargo install`，二进制装在用户不可写位置；不做自升级；Schema 迁移前 `VACUUM INTO` 备份 | F-14、F-07 | Proposed |
 | ADR-10 | **质量保障** | 只保留 Plane A 确定性门禁（属性测试、DST、真实 Worker 契约测试、INV-RECOVERY、SEC 取证、格式化幂等、CLI 黄金测试、双平台 CI） | D6 | Proposed（M1） |
