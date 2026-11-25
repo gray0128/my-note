@@ -1,0 +1,147 @@
+{
+  "scenario": "G09",
+  "steps": [
+    {
+      "exit_code": 0,
+      "json": {
+        "data": {
+          "buffer_id": "<ULID>",
+          "content": "omarchy concurrent edit",
+          "display_op_id": "<ULID>",
+          "has_conflict": true,
+          "has_unlocked_concurrent_version": false,
+          "head_op_ids": [
+            "<ULID>",
+            "<ULID>"
+          ],
+          "id": "<ULID>",
+          "is_locked": false,
+          "lang": "text",
+          "position": "<POSITION>",
+          "public_hint": null,
+          "redacted": false,
+          "updated_at_ms": "<MS>",
+          "versions": [
+            {
+              "actor": "human",
+              "content": "omarchy concurrent edit",
+              "device_id": "<DEVICE_ID>",
+              "hlc": "<HLC>",
+              "is_display": true,
+              "is_locked": false,
+              "op_id": "<ULID>"
+            },
+            {
+              "actor": "human",
+              "content": "mac edit",
+              "device_id": "<DEVICE_ID>",
+              "hlc": "<HLC>",
+              "is_display": false,
+              "is_locked": false,
+              "op_id": "<ULID>"
+            }
+          ]
+        },
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 0,
+          "redacted_locked_count": 0,
+          "sync_state": "conflict_present"
+        },
+        "ok": true
+      },
+      "name": "get_conflict"
+    },
+    {
+      "exit_code": 0,
+      "name": "get_conflict_raw",
+      "raw": "omarchy concurrent edit",
+      "stderr_mentions_2_versions": true
+    },
+    {
+      "exit_code": 4,
+      "json": {
+        "data": null,
+        "error": {
+          "code": "CONFLICT_PRESENT",
+          "hint": "<HINT>",
+          "message": "<MESSAGE>",
+          "retryable": false
+        },
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 0,
+          "redacted_locked_count": 0,
+          "sync_state": "conflict_present"
+        },
+        "ok": false
+      },
+      "name": "append_conflict"
+    },
+    {
+      "exit_code": 0,
+      "json": {
+        "data": {
+          "block_id": "<ULID>",
+          "buffer_id": "<ULID>",
+          "head_op_ids": [
+            "<ULID>"
+          ],
+          "op_id": "<ULID>"
+        },
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 1,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": true
+      },
+      "name": "merge_update"
+    },
+    {
+      "exit_code": 0,
+      "json": {
+        "data": {
+          "buffer_id": "<ULID>",
+          "content": "merged final content",
+          "display_op_id": "<ULID>",
+          "has_conflict": false,
+          "has_unlocked_concurrent_version": false,
+          "head_op_ids": [
+            "<ULID>"
+          ],
+          "id": "<ULID>",
+          "is_locked": false,
+          "lang": "text",
+          "position": "<POSITION>",
+          "public_hint": null,
+          "redacted": false,
+          "updated_at_ms": "<MS>",
+          "versions": [
+            {
+              "actor": "human",
+              "content": "merged final content",
+              "device_id": "<DEVICE_ID>",
+              "hlc": "<HLC>",
+              "is_display": true,
+              "is_locked": false,
+              "op_id": "<ULID>"
+            }
+          ]
+        },
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 1,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": true
+      },
+      "name": "get_after_merge"
+    }
+  ]
+}

@@ -1,0 +1,73 @@
+{
+  "db_active_blocks": 2,
+  "scenario": "G01",
+  "steps": [
+    {
+      "exit_code": 0,
+      "json": {
+        "data": {
+          "block_id": "<ULID>",
+          "buffer_id": "<ULID>",
+          "head_op_ids": [
+            "<ULID>"
+          ],
+          "op_id": "<ULID>"
+        },
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 2,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": true
+      },
+      "name": "add_arg"
+    },
+    {
+      "exit_code": 0,
+      "json": {
+        "data": {
+          "block_id": "<ULID>",
+          "buffer_id": "<ULID>",
+          "head_op_ids": [
+            "<ULID>"
+          ],
+          "idempotent_replay": true,
+          "op_id": "<ULID>"
+        },
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 2,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": true
+      },
+      "name": "add_idempotent_replay"
+    },
+    {
+      "exit_code": 0,
+      "json": {
+        "data": {
+          "block_id": "<ULID>",
+          "buffer_id": "<ULID>",
+          "head_op_ids": [
+            "<ULID>"
+          ],
+          "op_id": "<ULID>"
+        },
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 3,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": true
+      },
+      "name": "add_stdin"
+    }
+  ]
+}

@@ -1,0 +1,88 @@
+{
+  "scenario": "G10",
+  "steps": [
+    {
+      "exit_code": 5,
+      "name": "get_raw_locked",
+      "stdout_empty": true,
+      "zero_canary": true
+    },
+    {
+      "exit_code": 5,
+      "json": {
+        "data": null,
+        "error": {
+          "code": "BLOCK_LOCKED",
+          "hint": "<HINT>",
+          "message": "<MESSAGE>",
+          "retryable": false
+        },
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 3,
+          "redacted_locked_count": 1,
+          "sync_state": "pending_offline"
+        },
+        "ok": false
+      },
+      "name": "get_decrypt_non_tty"
+    },
+    {
+      "exit_code": 0,
+      "json": {
+        "data": {
+          "buffer_id": "<ULID>",
+          "content": null,
+          "display_op_id": "<ULID>",
+          "has_conflict": false,
+          "has_unlocked_concurrent_version": false,
+          "head_op_ids": [
+            "<ULID>"
+          ],
+          "id": "<ULID>",
+          "is_locked": true,
+          "lang": "text",
+          "position": "<POSITION>",
+          "public_hint": "api key",
+          "redacted": true,
+          "updated_at_ms": "<MS>",
+          "versions": [
+            {
+              "actor": "human",
+              "content": null,
+              "device_id": "<DEVICE_ID>",
+              "hlc": "<HLC>",
+              "is_display": true,
+              "is_locked": true,
+              "op_id": "<ULID>"
+            }
+          ]
+        },
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 3,
+          "redacted_locked_count": 1,
+          "sync_state": "pending_offline"
+        },
+        "ok": true
+      },
+      "name": "get_meta_redacted"
+    },
+    {
+      "exit_code": 0,
+      "json": {
+        "data": [],
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 3,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": true
+      },
+      "name": "search_canary"
+    }
+  ]
+}

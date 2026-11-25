@@ -1,0 +1,168 @@
+{
+  "scenario": "G08",
+  "steps": [
+    {
+      "exit_code": 0,
+      "json": {
+        "data": {
+          "block_id": "<ULID>",
+          "buffer_id": "<ULID>",
+          "head_op_ids": [
+            "<ULID>"
+          ],
+          "in_trash": true,
+          "op_id": "<ULID>",
+          "shred_not_before_ms": null,
+          "shred_state": "pending_sync"
+        },
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 3,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": true
+      },
+      "name": "block_delete"
+    },
+    {
+      "exit_code": 3,
+      "json": {
+        "data": null,
+        "error": {
+          "code": "IN_TRASH",
+          "details": {
+            "deleted_at_ms": "<MS>",
+            "shred_not_before_ms": null
+          },
+          "hint": "<HINT>",
+          "message": "<MESSAGE>",
+          "retryable": false
+        },
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 3,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": false
+      },
+      "name": "get_in_trash"
+    },
+    {
+      "exit_code": 0,
+      "json": {
+        "data": [
+          {
+            "actor": "human",
+            "buffer_id": "<ULID>",
+            "buffer_name": "scratch",
+            "deleted_at_ms": "<MS>",
+            "deleted_by_device": "<DEVICE_ID>",
+            "id": "<ULID>",
+            "is_locked": false,
+            "preview": null,
+            "shred_not_before_ms": null,
+            "shred_state": "pending_sync"
+          }
+        ],
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 3,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": true
+      },
+      "name": "trash_ls"
+    },
+    {
+      "exit_code": 2,
+      "json": {
+        "data": null,
+        "error": {
+          "code": "UI_CONFIRMATION_REQUIRED",
+          "hint": "<HINT>",
+          "message": "<MESSAGE>",
+          "retryable": false
+        },
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 0,
+          "redacted_locked_count": 0,
+          "sync_state": "unconfigured"
+        },
+        "ok": false
+      },
+      "name": "trash_empty_refused"
+    },
+    {
+      "exit_code": 2,
+      "json": {
+        "data": null,
+        "error": {
+          "code": "UI_CONFIRMATION_REQUIRED",
+          "hint": "<HINT>",
+          "message": "<MESSAGE>",
+          "retryable": false
+        },
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 0,
+          "redacted_locked_count": 0,
+          "sync_state": "unconfigured"
+        },
+        "ok": false
+      },
+      "name": "trash_expedite_refused"
+    },
+    {
+      "exit_code": 2,
+      "json": {
+        "data": null,
+        "error": {
+          "code": "UI_CONFIRMATION_REQUIRED",
+          "hint": "<HINT>",
+          "message": "<MESSAGE>",
+          "retryable": false
+        },
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 0,
+          "redacted_locked_count": 0,
+          "sync_state": "unconfigured"
+        },
+        "ok": false
+      },
+      "name": "trash_confirm_refused"
+    },
+    {
+      "exit_code": 2,
+      "name": "trash_empty_tty_exit_code"
+    },
+    {
+      "exit_code": 0,
+      "json": {
+        "data": {
+          "block_id": "<ULID>",
+          "buffer_id": "<ULID>",
+          "head_op_ids": [
+            "<ULID>"
+          ],
+          "op_id": "<ULID>"
+        },
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 4,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": true
+      },
+      "name": "trash_restore"
+    }
+  ]
+}

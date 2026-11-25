@@ -13,7 +13,7 @@
 
 - [`seeds/regression_seeds.txt`](./seeds/regression_seeds.txt) — Shrunk deterministic `SimCluster` `u64` seeds replayed on every commit (Tier 0/1)。同步核心 DST 与针对 workerd / miniflare 真实 Worker 的契约测试共用这些场景（F-12）；依赖已移除机制的种子以 `# RETIRED` 注释保留、不再回放。
 - `fixtures/` — Dirty Heynote `∞∞∞` migration samples and XSS / `<foreignObject>` payload vectors（供导入差分、格式化幂等与渲染安全测试使用）。
-- `golden/`（M1 新增，尚未创建）— 约 10 个 CLI 黄金测试场景：断言 `--json` 输出结构、退出码与错误码；取代 Plane B「Agent 能否正确使用 CLI」的目标。
+- [`golden/`](./golden/) — 11 个 CLI 黄金测试场景（`G01`–`G11`）及冻结规范化快照（[`snapshots/`](./golden/snapshots/)）与统一运行脚本 [`run_golden.sh`](./golden/run_golden.sh)：在隔离 `HOME`/`XDG_*`/`MYNOTE_DATA_DIR` 环境中断言 `--json` 输出结构、退出码、错误码、数据库终态、L1–L3 `--help` 非空与 `skill/SKILL.md < 250 tokens` 预算；取代 Plane B「Agent 能否正确使用 CLI」的目标。运行方式：`cargo build --bin mynote && ./evals/golden/run_golden.sh`。
 - `reports/` — Archived milestone gate results.
 
 门禁的完整清单（属性测试、DST、真实 Worker 契约测试、INV-RECOVERY、INV-KEY-LIVENESS / INV-SHRED-BOUND / INV-GRACE、SEC 取证、格式化幂等、CLI 黄金测试、可选信封 fuzz、macOS + Linux CI）以 [`docs/eval-framework.md`](../docs/eval-framework.md) 为单一事实来源，此处不重复定义。

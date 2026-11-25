@@ -1,0 +1,53 @@
+{
+  "scenario": "G03",
+  "steps": [
+    {
+      "exact_bytes_utf8": "{\"k\":\"v\",\"emoji\":\"🚀\",\"lines\":\"a\\nb\"}",
+      "exit_code": 0,
+      "name": "get_raw",
+      "stderr_empty": true
+    },
+    {
+      "exit_code": 0,
+      "json": {
+        "data": {
+          "buffer_id": "<ULID>",
+          "content": "{\"k\":\"v\",\"emoji\":\"🚀\",\"lines\":\"a\\nb\"}",
+          "display_op_id": "<ULID>",
+          "has_conflict": false,
+          "has_unlocked_concurrent_version": false,
+          "head_op_ids": [
+            "<ULID>"
+          ],
+          "id": "<ULID>",
+          "is_locked": false,
+          "lang": "json",
+          "position": "<POSITION>",
+          "public_hint": null,
+          "redacted": false,
+          "updated_at_ms": "<MS>",
+          "versions": [
+            {
+              "actor": "human",
+              "content": "{\"k\":\"v\",\"emoji\":\"🚀\",\"lines\":\"a\\nb\"}",
+              "device_id": "<DEVICE_ID>",
+              "hlc": "<HLC>",
+              "is_display": true,
+              "is_locked": false,
+              "op_id": "<ULID>"
+            }
+          ]
+        },
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 2,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": true
+      },
+      "name": "get_json"
+    }
+  ]
+}

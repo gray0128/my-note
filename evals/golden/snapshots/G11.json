@@ -1,0 +1,87 @@
+{
+  "scenario": "G11",
+  "steps": [
+    {
+      "exit_code": 7,
+      "json": {
+        "data": null,
+        "error": {
+          "code": "FORMAT_SYNTAX_ERROR",
+          "hint": "<HINT>",
+          "message": "<MESSAGE>",
+          "retryable": false
+        },
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 0,
+          "redacted_locked_count": 0,
+          "sync_state": "unconfigured"
+        },
+        "ok": false
+      },
+      "name": "format_stdin_broken"
+    },
+    {
+      "exit_code": 7,
+      "json": {
+        "data": null,
+        "error": {
+          "code": "FORMAT_SYNTAX_ERROR",
+          "hint": "<HINT>",
+          "message": "<MESSAGE>",
+          "retryable": false
+        },
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 2,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": false
+      },
+      "name": "format_inplace_broken"
+    },
+    {
+      "json": {
+        "data": {
+          "buffer_id": "<ULID>",
+          "content": "{\"broken\": ",
+          "display_op_id": "<ULID>",
+          "has_conflict": false,
+          "has_unlocked_concurrent_version": false,
+          "head_op_ids": [
+            "<ULID>"
+          ],
+          "id": "<ULID>",
+          "is_locked": false,
+          "lang": "json",
+          "position": "<POSITION>",
+          "public_hint": null,
+          "redacted": false,
+          "updated_at_ms": "<MS>",
+          "versions": [
+            {
+              "actor": "human",
+              "content": "{\"broken\": ",
+              "device_id": "<DEVICE_ID>",
+              "hlc": "<HLC>",
+              "is_display": true,
+              "is_locked": false,
+              "op_id": "<ULID>"
+            }
+          ]
+        },
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 2,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": true
+      },
+      "name": "block_unchanged",
+      "ops_delta": 0
+    }
+  ]
+}

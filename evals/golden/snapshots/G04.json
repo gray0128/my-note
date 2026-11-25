@@ -1,0 +1,38 @@
+{
+  "scenario": "G04",
+  "steps": [
+    {
+      "exit_code": 4,
+      "json": {
+        "data": null,
+        "error": {
+          "code": "HEAD_MISMATCH",
+          "details": {
+            "actual_heads": [
+              "<ULID>"
+            ],
+            "expected_heads": [
+              "<ULID>"
+            ]
+          },
+          "hint": "<HINT>",
+          "message": "<MESSAGE>",
+          "retryable": true
+        },
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 2,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": false
+      },
+      "name": "stale_update"
+    },
+    {
+      "name": "content_unchanged",
+      "ops_delta": 0,
+      "raw": "original precious note"
+    }
+  ]
+}
