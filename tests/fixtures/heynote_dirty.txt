@@ -1,0 +1,32 @@
+﻿First block before any delimiter with UTF-8 BOM & CRLF
+Line 2 with emoji 🚀 and 中文内容
+∞∞∞json-a
+{
+  "service": "my-note",
+  "escaped": "contains ∞∞∞ inside a string literal — NOT a delimiter!",
+  "items": [1, 2, 3]
+}
+∞∞∞sql
+SELECT id, name FROM buffers WHERE state = 'ACTIVE';
+-- trailing blank lines follow intentionally
+
+
+∞∞∞
+Plain block with empty language specifier
+  indented ∞∞∞python should stay literal inside this block
+∞∞∞markdown
+# Heading
+
+| 名称 | 状态 |
+| --- | --- |
+| 中文 | ✅ |
+
+```text
+fenced code with ∞∞∞ inline
+```
+∞∞∞rust-a
+fn main() {
+    println!("Heynote 2.x -a auto-format flag normalized!");
+}
+∞∞∞custom-unknown-lang
+preserved unknown language token verbatim

@@ -1,6 +1,6 @@
 # 轻量级多端可靠同步开发者笔记软件：深度调研与架构方案
 
-> 2026-11-24 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D7 更新。
+> 2026-11-25 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D7 及 2026-11-25 真机实测拍板（D5′ 移除 macOS Tauri 薄壳 + S0-3 iPhone Argon2id 定值 `(32768, 2, 1)`）更新。
 
 > **定位**：面向开发者的高频临时记录 / Scratchpad 工具，继承 Heynote「多语言分块 + 一键格式化」的顺手体验，从架构根源消除同步丢数问题，原生适配 **macOS**、**Omarchy（Arch + Hyprland）** 与 **移动端（只读 + 复制 + Vault 解锁）**，并兼顾**块级加密**、**Markdown/Mermaid 渲染**与 **CLI + Skill（Agent 友好）**。
 >
@@ -44,7 +44,7 @@
 按不可逆程度排序（来自审查 §1.2，已按 D1、D4、D7 修订）：
 
 - **G1 永不静默丢数**：涵盖同步 bug、**丢钥匙**、误操作、平台驱逐、逻辑 bug 扩散。
-- **G2 随手即记、随叫随到**：热键唤出 < 100 ms [目标]，CLI 秒回。
+- **G2 随手即记、随叫随到**：CLI 本地读写 `< 15 ms` [目标]；桌面统一通过浏览器 / Web App（Omarchy Hyprland 键绑定 / macOS 系统级切窗工具或 `mynote open`）直达常驻本地页面。
 - **G3 多端可得**：桌面之间实时同步；**手机能读、能复制，并能解锁 Vault**（D1、D7）。
 - **G4 秘密不落明文、不以明文进云端。**
 - **G5 Agent 可读写**（通过 CLI）。
@@ -64,9 +64,9 @@
 
 ### 0.3 成功指标
 
-- **M1 准出**：Mac 与 Omarchy 日常使用连续 4 周零丢数；Heynote（及其 iCloud 目录）已卸载；热键唤出实测 < 100 ms；[`eval-framework.md`](./eval-framework.md) 中的质量门禁全部通过。
+- **M1 准出**：Mac 与 Omarchy 双桌面（纯 CLI + Daemon + HTML，D5′）日常使用连续 4 周零丢数；Heynote（及其 iCloud 目录）已卸载；[`eval-framework.md`](./eval-framework.md) 中的质量门禁全部通过。
 - **可恢复性**：INV-RECOVERY（零设备 + 恢复包 + 本地导出的 R2 归档目录 → 恢复全部已归档未删除数据）在 CI 中持续通过。
-- **M2 准出**：iPhone 单次 Vault 解锁约 1–2 s [目标]；手机端 SEC 取证（IndexedDB / Cache Storage 无明文与 VKEK）与自动上锁测试通过。
+- **M2 准出**：iPhone 单次 Vault 解锁约 1–2 s（S0-3 真机已测 `(32768, 2, 1)` = `1553 ms` [已测]）；手机端 SEC 取证（IndexedDB / Cache Storage 无明文与 VKEK）与自动上锁测试通过。
 - **成本与复杂度**：月账单约 \$5 [估算]、支出告警未触发；代码量在 C1 预算内。
 
 ### 0.4 数据可移植性
@@ -175,10 +175,9 @@ Heynote（Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js）将每个 Buffe
 - **真实诉求**：不要被框架教条束缚，关键是跨 **macOS + Omarchy + 移动端** 好用、省心、维护成本低。
 - **架构挑战 1A — 真正的分水岭不是「GUI vs 网页」，而是「桌面本地二进制 vs 移动端沙盒」**：
   - 无论选 Rust 原生 GUI（GPUI / egui / Slint）还是桌面单二进制，都**无法直接作为本地守护进程跑在 iOS 上**。如果桌面做原生 GUI、iOS 做 SwiftUI、Android 做 Kotlin，个人维护三套编辑器和格式化 UI 会直接拖垮项目。
-- **架构挑战 1B — 慎选 Tauri v2 作为 Omarchy 主力 GUI（但 macOS 用 Tauri 薄壳）**：
-  - Tauri v2 在 Linux 下底层依赖 **WebKitGTK**。在 Arch Linux + Hyprland（Wayland）环境下（尤其配合高分屏分数缩放或 NVIDIA 显卡），WebKitGTK 长期存在黑屏/白屏、渲染卡顿、焦点键（如 `Shift+Tab`）被吞掉等顽疾。
-  - 反观 **Omarchy 的原生工作流**：Omarchy 一等公民支持 **Chromium Web App（`omarchy-launch-webapp`）**、**Hyprland Special Workspace Scratchpad（`SUPER + S` 一键呼出/隐藏）** 与终端 TUI。因此，**「本地单二进制后台守护进程 + 内嵌 Web UI」**在 Omarchy 上反而是兼容坑最少的原生级体验：Hyprland 键绑定直接唤出 / 聚焦 Chromium webapp 即可。
-  - **macOS 则不同**：浏览器 App Mode 无法注册全局热键，而 Tauri 在 macOS 上用的是 WKWebView（没有 WebKitGTK 的问题）。因此 **M1 就采用「macOS Tauri 壳 + 全局快捷键插件」**（D5），两端加载同一份内嵌前端资源。
+- **架构挑战 1B — 双桌面统一纯「CLI + 本地 Daemon + 内嵌 HTML」，不引入原生 GUI / Tauri 薄壳（D5′）**：
+  - Tauri v2 在 Linux 下底层依赖 **WebKitGTK**，在 Arch Linux + Hyprland（Wayland）下长期存在缩放、渲染与快捷键顽疾；而在 macOS 上仅为了内置一条全局热键引入 Tauri 壳，也会带来 450+ crate 依赖、remote origin ACL、`AppManifest`、`.app` 打包、Gatekeeper 解除与跨二进制 Keychain ACL 等额外维护成本（详见 [`s0-2-macos-tauri-shell.md`](./spikes/s0-2-macos-tauri-shell.md)）。
+  - 2026-11-25 真机实测评估后拍板 **D5′**：**放弃 macOS Tauri 薄壳**，macOS 与 Omarchy 100% 统一为单一 `mynote` 二进制（CLI + 后台 Daemon + `rust-embed` 内嵌 Web UI），统一经浏览器 / Web App 访问 `http://localhost:<port>`（Omarchy 用 Hyprland 键绑定唤出 Chromium webapp；macOS 用浏览器固定标签页或 Chrome/Safari Web App 配合系统级快捷键工具 / `mynote open`）。
 - **架构挑战 1C — 移动端 PWA 的两个隐藏暗坑，及「手机只读」如何化解（D1）**：
   1. **iOS Safari / WebKit 存储驱逐**：在磁盘压力或长期未打开情况下，WebKit 仍可能清理 IndexedDB。手机第一版**只读 + 复制**，不持有任何未上传数据，被驱逐的后果只是「下次打开重新下载」，不再是丢数风险。
   2. **iOS PWA 不支持真正的后台同步（Background Sync API）**：切后台后 Service Worker 会被挂起。只读客户端只需在回到前台（`visibilitychange` / `pageshow`）时拉取最新状态，无需后台推送。
@@ -211,7 +210,7 @@ Heynote（Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js）将每个 Buffe
     - **无头后台守护态（未打开窗口，仅维持 CLI 唤醒与后台同步）**：`< 15–20 MB` [目标]（Electron 即使关窗驻留托盘仍占百兆以上）；
     - **打开 Web UI 窗口态**：复用系统已驻留浏览器主进程时渲染器增量约 `40–80 MB`（冷起独立浏览器 App Mode 进程组约 `120–200 MB`）[估算]，关闭窗口后释放。
   - CLI 单次命令耗时：`< 15 ms` [目标]（直写本地 SQLite WAL，Daemon 未启动亦可独立完成）
-  - 界面唤出延迟：`< 100 ms` [目标]（Omarchy：Hyprland 键绑定聚焦 Chromium webapp；macOS：Tauri 壳常驻隐藏窗口 + 全局热键只做显示 + 聚焦；M1 准出须实测）
+  - 界面唤出方式（D5′）：Omarchy 通过 Hyprland 键绑定聚焦常驻 Chromium webapp（`< 100 ms` [目标]）；macOS 通过浏览器固定标签页 / Web App 配合外部桌面热键工具（Raycast / Hammerspoon / Karabiner）或 `mynote open` 直达，不维护独立 GUI 壳。
   - 云端同步服：Cloudflare Workers + SQLite Durable Object + R2（或逃生舱单二进制 + SQLite），**Workers Paid 约 \$5/月** [估算]，并配置 Spend Management 支出告警（D4）
 - **架构挑战 3B — 同步引擎不要过度设计成「重型分布式系统」**：
   - 不要引入 CouchDB、Anytype 多节点、RabbitMQ/Redis 或复杂 P2P NAT 穿透。
@@ -268,16 +267,16 @@ Heynote（Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js）将每个 Buffe
 
 ## 4. 推荐系统架构设计蓝图
 
-综合以上调研与决策，推荐采用 **「Local-First Sans-I/O 核心（CLI + Skill + 内嵌 Web）+ macOS Tauri 薄壳 / Omarchy Chromium webapp + 手机只读 PWA + Cloudflare 盲中继追加日志同步」** 架构。
+综合以上调研与决策，推荐采用 **「Local-First Sans-I/O 核心（单二进制 CLI + Daemon + 内嵌 Web UI）+ 手机只读 PWA + Cloudflare 盲中继追加日志同步」** 架构。
 
 ### 4.1 整体架构图
 
 ```mermaid
 flowchart TD
-    subgraph Desktop["桌面端 (macOS / Omarchy Arch+Hyprland)"]
+    subgraph Desktop["桌面端 (macOS / Omarchy Arch+Hyprland 统一形态)"]
         Agent["本地 AI Agent (Claude Code / Codex / OpenCode)"]
         CLI["mynote CLI + SKILL.md (四级渐进帮助 / --json / 管道)"]
-        Shell["macOS: Tauri 壳 + 全局热键 / Omarchy: Hyprland 绑定 Chromium webapp"]
+        Browser["本地浏览器 / Web App (Omarchy Hyprland 绑定 / macOS 系统切窗或 mynote open)"]
         UI_D["桌面本地内嵌 UI (CM6 + 本地 WASM 解密)"]
         Daemon["mynote 单体二进制 Daemon (Rust, 不持有 Tier 2 明文)"]
         DB_L[("本地 SQLite (WAL + FTS5 + secure_delete, 单写入方)")]
@@ -288,7 +287,7 @@ flowchart TD
         Agent -->|"Shell + SKILL.md"| CLI
         CLI -->|"Daemon 运行时: 0600 UDS apply"| Daemon
         CLI -.->|"Daemon 未起时: 直写 WAL (只读始终直连 WAL)"| DB_L
-        Shell -->|"显示 + 聚焦"| UI_D
+        Browser -->|"http://localhost:<port>"| UI_D
         UI_D <-->|"localhost HTTP/WS (Host+Origin+HttpOnly Cookie)"| Daemon
         Daemon <--> DB_L
         Daemon -->|"单向投影 (跳过加密块)"| Mirror
@@ -320,10 +319,10 @@ flowchart TD
 
 ### 4.2 为什么这套架构契合目标？
 
-1. **一套前端覆盖桌面与手机，规避 WebKitGTK 坑，桌面不加载远端代码**：
-   - 前端基于 **CodeMirror 6 + Pele 纯 SVG + 极简响应式框架（SolidJS / Svelte 5 / Preact）**，打包后通过 `rust-embed` 内嵌进桌面单体二进制（不加载远端代码）。
-   - **Omarchy**：systemd user service 运行 `mynote daemon`，Hyprland 键绑定唤出 / 聚焦 Chromium webapp（可放入 Special Workspace），原生 Wayland 渲染，不依赖 WebKitGTK。
-   - **macOS**：**Tauri 壳（WKWebView）+ 全局快捷键插件，M1 必备**（D5）；窗口常驻隐藏，热键只做「显示 + 聚焦」、不重新加载页面，目标唤出 < 100 ms [目标]。壳内嵌 Daemon 还是拉起独立 Daemon 由 S0 决定；无论哪种，CLI 都必须在 UI 未打开时独立工作，SQLite 只有一个写入方。
+1. **一套前端覆盖双桌面与手机，零独立 GUI 壳，桌面不加载远端代码（D5′）**：
+   - 前端基于 **CodeMirror 6 + Pele 纯 SVG + 极简响应式框架（SolidJS / Svelte 5 / Preact）**，打包后通过 `rust-embed` 内嵌进桌面单体 `mynote` 二进制（不加载远端代码）。
+   - **Omarchy**：`systemd --user` 托管 `mynote daemon`，Hyprland 键绑定唤出 / 聚焦 Chromium webapp（可放入 Special Workspace），原生 Wayland 渲染，不依赖 WebKitGTK。
+   - **macOS**：与 Omarchy 完全一致，由 `launchd` LaunchAgent（或 `brew services`）托管同一个 `mynote daemon`，浏览器 / Web App 直接访问 `http://localhost:<port>`（无需 Tauri 壳、无需独立 `.app` 打包，全局只有一个 `mynote` 二进制接触 Keychain；UI 未打开时 CLI 照常独立读写）。
    - **手机**：访问自有域名 Workers Static Assets 托管的**只读 PWA**：查看、复制、解锁 Vault（D1、D7）；不编辑、不追加，因此没有 outbox、冲突合并 UI 与移动端编辑器，IndexedDB 被驱逐的后果只是下次重新下载。
 2. **结构性防丢 + 双层加密**：本地 SQLite WAL + 防空 `UPDATE` 类型门禁 + 多叶子并列（所有版本保留）+ 完整历史与 R2 永久 op 归档，配合每块数据密钥、受控碎纸与客户端内存级 Tier 2 解密。
 3. **Agent 友好（零 MCP 负担）**：完备的 `CLI + SKILL.md` + 四级渐进披露帮助 + 离线友好的稳定退出码契约 + 默认开启的只读 Markdown 镜像。
@@ -591,7 +590,7 @@ flowchart LR
 #### 3. Agent-Native CLI 工程契约（比 `--help` 更关键的 6 条硬规范）
 
 1. **单写入方本地存储 + 统一结构化输出信封（`--json`）**：
-   - 读命令始终直接读取本地 SQLite WAL；写命令在 Daemon 运行时经 `0600` Unix Socket `apply` 转交 Daemon 执行，**后台 Daemon 未启动时则由 CLI 直接以短事务写 SQLite WAL 独立完成**（单次命令 `< 15 ms` [目标]，协议见 [`interface-contracts.md` §3.0](./interface-contracts.md#30-进程模型daemonmacos-tauri-壳与-cli)）。
+   - 读命令始终直接读取本地 SQLite WAL；写命令在 Daemon 运行时经 `0600` Unix Socket `apply` 转交 Daemon 执行，**后台 Daemon 未启动时则由 CLI 直接以短事务写 SQLite WAL 独立完成**（单次命令 `< 15 ms` [目标]，协议见 [`interface-contracts.md` §3.0](./interface-contracts.md#30-进程模型daemon-与-cli)）。
    - 带 `--json` 时，stdout 永远是合法单条 JSON（日志/警告只走 stderr，精确字段见 [`interface-contracts.md` §2](./interface-contracts.md#2-cli-全子命令参数与机读输出契约agent-first)）：
      ```json
      {
@@ -691,7 +690,6 @@ my-note/
 │   ├── mynote-wasm/           # wasm-bindgen 封装 (复用 mynote-core 供桌面 Web UI Tier2 解密与手机只读 PWA 解密 / Vault 解锁使用)
 │   ├── mynote-store/          # 桌面端 SQLite WAL + FTS5 + secure_delete 持久化适配 (rusqlite)
 │   └── mynote-cli/            # 单体二进制入口 (CLI + Heynote导入 + 守护进程 Daemon + rust-embed 本地 WebUI)
-├── shell-macos/               # macOS Tauri 薄壳 (WKWebView + 全局快捷键插件，加载同一份前端资源)
 ├── web/                       # TypeScript 前端：桌面编辑 UI (CM6) + Markdown/Pele 预览层 + 手机只读 PWA (IndexedDB 只读缓存)
 ├── cloud-cf/                  # Cloudflare Worker (极薄中继 + SQLite DO + WS Hibernation + R2 + Static Assets)
 ├── skill/
@@ -704,8 +702,8 @@ my-note/
 
 | 方案 | macOS 体验 | Omarchy (Arch + Hyprland) 体验 | 移动端复用 | 真实资源开销（双态口径） | 综合评价 |
 | --- | --- | --- | :---: | --- | --- |
-| **方案 1：本地 Daemon + 内嵌 Web UI（推荐）+ macOS Tauri 薄壳** | 佳（**Tauri 壳 = WKWebView + 全局快捷键插件，M1 必备**；窗口常驻隐藏，热键只做显示 + 聚焦） | **极佳**（Hyprland 键绑定唤出 / 聚焦 `omarchy-launch-webapp` Chromium webapp，可放入 Special Workspace） | 渲染层复用（手机只读 PWA） | 关窗后台 `<20MB` [目标]；开窗复用浏览器增量 `~40–80MB`（独立实例 `120–200MB`）[估算] | **推荐**：两端加载同一份前端资源，桌面不加载远端代码 |
-| **方案 2：Tauri v2 作为全平台主力（macOS + Linux + Mobile）** | 极佳（WKWebView，包小） | **较差（高风险）**（WebKitGTK 在 Wayland/Hyprland 下图形/缩放/快捷键坑多） | 中（移动端调试构建重） | 轻（但 Linux 强依赖系统 webkit2gtk） | 只在 macOS 上作为薄壳采用（并入方案 1）；Linux 不用 |
+| **方案 1：本地 Daemon + 内嵌 Web UI（双桌面统一，已选定 D5′）** | 极简（同一 `mynote` 单二进制；浏览器 / Web App 访问 `http://localhost:<port>`，可配 Raycast/Hammerspoon 切窗；零 `.app` 打包与跨二进制 Keychain ACL） | **极佳**（Hyprland 键绑定唤出 / 聚焦 `omarchy-launch-webapp` Chromium webapp，可放入 Special Workspace） | 渲染层复用（手机只读 PWA） | 关窗后台 `<20MB` [目标]；开窗复用浏览器增量 `~40–80MB`（独立实例 `120–200MB`）[估算] | **推荐（已拍板）**：双桌面零分支，均加载本地内嵌 HTML，永不加载远端代码 |
+| **方案 2：Tauri v2（全平台或仅 macOS 薄壳）** | 需额外维护 450+ crate、remote origin ACL、`AppManifest`、`.app` 签名与 Gatekeeper 解除 | **较差（高风险）**（WebKitGTK 在 Wayland/Hyprland 下图形/缩放/快捷键坑多） | 中（移动端调试构建重） | 轻（但维护面大） | **已淘汰（D5′）**：2026-11-25 实测评估后决定不引入任何 Tauri 壳 |
 | **方案 3：原生 Rust GUI（GPUI / egui / Slint）** | 极佳（极致丝滑） | 极佳（原生 Wayland） | **0% 复用**（移动端需重写全部编辑器与 UI） | 极轻 | 缺少 CodeMirror 6 级多语言代码编辑与图表生态，自研成本黑洞 |
 | **方案 4：Electron** | 良（同 Heynote） | 一般（Wayland 需 flag，全局热键受限） | 0% | **重（即使关窗驻留后台仍占 `150–250MB` + 200MB 磁盘包）** | 直接淘汰 |
 
@@ -733,23 +731,23 @@ flowchart LR
 ```
 
 ### S0：技术 spike（约 1–1.5 周 [估算]，每项限时）
-- [ ] **编辑器形态**：单 CM6 文档 + 原子化块边界装饰 vs 按块挂载 `EditorView`（F-11）。
-- [ ] **macOS Tauri 壳 + 全局热键 + Keychain 跨二进制 ACL 验证（必做，D5）**：热键到窗口可输入的延迟实测（目标 < 100 ms）；是否需要「辅助功能」等系统权限；壳与 Daemon 的关系（壳内嵌 Daemon 单进程，或拉起独立 Daemon——无论哪种，CLI 都必须能在 UI 未打开时独立工作，且 SQLite 只有一个写入方）；**实测 Tauri `.app` 与 Homebrew CLI 两个不同代码签名身份访问同一 macOS Keychain 条目（`SMK`）是否触发重复密码授权弹窗**（决定 Keychain 是否只由单一签名主体读写、CLI 经 `daemon.sock` 请求）；登录自启、签名与公证（个人自用可先不公证，但记录 Gatekeeper 的处理方式）。
-- [ ] **WASM**：桌面 WASM 体积；**iPhone 上 Argon2id WASM 的耗时与内存（D7）**，目标单次解锁约 1–2 s [目标]。
-- [ ] **CF Paid echo 中继**（约 100 行 [估算]）：令牌范围、WebSocket Hibernation、Spend Management 告警；顺带验证 DO alarm 定时置空密钥、R2 生命周期规则（D2′）。
+- [x] **编辑器形态（S0-1）**：完成候选 A vs 候选 B 双原型 Chromium 实测，选定**候选 A（视口虚拟化 + 按源码块挂载 `EditorView`）**，详见 [`docs/spikes/s0-1-editor-architecture.md`](./spikes/s0-1-editor-architecture.md)。
+- [x] **macOS 平台形态（S0-2，D5′）**：2026-11-25 真机实测 Tauri v2 脚手架后拍板**移除 macOS Tauri 薄壳**，双桌面 100% 统一为纯 `mynote` 单二进制（CLI + Daemon + 内嵌 HTML），详见 [`docs/spikes/s0-2-macos-tauri-shell.md`](./spikes/s0-2-macos-tauri-shell.md)。
+- [x] **WASM 与 iPhone 真机 Argon2id（S0-3，D7）**：WASM 体积基线与纯 Rust `ruzstd` 帧互通全部达标（手机 `71.5 KiB` / 桌面全功能 `260.4 KiB` gzip [已测]）；2026-11-25 iPhone 主屏 PWA 真机实测 7 组参数全部零 OOM，拍板 `VaultHeaderV1` 默认 KDF 为 **`(32768, 2, 1)`（`1553 ms` [已测]）**，否决原暂定 `(65536, 3, 1)`（`4812 ms`），详见 [`docs/spikes/s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md)。
+- [ ] **CF Paid echo 中继（S0-4）**：真实 `workerd` 验证全部通过（`297 LOC` TS、令牌范围、WS Hibernation、150-op 批次、DO Alarm 复用与 R2 双轨归档，详见 [`docs/spikes/s0-4-cloudflare-relay.md`](./spikes/s0-4-cloudflare-relay.md)）；真实 CF Paid 账号的 Spend Management 告警与 R2 30 天前缀生命周期待控制台核验回填。
 - 「γ vs β（Loro）」spike 已取消（D3）。
-- **产出**：每项一页结论；§8 中对应 ADR 据此由 Proposed 改为 Accepted 或 Rejected。
+- **产出**：4 份一页报告位于 `docs/spikes/s0-*.md`；§8 中已获完整实测证据的 ADR（`ADR-01`、`ADR-06`、`ADR-07`）已升级为 `Accepted`。
 
 ### M1：替换 Heynote + iCloud
-- [ ] **core**：块、全量载荷 op、在完整因果图 `G(b)` 上求叶子、多叶子并列 + 手动合并、字段 LWW、Update-Wins（[`sync-protocol.md`](./sync-protocol.md)）。
-- [ ] **每块数据密钥 BDEK + 信封带 `key_id` + 独立密钥表 `block_keys` / `key_material`（D2′ 不可逆线格式，必须在 M1 定型，服务端仅校验 `KEY_UNKNOWN`）**；删除走纯软删回收站（写 `DELETE` 墓碑 op，`shred_state = "unscheduled"`，随时可 `trash restore`，M1 4 周观察期内物理零删钥路径）。
-- [ ] SQLite 存储；CLI：`add` / `ls` / `block` / `buf` / `trash` / `search` / `format`（Layer 1）/ `sync` / `device` / `keyring` / `recovery` / `restore`；最小可用 UI；Heynote 导入。
-- [ ] **macOS Tauri 壳 + 全局热键；Omarchy 用 Hyprland 键绑定唤出 / 聚焦 Chromium webapp**；两端加载同一份前端资源。
-- [ ] Tier 1 E2EE 同步到 CF DO：push / pull / `/v1/keys` / `BOOTSTRAP_TOKEN` 首台引导 / 一次性配对与刷新 / epoch / WebSocket 唤醒（只发通知），**无手机快照、无 GC、云端代码 < 500 行 [目标]**。
-- [ ] R2 每日 op 密文归档（永久、只追加）+ 密钥表快照（每日覆写、不挂过期删除的 `latest.mnks` + 30 天生命周期的 `history/<yyyy-mm-dd>.mnks`）+ 纯离线 `mynote restore --from-archive <local-dir>`；本地 `VACUUM INTO` 自动备份（按 `T_snap` 轮换）+ 只读 Markdown 镜像（默认开启）。
-- [ ] 统一恢复包 + 恢复密钥环（公钥封装追加、旧 SMK 代际永久保留）+ `mynote recovery drill` + INV-RECOVERY + INV-KEY-LIVENESS + 密钥每日自检。
-- [ ] 质量门禁（[`eval-framework.md`](./eval-framework.md)）：属性测试、同步核心 DST、针对真实 Worker 的契约测试、CLI 黄金测试、macOS + Linux 双平台 CI；部署时配置 Spend Management 支出告警。
-- **准出条件**：上述门禁全部通过；热键唤出实测 < 100 ms；Mac 与 Omarchy 日常使用 4 周零丢数；Heynote 卸载。
+- [x] **core**：块、全量载荷 op、在完整因果图 `G(b)` 上求叶子、多叶子并列 + 手动合并、字段 LWW、Update-Wins（`crates/mynote-core`，见 [`sync-protocol.md`](./sync-protocol.md)）。
+- [x] **每块数据密钥 BDEK + 信封带 `key_id` + 独立密钥表 `block_keys` / `key_material`（D2′ 不可逆线格式，已在 M1 Day-1 定型，服务端仅校验 `KEY_UNKNOWN`）**；删除走纯软删回收站（写 `DELETE` 墓碑 op，`shred_state = "unscheduled"`，随时可 `trash restore`，M1 4 周观察期内物理零删钥路径）。
+- [ ] SQLite 存储；CLI：`add` / `ls` / `block` / `buf` / `trash` / `search` / `format`（Layer 1）/ `sync` / `device` / `keyring` / `recovery` / `restore`；最小可用 UI；Heynote 导入。（*进度：SQLite 存储 `mynote-store`、完整 `mynote` CLI + `skill/SKILL.md`、Layer 1/2 格式化与 Heynote 导入已完成并绿灯；待本地 Daemon 与最小可用桌面 UI*）
+- [ ] **双桌面统一形态（D5′）**：macOS（`launchd` LaunchAgent + 浏览器/WebApp）与 Omarchy（`systemd --user` + Hyprland 绑定 Chromium webapp）运行同一个 `mynote` 单体二进制，加载同一份内嵌前端资源（`http://localhost:<port>`）。
+- [ ] Tier 1 E2EE 同步到 CF DO：push / pull / `/v1/keys` / `BOOTSTRAP_TOKEN` 首台引导 / 一次性配对与刷新 / epoch / WebSocket 唤醒（只发通知），**无手机快照、无 GC、云端代码 < 500 行 [目标]**。（*进度：S0-4 `workerd` 原型已验证 `297 LOC` [已测]；待正式 `cloud-cf/` 落地*）
+- [ ] R2 每日 op 密文归档（永久、只追加）+ 密钥表快照（每日覆写、不挂过期删除的 `latest.mnks` + 30 天生命周期的 `history/<yyyy-mm-dd>.mnks`）+ 纯离线 `mynote restore --from-archive <local-dir>`；本地 `VACUUM INTO` 自动备份（按 `T_snap` 轮换）+ 只读 Markdown 镜像（默认开启）。（*进度：本地离线 `restore --from-archive`、`VACUUM INTO` 备份与只读 Markdown 镜像已完成；待云端 `cloud-cf/` 每日归档任务部署*）
+- [x] 统一恢复包 + 恢复密钥环（公钥封装追加、旧 SMK 代际永久保留）+ `mynote recovery drill` + INV-RECOVERY + INV-KEY-LIVENESS + 密钥每日自检。
+- [ ] 质量门禁（[`eval-framework.md`](./eval-framework.md)）：属性测试、同步核心 DST、针对真实 Worker 的契约测试、CLI 黄金测试、macOS + Linux 双平台 CI；部署时配置 Spend Management 支出告警。（*进度：属性测试、200 种子 DST + 回归种子集、`INV-RECOVERY`、CLI `G01–G11` 合约测试与双平台 CI `.github/workflows/ci.yml` 已就绪；待正式 `cloud-cf/` Worker 契约测试、独立 `[eval-only]` 黄金快照与 Spend Management 配置*）
+- **准出条件**：上述门禁全部通过；Mac 与 Omarchy 日常使用 4 周零丢数；Heynote 卸载。
 
 ### M2：手机只读 + Vault + 碎纸
 - [ ] **只读 PWA**：一次性领取配对（发起桌面本地生成令牌并用 `K_pair` 加密，PWA 内 `getUserMedia` 扫码或粘贴配对码，`mynote device add --scope read`）、轮换后 `device refresh` 10 分钟票据、`read` 范围设备令牌、「状态快照（含 `Active` + `Trashed`）+ 尾部 op」引导、多版本只读展示、每块复制按钮。
@@ -783,20 +781,20 @@ flowchart LR
 <a id="8-已最终拍板的架构决策基线adr-摘要"></a>
 
 > [!NOTE]
-> **状态：Proposed（2026-11-24）**。此前「已最终拍板 / 冻结」的表述作废。每条决策在 S0 spike 或对应里程碑给出证据后逐条改为 **Accepted**（或 Rejected 并回到本表修订）。实现细节以各专题文档为准：线格式 / AAD / 表结构 → [`data-structures.md`](./data-structures.md)；同步协议 → [`sync-protocol.md`](./sync-protocol.md)；安全承诺 → [`threat-model.md`](./threat-model.md)；云端实现 → [`cloudflare-cloud-architecture.md`](./cloudflare-cloud-architecture.md)；本地 API / CLI → [`interface-contracts.md`](./interface-contracts.md)；测试门禁 → [`eval-framework.md`](./eval-framework.md)。
+> **状态：按实测证据逐条转为 Accepted（2026-11-24）**。每条决策在 S0 spike 或对应里程碑给出实测证据后逐条改为 **Accepted**（或 Rejected 并回到本表修订）。实现细节以各专题文档为准：线格式 / AAD / 表结构 → [`data-structures.md`](./data-structures.md)；同步协议 → [`sync-protocol.md`](./sync-protocol.md)；安全承诺 → [`threat-model.md`](./threat-model.md)；云端实现 → [`cloudflare-cloud-architecture.md`](./cloudflare-cloud-architecture.md)；本地 API / CLI → [`interface-contracts.md`](./interface-contracts.md)；测试门禁 → [`eval-framework.md`](./eval-framework.md)。
 
-| # | 决策项 | 结论 | 依据 | 状态（待补证据） |
+| # | 决策项 | 结论 | 依据 | 状态（证据链接） |
 | --- | --- | --- | --- | --- |
-| ADR-01 | **核心状态机与存储** | Rust Sans-I/O `mynote-core`；桌面 `rusqlite`（SQLite 单写入方）；手机 IndexedDB 仅作只读缓存 | §6.1、D1 | Proposed（S0：桌面 WASM 体积） |
-| ADR-02 | **云端基础设施** | Cloudflare **Workers Paid**（约 \$5/月 [估算]）：单 Worker + SQLite DO + R2 + Static Assets；服务端极薄（幂等追加、分配 seq、按 seq 分页、epoch、令牌范围、WebSocket 唤醒、密钥表 / `key_material` / 碎纸标记存储 + 宽限期 / 批量阈值校验 + alarm 置空、每日归档，不暴露云端归档 HTTP 路由）；配置支出告警 | D4、F-12 | Proposed（S0：echo 中继） |
-| ADR-03 | **同步协议（路径 γ）** | 全量载荷 op；在完整因果图 `G(b)` 上求叶子，冲突 = 同块多存活叶子，并列展示 + 手动合并；HLC 只决定展示顺序；字段 LWW；Update-Wins；无 `SPAN_PATCH` / Lock-Wins / GC / 快照 CAS | D3 | Proposed（M1：DST + 属性测试 + 4 周实测） |
-| ADR-04 | **加密与密钥** | 每块 BDEK，信封只带 `key_id`；独立密钥表 `block_keys` + `key_material` + `shred_marks`（2P-Set）；统一恢复包 → Root Seed → X25519 恢复密钥对（设备只存公钥，SMK 代际 / VKEK 封装追加，旧 SMK 代际永久保留）；AAD 只在 `data-structures.md` 定义 | D2′、F-01、F-05 | Proposed（M1 线格式定型前评审；INV-RECOVERY、INV-KEY-LIVENESS） |
-| ADR-05 | **删除语义** | 删除优先、有界时延：M1 软删回收站，M2 启用服务端强制宽限期（`T_grace` = 7 天）+ 加密碎纸（仅服务端 `executed` 触发本地删钥）；彻底不可恢复上界约 37 天；op 密文永久保留 | D2′、Q7–Q9 | Proposed（S0：DO alarm、R2 生命周期；M2：INV-SHRED-BOUND、INV-GRACE） |
-| ADR-06 | **平台形态** | macOS：Tauri 壳 + 全局热键（M1 必备）；Omarchy：Hyprland 绑定 Chromium webapp；手机：只读 PWA + Vault 解锁；本地 UI 统一 `http://localhost:<port>` | D1、D5、D7、F-15 | Proposed（S0：热键 < 100 ms、Keychain ACL、iPhone Argon2id） |
-| ADR-07 | **编辑器与渲染** | CodeMirror 6（单文档 vs 按块挂载由 S0 决定）+ Markdown 双模 + `Pele` 纯 SVG | F-11 | Proposed（S0：编辑器 spike） |
-| ADR-08 | **Agent 集成** | 纯 CLI（Daemon 运行时 UDS `apply` / 未起时直写 WAL）+ 极轻 `SKILL.md`（L0–L3a，`--help-json` 推迟）；不做本地与云端 MCP；CLI 只能把块删进回收站 | §5.5、D2′ | Proposed（M1：CLI 黄金测试） |
-| ADR-09 | **分发与升级** | Homebrew tap / AUR / `cargo install`，二进制装在用户不可写位置；不做自升级；Schema 迁移前 `VACUUM INTO` 备份 | F-14、F-07 | Proposed |
-| ADR-10 | **质量保障** | 只保留 Plane A 确定性门禁（属性测试、DST、真实 Worker 契约测试、INV-RECOVERY、SEC 取证、格式化幂等、CLI 黄金测试、双平台 CI） | D6 | Proposed（M1） |
+| ADR-01 | **核心状态机与存储** | Rust Sans-I/O `mynote-core`（WASM 侧采用纯 Rust `ruzstd` + 关闭 `x25519` 预计算表）；桌面 `rusqlite`（SQLite 单写入方）；手机 IndexedDB 仅作只读缓存 | §6.1、D1 | **Accepted**（[`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md)：手机 `71.5 KiB` / 桌面全功能 `260.4 KiB` gzip [已测]；`mynote-core` + `mynote-store` 绿灯） |
+| ADR-02 | **云端基础设施** | Cloudflare **Workers Paid**（约 \$5/月 [估算]）：单 Worker + SQLite DO + R2 + Static Assets；服务端极薄（幂等追加、分配 seq、按 seq 分页、epoch、令牌范围、WebSocket 唤醒、密钥表 / `key_material` / 碎纸标记存储 + 宽限期 / 批量阈值校验 + alarm 置空、每日归档，不暴露云端归档 HTTP 路由）；配置支出告警 | D4、F-12 | Proposed（[`s0-4-cloudflare-relay.md`](./spikes/s0-4-cloudflare-relay.md)：`workerd` 3/3 绿灯、`297 LOC` [已测]；待真实 CF 账号补测 Spend Management） |
+| ADR-03 | **同步协议（路径 γ）** | 全量载荷 op；在完整因果图 `G(b)` 上求叶子，冲突 = 同块多存活叶子，并列展示 + 手动合并；HLC 只决定展示顺序；字段 LWW；Update-Wins；无 `SPAN_PATCH` / Lock-Wins / GC / 快照 CAS | D3 | Proposed（`mynote-core` 200 种子 DST + 回归种子集 + 属性测试绿灯 [已测]；待 M1 4 周真机实测） |
+| ADR-04 | **加密与密钥** | 每块 BDEK，信封只带 `key_id`；独立密钥表 `block_keys` + `key_material` + `shred_marks`（2P-Set）；统一恢复包 → Root Seed → X25519 恢复密钥对（设备只存公钥，SMK 代际 / VKEK 封装追加，旧 SMK 代际永久保留）；AAD 只在 `data-structures.md` 定义 | D2′、F-01、F-05 | Proposed（[`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md) + `INV-RECOVERY` / `INV-KEY-LIVENESS` / `SEC-04` 绿灯 [已测]；待真机联调闭环） |
+| ADR-05 | **删除语义** | 删除优先、有界时延：M1 软删回收站，M2 启用服务端强制宽限期（`T_grace` = 7 天）+ 加密碎纸（仅服务端 `executed` 触发本地删钥）；彻底不可恢复上界约 37 天；op 密文永久保留 | D2′、Q7–Q9 | Proposed（[`s0-4-cloudflare-relay.md`](./spikes/s0-4-cloudflare-relay.md)：DO alarm 置空 `workerd` [已测]；待真账号 R2 生命周期 & M2 INV-SHRED-BOUND / INV-GRACE） |
+| ADR-06 | **平台形态** | macOS 与 Omarchy 100% 统一为纯 `mynote` 单二进制（CLI + Daemon + 内嵌 HTML），放弃 macOS Tauri 薄壳；手机：只读 PWA + Vault 解锁（Argon2id 定值 `(32768, 2, 1)`）；本地 UI 唯一入口 `http://localhost:<port>` | D1、D5′、D7、F-15 | **Accepted**（[`s0-2-macos-tauri-shell.md`](./spikes/s0-2-macos-tauri-shell.md)：D5′ 去 Tauri 壳；[`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md)：iPhone 主屏 PWA 实测 `(32768, 2, 1)` = `1553 ms`、64 MiB 零 OOM [已测]） |
+| ADR-07 | **编辑器与渲染** | CodeMirror 6 **候选 A：视口虚拟化 + 按源码块独立挂载 `EditorView`** + Markdown 双模 + `Pele` 纯 SVG | F-11 | **Accepted**（[`s0-1-editor-architecture.md`](./spikes/s0-1-editor-architecture.md)：200 块虚拟化挂载 `31.7 ms`、打字 P50 `7.30 ms`、`266 LOC`，Vim `dG` 物理隔离 [已测]） |
+| ADR-08 | **Agent 集成** | 纯 CLI（Daemon 运行时 UDS `apply` / 未起时直写 WAL）+ 极轻 `SKILL.md`（L0–L3a，`--help-json` 推迟）；不做本地与云端 MCP；CLI 只能把块删进回收站 | §5.5、D2′ | Proposed（`mynote-cli` + `skill/SKILL.md` + `G01–G11` 合约测试绿灯 [已测]；待 UDS Daemon 联调与独立黄金快照） |
+| ADR-09 | **分发与升级** | Homebrew tap / AUR / `cargo install`，二进制装在用户不可写位置；不做自升级；Schema 迁移前 `VACUUM INTO` 备份 | F-14、F-07 | Proposed（`VACUUM INTO` 备份与 `SCHEMA_TOO_NEW` 守卫已测；待打包发布） |
+| ADR-10 | **质量保障** | 只保留 Plane A 确定性门禁（属性测试、DST、真实 Worker 契约测试、INV-RECOVERY、SEC 取证、格式化幂等、CLI 黄金测试、双平台 CI） | D6 | Proposed（双平台 CI + DST + 属性测试 + CLI 合约测试已上线；待 `cloud-cf/` 契约测试与夜间长浸泡） |
 
 ---
 
@@ -822,4 +820,5 @@ flowchart LR
 - 分数索引重平衡：删除，保留随机抖动后缀（F-18、§9.4）。
 - `mynote update` 自升级子系统：交给包管理器（F-14）。
 - Plane B 统计评测与自动爬山：移出路线图（§9.9）。
+- macOS Tauri 薄壳（`shell-macos/`）与内置全局热键窗口：2026-11-25 拍板 D5′ 移除，双桌面统一纯 CLI + Daemon + 内嵌 HTML（§9.8、§9.12）。
 - 「复杂度只有 CRDT 的 1/5」「云端代码量骤减 ~70%」「约 300–350 行 TypeScript」等无测量依据的论断：已删除（F-09、F-16）。

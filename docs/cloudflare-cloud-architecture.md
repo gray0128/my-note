@@ -66,7 +66,7 @@
 ```mermaid
 flowchart TD
     subgraph Clients["客户端 (持有本地明文与密钥)"]
-        Mac["macOS: Tauri 壳 + mynote Rust Daemon + CLI + Skill (read-write 令牌)"]
+        Mac["macOS: mynote Rust Daemon + CLI + Skill + 浏览器/WebApp (read-write 令牌)"]
         Linux["Omarchy: mynote Rust Daemon + CLI + Skill + Chromium webapp (read-write 令牌)"]
         Phone["iOS / Android: 只读 PWA (WASM 解密 + 复制 + Vault 解锁, read 令牌)"]
         Agent["本地 AI Agent (Claude Code / Codex / OpenCode)"]
@@ -176,7 +176,7 @@ INV-RECOVERY（零设备 + 恢复包 + 本地导出的 R2 归档目录 → 恢�
    - DO 与 R2 中只有密文：op 信封只带 `key_id`、不带密钥；块内容由各块 BDEK 加密，BDEK 由 SMK（Tier 1）或 VKEK（Tier 2）包裹后存于 `block_keys`。服务端不持有 SMK / VKEK / 恢复包。信封字节布局、填充与 AAD **只在 [`data-structures.md`](./data-structures.md) 定义**。
    - 服务端为执行职责必然可见的元数据：`op_id`、`seq`、设备、时间、密文长度（已填充）、`key_id`（op 与密钥记录上都有，用于竞态校验）、`wrap_gen`、`not_before`、碎纸标记的状态与时间。`block_id` 与 `tier` 只在 `MNR1` 密文内，服务端**看不出**哪把密钥属于哪个块、哪些块在 Vault 中（时序侧信道见 [`threat-model.md`](./threat-model.md)）。
 2. **诚实界定 Web 代码分发边界（桌面不受影响 vs 手机 PWA 受影响）**：
-   - **桌面端（macOS Tauri 壳 / Omarchy Chromium webapp）加载的是本地二进制内嵌的前端资源**，不从云端加载 JS/WASM，因此 Cloudflare 账号失守不能向桌面端投毒。
+   - **桌面端（macOS / Omarchy 浏览器与 WebApp）加载的是本地 `mynote` 二进制内嵌的前端资源**，不从云端加载 JS/WASM，因此 Cloudflare 账号失守不能向桌面端投毒。
    - **手机 PWA 的前端静态资源由同一 Cloudflare Worker 下发**：若攻击者夺取 Cloudflare 账号写权限或部署流水线，可篡改静态资源，在你下次打开手机端时窃取 SMK，或在你输入 Vault 口令时截获它（D7）。因此手机端（Tier 1 与 Tier 2）的保证**不覆盖 CF 账户 / 部署流水线被攻破**的情形，详见 [`threat-model.md`](./threat-model.md)。
    - **缓解（部署规范，强制）**：
      - Cloudflare 账号开启 **FIDO2 硬件安全密钥 2FA**；
@@ -274,7 +274,7 @@ Cloudflare 于 2026-11-13 推出 Spend Management（beta），可分别为 Worke
 | --- | --- | --- |
 | **云端 Worker (`cloud-cf/`)** | **TypeScript + Wrangler + SQLite DO + R2** | 1. Cloudflare 的 `ctx.storage.sql`、WebSocket Hibernation 与 DO Alarm 是 **TypeScript 一等公民**，`workers-rs` 在新 API 与本地 `miniflare` 调试体验上明显滞后；<br>2. M1 盲密文中继 `< 500` 行 TS [目标]（M2 含碎纸状态机约 `500–700` 行 [估算]），不在云端跑任何密码学或业务合并逻辑；<br>3. 「两份实现」的风险用 [§9](#9-测试真实-worker-契约测试与-dst-共用场景) 的契约测试兜住。 |
 | **本地无 I/O 核心与存储 (`crates/`)** | **Rust**（Sans-I/O `mynote-core` + `rusqlite` + `clap`） | 1. `mynote-core` 纯同步状态机零异步依赖，`zeroize` 安全擦除；<br>2. 解密、Argon2id 与渲染所需部分编译为 **WASM** 供手机只读 PWA 使用（体积与 iPhone 上的 Argon2id 耗时由 S0 实测）。 |
-| **Web / PWA 前端 (`web/`)** | **TypeScript + `mynote-wasm`**（桌面另含编辑器） | 编译产物服务两处：<br>- 嵌入桌面本地二进制（macOS Tauri 壳 / Omarchy Chromium webapp 加载同一份资源，永不加载远端代码）；<br>- 手机只读子集（解密、渲染、复制、Vault 解锁，无编辑器）由 **CI** 部署到 **Workers Static Assets**（信任边界见 [§4](#4-存储零知识与代码分发信任模型)）。 |
+| **Web / PWA 前端 (`web/`)** | **TypeScript + `mynote-wasm`**（桌面另含编辑器） | 编译产物服务两处：<br>- 嵌入桌面本地 `mynote` 二进制（macOS / Omarchy 均通过 `http://localhost:<port>` 加载同一份资源，永不加载远端代码）；<br>- 手机只读子集（解密、渲染、复制、Vault 解锁，无编辑器）由 **CI** 部署到 **Workers Static Assets**（信任边界见 [§4](#4-存储零知识与代码分发信任模型)）。 |
 
 ---
 

@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <title>my-note S0-3 Argon2id WASM Benchmark</title>
+  <style>
+    body { font-family: -apple-system, system-ui, monospace; max-width: 780px; margin: 20px auto; padding: 0 16px; background: #111; color: #eee; }
+    button { padding: 10px 18px; font-size: 16px; border-radius: 6px; border: none; background: #2563eb; color: #fff; cursor: pointer; }
+    table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 13px; }
+    th, td { border: 1px solid #333; padding: 6px 8px; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    pre { background: #1c1c1c; padding: 12px; border-radius: 6px; overflow: auto; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>S0-3: mynote-wasm Argon2id Benchmark</h1>
+  <p id="ua"></p>
+  <button id="run-btn">Run Argon2id Matrix</button>
+  <p id="status">Idle</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Params (m_kib, t, p)</th>
+        <th>m (MiB)</th>
+        <th>Run 1 (ms)</th>
+        <th>Run 2 (ms)</th>
+        <th>Run 3 (ms)</th>
+        <th>Median (ms)</th>
+        <th>Peak WASM Mem (MiB)</th>
+        <th>Hash prefix</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <pre id="json-out"></pre>
+  <script type="module">
+    const MATRIX = [
+      { m_kib: 19456, t: 2, p: 1 },
+      { m_kib: 19456, t: 3, p: 1 },
+      { m_kib: 32768, t: 2, p: 1 },
+      { m_kib: 32768, t: 3, p: 1 },
+      { m_kib: 47104, t: 2, p: 1 },
+      { m_kib: 65536, t: 2, p: 1 },
+      { m_kib: 65536, t: 3, p: 1 },
+    ];
+
+    document.getElementById("ua").textContent = `UA: ${navigator.userAgent}`;
+
+    async function loadWasm(url) {
+      const resp = await fetch(url);
+      const bytes = await resp.arrayBuffer();
+      const { instance } = await WebAssembly.instantiate(bytes, {});
+      return { exports: instance.exports, wasmBytes: bytes.byteLength };
+    }
+
+    function writeBytes(exports, arr) {
+      const ptr = exports.alloc(arr.length);
+      new Uint8Array(exports.memory.buffer, ptr, arr.length).set(arr);
+      return ptr;
+    }
+
+    function toHex(u8) {
+      return [...u8].map((b) => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    window.runBenchmark = async function runBenchmark(wasmUrl = "./dist/4-desktop-ruzstd-rw.opt.wasm", runs = 3) {
+      const status = document.getElementById("status");
+      const tbody = document.getElementById("rows");
+      tbody.innerHTML = "";
+      status.textContent = `Loading ${wasmUrl}...`;
+
+      const { exports, wasmBytes } = await loadWasm(wasmUrl);
+
+      // Smoke-verify full crypto + ruzstd + msgpack + pad256 roundtrip in WASM
+      const key = new Uint8Array(32).fill(0x42);
+      const nonce = new Uint8Array(24).fill(0x13);
+      const sample = new TextEncoder().encode("my-note S0-3 WASM crypto+ruzstd roundtrip payload ".repeat(20));
+      const keyPtr = writeBytes(exports, key);
+      const noncePtr = writeBytes(exports, nonce);
+      const samplePtr = writeBytes(exports, sample);
+      const hashPtr = exports.alloc(32);
+      const smokeRc = exports.crypto_roundtrip_smoke(keyPtr, noncePtr, samplePtr, sample.length, hashPtr);
+      const smokeHash = toHex(new Uint8Array(exports.memory.buffer, hashPtr, 32).slice());
+      exports.dealloc(keyPtr, 32);
+      exports.dealloc(noncePtr, 24);
+      exports.dealloc(samplePtr, sample.length);
+      exports.dealloc(hashPtr, 32);
+
+      const pass = new TextEncoder().encode("correct-horse-battery-staple-2026");
+      const salt = new Uint8Array(16).map((_, i) => i + 1);
+      const results = [];
+
+      for (const cfg of MATRIX) {
+        status.textContent = `Testing m=${cfg.m_kib} KiB, t=${cfg.t}, p=${cfg.p}...`;
+        await new Promise((r) => setTimeout(r, 20));
+        const times = [];
+        let lastHex = "";
+        let peakMemBytes = 0;
+
+        for (let r = 0; r < runs; r++) {
+          // Instantiate fresh module per trial to measure true peak WASM linear memory per parameter set
+          const fresh = (await loadWasm(wasmUrl)).exports;
+          const pPtr = writeBytes(fresh, pass);
+          const sPtr = writeBytes(fresh, salt);
+          const oPtr = fresh.alloc(32);
+          const t0 = performance.now();
+          const rc = fresh.derive_argon2id(pPtr, pass.length, sPtr, salt.length, cfg.m_kib, cfg.t, cfg.p, oPtr);
+          const elapsed = performance.now() - t0;
+          if (rc !== 0) throw new Error(`derive_argon2id failed rc=${rc}`);
+          peakMemBytes = Math.max(peakMemBytes, fresh.memory.buffer.byteLength);
+          lastHex = toHex(new Uint8Array(fresh.memory.buffer, oPtr, 32).slice());
+          times.push(Number(elapsed.toFixed(1)));
+        }
+
+        const sorted = [...times].sort((a, b) => a - b);
+        const median = sorted[Math.floor(sorted.length / 2)];
+        const entry = {
+          ...cfg,
+          m_mib: Number((cfg.m_kib / 1024).toFixed(1)),
+          times_ms: times,
+          median_ms: median,
+          peak_wasm_mem_mib: Number((peakMemBytes / (1024 * 1024)).toFixed(2)),
+          hash_prefix: lastHex.slice(0, 12),
+        };
+        results.push(entry);
+
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>(${cfg.m_kib}, ${cfg.t}, ${cfg.p})</td>
+          <td>${entry.m_mib}</td>
+          <td>${times[0] ?? "-"}</td>
+          <td>${times[1] ?? "-"}</td>
+          <td>${times[2] ?? "-"}</td>
+          <td><b>${median}</b></td>
+          <td>${entry.peak_wasm_mem_mib}</td>
+          <td><code>${entry.hash_prefix}</code></td>`;
+        tbody.appendChild(tr);
+      }
+
+      const summary = {
+        userAgent: navigator.userAgent,
+        wasmUrl,
+        wasmBytes,
+        smokeRc,
+        smokeHashPrefix: smokeHash.slice(0, 16),
+        results,
+      };
+      document.getElementById("json-out").textContent = JSON.stringify(summary, null, 2);
+      status.textContent = "Done!";
+      return summary;
+    };
+
+    document.getElementById("run-btn").addEventListener("click", () => window.runBenchmark());
+  </script>
+</body>
+</html>

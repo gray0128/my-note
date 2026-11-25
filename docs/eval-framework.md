@@ -278,8 +278,8 @@ my-note/
 | 里程碑 | 必须绿灯的门禁 | 非 CI 的准出条件 |
 | --- | --- | --- |
 | **S0 技术 spike** | 无门禁；spike 代码不进主干。产出性能基线，用于把 §10.1 的 [目标] 改为 [已测] | — |
-| **M1 替换 Heynote + iCloud** | 属性测试；DST（INV-SYNC-1/2/3/5、INV-KEY-LIVENESS）；真实 Worker 契约测试（push / pull / epoch / 令牌范围 / WS 唤醒 / 密钥表 / 归档）；INV-RECOVERY；`SEC-04`、`SEC-05`；Layer 1 格式化幂等与 Heynote 导入差分；CLI 黄金测试；双平台 CI | 热键唤出 < 100 ms [目标]（实测）；Mac 与 Omarchy 日常使用 4 周零丢数；Heynote 卸载 |
-| **M2 手机只读 + Vault + 碎纸** | 新增：INV-GRACE；INV-SHRED-BOUND；`SEC-01`（换钥语义）；`SEC-03`；`SEC-08`（手机 IndexedDB / Cache Storage）；INV-SYNC-7；DST 加入碎纸 / 撤销 / 到期与离线编辑交错 | iPhone 真机 Vault 解锁约 1–2 s [目标]（实测）；手机自动上锁人工验证 |
+| **M1 替换 Heynote + iCloud** | 属性测试；DST（INV-SYNC-1/2/3/5、INV-KEY-LIVENESS）；真实 Worker 契约测试（push / pull / epoch / 令牌范围 / WS 唤醒 / 密钥表 / 归档）；INV-RECOVERY；`SEC-04`、`SEC-05`；Layer 1 格式化幂等与 Heynote 导入差分；CLI 黄金测试；双平台 CI | 双桌面纯 CLI + Daemon + HTML（`http://localhost:<port>`）日常流畅可用（D5′）；Mac 与 Omarchy 日常使用 4 周零丢数；Heynote 卸载 |
+| **M2 手机只读 + Vault + 碎纸** | 新增：INV-GRACE；INV-SHRED-BOUND；`SEC-01`（换钥语义）；`SEC-03`；`SEC-08`（手机 IndexedDB / Cache Storage）；INV-SYNC-7；DST 加入碎纸 / 撤销 / 到期与离线编辑交错 | iPhone 真机 Vault 解锁约 1–2 s（S0-3 已测 `(32768, 2, 1)` = `1553 ms` [已测]）；手机自动上锁人工验证 |
 | **M3 渲染与打磨** | 新增：`SEC-06`；Layer 2 外部格式化熔断 | — |
 
 ### 10.1 观测指标（不阻断）
@@ -289,7 +289,7 @@ my-note/
 | 指标 | 测量方法 | 值 |
 | --- | --- | --- |
 | 桌面单体二进制体积 | Linux `x86_64` / macOS `aarch64` release 构建（strip 后，含内嵌 Web UI） | < 15 MiB [目标] |
-| WASM 与首屏包体积 | `mynote-wasm`（`wasm-opt -Oz` + gzip）与 `web/` 首屏 JS/CSS（gzip，不含懒加载的 `Pele` chunk） | WASM < 350 KiB [目标]；首屏 < 220 KiB [目标] |
+| WASM 与首屏包体积 | `mynote-wasm`（`wasm-opt -Oz` + gzip）与 `web/` 首屏 JS/CSS（gzip，不含懒加载的 `Pele` chunk） | WASM 目标 < 350 KiB（S0-3 基线：手机只读 `71.5 KiB` / 桌面全功能含 Layer 1 `260.4 KiB` [已测]，详见 [`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md)）；首屏 < 220 KiB [目标] |
 | 无头 Daemon 常驻内存 | 导入 5,000 块后静置，采样 RSS | < 20 MiB [目标] |
 | CLI 本地读写延迟 | 10,000 块 WAL 库上连跑 200 次 `add` 与 `ls --json` | P95 < 15 ms [目标] |
 | DO 行写数 | DST 统计（INV-SYNC-6） | ≤ 10 行 / op [目标] |
