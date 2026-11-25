@@ -4,27 +4,40 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["layer1-format"]
+layer1-format = [
+    "dep:chrono",
+    "dep:form_urlencoded",
+    "dep:json5",
+    "dep:quick-xml",
+    "dep:serde_yaml_ng",
+    "dep:sqlformat",
+    "dep:toml",
+    "dep:unicode-width",
+]
+
 [dependencies]
 argon2.workspace = true
 base64.workspace = true
 bip39.workspace = true
 blake3.workspace = true
 chacha20poly1305.workspace = true
-chrono.workspace = true
+chrono = { workspace = true, optional = true }
 hkdf.workspace = true
-json5.workspace = true
-quick-xml.workspace = true
+json5 = { workspace = true, optional = true }
+quick-xml = { workspace = true, optional = true }
 rmp-serde.workspace = true
 ruzstd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml_ng.workspace = true
+serde_yaml_ng = { workspace = true, optional = true }
 sha2.workspace = true
-sqlformat.workspace = true
+sqlformat = { workspace = true, optional = true }
 thiserror.workspace = true
-toml.workspace = true
-unicode-width.workspace = true
-url.workspace = true
+toml = { workspace = true, optional = true }
+form_urlencoded = { workspace = true, optional = true }
+unicode-width = { workspace = true, optional = true }
 uuid.workspace = true
 x25519-dalek.workspace = true
 zeroize.workspace = true
@@ -32,3 +45,4 @@ zeroize.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 roxmltree.workspace = true
+

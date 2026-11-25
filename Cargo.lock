@@ -1137,6 +1137,7 @@ dependencies = [
  "mynote-store",
  "qrcode",
  "reqwest",
+ "rmp-serde",
  "rust-embed",
  "serde",
  "serde_json",
@@ -1158,6 +1159,7 @@ dependencies = [
  "blake3",
  "chacha20poly1305",
  "chrono",
+ "form_urlencoded",
  "hkdf",
  "json5",
  "proptest",
@@ -1173,7 +1175,6 @@ dependencies = [
  "thiserror",
  "toml",
  "unicode-width",
- "url",
  "uuid",
  "x25519-dalek",
  "zeroize",
@@ -1183,6 +1184,7 @@ dependencies = [
 name = "mynote-store"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "getrandom 0.4.3",
  "mynote-core",
@@ -1198,7 +1200,14 @@ dependencies = [
 name = "mynote-wasm"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "getrandom 0.4.3",
  "mynote-core",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "zeroize",
 ]
 
 [[package]]

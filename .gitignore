@@ -6,7 +6,9 @@ target/
 # Node / Web / Cloudflare
 node_modules/
 dist/
+dist-pwa/
 pkg/
+pkg-pwa/
 .wrangler/
 .dev.vars
 .vite/

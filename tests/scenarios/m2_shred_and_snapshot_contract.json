@@ -1,0 +1,161 @@
+{
+  "name": "m2_shred_and_snapshot_contract",
+  "description": "Shared M2 scenario executed identically by Rust SimRelay and real Cloudflare workerd SyncJournalDO (F-12, INV-GRACE, #9a, mobile snapshots)",
+  "devices": [
+    { "device_id": "dev_mac00001", "device_name": "MacBook" },
+    { "device_id": "dev_lin00002", "device_name": "Omarchy" }
+  ],
+  "steps": [
+    {
+      "id": "m2_01_create_k1_and_k2_with_ops",
+      "action": "push",
+      "as_device": "dev_mac00001",
+      "seen_seq": 0,
+      "key_records": [
+        { "key_id": "01JDF9M20000000000000000K1", "wrap_gen": 1, "key_record_b64": "bW5yMV9tMl9rMQ==" },
+        { "key_id": "01JDF9M20000000000000000K2", "wrap_gen": 1, "key_record_b64": "bW5yMV9tMl9rMg==" }
+      ],
+      "ops": [
+        { "op_id": "01JDF9M20000000000000000P1", "device_id": "dev_mac00001", "key_id": "01JDF9M20000000000000000K1", "envelope_b64": "bW5zMV9tMl9vcDE=" },
+        { "op_id": "01JDF9M20000000000000000P2", "device_id": "dev_mac00001", "key_id": "01JDF9M20000000000000000K2", "envelope_b64": "bW5zMV9tMl9vcDI=" }
+      ],
+      "expect": { "status": 200, "acked_seqs": [1, 2], "head_seq": 2 }
+    },
+    {
+      "id": "m2_02_offline_create_and_shred_same_batch_succeeds_without_self_stale",
+      "action": "push",
+      "as_device": "dev_mac00001",
+      "seen_seq": 2,
+      "key_records": [
+        { "key_id": "01JDF9M20000000000000000K3", "wrap_gen": 1, "key_record_b64": "bW5yMV9tMl9rMw==" }
+      ],
+      "ops": [
+        { "op_id": "01JDF9M20000000000000000P3", "device_id": "dev_mac00001", "key_id": "01JDF9M20000000000000000K3", "envelope_b64": "bW5zMV9tMl9vcDM=" },
+        { "op_id": "01JDF9M20000000000000000P4", "device_id": "dev_mac00001", "key_id": null, "envelope_b64": "bW5zMV9tMl9kZWwz" }
+      ],
+      "shred_marks": [
+        { "mark_id": "01JDF9M20000000000000000M3", "key_id": "01JDF9M20000000000000000K3", "grace_ms": 604800000, "requested_by": "dev_mac00001" }
+      ],
+      "expect": { "status": 200, "acked_seqs": [3, 4], "head_seq": 4, "shred_states": ["scheduled"] }
+    },
+    {
+      "id": "m2_03_reject_grace_too_short",
+      "action": "keys_shred",
+      "as_device": "dev_mac00001",
+      "seen_seq": 4,
+      "marks": [
+        { "mark_id": "01JDF9M20000000000000000M0", "key_id": "01JDF9M20000000000000000K1", "grace_ms": 3600000, "requested_by": "dev_mac00001" }
+      ],
+      "expect": { "status": 422, "error_code": "GRACE_TOO_SHORT" }
+    },
+    {
+      "id": "m2_04_reject_shred_stale_when_seen_seq_behind_remote_op",
+      "action": "keys_shred",
+      "as_device": "dev_lin00002",
+      "seen_seq": 0,
+      "marks": [
+        { "mark_id": "01JDF9M20000000000000000M1", "key_id": "01JDF9M20000000000000000K1", "grace_ms": 604800000, "requested_by": "dev_lin00002" }
+      ],
+      "expect": { "status": 409, "error_code": "SHRED_STALE" }
+    },
+    {
+      "id": "m2_05_schedule_shred_on_k1_and_k2",
+      "action": "keys_shred",
+      "as_device": "dev_mac00001",
+      "seen_seq": 4,
+      "marks": [
+        { "mark_id": "01JDF9M20000000000000000M1", "key_id": "01JDF9M20000000000000000K1", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M20000000000000000M2", "key_id": "01JDF9M20000000000000000K2", "grace_ms": 604800000, "requested_by": "dev_mac00001" }
+      ],
+      "expect": { "status": 200, "shred_states": ["scheduled", "scheduled"] }
+    },
+    {
+      "id": "m2_06_reject_op_using_pending_shred_key_without_cancel",
+      "action": "push",
+      "as_device": "dev_lin00002",
+      "seen_seq": 4,
+      "ops": [
+        { "op_id": "01JDF9M20000000000000000P5", "device_id": "dev_lin00002", "key_id": "01JDF9M20000000000000000K1", "envelope_b64": "bW5zMV9tMl9vcDU=" }
+      ],
+      "expect": { "status": 409, "error_code": "KEY_PENDING_SHRED" }
+    },
+    {
+      "id": "m2_07_atomic_update_wins_cancel_and_push_revives_k1",
+      "action": "push",
+      "as_device": "dev_lin00002",
+      "seen_seq": 4,
+      "cancel_key_ids": ["01JDF9M20000000000000000K1"],
+      "ops": [
+        { "op_id": "01JDF9M20000000000000000P5", "device_id": "dev_lin00002", "key_id": "01JDF9M20000000000000000K1", "envelope_b64": "bW5zMV9tMl9vcDU=" }
+      ],
+      "expect": { "status": 200, "acked_seqs": [5], "head_seq": 5 }
+    },
+    {
+      "id": "m2_08_expedite_k2_to_min_grace_24h",
+      "action": "keys_shred",
+      "as_device": "dev_mac00001",
+      "seen_seq": 5,
+      "expedite": true,
+      "marks": [
+        { "mark_id": "01JDF9M20000000000000000M2", "key_id": "01JDF9M20000000000000000K2", "grace_ms": 86400000, "requested_by": "dev_mac00001" }
+      ],
+      "expect": { "status": 200, "shred_states": ["scheduled"] }
+    },
+    {
+      "id": "m2_09_advance_clock_25h_and_run_alarm_executes_k2_not_k1_or_k3",
+      "action": "advance_and_alarm",
+      "delta_ms": 90000000,
+      "expect": { "shredded_keys": ["01JDF9M20000000000000000K2"], "alive_keys": ["01JDF9M20000000000000000K1", "01JDF9M20000000000000000K3"] }
+    },
+    {
+      "id": "m2_10_cancel_after_executed_returns_410_key_shredded",
+      "action": "keys_cancel",
+      "as_device": "dev_mac00001",
+      "key_ids": ["01JDF9M20000000000000000K2"],
+      "expect": { "status": 410, "error_code": "KEY_SHREDDED" }
+    },
+    {
+      "id": "m2_11_push_op_on_shredded_k2_returns_410_key_shredded",
+      "action": "push",
+      "as_device": "dev_lin00002",
+      "seen_seq": 5,
+      "ops": [
+        { "op_id": "01JDF9M20000000000000000P6", "device_id": "dev_lin00002", "key_id": "01JDF9M20000000000000000K2", "envelope_b64": "bW5zMV9tMl9vcDY=" }
+      ],
+      "expect": { "status": 410, "error_code": "KEY_SHREDDED" }
+    },
+    {
+      "id": "m2_12_snapshot_put_monotonic_and_get",
+      "action": "snapshot_put",
+      "as_device": "dev_mac00001",
+      "covers_seq": 2,
+      "snapshot_id": "01JDF9M20000000000000000S1",
+      "body_b64": "TU5QMVsxX3NuYXAx",
+      "expect": { "status": 200 }
+    },
+    {
+      "id": "m2_13_snapshot_put_stale_covers_seq_rejected",
+      "action": "snapshot_put",
+      "as_device": "dev_lin00002",
+      "covers_seq": 2,
+      "snapshot_id": "01JDF9M20000000000000000S2",
+      "body_b64": "TU5QMVsxX3N0YWxl",
+      "expect": { "status": 409, "error_code": "CAS_MISMATCH" }
+    },
+    {
+      "id": "m2_14_snapshot_put_newer_and_get_returns_latest",
+      "action": "snapshot_put",
+      "as_device": "dev_lin00002",
+      "covers_seq": 5,
+      "snapshot_id": "01JDF9M20000000000000000S3",
+      "body_b64": "TU5QMVsxX3NuYXAz",
+      "expect": { "status": 200 }
+    },
+    {
+      "id": "m2_15_snapshot_get_returns_covers_seq_5",
+      "action": "snapshot_get",
+      "as_device": "dev_mac00001",
+      "expect": { "status": 200, "covers_seq": 5, "body_b64": "TU5QMVsxX3NuYXAz" }
+    }
+  ]
+}

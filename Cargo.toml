@@ -51,6 +51,7 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8"
 unicode-width = "0.2.3"
 url = "2.5.9"
+form_urlencoded = "1.2"
 uuid = { version = "1.29.3", default-features = false, features = ["serde"] }
 x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets", "zeroize"] }
 zeroize = { version = "1.9.2", features = ["derive"] }
@@ -58,4 +59,12 @@ zeroize = { version = "1.9.2", features = ["derive"] }
 [profile.release]
 lto = "thin"
 strip = true
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = false
 

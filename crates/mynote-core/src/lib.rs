@@ -1,5 +1,6 @@
 pub mod crypto;
 pub mod error;
+#[cfg(feature = "layer1-format")]
 pub mod format;
 pub mod fractional_index;
 pub mod hlc;
@@ -8,4 +9,6 @@ pub mod keys;
 pub mod materialize;
 pub mod model;
 pub mod sim;
+pub mod snapshot;
 pub mod sync;
+pub mod vault;
