@@ -160,8 +160,28 @@ pub enum ApplyRequest {
         buf: Option<String>,
         dry_run: bool,
     },
+    PutVaultHeader {
+        gen: i64,
+        blob_b64: String,
+    },
+    LockBlockTier2 {
+        id: String,
+        op_id: String,
+        key_id: String,
+        mnb1_b64: String,
+        mnw1_b64: String,
+        expected_heads: Vec<String>,
+        public_hint: Option<String>,
+    },
+    UnlockBlockTier1 {
+        id: String,
+        plaintext_content: String,
+        expected_heads: Vec<String>,
+        shred_old_key: bool,
+    },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum UdsRequest {
@@ -242,6 +262,9 @@ impl UdsResponse {
                 "BLOCK_LOCKED" => ErrorCode::BlockLocked,
                 "KEY_SHREDDED" => ErrorCode::KeyShredded,
                 "KEY_UNKNOWN" => ErrorCode::KeyUnknown,
+                "KEY_PENDING_SHRED" => ErrorCode::KeyPendingShred,
+                "SHRED_STALE" => ErrorCode::ShredStale,
+                "GRACE_TOO_SHORT" => ErrorCode::GraceTooShort,
                 "AUTH_REQUIRED" => ErrorCode::AuthRequired,
                 "DEVICE_REVOKED" => ErrorCode::DeviceRevoked,
                 "TOKEN_SCOPE_FORBIDDEN" => ErrorCode::TokenScopeForbidden,

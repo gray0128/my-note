@@ -768,22 +768,77 @@ async fn mock_push(
             envelope: b64.decode(o["envelope_b64"].as_str().unwrap()).unwrap(),
         })
         .collect();
+    let cancel_key_ids: Vec<KeyId> = body["cancel_key_ids"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|v| v.as_str().and_then(|s| KeyId::parse(s).ok()))
+        .collect();
+    let shred_marks: Vec<mynote_core::model::ShredMarkRow> = body["shred_marks"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| {
+            Some(mynote_core::model::ShredMarkRow {
+                mark_id: mynote_core::ids::MarkId::parse(m["mark_id"].as_str()?).ok()?,
+                key_id: KeyId::parse(m["key_id"].as_str()?).ok()?,
+                seen_seq,
+                requested_by: dev_id.clone(),
+                requested_at_ms: 1_795_521_600_000,
+                grace_ms: m["grace_ms"]
+                    .as_i64()
+                    .unwrap_or(mynote_core::vault::T_GRACE_DEFAULT_MS),
+                not_before_ms: None,
+                state: mynote_core::model::ShredMarkState::PendingConfirm,
+                confirmed_at_ms: None,
+                cancelled_by: None,
+                executed_at_ms: None,
+            })
+        })
+        .collect();
     let req = PushRequestDto {
         expected_epoch,
         seen_seq,
         key_records,
+        cancel_key_ids,
         ops,
+        shred_marks,
     };
     match g.relay.handle_push(&dev_id, &req, 1_795_521_600_000) {
-        Ok((epoch, acked, head_seq)) => {
-            let acked_json: Vec<Value> = acked
+        Ok(ok) => {
+            let acked_json: Vec<Value> = ok
+                .acked
                 .into_iter()
                 .map(|a| json!({ "op_id": a.op_id.to_string(), "seq": a.seq }))
                 .collect();
-            Json(json!({ "ok": true, "epoch": epoch.to_string(), "acked": acked_json, "head_seq": head_seq }))
-                .into_response()
+            let shred_json: Vec<Value> = ok
+                .shred_results
+                .into_iter()
+                .map(|r| {
+                    json!({
+                        "key_id": r.key_id.to_string(),
+                        "state": match r.state {
+                            mynote_core::model::ShredMarkState::PendingConfirm => "pending_confirm",
+                            mynote_core::model::ShredMarkState::Scheduled => "scheduled",
+                            mynote_core::model::ShredMarkState::Cancelled => "cancelled",
+                            mynote_core::model::ShredMarkState::Executed => "executed",
+                        },
+                        "not_before_ms": r.not_before_ms,
+                    })
+                })
+                .collect();
+            Json(json!({
+                "ok": true,
+                "epoch": ok.epoch.to_string(),
+                "acked": acked_json,
+                "shred_results": shred_json,
+                "head_seq": ok.head_seq,
+            }))
+            .into_response()
         }
-        Err(ErrorCode::CasMismatch) => (
+        Err(err) if err.code == ErrorCode::CasMismatch => (
             StatusCode::CONFLICT,
             Json(json!({
                 "ok": false,
@@ -795,9 +850,9 @@ async fn mock_push(
             })),
         )
             .into_response(),
-        Err(code) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "ok": false, "error": { "code": code.as_str(), "message": "push error" } })),
+        Err(err) => (
+            StatusCode::from_u16(err.code.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(json!({ "ok": false, "error": { "code": err.code.as_str(), "message": "push error" } })),
         )
             .into_response(),
     }
@@ -823,6 +878,32 @@ async fn mock_keys_get(State(st): State<Arc<Mutex<MockRelayState>>>, headers: He
             })
         })
         .collect();
+    let marks: Vec<Value> = g
+        .relay
+        .keys
+        .marks
+        .values()
+        .map(|m| {
+            json!({
+                "mark_id": m.mark_id.to_string(),
+                "key_id": m.key_id.to_string(),
+                "seen_seq": m.seen_seq,
+                "requested_by": m.requested_by.as_str(),
+                "requested_at_ms": m.requested_at_ms,
+                "grace_ms": m.grace_ms,
+                "not_before_ms": m.not_before_ms,
+                "state": match m.state {
+                    mynote_core::model::ShredMarkState::PendingConfirm => "pending_confirm",
+                    mynote_core::model::ShredMarkState::Scheduled => "scheduled",
+                    mynote_core::model::ShredMarkState::Cancelled => "cancelled",
+                    mynote_core::model::ShredMarkState::Executed => "executed",
+                },
+                "confirmed_at_ms": m.confirmed_at_ms,
+                "cancelled_by": m.cancelled_by.as_ref().map(|d| d.as_str()),
+                "executed_at_ms": m.executed_at_ms,
+            })
+        })
+        .collect();
     let mut km = serde_json::Map::new();
     if let Some((gen, blob)) = &g.relay.keys.keyring_material {
         km.insert(
@@ -830,10 +911,17 @@ async fn mock_keys_get(State(st): State<Arc<Mutex<MockRelayState>>>, headers: He
             json!({ "gen": gen, "blob_b64": b64.encode(blob) }),
         );
     }
+    if let Some((gen, blob)) = &g.relay.keys.vault_header_material {
+        km.insert(
+            "vault_header".into(),
+            json!({ "gen": gen, "blob_b64": b64.encode(blob) }),
+        );
+    }
     Json(json!({
         "ok": true,
         "keys_digest": g.relay.keys.digest(),
         "key_records": recs,
+        "shred_marks": marks,
         "key_material": km,
     }))
     .into_response()

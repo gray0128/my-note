@@ -9,10 +9,10 @@ use mynote_core::crypto::{
     decrypt_pairing_ticket, encrypt_pairing_ticket, PairingPayloadV1, SmkGenerationBytes,
 };
 use mynote_core::error::{CoreError, ErrorCode};
-use mynote_core::ids::{DeviceId, JournalEpoch, KeyId, OpId};
-use mynote_core::model::{KeyRecordRow, ShredMarkRow};
+use mynote_core::ids::{DeviceId, JournalEpoch, KeyId, MarkId, OpId};
+use mynote_core::model::{KeyRecordRow, ShredMarkRow, ShredMarkState};
 use mynote_core::sync::{
-    step, AckedOp, KeyTableSyncDto, PushRequestDto, RemoteEnvelopeRow, SyncCommand, SyncEvent,
+    step, AckedOp, KeyTableSyncDto, PushRequestDto, RemoteEnvelopeRow, ShredResultDto, SyncCommand, SyncEvent,
 };
 use mynote_store::store::SyncApplySummary;
 use mynote_store::{DeviceCredentials, LocalStore};
@@ -605,7 +605,73 @@ impl RelayClient {
         let val = parse_relay_json(res).await?;
         Ok(val["revoked_at_ms"].as_i64().unwrap_or(now_ms() as i64))
     }
+}
 
+#[derive(Clone, Debug)]
+pub enum PushOutcome {
+    Acked {
+        epoch: JournalEpoch,
+        acked: Vec<AckedOp>,
+        shred_results: Vec<ShredResultDto>,
+        cancelled_keys: Vec<KeyId>,
+        head_seq: i64,
+    },
+    EpochMismatch(JournalEpoch),
+    KeyRace {
+        code: ErrorCode,
+    },
+}
+
+fn parse_shred_state(s: &str) -> ShredMarkState {
+    match s {
+        "scheduled" => ShredMarkState::Scheduled,
+        "cancelled" => ShredMarkState::Cancelled,
+        "executed" => ShredMarkState::Executed,
+        _ => ShredMarkState::PendingConfirm,
+    }
+}
+
+fn parse_shred_mark_json(item: &serde_json::Value) -> Result<ShredMarkRow, CoreError> {
+    let mark_id = MarkId::parse(item["mark_id"].as_str().unwrap_or_default())?;
+    let key_id = KeyId::parse(item["key_id"].as_str().unwrap_or_default())?;
+    let requested_by = DeviceId::parse(item["requested_by"].as_str().unwrap_or_default())?;
+    let cancelled_by = item["cancelled_by"].as_str().map(DeviceId::parse).transpose()?;
+    Ok(ShredMarkRow {
+        mark_id,
+        key_id,
+        seen_seq: item["seen_seq"].as_i64().unwrap_or(0),
+        requested_by,
+        requested_at_ms: item["requested_at_ms"].as_i64().unwrap_or(0),
+        grace_ms: item["grace_ms"]
+            .as_i64()
+            .unwrap_or(mynote_core::vault::T_GRACE_DEFAULT_MS),
+        not_before_ms: item["not_before_ms"].as_i64(),
+        state: parse_shred_state(item["state"].as_str().unwrap_or("pending_confirm")),
+        confirmed_at_ms: item["confirmed_at_ms"].as_i64(),
+        cancelled_by,
+        executed_at_ms: item["executed_at_ms"].as_i64(),
+    })
+}
+
+fn parse_shred_results(val: &serde_json::Value) -> Result<Vec<ShredResultDto>, CoreError> {
+    let mut out = Vec::new();
+    let arr_opt = val["shred_results"]
+        .as_array()
+        .or_else(|| val["results"].as_array());
+    if let Some(arr) = arr_opt {
+        for r in arr {
+            let key_id = KeyId::parse(r["key_id"].as_str().unwrap_or_default())?;
+            out.push(ShredResultDto {
+                key_id,
+                state: parse_shred_state(r["state"].as_str().unwrap_or("pending_confirm")),
+                not_before_ms: r["not_before_ms"].as_i64(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+impl RelayClient {
     pub async fn pull_page_for_daemon(
         &self,
         since_seq: i64,
@@ -614,10 +680,7 @@ impl RelayClient {
         self.http_pull(since_seq, limit).await
     }
 
-    pub async fn push_batch_for_daemon(
-        &self,
-        req: &PushRequestDto,
-    ) -> Result<Result<(JournalEpoch, Vec<AckedOp>, i64), JournalEpoch>, CoreError> {
+    pub async fn push_batch_for_daemon(&self, req: &PushRequestDto) -> Result<PushOutcome, CoreError> {
         self.http_push(req).await
     }
 
@@ -664,10 +727,7 @@ impl RelayClient {
         Ok((epoch, ops, keys_digest, head_seq, has_more))
     }
 
-    async fn http_push(
-        &self,
-        req: &PushRequestDto,
-    ) -> Result<Result<(JournalEpoch, Vec<AckedOp>, i64), JournalEpoch>, CoreError> {
+    async fn http_push(&self, req: &PushRequestDto) -> Result<PushOutcome, CoreError> {
         let b64 = base64::engine::general_purpose::STANDARD;
         let key_records: Vec<serde_json::Value> = req
             .key_records
@@ -681,6 +741,7 @@ impl RelayClient {
                 }))
             })
             .collect();
+        let cancel_key_ids: Vec<String> = req.cancel_key_ids.iter().map(ToString::to_string).collect();
         let ops: Vec<serde_json::Value> = req
             .ops
             .iter()
@@ -693,11 +754,24 @@ impl RelayClient {
                 })
             })
             .collect();
+        let shred_marks: Vec<serde_json::Value> = req
+            .shred_marks
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "mark_id": m.mark_id.to_string(),
+                    "key_id": m.key_id.to_string(),
+                    "grace_ms": m.grace_ms,
+                })
+            })
+            .collect();
         let body = serde_json::json!({
             "expected_epoch": req.expected_epoch.to_string(),
             "seen_seq": req.seen_seq,
             "key_records": key_records,
+            "cancel_key_ids": cancel_key_ids,
             "ops": ops,
+            "shred_marks": shred_marks,
         });
         let res = self
             .add_headers(self.http.post(self.endpoint("/v1/sync/push")).json(&body))
@@ -723,7 +797,14 @@ impl RelayClient {
                         });
                     }
                 }
-                Ok(Ok((epoch, acked, head_seq)))
+                let shred_results = parse_shred_results(&val)?;
+                Ok(PushOutcome::Acked {
+                    epoch,
+                    acked,
+                    shred_results,
+                    cancelled_keys: req.cancel_key_ids.clone(),
+                    head_seq,
+                })
             }
             Err(err) if err.code() == ErrorCode::CasMismatch => {
                 if let Some(remote_ep) = err
@@ -732,11 +813,260 @@ impl RelayClient {
                     .and_then(|v| v.as_str())
                 {
                     let ep = JournalEpoch::parse(remote_ep)?;
-                    return Ok(Err(ep));
+                    return Ok(PushOutcome::EpochMismatch(ep));
                 }
                 Err(err)
             }
+            Err(err)
+                if matches!(
+                    err.code(),
+                    ErrorCode::ShredStale
+                        | ErrorCode::KeyPendingShred
+                        | ErrorCode::KeyShredded
+                        | ErrorCode::KeyUnknown
+                ) =>
+            {
+                Ok(PushOutcome::KeyRace { code: err.code() })
+            }
             Err(err) => Err(err),
+        }
+    }
+
+    /// `POST /v1/keys/shred`: register or expedite shred marks on the relay (M2).
+    pub async fn post_keys_shred(
+        &self,
+        seen_seq: i64,
+        expedite: bool,
+        migration_exempt: bool,
+        marks: &[ShredMarkRow],
+    ) -> Result<Vec<ShredResultDto>, CoreError> {
+        let marks_json: Vec<serde_json::Value> = marks
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "mark_id": m.mark_id.to_string(),
+                    "key_id": m.key_id.to_string(),
+                    "grace_ms": m.grace_ms,
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "seen_seq": seen_seq,
+            "expedite": expedite,
+            "migration_exempt": migration_exempt,
+            "marks": marks_json,
+        });
+        let res = self
+            .add_headers(self.http.post(self.endpoint("/v1/keys/shred")).json(&body))
+            .send()
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::SyncOffline,
+                    format!("POST /v1/keys/shred failed: {e}"),
+                    "Retry online",
+                )
+            })?;
+        let val = parse_relay_json(res).await?;
+        parse_shred_results(&val)
+    }
+
+    /// `POST /v1/keys/cancel`: cancel active shred marks on the relay (`410 KEY_SHREDDED` if already executed).
+    pub async fn post_keys_cancel(&self, key_ids: &[KeyId]) -> Result<Vec<KeyId>, CoreError> {
+        let ids: Vec<String> = key_ids.iter().map(ToString::to_string).collect();
+        let body = serde_json::json!({ "key_ids": ids });
+        let res = self
+            .add_headers(self.http.post(self.endpoint("/v1/keys/cancel")).json(&body))
+            .send()
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::SyncOffline,
+                    format!("POST /v1/keys/cancel failed: {e}"),
+                    "Retry online",
+                )
+            })?;
+        let val = parse_relay_json(res).await?;
+        let mut out = Vec::new();
+        if let Some(arr) = val["cancelled"].as_array() {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    out.push(KeyId::parse(s)?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// `POST /v1/keys/confirm`: confirm `pending_confirm` shred marks into `scheduled` with `T_grace_min`.
+    pub async fn post_keys_confirm(
+        &self,
+        key_ids: &[KeyId],
+        grace_ms: Option<i64>,
+    ) -> Result<Vec<ShredResultDto>, CoreError> {
+        let ids: Vec<String> = key_ids.iter().map(ToString::to_string).collect();
+        let mut body = serde_json::json!({ "key_ids": ids });
+        if let Some(g) = grace_ms {
+            body["grace_ms"] = serde_json::json!(g);
+        }
+        let res = self
+            .add_headers(self.http.post(self.endpoint("/v1/keys/confirm")).json(&body))
+            .send()
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::SyncOffline,
+                    format!("POST /v1/keys/confirm failed: {e}"),
+                    "Retry online",
+                )
+            })?;
+        let val = parse_relay_json(res).await?;
+        parse_shred_results(&val)
+    }
+
+    /// `PUT /v1/snapshots/state`: upload encrypted `MNP1` mobile state snapshot (monotonic `covers_seq`).
+    pub async fn put_state_snapshot(
+        &self,
+        epoch: &str,
+        covers_seq: i64,
+        snapshot_id: &str,
+        mnp1_bytes: &[u8],
+    ) -> Result<serde_json::Value, CoreError> {
+        let res = self
+            .add_headers(
+                self.http
+                    .put(self.endpoint("/v1/snapshots/state"))
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .header("X-Mynote-Epoch", epoch)
+                    .header("X-Mynote-Covers-Seq", covers_seq.to_string())
+                    .header("X-Mynote-Snapshot-Id", snapshot_id)
+                    .body(mnp1_bytes.to_vec()),
+            )
+            .send()
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::SyncOffline,
+                    format!("PUT /v1/snapshots/state failed: {e}"),
+                    "Retry online",
+                )
+            })?;
+        parse_relay_json(res).await
+    }
+
+    /// `GET /v1/snapshots/state`: download latest `MNP1` mobile state snapshot (returns `Ok(None)` on 404).
+    pub async fn get_state_snapshot(&self) -> Result<Option<(String, i64, String, Vec<u8>)>, CoreError> {
+        let res = self
+            .add_headers(self.http.get(self.endpoint("/v1/snapshots/state")))
+            .send()
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::SyncOffline,
+                    format!("GET /v1/snapshots/state failed: {e}"),
+                    "Retry online",
+                )
+            })?;
+        let status = res.status();
+        if status.is_redirection() {
+            return Err(CoreError::new(
+                ErrorCode::SyncOffline,
+                format!("snapshot endpoint returned redirect HTTP {}", status.as_u16()),
+                "Check sync URL",
+            ));
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if status != StatusCode::OK {
+            let _ = parse_relay_json(res).await?;
+            return Ok(None);
+        }
+        let epoch = res
+            .headers()
+            .get("X-Mynote-Epoch")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let covers_seq = res
+            .headers()
+            .get("X-Mynote-Covers-Seq")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        let snapshot_id = res
+            .headers()
+            .get("X-Mynote-Snapshot-Id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = res.bytes().await.map_err(|e| {
+            CoreError::new(
+                ErrorCode::SyncOffline,
+                format!("reading snapshot body failed: {e}"),
+                "Retry online",
+            )
+        })?;
+        Ok(Some((epoch, covers_seq, snapshot_id, bytes.to_vec())))
+    }
+
+    /// Publish an encrypted `MNP1` mobile state snapshot if due (first bootstrap, >= 1000 ops, daily, or immediately after ExecuteShred).
+    pub async fn maybe_publish_state_snapshot(
+        &self,
+        store: &mut LocalStore,
+        force_after_shred: bool,
+    ) -> Result<bool, CoreError> {
+        let snap_info = {
+            if store.get_local_meta("bootstrap_completed").as_deref() != Some("1") {
+                return Ok(false);
+            }
+            let last_seq = store
+                .get_local_meta("last_seq")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            if last_seq <= 0 && !force_after_shred {
+                return Ok(false);
+            }
+            let last_snap_seq = store
+                .get_local_meta("last_snapshot_seq")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(-1);
+            let last_snap_at = store
+                .get_local_meta("last_snapshot_at_ms")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let now = now_ms() as i64;
+            let due = force_after_shred
+                || last_snap_seq < 0
+                || last_seq.saturating_sub(last_snap_seq) >= 1000
+                || (now.saturating_sub(last_snap_at) >= 86_400_000 && last_seq > last_snap_seq);
+            if !due {
+                return Ok(false);
+            }
+            store.build_state_snapshot()?
+        };
+        let (hdr, bytes) = snap_info;
+        match self
+            .put_state_snapshot(
+                &hdr.journal_epoch.to_string(),
+                hdr.covers_seq,
+                &hdr.snapshot_id.to_string(),
+                &bytes,
+            )
+            .await
+        {
+            Ok(_) => {
+                let _ = store.set_local_meta("last_snapshot_seq", &hdr.covers_seq.to_string());
+                let _ = store.set_local_meta("last_snapshot_at_ms", &(now_ms() as i64).to_string());
+                Ok(true)
+            }
+            Err(e) if e.code() == ErrorCode::CasMismatch => {
+                // Another desktop already uploaded a newer snapshot covering >= covers_seq
+                let _ = store.set_local_meta("last_snapshot_seq", &hdr.covers_seq.to_string());
+                let _ = store.set_local_meta("last_snapshot_at_ms", &(now_ms() as i64).to_string());
+                Ok(false)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -786,6 +1116,14 @@ impl RelayClient {
                 });
             }
         }
+        let mut marks = Vec::new();
+        if let Some(arr) = val["shred_marks"].as_array() {
+            for item in arr {
+                if let Ok(m) = parse_shred_mark_json(item) {
+                    marks.push(m);
+                }
+            }
+        }
         let keyring = val["key_material"]["keyring"].as_object().and_then(|o| {
             let gen = o.get("gen")?.as_u64()? as u32;
             let blob = b64.decode(o.get("blob_b64")?.as_str()?).ok()?;
@@ -796,7 +1134,7 @@ impl RelayClient {
             let blob = b64.decode(o.get("blob_b64")?.as_str()?).ok()?;
             Some((gen, blob))
         });
-        Ok((records, Vec::new(), keyring, vault_header))
+        Ok((records, marks, keyring, vault_header))
     }
 
     /// Synchronize key table using GET-before-POST diffing so a stale local `keyring`/`vault_header`
@@ -899,7 +1237,7 @@ impl RelayClient {
         Ok(remote)
     }
 
-    /// Execute a full Sans-I/O sync round against Cloudflare relay (pull -> key diff -> push -> PITR reconcile).
+    /// Execute a full Sans-I/O sync round against Cloudflare relay (pull -> key diff -> push -> PITR reconcile -> MNP1 snapshot).
     pub async fn run_sync_round(
         &self,
         store: &mut LocalStore,
@@ -918,6 +1256,7 @@ impl RelayClient {
 
         let mut steps = 0usize;
         let mut stalled_steps = 0usize;
+        let mut shred_acks = 0usize;
         let mut prev_progress = (
             store.get_local_meta("last_seq"),
             store.get_local_meta("bootstrap_completed"),
@@ -925,6 +1264,7 @@ impl RelayClient {
             report.pulled_ops,
             report.pushed_ops,
             report.keys_synced,
+            shred_acks,
         );
 
         while !queue.is_empty() && steps < MAX_SYNC_STEPS {
@@ -958,7 +1298,6 @@ impl RelayClient {
                         report.reconciled_epoch_change = true;
                     }
                     merge_summary(&mut report.apply_summary, store.apply_store_mutations(&muts)?);
-                    // Prioritize SyncKeyTable before HttpPush so key_material & keys settle first
                     for c in next_cmds {
                         if matches!(c, SyncCommand::SyncKeyTable(_)) {
                             queue.insert(0, c);
@@ -990,27 +1329,44 @@ impl RelayClient {
                         continue;
                     }
                     match self.http_push(&push_req).await? {
-                        Ok((epoch, acked, head_seq)) => {
+                        PushOutcome::Acked {
+                            epoch,
+                            acked,
+                            shred_results,
+                            cancelled_keys,
+                            head_seq,
+                        } => {
                             report.epoch = Some(epoch.to_string());
                             report.head_seq = head_seq;
                             report.pushed_ops += acked.len();
+                            shred_acks += shred_results.len() + cancelled_keys.len();
                             let snap = store.export_engine_snapshot()?;
                             let (muts, next_cmds) = step(
                                 &snap,
                                 SyncEvent::PushAcked {
                                     epoch,
                                     acked,
+                                    shred_results,
+                                    cancelled_keys,
                                     head_seq,
                                 },
                             )?;
                             merge_summary(&mut report.apply_summary, store.apply_store_mutations(&muts)?);
                             queue.extend(next_cmds);
                         }
-                        Err(remote_epoch) => {
+                        PushOutcome::EpochMismatch(remote_epoch) => {
                             report.reconciled_epoch_change = true;
                             let snap = store.export_engine_snapshot()?;
                             let (muts, next_cmds) =
                                 step(&snap, SyncEvent::PushEpochMismatch { remote_epoch })?;
+                            merge_summary(&mut report.apply_summary, store.apply_store_mutations(&muts)?);
+                            queue.clear();
+                            queue.extend(next_cmds);
+                        }
+                        PushOutcome::KeyRace { code } => {
+                            let snap = store.export_engine_snapshot()?;
+                            let (muts, next_cmds) =
+                                step(&snap, SyncEvent::PushKeyRaceError { code, key_id: None })?;
                             merge_summary(&mut report.apply_summary, store.apply_store_mutations(&muts)?);
                             queue.clear();
                             queue.extend(next_cmds);
@@ -1026,6 +1382,7 @@ impl RelayClient {
                 report.pulled_ops,
                 report.pushed_ops,
                 report.keys_synced,
+                shred_acks,
             );
             if cur_progress == prev_progress {
                 stalled_steps += 1;
@@ -1049,6 +1406,30 @@ impl RelayClient {
                 "Re-run 'mynote sync pull' to continue syncing remaining operations",
             ));
         }
+
+        // One-time M1 -> M2 trash migration (`sync-protocol.md` §5.9): submit pre-existing trashed blocks with `migration_exempt: true`
+        if !read_only && store.get_local_meta("bootstrap_completed").as_deref() == Some("1") {
+            if let Ok(mig_marks) = store.migrate_m1_trashed_blocks_if_needed() {
+                if !mig_marks.is_empty() {
+                    let seen_seq = store
+                        .get_local_meta("last_seq")
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    if let Ok(results) = self.post_keys_shred(seen_seq, false, true, &mig_marks).await {
+                        let _ = store.apply_store_mutations(&[
+                            mynote_core::sync::StoreMutation::MarkShredMarksAcked {
+                                results,
+                                cancelled_keys: Vec::new(),
+                            },
+                        ]);
+                    }
+                }
+            }
+            // Auto-publish mobile MNP1 state snapshot when due or immediately after ExecuteShred
+            let force_snap = !report.apply_summary.executed_shreds.is_empty();
+            let _ = self.maybe_publish_state_snapshot(store, force_snap).await;
+        }
+
         Ok(report)
     }
 }
@@ -1063,6 +1444,9 @@ fn merge_summary(dst: &mut SyncApplySummary, src: SyncApplySummary) {
         dst.clock_skew_ms = src.clock_skew_ms;
     }
     dst.integrity_alerts.extend(src.integrity_alerts);
+    dst.executed_shreds.extend(src.executed_shreds);
+    dst.needs_vault_rekey.extend(src.needs_vault_rekey);
+    dst.pending_confirm_count += src.pending_confirm_count;
 }
 
 /// Long-running WebSocket Hibernation wakeup listener (`GET /v1/sync/ws`).

@@ -2,7 +2,7 @@
 //! middleware, `rust-embed` Web UI assets, `0600` UDS NDJSON IPC, and Single-Flight cloud sync.
 
 use crate::formatters::format_content;
-use crate::sync_client::{hex_encode, run_cloud_ws_loop, RelayClient};
+use crate::sync_client::{hex_encode, run_cloud_ws_loop, PushOutcome, RelayClient};
 use crate::uds::{socket_path_for, ApplyMeta, ApplyRequest, UdsRequest, UdsResponse};
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, Request, State};
@@ -20,9 +20,10 @@ use fs2::FileExt;
 use futures_util::{SinkExt, StreamExt};
 use mynote_core::error::{CoreError, ErrorCode};
 use mynote_core::ids::KeyId;
-use mynote_core::model::{KeyMaterialKind, KeyRecordRow};
+use mynote_core::model::{KeyMaterialKind, KeyRecordRow, ShredMarkRow, ShredMarkState};
 use mynote_core::sync::StoreMutation;
-use mynote_store::LocalStore;
+use mynote_core::vault::{T_GRACE_DEFAULT_MS, T_GRACE_MIN_MS};
+use mynote_store::{LocalStore, Tier2OpInput};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -30,7 +31,7 @@ use std::fs::{File, OpenOptions};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch, Notify};
@@ -41,6 +42,16 @@ struct EmbeddedWebAssets;
 
 const SESSION_COOKIE_NAME: &str = "mynote_local_session";
 const TICKET_TTL: Duration = Duration::from_secs(10);
+const TRASH_CONFIRM_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Debug)]
+pub struct PendingTrashAction {
+    pub action: String,
+    pub block_ids: Vec<String>,
+    pub key_ids: Vec<KeyId>,
+    pub grace_ms: i64,
+    pub created_at: Instant,
+}
 
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
@@ -54,6 +65,7 @@ pub struct DaemonState {
     pub port: u16,
     pub tickets: Mutex<HashMap<String, Instant>>,
     pub sessions: Mutex<HashSet<String>>,
+    pub trash_confirm_nonces: Mutex<HashMap<String, PendingTrashAction>>,
     pub ws_tx: broadcast::Sender<String>,
     pub sync_lock: tokio::sync::Mutex<()>,
     pub sync_notify: Arc<Notify>,
@@ -96,6 +108,27 @@ impl DaemonState {
         self.sessions.lock().unwrap().contains(token)
     }
 
+    pub fn issue_trash_confirm_nonce(&self, pending: PendingTrashAction) -> Result<String, CoreError> {
+        let mut raw = [0u8; 24];
+        getrandom::fill(&mut raw)
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, format!("CSPRNG failed: {e}"), "Retry"))?;
+        let nonce = hex_encode(&raw);
+        let mut guard = self.trash_confirm_nonces.lock().unwrap();
+        let now = Instant::now();
+        guard.retain(|_, item| now.duration_since(item.created_at) <= TRASH_CONFIRM_TTL);
+        guard.insert(nonce.clone(), pending);
+        Ok(nonce)
+    }
+
+    pub fn consume_trash_confirm_nonce(&self, nonce: &str) -> Option<PendingTrashAction> {
+        let mut guard = self.trash_confirm_nonces.lock().unwrap();
+        let item = guard.remove(nonce)?;
+        if Instant::now().duration_since(item.created_at) > TRASH_CONFIRM_TTL {
+            return None;
+        }
+        Some(item)
+    }
+
     fn broadcast_json(&self, val: serde_json::Value) {
         let _ = self.ws_tx.send(val.to_string());
     }
@@ -103,7 +136,7 @@ impl DaemonState {
     fn broadcast_block_upserted(&self, block_id: &str) {
         let dto = {
             let store = self.store.lock().unwrap();
-            store.get_block(block_id).ok()
+            store.get_block_for_daemon(block_id).ok()
         };
         if let Some(b) = dto {
             self.broadcast_json(serde_json::json!({
@@ -138,9 +171,12 @@ impl DaemonState {
     }
 
     fn broadcast_sync_and_trash(&self) {
-        let status = {
+        let (status, blocked_count) = {
             let store = self.store.lock().unwrap();
-            store.sync_status().ok()
+            (
+                store.sync_status().ok(),
+                store.list_blocked_tier2_ops().map(|v| v.len()).unwrap_or(0),
+            )
         };
         if let Some(st) = status {
             self.broadcast_json(serde_json::json!({
@@ -155,6 +191,20 @@ impl DaemonState {
                 "last_seq": st.last_seq,
                 "pending_ops": st.pending_ops
             }));
+            if st.trash.pending_confirm_count > 0 {
+                self.broadcast_json(serde_json::json!({
+                    "type": "alert",
+                    "code": "SHRED_PENDING_CONFIRM",
+                    "details": { "pending_confirm_count": st.trash.pending_confirm_count }
+                }));
+            }
+            if blocked_count > 0 {
+                self.broadcast_json(serde_json::json!({
+                    "type": "alert",
+                    "code": "NEEDS_VAULT_REKEY",
+                    "details": { "blocked_count": blocked_count }
+                }));
+            }
             if !st.key_self_check.ok {
                 self.broadcast_json(serde_json::json!({
                     "type": "alert",
@@ -239,7 +289,7 @@ impl DaemonState {
                     .apply_summary
                     .upserted_block_ids
                     .iter()
-                    .filter_map(|id| store.get_block(id).ok())
+                    .filter_map(|id| store.get_block_for_daemon(id).ok())
                     .collect()
             };
             self.broadcast_json(serde_json::json!({
@@ -270,6 +320,7 @@ async fn run_sync_round_with_mutex(
     const MAX_STALLED_STEPS: usize = 8;
 
     let mut report = crate::sync_client::SyncRoundReport::default();
+    let mut shred_acks = 0usize;
 
     let (mut queue, mut prev_progress) = {
         let mut store = store_mutex.lock().unwrap();
@@ -284,6 +335,7 @@ async fn run_sync_round_with_mutex(
             report.pulled_ops,
             report.pushed_ops,
             report.keys_synced,
+            shred_acks,
         );
         (cmds, prog)
     };
@@ -303,8 +355,8 @@ async fn run_sync_round_with_mutex(
                 let next_cmds = {
                     let mut store = store_mutex.lock().unwrap();
                     let snap = store.export_engine_snapshot()?;
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(1);
                     let (muts, cmds) = step(
@@ -342,8 +394,8 @@ async fn run_sync_round_with_mutex(
                 let next_cmds = {
                     let mut store = store_mutex.lock().unwrap();
                     let snap = store.export_engine_snapshot()?;
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_millis() as i64)
                         .unwrap_or(1);
                     let (muts, cmds) = step(
@@ -367,10 +419,17 @@ async fn run_sync_round_with_mutex(
                     continue;
                 }
                 match client.push_batch_for_daemon(&push_req).await? {
-                    Ok((epoch, acked, head_seq)) => {
+                    PushOutcome::Acked {
+                        epoch,
+                        acked,
+                        shred_results,
+                        cancelled_keys,
+                        head_seq,
+                    } => {
                         report.epoch = Some(epoch.to_string());
                         report.head_seq = head_seq;
                         report.pushed_ops += acked.len();
+                        shred_acks += shred_results.len() + cancelled_keys.len();
                         let next_cmds = {
                             let mut store = store_mutex.lock().unwrap();
                             let snap = store.export_engine_snapshot()?;
@@ -379,6 +438,8 @@ async fn run_sync_round_with_mutex(
                                 SyncEvent::PushAcked {
                                     epoch,
                                     acked,
+                                    shred_results,
+                                    cancelled_keys,
                                     head_seq,
                                 },
                             )?;
@@ -388,12 +449,25 @@ async fn run_sync_round_with_mutex(
                         };
                         queue.extend(next_cmds);
                     }
-                    Err(remote_epoch) => {
+                    PushOutcome::EpochMismatch(remote_epoch) => {
                         report.reconciled_epoch_change = true;
                         let next_cmds = {
                             let mut store = store_mutex.lock().unwrap();
                             let snap = store.export_engine_snapshot()?;
                             let (muts, cmds) = step(&snap, SyncEvent::PushEpochMismatch { remote_epoch })?;
+                            let sum = store.apply_store_mutations(&muts)?;
+                            merge_apply(&mut report.apply_summary, sum);
+                            cmds
+                        };
+                        queue.clear();
+                        queue.extend(next_cmds);
+                    }
+                    PushOutcome::KeyRace { code } => {
+                        let next_cmds = {
+                            let mut store = store_mutex.lock().unwrap();
+                            let snap = store.export_engine_snapshot()?;
+                            let (muts, cmds) =
+                                step(&snap, SyncEvent::PushKeyRaceError { code, key_id: None })?;
                             let sum = store.apply_store_mutations(&muts)?;
                             merge_apply(&mut report.apply_summary, sum);
                             cmds
@@ -414,6 +488,7 @@ async fn run_sync_round_with_mutex(
                 report.pulled_ops,
                 report.pushed_ops,
                 report.keys_synced,
+                shred_acks,
             )
         };
         if cur_progress == prev_progress {
@@ -438,6 +513,97 @@ async fn run_sync_round_with_mutex(
             "Trigger another sync round to continue",
         ));
     }
+
+    // M2 post-sync tasks (without holding std::sync::Mutex across await!)
+    if !read_only {
+        let mig_req: Option<(i64, Vec<ShredMarkRow>)> = {
+            let mut store = store_mutex.lock().unwrap();
+            if store.get_local_meta("bootstrap_completed").as_deref() == Some("1") {
+                match store.migrate_m1_trashed_blocks_if_needed() {
+                    Ok(marks) if !marks.is_empty() => {
+                        let seen_seq = store
+                            .get_local_meta("last_seq")
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        Some((seen_seq, marks))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((seen_seq, marks)) = mig_req {
+            if let Ok(results) = client.post_keys_shred(seen_seq, false, true, &marks).await {
+                let mut store = store_mutex.lock().unwrap();
+                let _ = store.apply_store_mutations(&[StoreMutation::MarkShredMarksAcked {
+                    results,
+                    cancelled_keys: Vec::new(),
+                }]);
+            }
+        }
+
+        // Auto-publish mobile MNP1 state snapshot when due or immediately after ExecuteShred
+        let force_snap = !report.apply_summary.executed_shreds.is_empty();
+        let snap_to_put = {
+            let mut store = store_mutex.lock().unwrap();
+            let boot = store.get_local_meta("bootstrap_completed").as_deref() == Some("1");
+            let last_seq = store
+                .get_local_meta("last_seq")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let last_snap_seq = store
+                .get_local_meta("last_snapshot_seq")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(-1);
+            let last_snap_at = store
+                .get_local_meta("last_snapshot_at_ms")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(1);
+            let due = boot
+                && (last_seq > 0 || force_snap)
+                && (force_snap
+                    || last_snap_seq < 0
+                    || last_seq.saturating_sub(last_snap_seq) >= 1000
+                    || (now.saturating_sub(last_snap_at) >= 86_400_000 && last_seq > last_snap_seq));
+            if due {
+                store.build_state_snapshot().ok()
+            } else {
+                None
+            }
+        };
+        if let Some((hdr, bytes)) = snap_to_put {
+            match client
+                .put_state_snapshot(
+                    &hdr.journal_epoch.to_string(),
+                    hdr.covers_seq,
+                    &hdr.snapshot_id.to_string(),
+                    &bytes,
+                )
+                .await
+            {
+                Ok(_) => {
+                    let store = store_mutex.lock().unwrap();
+                    let _ = store.set_local_meta("last_snapshot_seq", &hdr.covers_seq.to_string());
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(1);
+                    let _ = store.set_local_meta("last_snapshot_at_ms", &now.to_string());
+                }
+                Err(e) if e.code() == ErrorCode::CasMismatch => {
+                    let store = store_mutex.lock().unwrap();
+                    let _ = store.set_local_meta("last_snapshot_seq", &hdr.covers_seq.to_string());
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
     Ok(report)
 }
 
@@ -451,6 +617,9 @@ fn merge_apply(dst: &mut mynote_store::store::SyncApplySummary, src: mynote_stor
         dst.clock_skew_ms = src.clock_skew_ms;
     }
     dst.integrity_alerts.extend(src.integrity_alerts);
+    dst.executed_shreds.extend(src.executed_shreds);
+    dst.needs_vault_rekey.extend(src.needs_vault_rekey);
+    dst.pending_confirm_count += src.pending_confirm_count;
 }
 
 pub struct RunningDaemon {
@@ -531,6 +700,7 @@ pub async fn start_daemon(cfg: DaemonConfig) -> Result<RunningDaemon, CoreError>
         port: actual_port,
         tickets: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashSet::new()),
+        trash_confirm_nonces: Mutex::new(HashMap::new()),
         ws_tx,
         sync_lock: tokio::sync::Mutex::new(()),
         sync_notify: sync_notify.clone(),
@@ -765,8 +935,32 @@ fn build_router(state: Arc<DaemonState>) -> Router {
         )
         .route("/v1/local/blocks/{id}/resolve", post(handle_resolve_block))
         .route("/v1/local/blocks/{id}/history", get(handle_block_history))
+        .route("/v1/local/blocks/{id}/lock", post(handle_lock_block))
+        .route("/v1/local/blocks/{id}/unlock", post(handle_unlock_block))
+        .route(
+            "/v1/local/blocks/{id}/purge-history",
+            post(handle_purge_block_history),
+        )
         .route("/v1/local/trash", get(handle_list_trash))
         .route("/v1/local/trash/{id}/restore", post(handle_restore_trash))
+        .route("/v1/local/trash/{id}/tier2-blob", get(handle_trash_tier2_blob))
+        .route(
+            "/v1/local/trash/actions/prepare",
+            post(handle_trash_actions_prepare),
+        )
+        .route(
+            "/v1/local/trash/actions/commit",
+            post(handle_trash_actions_commit),
+        )
+        .route(
+            "/v1/local/vault/header",
+            get(handle_get_vault_header).put(handle_put_vault_header),
+        )
+        .route("/v1/local/blocked-ops", get(handle_list_blocked_ops))
+        .route(
+            "/v1/local/blocked-ops/{op_id}/rekey",
+            post(handle_rekey_blocked_op),
+        )
         .route("/v1/local/format", post(handle_format))
         .route("/v1/local/keys", get(handle_get_keys).post(handle_post_keys))
         .route("/v1/local/sync/status", get(handle_sync_status))
@@ -983,6 +1177,18 @@ async fn handle_static_asset(State(state): State<Arc<DaemonState>>, req: Request
     res
 }
 
+fn decode_b64_arg(field: &str, raw: &str) -> Result<Vec<u8>, CoreError> {
+    base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .map_err(|e| {
+            CoreError::new(
+                ErrorCode::InvalidArgument,
+                format!("invalid base64 in '{field}': {e}"),
+                "Provide valid standard base64",
+            )
+        })
+}
+
 async fn handle_bootstrap(State(state): State<Arc<DaemonState>>) -> Response {
     let res = {
         let store = state.store.lock().unwrap();
@@ -990,17 +1196,25 @@ async fn handle_bootstrap(State(state): State<Arc<DaemonState>>) -> Response {
             let buffers = store.list_buffers()?;
             let initial_buffer_id = buffers.first().map(|b| b.id.clone());
             let blocks = match &initial_buffer_id {
-                Some(bid) => store.list_blocks_detailed(bid)?,
+                Some(bid) => store.list_blocks_for_daemon(bid)?,
                 None => Vec::new(),
             };
             let sync_status = store.sync_status()?;
             let trash_count = sync_status.trash.count;
+            let vault_header = store.get_vault_header()?;
+            let recovery_pk_b64 = store
+                .recovery_pk()
+                .ok()
+                .map(|pk| base64::engine::general_purpose::STANDARD.encode(pk));
+            let blocked_tier2_ops = store.list_blocked_tier2_ops().unwrap_or_default();
             Ok(serde_json::json!({
                 "buffers": buffers,
                 "initial_buffer_id": initial_buffer_id,
                 "blocks": blocks,
                 "sync_status": sync_status,
-                "vault_header": serde_json::Value::Null,
+                "vault_header": vault_header,
+                "recovery_pk_b64": recovery_pk_b64,
+                "blocked_tier2_ops": blocked_tier2_ops,
                 "trash_count": trash_count,
                 "device_id": store.device_id().as_str(),
                 "last_hlc": store.last_hlc_string(),
@@ -1100,11 +1314,11 @@ async fn handle_list_blocks(State(state): State<Arc<DaemonState>>, Query(q): Que
     let res = {
         let store = state.store.lock().unwrap();
         match q.buffer_id.as_deref() {
-            Some(bid) => store.list_blocks_detailed(bid),
+            Some(bid) => store.list_blocks_for_daemon(bid),
             None => {
                 let bufs = store.list_buffers();
                 match bufs {
-                    Ok(list) if !list.is_empty() => store.list_blocks_detailed(&list[0].id),
+                    Ok(list) if !list.is_empty() => store.list_blocks_for_daemon(&list[0].id),
                     Ok(_) => Ok(Vec::new()),
                     Err(e) => Err(e),
                 }
@@ -1121,8 +1335,15 @@ async fn handle_list_blocks(State(state): State<Arc<DaemonState>>, Query(q): Que
 struct CreateBlockBody {
     buffer_id: String,
     lang: Option<String>,
-    content: String,
+    content: Option<String>,
     after_id: Option<String>,
+    // Tier 2 fields (produced by WasmVaultSession; Daemon NEVER sees plaintext or VKEK)
+    block_id: Option<String>,
+    op_id: Option<String>,
+    key_id: Option<String>,
+    mnb1_b64: Option<String>,
+    mnw1_b64: Option<String>,
+    public_hint: Option<String>,
     #[serde(default)]
     fast_sync: bool,
 }
@@ -1133,15 +1354,65 @@ async fn handle_create_block(
 ) -> Response {
     let res = {
         let mut store = state.store.lock().unwrap();
-        let receipt = store.add_block(
-            &body.buffer_id,
-            &body.content,
-            body.lang.as_deref(),
-            body.after_id.as_deref(),
-            "human",
-            None,
-        );
-        receipt.and_then(|r| store.get_block(&r.block_id))
+        let receipt = if let Some(mnb1_b64) = body.mnb1_b64.as_deref() {
+            (|| -> Result<mynote_store::WriteReceipt, CoreError> {
+                let block_id = body.block_id.as_deref().ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::InvalidArgument,
+                        "block_id is required for Tier 2 block creation",
+                        "Use WasmVaultSession.encryptNewBlock",
+                    )
+                })?;
+                let op_id = body.op_id.as_deref().ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::InvalidArgument,
+                        "op_id is required for Tier 2 block creation",
+                        "Use WasmVaultSession.encryptNewBlock",
+                    )
+                })?;
+                let key_id = body.key_id.as_deref().ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::InvalidArgument,
+                        "key_id is required for Tier 2 block creation",
+                        "Use WasmVaultSession.encryptNewBlock",
+                    )
+                })?;
+                let mnw1_b64 = body.mnw1_b64.as_deref().ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::InvalidArgument,
+                        "mnw1_b64 is required for Tier 2 block creation",
+                        "Use WasmVaultSession.encryptNewBlock",
+                    )
+                })?;
+                let mnb1 = decode_b64_arg("mnb1_b64", mnb1_b64)?;
+                let mnw1 = decode_b64_arg("mnw1_b64", mnw1_b64)?;
+                store.add_tier2_block(
+                    block_id,
+                    Tier2OpInput {
+                        op_id,
+                        key_id,
+                        mnb1: &mnb1,
+                        mnw1: Some(&mnw1),
+                    },
+                    &body.buffer_id,
+                    body.lang.as_deref().unwrap_or("text"),
+                    body.after_id.as_deref(),
+                    body.public_hint.as_deref(),
+                    "human",
+                )
+            })()
+        } else {
+            let content = body.content.as_deref().unwrap_or("");
+            store.add_block(
+                &body.buffer_id,
+                content,
+                body.lang.as_deref(),
+                body.after_id.as_deref(),
+                "human",
+                None,
+            )
+        };
+        receipt.and_then(|r| store.get_block_for_daemon(&r.block_id))
     };
     match res {
         Ok(blk) => {
@@ -1156,7 +1427,7 @@ async fn handle_create_block(
 }
 
 async fn handle_get_block(State(state): State<Arc<DaemonState>>, AxumPath(id): AxumPath<String>) -> Response {
-    let res = state.store.lock().unwrap().get_block(&id);
+    let res = state.store.lock().unwrap().get_block_for_daemon(&id);
     match res {
         Ok(v) => ok_json(v),
         Err(e) => core_err_to_response(e),
@@ -1167,6 +1438,12 @@ async fn handle_get_block(State(state): State<Arc<DaemonState>>, AxumPath(id): A
 struct PatchBlockBody {
     expected_heads: Option<Vec<String>>,
     content: Option<String>,
+    // Tier 2 fields (WasmVaultSession encrypted)
+    op_id: Option<String>,
+    key_id: Option<String>,
+    mnb1_b64: Option<String>,
+    mnw1_b64: Option<String>,
+    public_hint: Option<String>,
     lang: Option<String>,
     after_id: Option<String>,
     before_id: Option<String>,
@@ -1183,7 +1460,55 @@ async fn handle_patch_block(
     let res = {
         let mut store = state.store.lock().unwrap();
         let mut op_res: Result<(), CoreError> = Ok(());
-        if let Some(content) = &body.content {
+        if let Some(mnb1_b64) = &body.mnb1_b64 {
+            let heads = match &body.expected_heads {
+                Some(h) if !h.is_empty() => h,
+                _ => {
+                    return core_err_to_response(CoreError::new(
+                        ErrorCode::InvalidArgument,
+                        "expected_heads is required when updating Tier 2 block content",
+                        "Pass all current head_op_ids in expected_heads",
+                    ));
+                }
+            };
+            op_res = (|| -> Result<(), CoreError> {
+                let op_id = body.op_id.as_deref().ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::InvalidArgument,
+                        "op_id is required for Tier 2 update",
+                        "Use WasmVaultSession.encryptUpdate",
+                    )
+                })?;
+                let key_id = body.key_id.as_deref().ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::InvalidArgument,
+                        "key_id is required for Tier 2 update",
+                        "Use WasmVaultSession.encryptUpdate",
+                    )
+                })?;
+                let mnb1 = decode_b64_arg("mnb1_b64", mnb1_b64)?;
+                let mnw1 = body
+                    .mnw1_b64
+                    .as_deref()
+                    .map(|s| decode_b64_arg("mnw1_b64", s))
+                    .transpose()?;
+                store
+                    .update_tier2_block(
+                        &id,
+                        Tier2OpInput {
+                            op_id,
+                            key_id,
+                            mnb1: &mnb1,
+                            mnw1: mnw1.as_deref(),
+                        },
+                        heads,
+                        body.lang.as_deref(),
+                        body.public_hint.as_deref().map(Some),
+                        "human",
+                    )
+                    .map(|_| ())
+            })();
+        } else if let Some(content) = &body.content {
             let heads = match &body.expected_heads {
                 Some(h) if !h.is_empty() => h,
                 _ => {
@@ -1203,6 +1528,7 @@ async fn handle_patch_block(
                 || body.after_id.is_some()
                 || body.before_id.is_some()
                 || body.buffer_id.is_some())
+            && body.mnb1_b64.is_none()
         {
             op_res = store
                 .move_block(
@@ -1215,7 +1541,7 @@ async fn handle_patch_block(
                 )
                 .map(|_| ());
         }
-        op_res.and_then(|_| store.get_block(&id))
+        op_res.and_then(|_| store.get_block_for_daemon(&id))
     };
     match res {
         Ok(blk) => {
@@ -1234,6 +1560,11 @@ struct ResolveBlockBody {
     expected_heads: Vec<String>,
     content: Option<String>,
     keep_op_id: Option<String>,
+    // Tier 2 conflict merge fields
+    op_id: Option<String>,
+    key_id: Option<String>,
+    mnb1_b64: Option<String>,
+    mnw1_b64: Option<String>,
 }
 
 async fn handle_resolve_block(
@@ -1243,24 +1574,215 @@ async fn handle_resolve_block(
 ) -> Response {
     let res = {
         let mut store = state.store.lock().unwrap();
-        let write = if let Some(keep) = body.keep_op_id.as_deref() {
+        let write = if let Some(mnb1_b64) = body.mnb1_b64.as_deref() {
+            (|| -> Result<mynote_store::WriteReceipt, CoreError> {
+                let op_id = body.op_id.as_deref().ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::InvalidArgument,
+                        "op_id required for Tier 2 resolve",
+                        "Retry",
+                    )
+                })?;
+                let key_id = body.key_id.as_deref().ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::InvalidArgument,
+                        "key_id required for Tier 2 resolve",
+                        "Retry",
+                    )
+                })?;
+                let mnb1 = decode_b64_arg("mnb1_b64", mnb1_b64)?;
+                let mnw1 = body
+                    .mnw1_b64
+                    .as_deref()
+                    .map(|s| decode_b64_arg("mnw1_b64", s))
+                    .transpose()?;
+                store.update_tier2_block(
+                    &id,
+                    Tier2OpInput {
+                        op_id,
+                        key_id,
+                        mnb1: &mnb1,
+                        mnw1: mnw1.as_deref(),
+                    },
+                    &body.expected_heads,
+                    None,
+                    None,
+                    "human",
+                )
+            })()
+        } else if let Some(keep) = body.keep_op_id.as_deref() {
             store.resolve_block_keep(&id, &body.expected_heads, keep, "human")
         } else if let Some(content) = body.content.as_deref() {
             store.update_block(&id, content, &body.expected_heads, false, "human")
         } else {
             Err(CoreError::new(
                 ErrorCode::InvalidArgument,
-                "provide either keep_op_id or content to resolve",
+                "provide either keep_op_id, content, or Tier 2 mnb1_b64 to resolve",
                 "Pass keep_op_id or merged content",
             ))
         };
-        write.and_then(|_| store.get_block(&id))
+        write.and_then(|_| store.get_block_for_daemon(&id))
     };
     match res {
         Ok(blk) => {
             state.broadcast_block_upserted(&blk.id);
             state.sync_notify.notify_one();
             ok_json(blk)
+        }
+        Err(e) => core_err_to_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct LockBlockBody {
+    expected_heads: Vec<String>,
+    op_id: String,
+    key_id: String,
+    mnb1_b64: String,
+    mnw1_b64: String,
+    public_hint: Option<String>,
+}
+
+async fn handle_lock_block(
+    State(state): State<Arc<DaemonState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<LockBlockBody>,
+) -> Response {
+    let res = (|| -> Result<mynote_store::BlockDetailDto, CoreError> {
+        let mnb1 = decode_b64_arg("mnb1_b64", &body.mnb1_b64)?;
+        let mnw1 = decode_b64_arg("mnw1_b64", &body.mnw1_b64)?;
+        let mut store = state.store.lock().unwrap();
+        store.lock_block_tier2(
+            &id,
+            Tier2OpInput {
+                op_id: &body.op_id,
+                key_id: &body.key_id,
+                mnb1: &mnb1,
+                mnw1: Some(&mnw1),
+            },
+            &body.expected_heads,
+            None,
+            body.public_hint.as_deref(),
+            T_GRACE_DEFAULT_MS,
+            "human",
+        )?;
+        store.get_block_for_daemon(&id)
+    })();
+    match res {
+        Ok(blk) => {
+            state.broadcast_block_upserted(&blk.id);
+            state.sync_notify.notify_one();
+            ok_json(blk)
+        }
+        Err(e) => core_err_to_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct UnlockBlockBody {
+    expected_heads: Vec<String>,
+    content: String,
+    lang: Option<String>,
+    #[serde(default)]
+    shred_old_key: bool,
+}
+
+async fn handle_unlock_block(
+    State(state): State<Arc<DaemonState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<UnlockBlockBody>,
+) -> Response {
+    let res = {
+        let mut store = state.store.lock().unwrap();
+        store
+            .unlock_block_tier1(
+                &id,
+                &body.expected_heads,
+                &body.content,
+                body.lang.as_deref(),
+                body.shred_old_key,
+                "human",
+            )
+            .and_then(|_| store.get_block_for_daemon(&id))
+    };
+    match res {
+        Ok(blk) => {
+            state.broadcast_block_upserted(&blk.id);
+            state.sync_notify.notify_one();
+            ok_json(blk)
+        }
+        Err(e) => core_err_to_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct Tier2RekeyJson {
+    op_id: String,
+    key_id: String,
+    mnb1_b64: String,
+    mnw1_b64: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PurgeHistoryBody {
+    confirm_nonce: String,
+    grace_ms: Option<i64>,
+    tier2: Option<Tier2RekeyJson>,
+}
+
+async fn handle_purge_block_history(
+    State(state): State<Arc<DaemonState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<PurgeHistoryBody>,
+) -> Response {
+    let Some(pending) = state.consume_trash_confirm_nonce(&body.confirm_nonce) else {
+        return core_err_to_response(CoreError::new(
+            ErrorCode::UiConfirmationRequired,
+            "missing, expired, or already-used confirmation nonce",
+            "Call POST /v1/local/trash/actions/prepare and confirm inside the desktop UI",
+        ));
+    };
+    if pending.action != "purge_history" || !pending.block_ids.iter().any(|b| b == &id) {
+        return core_err_to_response(CoreError::new(
+            ErrorCode::UiConfirmationRequired,
+            "confirmation nonce does not match purge_history for this block",
+            "Re-open the confirmation modal in the desktop UI",
+        ));
+    }
+    let grace_ms = body.grace_ms.unwrap_or(pending.grace_ms);
+    let res = (|| -> Result<serde_json::Value, CoreError> {
+        let t2_decoded = match &body.tier2 {
+            Some(t) => Some((
+                t.op_id.clone(),
+                t.key_id.clone(),
+                decode_b64_arg("mnb1_b64", &t.mnb1_b64)?,
+                t.mnw1_b64
+                    .as_deref()
+                    .map(|s| decode_b64_arg("mnw1_b64", s))
+                    .transpose()?,
+            )),
+            None => None,
+        };
+        let mut store = state.store.lock().unwrap();
+        let t2_input = t2_decoded.as_ref().map(|(oid, kid, mnb1, mnw1)| Tier2OpInput {
+            op_id: oid,
+            key_id: kid,
+            mnb1,
+            mnw1: mnw1.as_deref(),
+        });
+        let (receipt, old_keys) = store.purge_block_history(&id, t2_input, grace_ms, "human")?;
+        let blk = store.get_block_for_daemon(&id)?;
+        Ok(serde_json::json!({
+            "block": blk,
+            "receipt": receipt,
+            "scheduled_old_key_ids": old_keys.into_iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+        }))
+    })();
+    match res {
+        Ok(val) => {
+            state.broadcast_block_upserted(&id);
+            state.sync_notify.notify_one();
+            ok_json(val)
         }
         Err(e) => core_err_to_response(e),
     }
@@ -1323,16 +1845,385 @@ async fn handle_list_trash(State(state): State<Arc<DaemonState>>) -> Response {
     }
 }
 
-async fn handle_restore_trash(
+async fn handle_trash_tier2_blob(
     State(state): State<Arc<DaemonState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
+    let res = state.store.lock().unwrap().trashed_tier2_blob(&id);
+    match res {
+        Ok(Some((op_id, key_id, mnb1_b64, mnw1_b64))) => ok_json(serde_json::json!({
+            "op_id": op_id,
+            "key_id": key_id,
+            "mnb1_b64": mnb1_b64,
+            "mnw1_b64": mnw1_b64,
+        })),
+        Ok(None) => core_err_to_response(CoreError::new(
+            ErrorCode::NotFound,
+            "no recoverable Tier 2 blob found for this trashed block",
+            "Block may be Tier 1 or already shredded",
+        )),
+        Err(e) => core_err_to_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct RestoreTrashBody {
+    op_id: Option<String>,
+    key_id: Option<String>,
+    mnb1_b64: Option<String>,
+}
+
+async fn handle_restore_trash(
+    State(state): State<Arc<DaemonState>>,
+    AxumPath(id): AxumPath<String>,
+    body: Option<Json<RestoreTrashBody>>,
+) -> Response {
     let res = {
         let mut store = state.store.lock().unwrap();
-        store
-            .restore_trash(&id, "human")
-            .and_then(|r| store.get_block(&r.block_id))
+        let write = if let Some(Json(b)) = body {
+            if let Some(mnb1_b64) = b.mnb1_b64.as_deref() {
+                (|| -> Result<mynote_store::WriteReceipt, CoreError> {
+                    let op_id = b.op_id.as_deref().ok_or_else(|| {
+                        CoreError::new(
+                            ErrorCode::InvalidArgument,
+                            "op_id required for Tier 2 restore",
+                            "Retry",
+                        )
+                    })?;
+                    let key_id = b.key_id.as_deref().ok_or_else(|| {
+                        CoreError::new(
+                            ErrorCode::InvalidArgument,
+                            "key_id required for Tier 2 restore",
+                            "Retry",
+                        )
+                    })?;
+                    let mnb1 = decode_b64_arg("mnb1_b64", mnb1_b64)?;
+                    store.restore_trash_tier2(
+                        &id,
+                        Tier2OpInput {
+                            op_id,
+                            key_id,
+                            mnb1: &mnb1,
+                            mnw1: None,
+                        },
+                        "human",
+                    )
+                })()
+            } else {
+                store.restore_trash(&id, "human")
+            }
+        } else {
+            store.restore_trash(&id, "human")
+        };
+        write.and_then(|r| store.get_block_for_daemon(&r.block_id))
     };
+    match res {
+        Ok(blk) => {
+            state.broadcast_block_upserted(&blk.id);
+            state.sync_notify.notify_one();
+            ok_json(blk)
+        }
+        Err(e) => core_err_to_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct TrashActionPrepareBody {
+    action: String,
+    block_ids: Option<Vec<String>>,
+    grace_ms: Option<i64>,
+}
+
+async fn handle_trash_actions_prepare(
+    State(state): State<Arc<DaemonState>>,
+    Json(body): Json<TrashActionPrepareBody>,
+) -> Response {
+    if !matches!(
+        body.action.as_str(),
+        "expedite" | "confirm_pending" | "purge_history"
+    ) {
+        return core_err_to_response(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!("unsupported trash action '{}'", body.action),
+            "Use 'expedite', 'confirm_pending', or 'purge_history'",
+        ));
+    }
+    let grace_ms = body.grace_ms.unwrap_or_else(|| {
+        if body.action == "expedite" {
+            T_GRACE_MIN_MS
+        } else {
+            T_GRACE_DEFAULT_MS
+        }
+    });
+    if grace_ms < T_GRACE_MIN_MS {
+        return core_err_to_response(CoreError::new(
+            ErrorCode::GraceTooShort,
+            format!("grace_ms {grace_ms} < minimum {T_GRACE_MIN_MS} (24h)"),
+            "Server enforces a mandatory 24-hour minimum grace period",
+        ));
+    }
+    let collected = {
+        let store = state.store.lock().unwrap();
+        store.collect_trash_action_keys(&body.action, body.block_ids.as_deref())
+    };
+    match collected {
+        Ok((blocks, key_ids, earliest_nb)) => {
+            let block_count = blocks.len();
+            let key_count = key_ids.len();
+            match state.issue_trash_confirm_nonce(PendingTrashAction {
+                action: body.action.clone(),
+                block_ids: blocks,
+                key_ids,
+                grace_ms,
+                created_at: Instant::now(),
+            }) {
+                Ok(nonce) => ok_json(serde_json::json!({
+                    "confirm_nonce": nonce,
+                    "expires_in_ms": TRASH_CONFIRM_TTL.as_millis() as i64,
+                    "summary": {
+                        "action": body.action,
+                        "block_count": block_count,
+                        "key_count": key_count,
+                        "grace_ms": grace_ms,
+                        "earliest_not_before_ms": earliest_nb,
+                    }
+                })),
+                Err(e) => core_err_to_response(e),
+            }
+        }
+        Err(e) => core_err_to_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct TrashActionCommitBody {
+    confirm_nonce: String,
+    tier2: Option<Tier2RekeyJson>,
+}
+
+async fn handle_trash_actions_commit(
+    State(state): State<Arc<DaemonState>>,
+    Json(body): Json<TrashActionCommitBody>,
+) -> Response {
+    let Some(pending) = state.consume_trash_confirm_nonce(&body.confirm_nonce) else {
+        return core_err_to_response(CoreError::new(
+            ErrorCode::UiConfirmationRequired,
+            "missing, expired, or already-used confirmation nonce",
+            "Call POST /v1/local/trash/actions/prepare and confirm inside the desktop UI",
+        ));
+    };
+
+    if pending.action == "purge_history" {
+        let Some(blk_id) = pending.block_ids.first().cloned() else {
+            return core_err_to_response(CoreError::new(
+                ErrorCode::InvalidArgument,
+                "purge_history requires a target block_id",
+                "Select a block to purge history",
+            ));
+        };
+        let res = (|| -> Result<serde_json::Value, CoreError> {
+            let t2_decoded = match &body.tier2 {
+                Some(t) => Some((
+                    t.op_id.clone(),
+                    t.key_id.clone(),
+                    decode_b64_arg("mnb1_b64", &t.mnb1_b64)?,
+                    t.mnw1_b64
+                        .as_deref()
+                        .map(|s| decode_b64_arg("mnw1_b64", s))
+                        .transpose()?,
+                )),
+                None => None,
+            };
+            let mut store = state.store.lock().unwrap();
+            let t2_input = t2_decoded.as_ref().map(|(oid, kid, mnb1, mnw1)| Tier2OpInput {
+                op_id: oid,
+                key_id: kid,
+                mnb1,
+                mnw1: mnw1.as_deref(),
+            });
+            let (receipt, old_keys) =
+                store.purge_block_history(&blk_id, t2_input, pending.grace_ms, "human")?;
+            Ok(serde_json::json!({
+                "action": "purge_history",
+                "receipt": receipt,
+                "scheduled_old_key_ids": old_keys.into_iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+            }))
+        })();
+        return match res {
+            Ok(v) => {
+                state.broadcast_block_upserted(&blk_id);
+                state.sync_notify.notify_one();
+                ok_json(v)
+            }
+            Err(e) => core_err_to_response(e),
+        };
+    }
+
+    // `expedite` and `confirm_pending` MUST obtain authoritative server timestamps (`sync-protocol.md` §5.2)
+    let (creds_opt, seen_seq, device_id) = {
+        let store = state.store.lock().unwrap();
+        let c = store.load_credentials().ok().flatten();
+        let seq = store
+            .get_local_meta("last_seq")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        (c, seq, store.device_id().clone())
+    };
+    let Some(creds) = creds_opt else {
+        return core_err_to_response(CoreError::new(
+            ErrorCode::SyncOffline,
+            "expedite/confirm requires an online sync relay for authoritative server timestamps",
+            "Connect to sync relay first",
+        ));
+    };
+    let client = match RelayClient::from_credentials(&creds) {
+        Ok(c) => c,
+        Err(e) => return core_err_to_response(e),
+    };
+
+    let results_res = if pending.action == "confirm_pending" {
+        client
+            .post_keys_confirm(&pending.key_ids, Some(pending.grace_ms))
+            .await
+    } else {
+        // expedite
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(1);
+        let mut marks = Vec::with_capacity(pending.key_ids.len());
+        for kid in &pending.key_ids {
+            let mut rnd = [0u8; 10];
+            let _ = getrandom::fill(&mut rnd);
+            let mid =
+                mynote_core::ids::MarkId::from_ulid(mynote_core::ids::Ulid::from_parts(now as u64, rnd));
+            marks.push(ShredMarkRow {
+                mark_id: mid,
+                key_id: *kid,
+                seen_seq,
+                requested_by: device_id.clone(),
+                requested_at_ms: now,
+                grace_ms: pending.grace_ms,
+                not_before_ms: None,
+                state: ShredMarkState::PendingConfirm,
+                confirmed_at_ms: None,
+                cancelled_by: None,
+                executed_at_ms: None,
+            });
+        }
+        client.post_keys_shred(seen_seq, true, false, &marks).await
+    };
+
+    match results_res {
+        Ok(results) => {
+            let mut store = state.store.lock().unwrap();
+            let _ = store.apply_store_mutations(&[StoreMutation::MarkShredMarksAcked {
+                results: results.clone(),
+                cancelled_keys: Vec::new(),
+            }]);
+            drop(store);
+            state.broadcast_sync_and_trash();
+            state.sync_notify.notify_one();
+            let out: Vec<serde_json::Value> = results
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "key_id": r.key_id.to_string(),
+                        "state": match r.state {
+                            ShredMarkState::PendingConfirm => "pending_confirm",
+                            ShredMarkState::Scheduled => "scheduled",
+                            ShredMarkState::Cancelled => "cancelled",
+                            ShredMarkState::Executed => "executed",
+                        },
+                        "not_before_ms": r.not_before_ms,
+                    })
+                })
+                .collect();
+            ok_json(serde_json::json!({
+                "action": pending.action,
+                "results": out,
+            }))
+        }
+        Err(e) => core_err_to_response(e),
+    }
+}
+
+async fn handle_get_vault_header(State(state): State<Arc<DaemonState>>) -> Response {
+    let res = {
+        let store = state.store.lock().unwrap();
+        let hdr = store.get_vault_header();
+        let rpk = store
+            .recovery_pk()
+            .ok()
+            .map(|pk| base64::engine::general_purpose::STANDARD.encode(pk));
+        hdr.map(|h| serde_json::json!({ "vault_header": h, "recovery_pk_b64": rpk }))
+    };
+    match res {
+        Ok(v) => ok_json(v),
+        Err(e) => core_err_to_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct PutVaultHeaderBody {
+    gen: i64,
+    blob_b64: String,
+}
+
+async fn handle_put_vault_header(
+    State(state): State<Arc<DaemonState>>,
+    Json(body): Json<PutVaultHeaderBody>,
+) -> Response {
+    let res = (|| -> Result<mynote_store::VaultHeaderDto, CoreError> {
+        let blob = decode_b64_arg("blob_b64", &body.blob_b64)?;
+        state.store.lock().unwrap().put_vault_header(body.gen, &blob)
+    })();
+    match res {
+        Ok(dto) => {
+            state.broadcast_json(serde_json::json!({
+                "type": "vault_header_changed",
+                "vault_header": dto,
+            }));
+            state.sync_notify.notify_one();
+            ok_json(dto)
+        }
+        Err(e) => core_err_to_response(e),
+    }
+}
+
+async fn handle_list_blocked_ops(State(state): State<Arc<DaemonState>>) -> Response {
+    let res = state.store.lock().unwrap().list_blocked_tier2_ops();
+    match res {
+        Ok(v) => ok_json(v),
+        Err(e) => core_err_to_response(e),
+    }
+}
+
+async fn handle_rekey_blocked_op(
+    State(state): State<Arc<DaemonState>>,
+    AxumPath(op_id): AxumPath<String>,
+    Json(body): Json<Tier2RekeyJson>,
+) -> Response {
+    let res = (|| -> Result<mynote_store::BlockDetailDto, CoreError> {
+        let mnb1 = decode_b64_arg("mnb1_b64", &body.mnb1_b64)?;
+        let mnw1 = body
+            .mnw1_b64
+            .as_deref()
+            .map(|s| decode_b64_arg("mnw1_b64", s))
+            .transpose()?;
+        let mut store = state.store.lock().unwrap();
+        let receipt = store.rekey_blocked_tier2_op(
+            &op_id,
+            Tier2OpInput {
+                op_id: &body.op_id,
+                key_id: &body.key_id,
+                mnb1: &mnb1,
+                mnw1: mnw1.as_deref(),
+            },
+            "human",
+        )?;
+        store.get_block_for_daemon(&receipt.block_id)
+    })();
     match res {
         Ok(blk) => {
             state.broadcast_block_upserted(&blk.id);
@@ -1374,9 +2265,37 @@ async fn handle_get_keys(State(state): State<Arc<DaemonState>>) -> Response {
                     })
                 })
                 .collect();
+            let marks: Vec<serde_json::Value> = kt
+                .marks
+                .values()
+                .map(|m| {
+                    serde_json::json!({
+                        "mark_id": m.mark_id.to_string(),
+                        "key_id": m.key_id.to_string(),
+                        "seen_seq": m.seen_seq,
+                        "requested_by": m.requested_by.as_str(),
+                        "requested_at_ms": m.requested_at_ms,
+                        "grace_ms": m.grace_ms,
+                        "not_before_ms": m.not_before_ms,
+                        "state": match m.state {
+                            ShredMarkState::PendingConfirm => "pending_confirm",
+                            ShredMarkState::Scheduled => "scheduled",
+                            ShredMarkState::Cancelled => "cancelled",
+                            ShredMarkState::Executed => "executed",
+                        },
+                        "confirmed_at_ms": m.confirmed_at_ms,
+                        "cancelled_by": m.cancelled_by.as_ref().map(|d| d.as_str()),
+                        "executed_at_ms": m.executed_at_ms,
+                    })
+                })
+                .collect();
             serde_json::json!({
                 "key_records": records,
-                "shred_marks": [],
+                "shred_marks": marks,
+                "vault_header": kt.vault_header_material.as_ref().map(|(g, b)| serde_json::json!({
+                    "gen": g,
+                    "blob_b64": b64.encode(b),
+                })),
                 "digest": kt.digest(),
             })
         })
@@ -1786,7 +2705,7 @@ fn execute_uds_apply(state: &Arc<DaemonState>, meta: ApplyMeta, req: ApplyReques
                             "block_id": b.id,
                             "buffer_id": b.buffer_id,
                             "in_trash": true,
-                            "shred_state": "unscheduled",
+                            "shred_state": "pending_sync",
                             "shred_not_before_ms": serde_json::Value::Null
                         })
                     })
@@ -1831,6 +2750,66 @@ fn execute_uds_apply(state: &Arc<DaemonState>, meta: ApplyMeta, req: ApplyReques
                     }
                     serde_json::to_value(s).map_err(|e| {
                         CoreError::new(ErrorCode::IntegrityError, e.to_string(), "encode import")
+                    })
+                }),
+            ApplyRequest::PutVaultHeader { gen, blob_b64 } => decode_b64_arg("blob_b64", &blob_b64)
+                .and_then(|blob| store.put_vault_header(gen, &blob))
+                .and_then(|dto| {
+                    state.broadcast_json(serde_json::json!({
+                        "type": "vault_header_changed",
+                        "vault_header": dto,
+                    }));
+                    serde_json::to_value(dto).map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "encode vault header")
+                    })
+                }),
+            ApplyRequest::LockBlockTier2 {
+                id,
+                op_id,
+                key_id,
+                mnb1_b64,
+                mnw1_b64,
+                expected_heads,
+                public_hint,
+            } => (|| -> Result<serde_json::Value, CoreError> {
+                let mnb1 = decode_b64_arg("mnb1_b64", &mnb1_b64)?;
+                let mnw1 = decode_b64_arg("mnw1_b64", &mnw1_b64)?;
+                let r = store.lock_block_tier2(
+                    &id,
+                    Tier2OpInput {
+                        op_id: &op_id,
+                        key_id: &key_id,
+                        mnb1: &mnb1,
+                        mnw1: Some(&mnw1),
+                    },
+                    &expected_heads,
+                    None,
+                    public_hint.as_deref(),
+                    T_GRACE_DEFAULT_MS,
+                    &meta.actor,
+                )?;
+                broadcast_block_up = Some(r.block_id.clone());
+                serde_json::to_value(r)
+                    .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "encode receipt"))
+            })(),
+            ApplyRequest::UnlockBlockTier1 {
+                id,
+                plaintext_content,
+                expected_heads,
+                shred_old_key,
+            } => store
+                .unlock_block_tier1(
+                    &id,
+                    &expected_heads,
+                    &plaintext_content,
+                    None,
+                    shred_old_key,
+                    &meta.actor,
+                )
+                .and_then(|r| {
+                    broadcast_block_up = Some(r.block_id.clone());
+                    serde_json::to_value(r).map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "encode receipt")
                     })
                 }),
         };
