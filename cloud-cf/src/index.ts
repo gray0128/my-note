@@ -1,7 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   b64ToBytes, bytesEqual, bytesToB64, computeKeysDigest, encodeMna1, encodeMnks,
-  KeyMaterialEntry, KeyRecordWire, randomDeviceId, randomPairId, sha256Hex, timingSafeEqualStr, toU8,
+  KeyMaterialEntry, KeyRecordWire, randomDeviceId, randomPairId, sha256Hex, ShredMarkState,
+  ShredMarkWire, timingSafeEqualStr, toU8,
 } from "./wire";
 
 export interface Env {
@@ -10,17 +11,23 @@ export interface Env {
   BOOTSTRAP_TOKEN: string;
   DAILY_ARCHIVE_INTERVAL_MS?: string;
   PAIRING_TTL_MS?: string;
+  T_GRACE_MIN_MS?: string;
+  SHRED_BATCH_LIMIT_24H?: string;
   ALLOW_TEST_HOOKS?: string;
+  ASSETS?: Fetcher;
 }
 type Scope = "read" | "read-write";
 interface WsMeta { deviceId: string; scope: Scope; }
 interface KeyRecIn { key_id: string; wrap_gen: number; key_record_b64: string; }
+interface ShredMarkIn { mark_id: string; key_id: string; grace_ms: number; requested_by?: string; }
+interface ShredResultOut { key_id: string; state: ShredMarkState; not_before_ms: number | null; }
 class RelayError extends Error {
   constructor(public status: number, public code: string, message: string, public retryable = false, public details?: Record<string, unknown>) { super(message); }
 }
 const jsonRes = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
-const MAX_PUSH_OPS = 500, MAX_PUSH_BYTES = 4 * 1024 * 1024, MAX_ARCHIVE_BYTES = 8 * 1024 * 1024, HEX64 = /^[0-9a-f]{64}$/i;
+const MAX_PUSH_OPS = 500, MAX_PUSH_BYTES = 4 * 1024 * 1024, MAX_ARCHIVE_BYTES = 8 * 1024 * 1024, MAX_SNAP_BYTES = 16 * 1024 * 1024, HEX64 = /^[0-9a-f]{64}$/i;
+const PWA_CSP = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' wss: https:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'";
 
 export class SyncJournalDO extends DurableObject<Env> {
   private sql: SqlStorage;
@@ -36,6 +43,8 @@ export class SyncJournalDO extends DurableObject<Env> {
 
   private assertTestHook(): void { if (this.env.ALLOW_TEST_HOOKS !== "1") throw new Error("test hooks disabled"); }
   private archiveIntervalMs(): number { return Number(this.env.DAILY_ARCHIVE_INTERVAL_MS || 86_400_000); }
+  private tGraceMinMs(): number { return Number(this.env.T_GRACE_MIN_MS || 86_400_000); }
+  private shredBatchLimit24h(): number { return Number(this.env.SHRED_BATCH_LIMIT_24H || 20); }
   private nowMs(): number { return Date.now() + this.clockOffsetMs; }
   private headSeq(): number { return Number(this.sql.exec(`SELECT COALESCE(MAX(seq), 0) AS h FROM ops`).toArray()[0]?.h ?? 0); }
   private metaGet(key: string): string | null { const r = this.sql.exec(`SELECT value FROM journal_meta WHERE key = ?`, key).toArray()[0]; return r ? String(r.value) : null; }
@@ -62,7 +71,11 @@ export class SyncJournalDO extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS ops (seq INTEGER PRIMARY KEY, op_id TEXT NOT NULL UNIQUE, device_id TEXT NOT NULL, created_at INTEGER NOT NULL, key_id TEXT, envelope BLOB NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_ops_key ON ops (key_id, seq) WHERE key_id IS NOT NULL;
       CREATE TABLE IF NOT EXISTS block_keys (key_id TEXT PRIMARY KEY, wrap_gen INTEGER NOT NULL, key_record BLOB, created_by_device TEXT NOT NULL, created_at_ms INTEGER NOT NULL, shredded_at_ms INTEGER);
+      CREATE TABLE IF NOT EXISTS shred_marks (mark_id TEXT PRIMARY KEY, key_id TEXT NOT NULL REFERENCES block_keys(key_id), seen_seq INTEGER NOT NULL, requested_by TEXT NOT NULL, requested_at_ms INTEGER NOT NULL, grace_ms INTEGER NOT NULL, not_before_ms INTEGER, state TEXT NOT NULL CHECK (state IN ('pending_confirm', 'scheduled', 'cancelled', 'executed')), confirmed_at_ms INTEGER, cancelled_by TEXT, executed_at_ms INTEGER);
+      CREATE INDEX IF NOT EXISTS idx_shred_marks_due ON shred_marks (not_before_ms) WHERE state = 'scheduled';
+      CREATE INDEX IF NOT EXISTS idx_shred_marks_key ON shred_marks (key_id);
       CREATE TABLE IF NOT EXISTS key_material (kind TEXT PRIMARY KEY CHECK (kind IN ('keyring', 'vault_header')), gen INTEGER NOT NULL, blob BLOB NOT NULL, updated_at_ms INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS phone_snapshots (snapshot_id TEXT PRIMARY KEY, journal_epoch TEXT NOT NULL, covers_seq INTEGER NOT NULL, r2_key TEXT NOT NULL, created_by TEXT NOT NULL, created_at_ms INTEGER NOT NULL, UNIQUE (journal_epoch, covers_seq));
     `);
     const existing = this.metaGet("journal_epoch");
     if (existing) this.epoch = existing;
@@ -73,13 +86,20 @@ export class SyncJournalDO extends DurableObject<Env> {
   private loadKeyState() {
     const records: KeyRecordWire[] = this.sql.exec(`SELECT key_id, wrap_gen, key_record, created_at_ms FROM block_keys ORDER BY key_id ASC`).toArray()
       .map((r) => ({ key_id: String(r.key_id), wrap_gen: Number(r.wrap_gen), key_record: r.key_record === null ? null : toU8(r.key_record), created_at_ms: Number(r.created_at_ms) }));
+    const marks: ShredMarkWire[] = this.sql.exec(`SELECT mark_id, key_id, seen_seq, requested_by, requested_at_ms, grace_ms, not_before_ms, state, confirmed_at_ms, cancelled_by, executed_at_ms FROM shred_marks ORDER BY mark_id ASC`).toArray()
+      .map((m) => ({
+        mark_id: String(m.mark_id), key_id: String(m.key_id), seen_seq: Number(m.seen_seq), requested_by: String(m.requested_by),
+        requested_at_ms: Number(m.requested_at_ms), grace_ms: Number(m.grace_ms), not_before_ms: m.not_before_ms === null ? null : Number(m.not_before_ms),
+        state: String(m.state) as ShredMarkState, confirmed_at_ms: m.confirmed_at_ms === null ? null : Number(m.confirmed_at_ms),
+        cancelled_by: m.cancelled_by === null ? null : String(m.cancelled_by), executed_at_ms: m.executed_at_ms === null ? null : Number(m.executed_at_ms),
+      }));
     let keyring: KeyMaterialEntry | null = null, vaultHeader: KeyMaterialEntry | null = null;
     for (const m of this.sql.exec(`SELECT kind, gen, blob FROM key_material`).toArray()) {
       const entry = { gen: Number(m.gen), blob: toU8(m.blob) };
       if (m.kind === "keyring") keyring = entry;
       else if (m.kind === "vault_header") vaultHeader = entry;
     }
-    return { records, keyring, vaultHeader, digest: computeKeysDigest(records, keyring, vaultHeader) };
+    return { records, marks, keyring, vaultHeader, digest: computeKeysDigest(records, marks, keyring, vaultHeader) };
   }
 
   private upsertKeyRecord(rec: KeyRecIn, deviceId: string, now: number): void {
@@ -114,6 +134,79 @@ export class SyncJournalDO extends DurableObject<Env> {
     return gen;
   }
 
+  private cancelKeyMarks(keyIds: string[], deviceId: string): string[] {
+    const cancelled: string[] = [];
+    for (const kid of keyIds) {
+      const kr = this.sql.exec(`SELECT key_record FROM block_keys WHERE key_id = ?`, kid).toArray()[0];
+      const execMark = this.sql.exec(`SELECT 1 FROM shred_marks WHERE key_id = ? AND state = 'executed' LIMIT 1`, kid).toArray()[0];
+      if ((kr && kr.key_record === null) || execMark) throw new RelayError(410, "KEY_SHREDDED", `key ${kid} already shredded`, false, { key_id: kid });
+      const active = this.sql.exec(`SELECT mark_id FROM shred_marks WHERE key_id = ? AND state IN ('pending_confirm', 'scheduled')`, kid).toArray();
+      if (active.length > 0) {
+        this.sql.exec(`UPDATE shred_marks SET state = 'cancelled', cancelled_by = ? WHERE key_id = ? AND state IN ('pending_confirm', 'scheduled')`, deviceId, kid);
+        cancelled.push(kid);
+      }
+    }
+    return cancelled;
+  }
+
+  private applyShredMarks(
+    marks: ShredMarkIn[], seenSeq: number, preBatchHeadSeq: number, expedite: boolean,
+    migrationExempt: boolean, deviceId: string, now: number, rejectExecuted: boolean,
+  ): ShredResultOut[] {
+    const minGrace = this.tGraceMinMs(), limit24h = this.shredBatchLimit24h();
+    const allowExempt = migrationExempt && this.metaGet("m2_migration_exempt_used") !== "1";
+    let rolling = Number(
+      this.sql.exec(`SELECT COUNT(DISTINCT key_id) AS c FROM shred_marks WHERE requested_at_ms > ? AND state IN ('scheduled', 'executed')`, now - 86_400_000).toArray()[0]?.c ?? 0,
+    );
+    const results: ShredResultOut[] = [];
+    for (const m of marks) {
+      if (!m.mark_id || !m.key_id || !Number.isFinite(m.grace_ms)) throw new RelayError(400, "INVALID_ARGUMENT", "invalid shred mark payload");
+      if (m.grace_ms < minGrace) throw new RelayError(422, "GRACE_TOO_SHORT", `grace_ms ${m.grace_ms} < ${minGrace}`, false, { key_id: m.key_id, min_grace_ms: minGrace });
+      const kr = this.sql.exec(`SELECT key_record FROM block_keys WHERE key_id = ?`, m.key_id).toArray()[0];
+      if (!kr) throw new RelayError(409, "KEY_UNKNOWN", `unknown key_id ${m.key_id}`, false, { key_id: m.key_id });
+      if (kr.key_record === null) {
+        if (rejectExecuted) throw new RelayError(410, "KEY_SHREDDED", `key ${m.key_id} already shredded`, false, { key_id: m.key_id });
+        results.push({ key_id: m.key_id, state: "executed", not_before_ms: null });
+        continue;
+      }
+      const stale = this.sql.exec(`SELECT 1 FROM ops WHERE key_id = ? AND seq > ? AND seq <= ? LIMIT 1`, m.key_id, seenSeq, preBatchHeadSeq).toArray()[0];
+      if (stale) throw new RelayError(409, "SHRED_STALE", `newer ops exist for key ${m.key_id} after seen_seq=${seenSeq}`, true, { key_id: m.key_id, head_seq: preBatchHeadSeq });
+      if (expedite) {
+        const cur = this.sql.exec(`SELECT mark_id, requested_at_ms, not_before_ms FROM shred_marks WHERE key_id = ? AND state = 'scheduled' ORDER BY not_before_ms ASC LIMIT 1`, m.key_id).toArray()[0];
+        if (cur) {
+          const candidate = Math.max(now + Math.max(m.grace_ms, minGrace), Number(cur.requested_at_ms) + minGrace);
+          const nextNb = cur.not_before_ms === null ? candidate : Math.min(Number(cur.not_before_ms), candidate);
+          this.sql.exec(`UPDATE shred_marks SET not_before_ms = ? WHERE mark_id = ?`, nextNb, cur.mark_id);
+          results.push({ key_id: m.key_id, state: "scheduled", not_before_ms: nextNb });
+          continue;
+        }
+      }
+      const dup = this.sql.exec(`SELECT state, not_before_ms FROM shred_marks WHERE mark_id = ?`, m.mark_id).toArray()[0];
+      if (dup) {
+        results.push({ key_id: m.key_id, state: String(dup.state) as ShredMarkState, not_before_ms: dup.not_before_ms === null ? null : Number(dup.not_before_ms) });
+        continue;
+      }
+      let state: ShredMarkState = "scheduled", notBefore: number | null = now + m.grace_ms;
+      if (!allowExempt && rolling >= limit24h) { state = "pending_confirm"; notBefore = null; }
+      else if (!allowExempt) { rolling++; }
+      this.sql.exec(
+        `INSERT INTO shred_marks (mark_id, key_id, seen_seq, requested_by, requested_at_ms, grace_ms, not_before_ms, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        m.mark_id, m.key_id, seenSeq, m.requested_by || deviceId, now, m.grace_ms, notBefore, state,
+      );
+      results.push({ key_id: m.key_id, state, not_before_ms: notBefore });
+    }
+    if (allowExempt && marks.length > 0) this.metaSet("m2_migration_exempt_used", "1");
+    return results;
+  }
+
+  private broadcastWake(excludeDeviceId: string | null, headSeq: number): void {
+    const wake = JSON.stringify({ type: "wake", epoch: this.epoch, head_seq: headSeq });
+    for (const ws of this.ctx.getWebSockets()) {
+      const meta = ws.deserializeAttachment() as WsMeta | null;
+      if (!excludeDeviceId || meta?.deviceId !== excludeDeviceId) { try { ws.send(wake); } catch { /* ignore */ } }
+    }
+  }
+
   private disconnectDeviceWs(deviceId: string): void {
     const msg = JSON.stringify({ type: "device_revoked" });
     for (const ws of this.ctx.getWebSockets()) {
@@ -125,7 +218,12 @@ export class SyncJournalDO extends DurableObject<Env> {
 
   private async authenticate(req: Request, now: number): Promise<WsMeta> {
     const auth = req.headers.get("authorization") ?? "";
-    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    let token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    if (!token && req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      const protos = (req.headers.get("sec-websocket-protocol") ?? "").split(",").map((s) => s.trim());
+      const bearerProto = protos.find((p) => p.startsWith("bearer."));
+      if (bearerProto) token = bearerProto.slice(7);
+    }
     if (!token) throw new RelayError(401, "AUTH_REQUIRED", "missing bearer token");
     const row = this.sql
       .exec(`SELECT device_id, scope, claimed_at_ms, revoked_at_ms FROM devices WHERE token_sha256_hex = ?`, await sha256Hex(token))
@@ -142,6 +240,8 @@ export class SyncJournalDO extends DurableObject<Env> {
     if (!meta) this.metaSet("next_archive_at_ms", String(nextAt));
     const duePair = this.sql.exec(`SELECT MIN(expires_at_ms) AS t FROM pairing_tickets`).toArray()[0];
     if (duePair?.t !== null && duePair?.t !== undefined) nextAt = Math.min(nextAt, Number(duePair.t));
+    const dueShred = this.sql.exec(`SELECT MIN(not_before_ms) AS t FROM shred_marks WHERE state = 'scheduled' AND not_before_ms IS NOT NULL`).toArray()[0];
+    if (dueShred?.t !== null && dueShred?.t !== undefined) nextAt = Math.min(nextAt, Number(dueShred.t));
     await this.ctx.storage.setAlarm(Math.max(Date.now() + 1_000, nextAt - this.clockOffsetMs));
   }
 
@@ -204,7 +304,11 @@ export class SyncJournalDO extends DurableObject<Env> {
       const [client, server] = Object.values(new WebSocketPair());
       this.ctx.acceptWebSocket(server);
       server.serializeAttachment(auth);
-      return new Response(null, { status: 101, webSocket: client });
+      const headers = new Headers();
+      if ((req.headers.get("sec-websocket-protocol") ?? "").includes("mynote-v1")) {
+        headers.set("Sec-WebSocket-Protocol", "mynote-v1");
+      }
+      return new Response(null, { status: 101, webSocket: client, headers });
     }
 
     if (req.method === "GET" && path === "/v1/sync/pull") {
@@ -221,7 +325,7 @@ export class SyncJournalDO extends DurableObject<Env> {
     }
 
     if (req.method === "GET" && path === "/v1/keys") {
-      const { records, keyring, vaultHeader, digest } = this.loadKeyState();
+      const { records, marks, keyring, vaultHeader, digest } = this.loadKeyState();
       return jsonRes({
         ok: true,
         key_material: {
@@ -229,7 +333,21 @@ export class SyncJournalDO extends DurableObject<Env> {
           vault_header: vaultHeader ? { gen: vaultHeader.gen, blob_b64: bytesToB64(vaultHeader.blob) } : null,
         },
         key_records: records.map((r) => ({ key_id: r.key_id, wrap_gen: r.wrap_gen, key_record_b64: r.key_record ? bytesToB64(r.key_record) : null, created_at_ms: r.created_at_ms })),
-        shred_marks: [], digest,
+        shred_marks: marks, digest,
+      });
+    }
+
+    if (req.method === "GET" && path === "/v1/snapshots/state") {
+      const row = this.sql.exec(`SELECT snapshot_id, journal_epoch, covers_seq, r2_key FROM phone_snapshots WHERE journal_epoch = ? ORDER BY covers_seq DESC LIMIT 1`, this.epoch).toArray()[0];
+      if (!row) throw new RelayError(404, "NOT_FOUND", "no mobile state snapshot for current epoch");
+      const obj = await this.env.ARCHIVE_BUCKET.get(String(row.r2_key));
+      if (!obj) throw new RelayError(404, "NOT_FOUND", "snapshot blob missing from R2");
+      return new Response(await obj.arrayBuffer(), {
+        status: 200,
+        headers: {
+          "content-type": "application/octet-stream", "cache-control": "no-store",
+          "x-journal-epoch": String(row.journal_epoch), "x-covers-seq": String(row.covers_seq), "x-snapshot-id": String(row.snapshot_id),
+        },
       });
     }
 
@@ -240,19 +358,26 @@ export class SyncJournalDO extends DurableObject<Env> {
     if (req.method === "POST" && path === "/v1/sync/push") {
       const raw = await req.text();
       if (raw.length > MAX_PUSH_BYTES) throw new RelayError(400, "INVALID_ARGUMENT", "push body exceeds 4 MiB");
-      const b = JSON.parse(raw) as { expected_epoch?: string; key_records?: KeyRecIn[]; ops?: { op_id: string; key_id: string | null; device_id?: string; envelope_b64: string }[] };
+      const b = JSON.parse(raw) as {
+        expected_epoch?: string; seen_seq?: number; key_records?: KeyRecIn[]; cancel_key_ids?: string[];
+        ops?: { op_id: string; key_id: string | null; device_id?: string; envelope_b64: string }[]; shred_marks?: ShredMarkIn[];
+      };
       if (b.expected_epoch !== this.epoch) throw new RelayError(409, "CAS_MISMATCH", "Journal epoch changed; reconcile before pushing", true, { remote_epoch: this.epoch, head_seq: this.headSeq() });
-      const ops = b.ops ?? [];
+      const ops = b.ops ?? [], marksIn = b.shred_marks ?? [], cancels = b.cancel_key_ids ?? [];
       if (ops.length > MAX_PUSH_OPS) throw new RelayError(400, "INVALID_ARGUMENT", `batch exceeds ${MAX_PUSH_OPS} ops`);
       const acked: { op_id: string; seq: number }[] = [];
-      let headSeq = 0;
+      let shredResults: ShredResultOut[] = [], headSeq = 0;
       this.ctx.storage.transactionSync(() => {
+        const preBatchHeadSeq = this.headSeq();
         for (const rec of b.key_records ?? []) this.upsertKeyRecord(rec, auth.deviceId, now);
+        if (cancels.length > 0) this.cancelKeyMarks(cancels, auth.deviceId);
         for (const op of ops) {
           if (op.key_id !== null && op.key_id !== undefined) {
             const k = this.sql.exec(`SELECT key_record FROM block_keys WHERE key_id = ?`, op.key_id).toArray()[0];
             if (!k) throw new RelayError(409, "KEY_UNKNOWN", `unknown key_id ${op.key_id}`, false, { key_id: op.key_id });
             if (k.key_record === null) throw new RelayError(410, "KEY_SHREDDED", `shredded key_id ${op.key_id}`, false, { key_id: op.key_id });
+            const pend = this.sql.exec(`SELECT 1 FROM shred_marks WHERE key_id = ? AND state IN ('pending_confirm', 'scheduled') LIMIT 1`, op.key_id).toArray()[0];
+            if (pend) throw new RelayError(409, "KEY_PENDING_SHRED", `key_id ${op.key_id} has pending/scheduled shred mark`, true, { key_id: op.key_id });
           }
           const dup = this.sql.exec(`SELECT seq FROM ops WHERE op_id = ?`, op.op_id).toArray()[0];
           if (dup) { acked.push({ op_id: op.op_id, seq: Number(dup.seq) }); continue; }
@@ -262,15 +387,12 @@ export class SyncJournalDO extends DurableObject<Env> {
           ).toArray()[0];
           acked.push({ op_id: op.op_id, seq: Number(row.seq) });
         }
+        if (marksIn.length > 0) shredResults = this.applyShredMarks(marksIn, b.seen_seq ?? 0, preBatchHeadSeq, false, false, auth.deviceId, now, false);
         headSeq = this.headSeq();
       });
-      if (acked.length > 0) {
-        const wake = JSON.stringify({ type: "wake", epoch: this.epoch, head_seq: headSeq });
-        for (const ws of this.ctx.getWebSockets()) {
-          if ((ws.deserializeAttachment() as WsMeta | null)?.deviceId !== auth.deviceId) { try { ws.send(wake); } catch { /* ignore */ } }
-        }
-      }
-      return jsonRes({ ok: true, epoch: this.epoch, acked, head_seq: headSeq });
+      if (shredResults.length > 0) await this.rescheduleAlarm(now);
+      if (acked.length > 0 || shredResults.length > 0 || cancels.length > 0) this.broadcastWake(auth.deviceId, headSeq);
+      return jsonRes({ ok: true, epoch: this.epoch, acked, ...(shredResults.length > 0 ? { shred_results: shredResults } : {}), head_seq: headSeq });
     }
 
     if (req.method === "POST" && path === "/v1/keys") {
@@ -282,6 +404,76 @@ export class SyncJournalDO extends DurableObject<Env> {
         if (b.key_material?.vault_header) matGens.vault_header = this.upsertKeyMaterial("vault_header", b.key_material.vault_header.gen, b.key_material.vault_header.blob_b64, now);
       });
       return jsonRes({ ok: true, acked_key_ids: ackedKeyIds, key_material_gens: matGens });
+    }
+
+    if (req.method === "POST" && path === "/v1/keys/shred") {
+      const b = (await req.json()) as { seen_seq?: number; expedite?: boolean; migration_exempt?: boolean; marks?: ShredMarkIn[] };
+      const marksIn = b.marks ?? [];
+      let results: ShredResultOut[] = [];
+      this.ctx.storage.transactionSync(() => {
+        results = this.applyShredMarks(marksIn, b.seen_seq ?? 0, this.headSeq(), Boolean(b.expedite), Boolean(b.migration_exempt), auth.deviceId, now, true);
+      });
+      await this.rescheduleAlarm(now);
+      if (results.length > 0) this.broadcastWake(auth.deviceId, this.headSeq());
+      return jsonRes({ ok: true, results });
+    }
+
+    if (req.method === "POST" && path === "/v1/keys/cancel") {
+      const b = (await req.json()) as { key_ids?: string[] };
+      let cancelled: string[] = [];
+      this.ctx.storage.transactionSync(() => { cancelled = this.cancelKeyMarks(b.key_ids ?? [], auth.deviceId); });
+      if (cancelled.length > 0) this.broadcastWake(auth.deviceId, this.headSeq());
+      return jsonRes({ ok: true, cancelled });
+    }
+
+    if (req.method === "POST" && path === "/v1/keys/confirm") {
+      const b = (await req.json()) as { key_ids?: string[]; grace_ms?: number };
+      const minGrace = this.tGraceMinMs(), graceMs = Number(b.grace_ms ?? minGrace);
+      if (!Number.isFinite(graceMs) || graceMs < minGrace) throw new RelayError(422, "GRACE_TOO_SHORT", `grace_ms ${graceMs} < ${minGrace}`, false, { min_grace_ms: minGrace });
+      const results: ShredResultOut[] = [];
+      this.ctx.storage.transactionSync(() => {
+        for (const kid of b.key_ids ?? []) {
+          const kr = this.sql.exec(`SELECT key_record FROM block_keys WHERE key_id = ?`, kid).toArray()[0];
+          if (!kr) throw new RelayError(409, "KEY_UNKNOWN", `unknown key_id ${kid}`, false, { key_id: kid });
+          if (kr.key_record === null) throw new RelayError(410, "KEY_SHREDDED", `key ${kid} already shredded`, false, { key_id: kid });
+          const nb = now + Math.max(graceMs, minGrace);
+          const pending = this.sql.exec(`SELECT mark_id FROM shred_marks WHERE key_id = ? AND state = 'pending_confirm'`, kid).toArray();
+          if (pending.length > 0) {
+            this.sql.exec(`UPDATE shred_marks SET state = 'scheduled', confirmed_at_ms = ?, not_before_ms = ? WHERE key_id = ? AND state = 'pending_confirm'`, now, nb, kid);
+            results.push({ key_id: kid, state: "scheduled", not_before_ms: nb });
+          }
+        }
+      });
+      await this.rescheduleAlarm(now);
+      if (results.length > 0) this.broadcastWake(auth.deviceId, this.headSeq());
+      return jsonRes({ ok: true, results });
+    }
+
+    if (req.method === "PUT" && path === "/v1/snapshots/state") {
+      const reqEpoch = req.headers.get("x-journal-epoch") ?? "", coversSeq = Number.parseInt(req.headers.get("x-covers-seq") ?? "-1", 10);
+      if (reqEpoch !== this.epoch || !Number.isFinite(coversSeq) || coversSeq < 0) {
+        throw new RelayError(409, "CAS_MISMATCH", "snapshot epoch mismatch or invalid covers_seq", true, { remote_epoch: this.epoch });
+      }
+      const latest = this.sql.exec(`SELECT covers_seq FROM phone_snapshots WHERE journal_epoch = ? ORDER BY covers_seq DESC LIMIT 1`, this.epoch).toArray()[0];
+      if (latest && coversSeq <= Number(latest.covers_seq)) {
+        throw new RelayError(409, "CAS_MISMATCH", `covers_seq ${coversSeq} <= latest ${latest.covers_seq}`, true, { latest_covers_seq: Number(latest.covers_seq) });
+      }
+      const bytes = new Uint8Array(await req.arrayBuffer());
+      if (bytes.byteLength === 0 || bytes.byteLength > MAX_SNAP_BYTES) throw new RelayError(400, "INVALID_ARGUMENT", "invalid snapshot body size");
+      const snapshotId = req.headers.get("x-snapshot-id") || crypto.randomUUID();
+      const r2Key = `snapshots/state/${this.epoch}/${String(coversSeq).padStart(12, "0")}-${snapshotId}.mnp1`;
+      await this.env.ARCHIVE_BUCKET.put(r2Key, bytes);
+      const pruneKeys: string[] = [];
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec(`INSERT INTO phone_snapshots (snapshot_id, journal_epoch, covers_seq, r2_key, created_by, created_at_ms) VALUES (?, ?, ?, ?, ?, ?)`, snapshotId, this.epoch, coversSeq, r2Key, auth.deviceId, now);
+        const all = this.sql.exec(`SELECT snapshot_id, r2_key FROM phone_snapshots ORDER BY created_at_ms DESC, covers_seq DESC`).toArray();
+        for (const old of all.slice(2)) {
+          this.sql.exec(`DELETE FROM phone_snapshots WHERE snapshot_id = ?`, old.snapshot_id);
+          pruneKeys.push(String(old.r2_key));
+        }
+      });
+      for (const k of pruneKeys) { try { await this.env.ARCHIVE_BUCKET.delete(k); } catch { /* best-effort R2 trim */ } }
+      return jsonRes({ ok: true, snapshot_id: snapshotId, journal_epoch: this.epoch, covers_seq: coversSeq });
     }
 
     if (req.method === "POST" && path === "/v1/devices") {
@@ -333,16 +525,22 @@ export class SyncJournalDO extends DurableObject<Env> {
 
   async alarm(info?: AlarmInvocationInfo): Promise<void> {
     const now = this.nowMs();
-    let expiredTickets = 0;
+    let expiredTickets = 0, executedShreds = 0;
     this.ctx.storage.transactionSync(() => {
+      for (const m of this.sql.exec(`SELECT mark_id, key_id FROM shred_marks WHERE state = 'scheduled' AND not_before_ms IS NOT NULL AND not_before_ms <= ?`, now).toArray()) {
+        executedShreds++;
+        this.sql.exec(`UPDATE block_keys SET key_record = NULL, shredded_at_ms = COALESCE(shredded_at_ms, ?) WHERE key_id = ?`, now, m.key_id);
+        this.sql.exec(`UPDATE shred_marks SET state = 'executed', executed_at_ms = ? WHERE mark_id = ?`, now, m.mark_id);
+      }
       for (const t of this.sql.exec(`SELECT pair_id, kind, device_id FROM pairing_tickets WHERE expires_at_ms <= ?`, now).toArray()) {
         expiredTickets++;
         this.sql.exec(`DELETE FROM pairing_tickets WHERE pair_id = ?`, t.pair_id);
         if (t.kind === "pair") this.sql.exec(`DELETE FROM devices WHERE device_id = ? AND claimed_at_ms IS NULL`, t.device_id);
       }
     });
+    if (executedShreds > 0) this.broadcastWake(null, this.headSeq());
     const nextArchiveAt = Number(this.metaGet("next_archive_at_ms") ?? 0);
-    if (now >= nextArchiveAt || expiredTickets === 0) {
+    if (now >= nextArchiveAt || (expiredTickets === 0 && executedShreds === 0)) {
       try {
         let lastArchived = Number(this.metaGet("last_archive_seq") ?? 0);
         for (;;) {
@@ -360,9 +558,9 @@ export class SyncJournalDO extends DurableObject<Env> {
           lastArchived = seg[seg.length - 1].seq;
           this.metaSet("last_archive_seq", String(lastArchived));
         }
-        const { records, keyring, vaultHeader } = this.loadKeyState();
+        const { records, marks, keyring, vaultHeader } = this.loadKeyState();
         if (keyring) {
-          const mnks = encodeMnks(now, keyring, vaultHeader, records.filter((r) => r.key_record !== null));
+          const mnks = encodeMnks(now, keyring, vaultHeader, records.filter((r) => r.key_record !== null), marks);
           await this.env.ARCHIVE_BUCKET.put("archives/keys/latest.mnks", mnks);
           await this.env.ARCHIVE_BUCKET.put(`archives/keys/history/${new Date(now).toISOString().slice(0, 10)}.mnks`, mnks);
         }
@@ -377,5 +575,18 @@ export class SyncJournalDO extends DurableObject<Env> {
 }
 
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> { return env.SYNC_DO.get(env.SYNC_DO.idFromName("primary")).fetch(req); },
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const url = new URL(req.url);
+    if (url.pathname.startsWith("/v1/")) return env.SYNC_DO.get(env.SYNC_DO.idFromName("primary")).fetch(req);
+    if (env.ASSETS) {
+      const res = await env.ASSETS.fetch(req), h = new Headers(res.headers);
+      const isLoopbackHttp = url.protocol === "http:" && (url.hostname === "127.0.0.1" || url.hostname === "localhost");
+      h.set("content-security-policy", isLoopbackHttp ? PWA_CSP.replace("wss: https:", "ws: wss: http: https:") : PWA_CSP);
+      h.set("x-content-type-options", "nosniff");
+      h.set("referrer-policy", "no-referrer");
+      h.set("x-frame-options", "DENY");
+      return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
+    }
+    return env.SYNC_DO.get(env.SYNC_DO.idFromName("primary")).fetch(req);
+  },
 };

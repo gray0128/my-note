@@ -411,4 +411,148 @@ describe("cloud-cf M1 Thin Blind Sync Relay Contract Suite (real workerd)", () =
       `archives/ops/${boot.epoch}/${pad(firstSeq + 500)}-${pad(lastSeq)}.mna1`,
     ]);
   });
+
+  it("INV-GRACE & M2: enforces 24h min grace, rolling N=20 pending_confirm -> confirm, read-only 403 on shred/put-snapshot, R2 2-snapshot pruning, and Rust<->TS keys_digest parity", async () => {
+    const { computeKeysDigest } = await import("../src/wire");
+    const te = new TextEncoder();
+    const digestVec = computeKeysDigest(
+      [{ key_id: "01JDF9M20000000000000000K1", wrap_gen: 1, key_record: te.encode("mnr1_vec"), created_at_ms: 1_795_521_600_000 }],
+      [{
+        mark_id: "01JDF9M20000000000000000M1", key_id: "01JDF9M20000000000000000K1", seen_seq: 1,
+        requested_by: "dev_mac00001", requested_at_ms: 1_795_521_600_000, grace_ms: 604_800_000,
+        not_before_ms: 1_796_126_400_000, state: "scheduled", confirmed_at_ms: null, cancelled_by: null, executed_at_ms: null,
+      }],
+      { gen: 1, blob: te.encode("kr_vec") },
+      { gen: 1_795_521_600_000, blob: te.encode("vh_vec") },
+    );
+    // Must match crates/mynote-core/src/keys.rs::cross_language_keys_digest_vector_matches_wire_ts byte-for-byte!
+    expect(digestVec).toBe("blake3:38ec33ece0a92a473a0c05a51973dcd64784a8aaffabc71aa87f71046443aae0");
+
+    const macToken = "tok-inv-grace-mac";
+    const boot = await bootstrapDevice("MacBookGrace", macToken);
+    const stub = env.SYNC_DO.get(env.SYNC_DO.idFromName("primary"));
+    await runInDurableObject(stub, (inst) => (inst as SyncJournalDO).setClockOffsetMs(0));
+
+    // Pair read-only phone token to test M2 scope boundaries
+    const phoneToken = "tok-inv-grace-phone";
+    const addRes = await SELF.fetch("https://relay.test/v1/devices", {
+      method: "POST",
+      headers: { authorization: `Bearer ${macToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ device_name: "PhoneGrace", scope: "read", token_sha256_hex: await sha256Hex(phoneToken), ciphertext_b64: b64("ct") }),
+    });
+    const addJson = (await addRes.json()) as { pair_id: string };
+    await SELF.fetch("https://relay.test/v1/devices/pair-claim", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ pair_id: addJson.pair_id }),
+    });
+
+    // Read-only token gets 403 on shred, cancel, confirm, and PUT snapshot
+    for (const [method, path, body] of [
+      ["POST", "/v1/keys/shred", JSON.stringify({ seen_seq: 0, marks: [] })],
+      ["POST", "/v1/keys/cancel", JSON.stringify({ key_ids: [] })],
+      ["POST", "/v1/keys/confirm", JSON.stringify({ key_ids: [], grace_ms: 86_400_000 })],
+      ["PUT", "/v1/snapshots/state", new Uint8Array([1, 2, 3])],
+    ] as const) {
+      const r = await SELF.fetch(`https://relay.test${path}`, {
+        method,
+        headers: {
+          authorization: `Bearer ${phoneToken}`,
+          ...(typeof body === "string" ? { "content-type": "application/json" } : { "x-journal-epoch": boot.epoch, "x-covers-seq": "1" }),
+        },
+        body,
+      });
+      expect(r.status, `${method} ${path}`).toBe(403);
+      expect(await r.json()).toMatchObject({ ok: false, error: { code: "TOKEN_SCOPE_FORBIDDEN" } });
+    }
+
+    // Create 22 keys to test rolling 24h batch limit N=20!
+    const keyRecords = Array.from({ length: 22 }, (_, i) => ({
+      key_id: `01JDF9GRACE0000000000000${String(i).padStart(2, "0")}`,
+      wrap_gen: 1,
+      key_record_b64: b64(`mnr1_grace_${i}`),
+    }));
+    const postK = await SELF.fetch("https://relay.test/v1/keys", {
+      method: "POST",
+      headers: { authorization: `Bearer ${macToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ key_records: keyRecords }),
+    });
+    expect(postK.status).toBe(200);
+
+    // Submit 22 shred marks at once: first 20 -> scheduled, 21st & 22nd -> pending_confirm (not_before_ms = null)!
+    const marks = keyRecords.map((kr, i) => ({
+      mark_id: `01JDF9MARK00000000000000${String(i).padStart(2, "0")}`,
+      key_id: kr.key_id,
+      grace_ms: 7 * 86_400_000,
+    }));
+    const shredRes = await SELF.fetch("https://relay.test/v1/keys/shred", {
+      method: "POST",
+      headers: { authorization: `Bearer ${macToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ seen_seq: 99999, marks }),
+    });
+    expect(shredRes.status).toBe(200);
+    const shredJson = (await shredRes.json()) as { results: { key_id: string; state: string; not_before_ms: number | null }[] };
+    expect(shredJson.results.slice(0, 20).every((r) => r.state === "scheduled" && r.not_before_ms !== null)).toBe(true);
+    expect(shredJson.results.slice(20).every((r) => r.state === "pending_confirm" && r.not_before_ms === null)).toBe(true);
+
+    // Confirming with grace_ms < 24h -> 422 GRACE_TOO_SHORT
+    const badConf = await SELF.fetch("https://relay.test/v1/keys/confirm", {
+      method: "POST",
+      headers: { authorization: `Bearer ${macToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ key_ids: [keyRecords[20].key_id], grace_ms: 1000 }),
+    });
+    expect(badConf.status).toBe(422);
+    expect(await badConf.json()).toMatchObject({ ok: false, error: { code: "GRACE_TOO_SHORT" } });
+
+    // Confirm 21st key with 24h grace -> transitions to scheduled with not_before_ms >= now + 24h
+    const confRes = await SELF.fetch("https://relay.test/v1/keys/confirm", {
+      method: "POST",
+      headers: { authorization: `Bearer ${macToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ key_ids: [keyRecords[20].key_id], grace_ms: 86_400_000 }),
+    });
+    expect(confRes.status).toBe(200);
+    const confJson = (await confRes.json()) as { results: { key_id: string; state: string; not_before_ms: number }[] };
+    expect(confJson.results[0].state).toBe("scheduled");
+    expect(confJson.results[0].not_before_ms).toBeGreaterThanOrEqual(Date.now() + 86_000_000);
+
+    // Upload 3 mobile snapshots -> R2 only keeps latest 2; phone read token can GET latest!
+    for (const seq of [10, 20, 30]) {
+      const up = await SELF.fetch("https://relay.test/v1/snapshots/state", {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${macToken}`,
+          "content-type": "application/octet-stream",
+          "x-journal-epoch": boot.epoch,
+          "x-covers-seq": String(seq),
+          "x-snapshot-id": `01JDF9SNAP00000000000000${seq}`,
+        },
+        body: new TextEncoder().encode(`MNP1_BODY_${seq}`),
+      });
+      expect(up.status).toBe(200);
+    }
+    const r2Snaps = await env.ARCHIVE_BUCKET.list({ prefix: `snapshots/state/${boot.epoch}/` });
+    expect(r2Snaps.objects.length).toBe(2);
+
+    const phoneSnap = await SELF.fetch("https://relay.test/v1/snapshots/state", {
+      headers: { authorization: `Bearer ${phoneToken}` },
+    });
+    expect(phoneSnap.status).toBe(200);
+    expect(phoneSnap.headers.get("x-covers-seq")).toBe("30");
+    expect(await phoneSnap.text()).toBe("MNP1_BODY_30");
+
+    // Verify browser WS auth via Sec-WebSocket-Protocol (no token in query string)
+    const wsRes = await SELF.fetch("https://relay.test/v1/sync/ws", {
+      headers: { upgrade: "websocket", "sec-websocket-protocol": `mynote-v1, bearer.${phoneToken}` },
+    });
+    expect(wsRes.status).toBe(101);
+    expect(wsRes.headers.get("sec-websocket-protocol")).toBe("mynote-v1");
+    wsRes.webSocket?.accept();
+    wsRes.webSocket?.close();
+
+    // Verify Mobile Read-Only PWA static assets are served with strict CSP & security headers
+    const pwaRes = await SELF.fetch("https://relay.test/");
+    expect(pwaRes.status).toBe(200);
+    expect(pwaRes.headers.get("content-security-policy")).toContain("script-src 'self' 'wasm-unsafe-eval'");
+    expect(pwaRes.headers.get("x-frame-options")).toBe("DENY");
+    expect(pwaRes.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(await pwaRes.text()).toContain("pwa-app");
+  });
 });

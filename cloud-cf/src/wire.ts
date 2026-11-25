@@ -60,11 +60,15 @@ const concat = (parts: Uint8Array[]): Uint8Array => {
   return out;
 };
 
+export type ShredMarkState = "pending_confirm" | "scheduled" | "cancelled" | "executed";
 export interface KeyRecordWire { key_id: string; wrap_gen: number; key_record: Uint8Array | null; created_at_ms: number; }
+export interface ShredMarkWire { mark_id: string; key_id: string; seen_seq: number; requested_by: string; requested_at_ms: number; grace_ms: number; not_before_ms: number | null; state: ShredMarkState; confirmed_at_ms: number | null; cancelled_by: string | null; executed_at_ms: number | null; }
 export interface KeyMaterialEntry { gen: number; blob: Uint8Array; }
 
+const STATE_RANK: Record<ShredMarkState, number> = { pending_confirm: 0, scheduled: 1, cancelled: 2, executed: 3 };
+
 /** Byte-identical to Rust `mynote_core::keys::KeyTableState::digest()`. */
-export function computeKeysDigest(records: KeyRecordWire[], keyring: KeyMaterialEntry | null, vaultHeader: KeyMaterialEntry | null): string {
+export function computeKeysDigest(records: KeyRecordWire[], marks: ShredMarkWire[], keyring: KeyMaterialEntry | null, vaultHeader: KeyMaterialEntry | null): string {
   const h = blake3.create({});
   h.update(TE.encode("mynote-keys-digest-v1\0"));
   for (const r of [...records].sort((a, b) => (a.key_id < b.key_id ? -1 : a.key_id > b.key_id ? 1 : 0))) {
@@ -72,7 +76,12 @@ export function computeKeysDigest(records: KeyRecordWire[], keyring: KeyMaterial
     h.update(u32le(r.wrap_gen));
     if (r.key_record) { h.update(new Uint8Array([1])); h.update(u32le(r.key_record.length)); h.update(r.key_record); } else h.update(new Uint8Array([0]));
   }
-  h.update(TE.encode("\0marks\0\0mat\0"));
+  h.update(TE.encode("\0marks\0"));
+  for (const m of [...marks].sort((a, b) => (a.mark_id < b.mark_id ? -1 : a.mark_id > b.mark_id ? 1 : 0))) {
+    h.update(ulidToBytes(m.mark_id)); h.update(ulidToBytes(m.key_id));
+    h.update(new Uint8Array([STATE_RANK[m.state]])); h.update(i64le(m.not_before_ms ?? -1));
+  }
+  h.update(TE.encode("\0mat\0"));
   if (keyring) { h.update(new Uint8Array([1])); h.update(u32le(keyring.gen)); h.update(keyring.blob); } else h.update(new Uint8Array([0]));
   if (vaultHeader) { h.update(new Uint8Array([1])); h.update(i64le(vaultHeader.gen)); h.update(vaultHeader.blob); } else h.update(new Uint8Array([0]));
   return `blake3:${hexEncode(h.digest())}`;
@@ -83,15 +92,8 @@ const hashedContainer = (magic: string, hdr: Uint8Array, body: Uint8Array): Uint
   return concat([prefix, blake3(prefix)]);
 };
 
-export const encodeMna1 = (
-  epoch: string,
-  rows: { seq: number; op_id: string; key_id: string | null; device_id: string; created_at: number; envelope: Uint8Array }[],
-  createdAtMs: number,
-): Uint8Array => hashedContainer("MNA1", encode({ journal_epoch: uuidToBytes(epoch), from_seq: rows[0].seq, to_seq: rows[rows.length - 1].seq, row_count: rows.length, created_at_ms: createdAtMs }), encode(rows));
+export const encodeMna1 = (epoch: string, rows: { seq: number; op_id: string; key_id: string | null; device_id: string; created_at: number; envelope: Uint8Array }[], createdAtMs: number): Uint8Array =>
+  hashedContainer("MNA1", encode({ journal_epoch: uuidToBytes(epoch), from_seq: rows[0].seq, to_seq: rows[rows.length - 1].seq, row_count: rows.length, created_at_ms: createdAtMs }), encode(rows));
 
-export const encodeMnks = (createdAtMs: number, keyring: KeyMaterialEntry, vaultHeader: KeyMaterialEntry | null, records: KeyRecordWire[]): Uint8Array =>
-  hashedContainer(
-    "MNKS",
-    encode({ created_at_ms: createdAtMs, keyring_gen: keyring.gen, record_count: records.length }),
-    concat([new Uint8Array([0x84]), encode("keyring"), keyring.blob, encode("vault_header"), vaultHeader ? vaultHeader.blob : new Uint8Array([0xc0]), encode("records"), encode(records), encode("marks"), encode([])]),
-  );
+export const encodeMnks = (createdAtMs: number, keyring: KeyMaterialEntry, vaultHeader: KeyMaterialEntry | null, records: KeyRecordWire[], marks: ShredMarkWire[] = []): Uint8Array =>
+  hashedContainer("MNKS", encode({ created_at_ms: createdAtMs, keyring_gen: keyring.gen, record_count: records.length }), concat([new Uint8Array([0x84]), encode("keyring"), keyring.blob, encode("vault_header"), vaultHeader ? vaultHeader.blob : new Uint8Array([0xc0]), encode("records"), encode(records), encode("marks"), encode(marks)]));
