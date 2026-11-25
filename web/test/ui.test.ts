@@ -355,4 +355,252 @@ describe("M1 Embedded Desktop Web UI (Candidate A CM6)", () => {
 
     app.destroy();
   });
+
+  it("preserves original baseHeads on concurrent WS update (triggers HEAD_MISMATCH, zero silent overwrite) and keeps draft intact", async () => {
+    const { api, pushWs } = makeMockApi();
+    const { LocalApiError } = await import("../src/api");
+    const seenExpectedHeads: string[][] = [];
+    const origPatch = api.patchBlock.bind(api);
+    let currentServerHead = "01OP0000000000000000000001";
+    api.patchBlock = async (id, input, opts) => {
+      if (input.expected_heads) seenExpectedHeads.push([...input.expected_heads]);
+      if (input.content !== undefined && input.expected_heads) {
+        const exp = [...input.expected_heads].sort().join(",");
+        if (exp !== currentServerHead) {
+          throw new LocalApiError(409, { code: "HEAD_MISMATCH", message: "heads changed" });
+        }
+      }
+      const res = await origPatch(id, input, opts);
+      currentServerHead = res.head_op_ids.join(",");
+      return res;
+    };
+
+    const app = new MyNoteApp(root, api);
+    await app.start();
+
+    const blkId = "01BLK000000000000000000001";
+    // Simulate user editing block 1 in CM6 (making it dirty while baseHeads = [01OP...0001])
+    const mounted = (app.stream as unknown as { mounted: Map<string, { view: import("@codemirror/view").EditorView }> }).mounted.get(blkId)!;
+    mounted.view.dispatch({ changes: { from: 0, to: mounted.view.state.doc.length, insert: '{"a": 999}' } });
+
+    // Concurrent remote edit arrives on server + over WS before save fires, advancing server head to 01OP_REMOTE_2
+    currentServerHead = "01OP_REMOTE_2";
+    const remoteUpdated = {
+      ...app.stream.getBlocks().find((b) => b.id === blkId)!,
+      head_op_ids: ["01OP_REMOTE_2"],
+      display_op_id: "01OP_REMOTE_2",
+      content: '{"remote": true}',
+    };
+    const origList = api.listBlocks.bind(api);
+    api.listBlocks = async (bufId) => (await origList(bufId)).map((b) => (b.id === blkId ? remoteUpdated : b));
+    pushWs({ type: "blocks_changed", upserted: [remoteUpdated], deleted_ids: [] });
+
+    // Flush dirty block -> MUST send original baseHeads ["01OP...0001"], NOT ["01OP_REMOTE_2"]!
+    await app.stream.flushDirtyBlock(blkId, { fastSync: true });
+    expect(seenExpectedHeads[0]).toEqual(["01OP0000000000000000000001"]);
+    // Draft MUST be preserved in CM6 (never wiped!) and mismatch banner shown
+    expect(app.stream.getBlockDraftContent(blkId)).toBe('{"a": 999}');
+    expect(root.querySelector(".mismatch-panel")).not.toBeNull();
+
+    // User clicks "Save My Draft Over Latest" -> sends explicit merge with latest server head
+    const mergeBtn = [...root.querySelectorAll<HTMLButtonElement>(".mismatch-panel button")].find(
+      (b) => b.textContent === "Save My Draft Over Latest",
+    )!;
+    mergeBtn.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(seenExpectedHeads[1]).toEqual(["01OP_REMOTE_2"]);
+    expect(app.stream.getBlockDraftContent(blkId)).toBe('{"a": 999}');
+    expect(root.querySelector(".mismatch-panel")).toBeNull();
+
+    app.destroy();
+  });
+
+  it("serializes in-flight saves so keystrokes typed during PATCH are preserved and saved in a follow-up request", async () => {
+    const { api } = makeMockApi();
+    const savedContents: string[] = [];
+    let releaseFirstPatch!: () => void;
+    const origPatch = api.patchBlock.bind(api);
+    let callCount = 0;
+    api.patchBlock = async (id, input, opts) => {
+      callCount++;
+      if (input.content !== undefined) savedContents.push(input.content);
+      if (callCount === 1) {
+        await new Promise<void>((resolve) => {
+          releaseFirstPatch = resolve;
+        });
+      }
+      return origPatch(id, input, opts);
+    };
+
+    const app = new MyNoteApp(root, api);
+    await app.start();
+
+    const blkId = "01BLK000000000000000000001";
+    const mounted = (app.stream as unknown as { mounted: Map<string, { view: import("@codemirror/view").EditorView }> }).mounted.get(blkId)!;
+    mounted.view.dispatch({ changes: { from: 0, to: mounted.view.state.doc.length, insert: "draft-1" } });
+
+    const firstFlush = app.stream.flushDirtyBlock(blkId, { fastSync: true });
+    // While first PATCH is still in flight, user types more characters!
+    mounted.view.dispatch({ changes: { from: 7, to: 7, insert: "-more" } });
+    releaseFirstPatch();
+    await firstFlush;
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(savedContents).toEqual(["draft-1", "draft-1-more"]);
+    expect(app.stream.getBlockDraftContent(blkId)).toBe("draft-1-more");
+    expect(app.stream.hasDirtyBlocks()).toBe(false);
+
+    app.destroy();
+  });
+
+  it("renders unreadable Tier 1 blocks as read-only diagnostic cards and disables Keep on null conflict leaves", async () => {
+    const { api, pushWs } = makeMockApi();
+    const app = new MyNoteApp(root, api);
+    await app.start();
+
+    pushWs({
+      type: "blocks_changed",
+      upserted: [
+        {
+          id: "01BLK_UNREADABLE_000000001",
+          buffer_id: "01BUF000000000000000000001",
+          position: "d0",
+          lang: "text",
+          is_locked: false,
+          has_unlocked_concurrent_version: false,
+          public_hint: null,
+          head_op_ids: ["01OP_U1", "01OP_U2"],
+          display_op_id: "01OP_U1",
+          has_conflict: true,
+          content: null,
+          versions: [
+            {
+              op_id: "01OP_U1",
+              hlc: "000000000005000-00000-dev_remote00001",
+              device_id: "dev_remote00001",
+              actor: "human",
+              is_display: true,
+              is_locked: false,
+              key_id: "01KEY_MISSING",
+              content: null,
+            },
+            {
+              op_id: "01OP_U2",
+              hlc: "000000000004000-00000-dev_mac0000000001",
+              device_id: "dev_mac0000000001",
+              actor: "human",
+              is_display: false,
+              is_locked: false,
+              key_id: "01KEY_OK",
+              content: "readable sibling",
+            },
+          ],
+          updated_at_ms: 5000,
+        },
+      ],
+      deleted_ids: [],
+    });
+
+    const card = root.querySelector<HTMLElement>('[data-block-id="01BLK_UNREADABLE_000000001"]')!;
+    expect(card.querySelector(".unreadable-card")).not.toBeNull();
+    expect(card.querySelector(".block-editor-host")).toBeNull();
+    expect([...card.querySelectorAll("button")].some((b) => b.textContent === "Format")).toBe(false);
+    const keepBtns = [...card.querySelectorAll<HTMLButtonElement>(".leaf-card button")];
+    expect(keepBtns[0].disabled).toBe(true);
+    expect(keepBtns[1].disabled).toBe(false);
+
+    app.destroy();
+  });
+
+  it("flushes dirty edits on buffer switch, keeps Find focus, avoids double Ctrl+Enter, formats dirty blocks, and reconciles DOM incrementally", async () => {
+    const { api, pushWs } = makeMockApi();
+    let createCalls = 0;
+    const savedBeforeSwitch: string[] = [];
+    const origCreate = api.createBlock.bind(api);
+    const origPatch = api.patchBlock.bind(api);
+    api.createBlock = async (input) => {
+      createCalls++;
+      return origCreate(input);
+    };
+    api.patchBlock = async (id, input, opts) => {
+      if (input.content !== undefined) savedBeforeSwitch.push(input.content);
+      return origPatch(id, input, opts);
+    };
+
+    const app = new MyNoteApp(root, api);
+    await app.start();
+
+    // 1. Format dirty block updates CM6 cleanly and clears dirty
+    const blk1 = "01BLK000000000000000000001";
+    const m1 = (app.stream as unknown as { mounted: Map<string, { view: import("@codemirror/view").EditorView }> }).mounted.get(blk1)!;
+    m1.view.dispatch({ changes: { from: 0, to: m1.view.state.doc.length, insert: '{"z":2}' } });
+    const card1 = root.querySelector<HTMLElement>(`[data-block-id="${blk1}"]`)!;
+    const fmtBtn = [...card1.querySelectorAll("button")].find((b) => b.textContent === "Format")!;
+    fmtBtn.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(app.stream.getBlockDraftContent(blk1)).toBe('{\n  "z": 2\n}');
+    expect(app.stream.hasDirtyBlocks()).toBe(false);
+
+    // 2. Keep version on dirty conflict block displays kept version cleanly
+    const blk2 = "01BLK000000000000000000002";
+    const m2 = (app.stream as unknown as { mounted: Map<string, { view: import("@codemirror/view").EditorView }> }).mounted.get(blk2)!;
+    m2.view.dispatch({ changes: { from: 0, to: m2.view.state.doc.length, insert: "abandoned local typing" } });
+    const keepBtns = [...root.querySelectorAll<HTMLButtonElement>(`[data-block-id="${blk2}"] .leaf-card button`)];
+    keepBtns[1].click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(app.stream.getBlockDraftContent(blk2)).toBe("version from macos");
+
+    // 3. Find bar typing MUST NOT steal focus from findInputEl
+    const findBtn = [...root.querySelectorAll("button")].find((b) => b.textContent === "Find")!;
+    findBtn.click();
+    const findInput = root.querySelector<HTMLInputElement>(".find-bar input")!;
+    expect(document.activeElement).toBe(findInput);
+    findInput.value = "macos";
+    findInput.dispatchEvent(new Event("input"));
+    expect(document.activeElement).toBe(findInput);
+    expect(root.querySelector(".find-bar .kbd")?.textContent).toBe("1 matches");
+
+    // 4. Incremental DOM reconciliation: inserting a remote block via WS MUST preserve card1 DOM node & CM6 view instance
+    const card1Before = root.querySelector(`[data-block-id="${blk1}"]`);
+    pushWs({
+      type: "blocks_changed",
+      upserted: [
+        {
+          id: "01BLK_EXTRA_00000000000001",
+          buffer_id: "01BUF000000000000000000001",
+          position: "zz",
+          lang: "text",
+          is_locked: false,
+          has_unlocked_concurrent_version: false,
+          public_hint: null,
+          head_op_ids: ["01OP_EXTRA"],
+          display_op_id: "01OP_EXTRA",
+          has_conflict: false,
+          content: "remote added",
+          versions: [],
+          updated_at_ms: 8000,
+        },
+      ],
+      deleted_ids: [],
+    });
+    expect(root.querySelector(`[data-block-id="${blk1}"]`)).toBe(card1Before);
+
+    // 5. Ctrl/Cmd+Enter inside focused CM6 creates exactly 1 block (not 2)
+    app.stream.focusBlock(blk1, 0);
+    const cmContent = card1.querySelector<HTMLElement>(".cm-content")!;
+    cmContent.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true, cancelable: true }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(createCalls).toBe(1);
+
+    // 6. Buffer switch flushes dirty edits before switching
+    m1.view.dispatch({ changes: { from: 0, to: m1.view.state.doc.length, insert: '{"flushed":true}' } });
+    const secondBuf = await api.createBuffer({ name: "work" });
+    pushWs({ type: "buffers_changed", upserted: [secondBuf], deleted_ids: [] });
+    const workTab = [...root.querySelectorAll<HTMLButtonElement>(".buf-tab")].find((b) => b.textContent === "work")!;
+    workTab.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(savedBeforeSwitch).toContain('{"flushed":true}');
+
+    app.destroy();
+  });
 });

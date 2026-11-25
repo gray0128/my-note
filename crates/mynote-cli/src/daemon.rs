@@ -6,7 +6,10 @@ use crate::sync_client::{hex_encode, run_cloud_ws_loop, RelayClient};
 use crate::uds::{socket_path_for, ApplyMeta, ApplyRequest, UdsRequest, UdsResponse};
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, Request, State};
-use axum::http::header::{CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, HOST, LOCATION, ORIGIN, SET_COOKIE};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, HOST, LOCATION, ORIGIN, REFERRER_POLICY,
+    SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
+};
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -54,6 +57,7 @@ pub struct DaemonState {
     pub ws_tx: broadcast::Sender<String>,
     pub sync_lock: tokio::sync::Mutex<()>,
     pub sync_notify: Arc<Notify>,
+    pub creds_tx: watch::Sender<Option<mynote_store::DeviceCredentials>>,
     pub enable_cloud_sync: bool,
     pub version: &'static str,
 }
@@ -178,9 +182,15 @@ impl DaemonState {
     /// Execute Single-Flight cloud sync round against configured relay and push live UI frames.
     pub async fn run_cloud_sync_now(&self) -> Result<(i64, String, usize), CoreError> {
         let _sf = self.sync_lock.lock().await;
-        let creds = {
+        let (creds, cur_last_seq, cur_pending) = {
             let store = self.store.lock().unwrap();
-            store.load_credentials()?
+            let c = store.load_credentials()?;
+            let last_seq = store
+                .get_local_meta("last_seq")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let pending = store.pending_op_count();
+            (c, last_seq, pending)
         };
         let Some(creds) = creds else {
             return Err(CoreError::new(
@@ -194,14 +204,25 @@ impl DaemonState {
         self.broadcast_json(serde_json::json!({
             "type": "sync_status",
             "state": "syncing",
-            "last_seq": 0
+            "last_seq": cur_last_seq,
+            "pending_ops": cur_pending
         }));
 
-        // Run sync round on a short-locked store reference via a fresh handle or locked store:
-        // Since LocalStore owns a non-Send rusqlite::Connection, hold it inside `spawn_blocking`?
-        // Even better: `store` is behind `std::sync::Mutex<LocalStore>`, and we keep awaits outside the lock
-        // by opening a scoped lock only during snapshot export & mutation apply inside `sync_round_locked`.
-        let report = run_sync_round_with_mutex(&client, &self.store, read_only).await?;
+        // Keep awaits outside the std::sync::Mutex<LocalStore> lock; always clear "syncing" on error!
+        let report = match run_sync_round_with_mutex(&client, &self.store, read_only).await {
+            Ok(r) => r,
+            Err(e) => {
+                if e.code() == ErrorCode::DeviceRevoked {
+                    self.broadcast_json(serde_json::json!({
+                        "type": "alert",
+                        "code": "DEVICE_REVOKED",
+                        "details": { "message": e.message() }
+                    }));
+                }
+                self.broadcast_sync_and_trash();
+                return Err(e);
+            }
+        };
 
         // Broadcast any remotely pulled changes immediately over `/v1/local/ws`
         if !report.apply_summary.upserted_buffer_ids.is_empty()
@@ -245,24 +266,35 @@ async fn run_sync_round_with_mutex(
     read_only: bool,
 ) -> Result<crate::sync_client::SyncRoundReport, CoreError> {
     use mynote_core::sync::{step, SyncCommand, SyncEvent};
+    const MAX_SYNC_STEPS: usize = 10_000;
+    const MAX_STALLED_STEPS: usize = 8;
+
     let mut report = crate::sync_client::SyncRoundReport::default();
 
-    let mut queue: Vec<SyncCommand> = {
+    let (mut queue, mut prev_progress) = {
         let mut store = store_mutex.lock().unwrap();
         let snap = store.export_engine_snapshot()?;
         let (muts, cmds) = step(&snap, SyncEvent::StartSync)?;
         let summary = store.apply_store_mutations(&muts)?;
         report.apply_summary = summary;
-        cmds
+        let prog = (
+            store.get_local_meta("last_seq"),
+            store.get_local_meta("bootstrap_completed"),
+            store.get_local_meta("reconciling_epoch"),
+            report.pulled_ops,
+            report.pushed_ops,
+            report.keys_synced,
+        );
+        (cmds, prog)
     };
 
     let mut steps = 0usize;
-    while !queue.is_empty() && steps < 64 {
+    let mut stalled_steps = 0usize;
+    while !queue.is_empty() && steps < MAX_SYNC_STEPS {
         steps += 1;
         let cmd = queue.remove(0);
         match cmd {
             SyncCommand::HttpPull { since_seq, limit } => {
-                // Delegate HTTP pull via temporary LocalStore-free helper on RelayClient
                 let (epoch, ops, keys_digest, head_seq, has_more) =
                     client.pull_page_for_daemon(since_seq, limit).await?;
                 report.epoch = Some(epoch.to_string());
@@ -286,6 +318,12 @@ async fn run_sync_round_with_mutex(
                             has_more,
                         },
                     )?;
+                    if muts
+                        .iter()
+                        .any(|m| matches!(m, StoreMutation::ClearServerSeqsForReconcile { .. }))
+                    {
+                        report.reconciled_epoch_change = true;
+                    }
                     let sum = store.apply_store_mutations(&muts)?;
                     merge_apply(&mut report.apply_summary, sum);
                     cmds
@@ -366,6 +404,39 @@ async fn run_sync_round_with_mutex(
                 }
             }
         }
+
+        let cur_progress = {
+            let store = store_mutex.lock().unwrap();
+            (
+                store.get_local_meta("last_seq"),
+                store.get_local_meta("bootstrap_completed"),
+                store.get_local_meta("reconciling_epoch"),
+                report.pulled_ops,
+                report.pushed_ops,
+                report.keys_synced,
+            )
+        };
+        if cur_progress == prev_progress {
+            stalled_steps += 1;
+            if stalled_steps >= MAX_STALLED_STEPS && !queue.is_empty() {
+                return Err(CoreError::new(
+                    ErrorCode::SyncOffline,
+                    "daemon sync round stopped making progress (stalled loop detected)",
+                    "Inspect relay status and retry sync",
+                ));
+            }
+        } else {
+            stalled_steps = 0;
+            prev_progress = cur_progress;
+        }
+    }
+
+    if !queue.is_empty() {
+        return Err(CoreError::new(
+            ErrorCode::SyncOffline,
+            "daemon sync round reached step safety limit before draining queue",
+            "Trigger another sync round to continue",
+        ));
     }
     Ok(report)
 }
@@ -453,6 +524,8 @@ pub async fn start_daemon(cfg: DaemonConfig) -> Result<RunningDaemon, CoreError>
 
     let (ws_tx, _) = broadcast::channel::<String>(256);
     let sync_notify = Arc::new(Notify::new());
+    let initial_creds = store.load_credentials().ok().flatten();
+    let (creds_tx, creds_rx) = watch::channel(initial_creds);
     let state = Arc::new(DaemonState {
         store: Mutex::new(store),
         port: actual_port,
@@ -461,6 +534,7 @@ pub async fn start_daemon(cfg: DaemonConfig) -> Result<RunningDaemon, CoreError>
         ws_tx,
         sync_lock: tokio::sync::Mutex::new(()),
         sync_notify: sync_notify.clone(),
+        creds_tx,
         enable_cloud_sync: cfg.enable_cloud_sync,
         version: env!("CARGO_PKG_VERSION"),
     });
@@ -493,12 +567,43 @@ pub async fn start_daemon(cfg: DaemonConfig) -> Result<RunningDaemon, CoreError>
         });
     }
 
-    // Bind `0600` Unix Domain Socket for CLI `apply` / `open_ticket` / `sync_now` / `ping`
+    // Bind `0600` Unix Domain Socket inside `0700` owner-verified parent directory
     let sock_path = socket_path_for(&cfg.data_dir);
     #[cfg(unix)]
     {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if let Some(parent) = sock_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).map_err(|e| {
+                CoreError::new(
+                    ErrorCode::IntegrityError,
+                    format!("cannot create socket dir '{}': {e}", parent.display()),
+                    "Check directory permissions",
+                )
+            })?;
+            let meta = std::fs::symlink_metadata(parent).map_err(|e| {
+                CoreError::new(
+                    ErrorCode::IntegrityError,
+                    format!("cannot stat socket dir '{}': {e}", parent.display()),
+                    "Check directory permissions",
+                )
+            })?;
+            if meta.file_type().is_symlink() || meta.uid() != crate::uds::current_uid() {
+                return Err(CoreError::new(
+                    ErrorCode::IntegrityError,
+                    format!(
+                        "socket directory '{}' is not owned by current user or is a symlink",
+                        parent.display()
+                    ),
+                    "Verify directory ownership and remove untrusted paths",
+                ));
+            }
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+                CoreError::new(
+                    ErrorCode::IntegrityError,
+                    format!("cannot set 0700 on socket dir '{}': {e}", parent.display()),
+                    "Check directory permissions",
+                )
+            })?;
         }
         let _ = std::fs::remove_file(&sock_path);
         let uds_listener = tokio::net::UnixListener::bind(&sock_path).map_err(|e| {
@@ -508,10 +613,14 @@ pub async fn start_daemon(cfg: DaemonConfig) -> Result<RunningDaemon, CoreError>
                 "Check directory permissions",
             )
         })?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600));
-        }
+        std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            let _ = std::fs::remove_file(&sock_path);
+            CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("cannot set 0600 on daemon.sock '{}': {e}", sock_path.display()),
+                "Check socket directory permissions",
+            )
+        })?;
         let uds_state = state.clone();
         let mut rx = shutdown_rx.clone();
         tokio::spawn(async move {
@@ -529,7 +638,7 @@ pub async fn start_daemon(cfg: DaemonConfig) -> Result<RunningDaemon, CoreError>
         });
     }
 
-    // Spawn background Single-Flight cloud sync loop + Cloud WS Hibernation wakeup
+    // Spawn background Single-Flight cloud sync loop + dynamic Cloud WS Hibernation wakeup watcher
     if cfg.enable_cloud_sync {
         let sync_state = state.clone();
         let mut rx = shutdown_rx.clone();
@@ -550,19 +659,43 @@ pub async fn start_daemon(cfg: DaemonConfig) -> Result<RunningDaemon, CoreError>
             }
         });
 
-        let maybe_creds = state.store.lock().unwrap().load_credentials().ok().flatten();
-        if let Some(creds) = maybe_creds {
-            let notify = sync_notify.clone();
-            let mut rx = shutdown_rx.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = rx.changed() => {}
-                    _ = run_cloud_ws_loop(creds, move |_head_seq| {
-                        notify.notify_one();
-                    }) => {}
+        let notify = sync_notify.clone();
+        let mut rx = shutdown_rx.clone();
+        let mut creds_watch = creds_rx;
+        tokio::spawn(async move {
+            let mut ws_task: Option<tokio::task::JoinHandle<()>> = None;
+            loop {
+                if let Some(handle) = ws_task.take() {
+                    handle.abort();
                 }
-            });
-        }
+                let current_creds = creds_watch.borrow().clone();
+                if let Some(creds) = current_creds {
+                    let n = notify.clone();
+                    ws_task = Some(tokio::spawn(async move {
+                        run_cloud_ws_loop(creds, move |_head_seq| {
+                            n.notify_one();
+                        })
+                        .await;
+                    }));
+                }
+                tokio::select! {
+                    _ = rx.changed() => {
+                        if let Some(handle) = ws_task.take() {
+                            handle.abort();
+                        }
+                        break;
+                    }
+                    changed = creds_watch.changed() => {
+                        if changed.is_err() {
+                            if let Some(handle) = ws_task.take() {
+                                handle.abort();
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     // Consume unused mut warning on shutdown_rx
@@ -585,7 +718,25 @@ pub async fn run_daemon_foreground(cfg: DaemonConfig) -> Result<(), CoreError> {
         running.port,
         std::process::id()
     );
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
     running.shutdown();
     Ok(())
 }
@@ -666,7 +817,7 @@ fn extract_session_cookie(req: &Request) -> Option<String> {
 
 /// Strict `SEC-05` middleware (`docs/interface-contracts.md` §3.1, `docs/threat-model.md` §5.1):
 /// 1. `Host` MUST equal `localhost:<port>` ONLY (rejects `127.0.0.1:<port>`, `[::1]:<port>`, DNS rebind).
-/// 2. `Origin` MUST equal `http://localhost:<port>` on all non-GET HTTP requests AND `/v1/local/ws`.
+/// 2. `Origin` MUST equal `http://localhost:<port>` on all non-GET HTTP requests, `/v1/local/ws`, and any GET that sends `Origin`.
 /// 3. Session Cookie `mynote_local_session` MUST be valid on all `/v1/local/*` (except `/auth/exchange`) & WS.
 async fn sec05_security_middleware(
     State(state): State<Arc<DaemonState>>,
@@ -696,11 +847,10 @@ async fn sec05_security_middleware(
     let is_exchange = path == "/v1/local/auth/exchange";
     let is_api = path.starts_with("/v1/local/");
 
-    // 2. Strict Origin whitelist on non-GET HTTP methods and WebSocket handshake
-    if req.method() != Method::GET || is_ws {
-        let origin_ok = req
-            .headers()
-            .get(ORIGIN)
+    // 2. Strict Origin whitelist on non-GET, WebSocket handshake, and any GET that carries an Origin header
+    let origin_hdr = req.headers().get(ORIGIN);
+    if req.method() != Method::GET || is_ws || origin_hdr.is_some() {
+        let origin_ok = origin_hdr
             .and_then(|v| v.to_str().ok())
             .is_some_and(|o| o == expected_origin);
         if !origin_ok {
@@ -726,7 +876,16 @@ async fn sec05_security_middleware(
         }
     }
 
-    next.run(req).await
+    let mut res = next.run(req).await;
+    if is_api {
+        res.headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    res.headers_mut()
+        .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    res.headers_mut()
+        .insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    res
 }
 
 #[derive(Deserialize)]
@@ -784,7 +943,16 @@ async fn handle_static_asset(State(state): State<Arc<DaemonState>>, req: Request
     let mime = mime_guess::from_path(resolved_path).first_or_octet_stream();
     let (body_bytes, style_src) = if resolved_path == "index.html" {
         let mut nonce_raw = [0u8; 16];
-        let _ = getrandom::fill(&mut nonce_raw);
+        if let Err(e) = getrandom::fill(&mut nonce_raw) {
+            return api_err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &CoreError::new(
+                    ErrorCode::IntegrityError,
+                    format!("OS CSPRNG failure generating CSP nonce: {e}"),
+                    "Check OS entropy source",
+                ),
+            );
+        }
         let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce_raw);
         let html = String::from_utf8_lossy(&content.data);
         let meta = format!("<meta name=\"csp-nonce\" content=\"{nonce}\" />");
@@ -807,6 +975,10 @@ async fn handle_static_asset(State(state): State<Arc<DaemonState>>, req: Request
     }
     if let Ok(hv) = HeaderValue::from_str(&csp) {
         res.headers_mut().insert(CONTENT_SECURITY_POLICY, hv);
+    }
+    if resolved_path == "index.html" {
+        res.headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
     res
 }
@@ -1377,6 +1549,36 @@ async fn dispatch_uds_request(state: &Arc<DaemonState>, req: UdsRequest) -> UdsR
             Err(e) => UdsResponse::from_core_error(&e),
         },
         UdsRequest::Poke { fast_flush: _ } => {
+            let (bufs_updated, new_creds, refreshed_blocks) = {
+                let mut store = state.store.lock().unwrap();
+                let changed = store.reload_smks_from_disk().unwrap_or(false);
+                let (bufs_changed, blocks) = if changed {
+                    let (bc, updated_ids) = store.rematerialize_unavailable().unwrap_or((false, Vec::new()));
+                    let details = updated_ids
+                        .into_iter()
+                        .filter_map(|id| store.get_block(&id).ok())
+                        .collect();
+                    (bc, details)
+                } else {
+                    (false, Vec::new())
+                };
+                let creds = store.load_credentials().ok().flatten();
+                (bufs_changed, creds, blocks)
+            };
+            if *state.creds_tx.borrow() != new_creds {
+                let _ = state.creds_tx.send(new_creds);
+            }
+            if bufs_updated {
+                state.broadcast_buffers_snapshot(Vec::new());
+            }
+            if !refreshed_blocks.is_empty() {
+                state.broadcast_json(serde_json::json!({
+                    "type": "blocks_changed",
+                    "upserted": refreshed_blocks,
+                    "deleted_ids": []
+                }));
+                state.broadcast_sync_and_trash();
+            }
             state.sync_notify.notify_one();
             UdsResponse {
                 ok: true,
@@ -1515,14 +1717,14 @@ fn execute_uds_apply(state: &Arc<DaemonState>, meta: ApplyMeta, req: ApplyReques
             } => {
                 let wr = if let Some(keep) = keep_op_id.as_deref() {
                     store.resolve_block_keep(&id, &expected_heads, keep, &meta.actor)
+                } else if let Some(merged_content) = content.as_deref() {
+                    store.update_block(&id, merged_content, &expected_heads, meta.force, &meta.actor)
                 } else {
-                    store.update_block(
-                        &id,
-                        content.as_deref().unwrap_or_default(),
-                        &expected_heads,
-                        meta.force,
-                        &meta.actor,
-                    )
+                    Err(CoreError::new(
+                        ErrorCode::InvalidArgument,
+                        "resolve request requires either keep_op_id or merged content",
+                        "Pass --keep-op <op_id> or provide merged content on stdin",
+                    ))
                 };
                 wr.and_then(|r| {
                     broadcast_block_up = Some(r.block_id.clone());

@@ -11,7 +11,7 @@ use base64::Engine;
 use futures_util::StreamExt;
 use mynote_cli::daemon::{start_daemon, DaemonConfig};
 use mynote_cli::sync_client::{sha256_hex, RelayClient};
-use mynote_cli::uds::{try_send_uds, UdsRequest};
+use mynote_cli::uds::{try_send_uds, ApplyMeta, ApplyRequest, UdsRequest};
 use mynote_core::error::ErrorCode;
 use mynote_core::ids::{DeviceId, JournalEpoch, KeyId, OpId};
 use mynote_core::model::KeyRecordRow;
@@ -546,6 +546,12 @@ async fn mock_bootstrap(
         )
             .into_response();
     }
+    let revoke_existing = body["revoke_existing"].as_bool().unwrap_or(false);
+    if revoke_existing {
+        for d in g.devices.values_mut() {
+            d.revoked_at_ms = Some(1_795_521_700_000);
+        }
+    }
     let dev_id = body["device_id"].as_str().unwrap().to_string();
     g.devices.insert(
         dev_id.clone(),
@@ -1013,9 +1019,23 @@ async fn full_dual_desktop_sync_conflict_rotation_refresh_revoke_and_pitr_e2e() 
     let unsealed = store_b.unlock_keyring_with_words(&words_24).unwrap();
     assert_eq!(unsealed, 2);
     client_b.run_sync_round(&mut store_b, false).await.unwrap();
+    let b_v2 = store_b.get_block(&blk_v2.block_id).unwrap();
+    assert_eq!(b_v2.content.as_deref(), Some("secret written under smk_v2"));
+    // BLOCKER #3 regression: block_keys.block_id must be backfilled from Ulid::ZERO so B can edit!
+    store_b
+        .update_block(
+            &blk_v2.block_id,
+            "edited smk_v2 on desktop B",
+            &b_v2.head_op_ids,
+            false,
+            "human",
+        )
+        .expect("Desktop B must be able to edit block decrypted after 24-word unlock");
+    client_b.run_sync_round(&mut store_b, false).await.unwrap();
+    client_a.run_sync_round(&mut store_a, false).await.unwrap();
     assert_eq!(
-        store_b.get_block(&blk_v2.block_id).unwrap().content.as_deref(),
-        Some("secret written under smk_v2")
+        store_a.get_block(&blk_v2.block_id).unwrap().content.as_deref(),
+        Some("edited smk_v2 on desktop B")
     );
 
     // 5. Desktop A rotates SMK -> gen 3, writes block -> Desktop A `device refresh` -> Desktop B claims!
@@ -1048,10 +1068,18 @@ async fn full_dual_desktop_sync_conflict_rotation_refresh_revoke_and_pitr_e2e() 
 
     let mut store_b = LocalStore::open(&dir_b).unwrap();
     client_b.run_sync_round(&mut store_b, false).await.unwrap();
-    assert_eq!(
-        store_b.get_block(&blk_v3.block_id).unwrap().content.as_deref(),
-        Some("written under smk_v3")
-    );
+    let b_v3 = store_b.get_block(&blk_v3.block_id).unwrap();
+    assert_eq!(b_v3.content.as_deref(), Some("written under smk_v3"));
+    // BLOCKER #3 regression: block_keys.block_id must also be backfilled after `device refresh`!
+    store_b
+        .update_block(
+            &blk_v3.block_id,
+            "local edit of smk_v3 on desktop B",
+            &b_v3.head_op_ids,
+            false,
+            "human",
+        )
+        .expect("Desktop B must be able to edit block decrypted after device refresh");
 
     // 6. Desktop A revokes Desktop B -> Desktop B immediately receives DEVICE_REVOKED
     client_a
@@ -1091,4 +1119,349 @@ async fn full_dual_desktop_sync_conflict_rotation_refresh_revoke_and_pitr_e2e() 
     let _ = Path::new(&dir_b)
         .exists()
         .then(|| std::fs::remove_dir_all(&dir_b));
+}
+
+/// Regression suite covering:
+/// - BLOCKER #4: Disaster Recovery Path #1 (`bootstrap_register --revoke-existing` -> probe `/v1/keys`
+///   -> `open_for_recovery_bootstrap` -> `unlock_keyring_with_words` -> full multi-generation restore).
+/// - HIGH #2: `sync_key_table` GET-before-POST strictly-newer diff when peer holds older `keyring_gen`.
+/// - HIGH #4: `build_pending_push` 4 MiB JSON byte-budget batching across multi-hundred-KiB blocks.
+/// - HIGH #8: Live daemon hot-reloads rotated SMKs on `UdsRequest::Poke` so subsequent writes use new SMK.
+/// - HIGH #9: `run_cloud_sync_now` failure always clears `"syncing"` WS state & emits `DEVICE_REVOKED`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn regression_recovery_bootstrap_key_table_diff_large_batch_and_daemon_smk_reload() {
+    let state = Arc::new(Mutex::new(MockRelayState {
+        bootstrap_token: "rec-bootstrap-secret".into(),
+        relay: SimRelay::new(JournalEpoch::from_random_bytes([0x22; 16])),
+        devices: BTreeMap::new(),
+        pairings: BTreeMap::new(),
+    }));
+
+    let app = Router::new()
+        .route("/v1/devices/bootstrap", post(mock_bootstrap))
+        .route("/v1/devices", post(mock_devices_post))
+        .route("/v1/devices/pair-claim", post(mock_pair_claim))
+        .route("/v1/devices/{id}/refresh", post(mock_device_refresh))
+        .route("/v1/devices/{id}", delete(mock_device_revoke))
+        .route("/v1/sync/pull", get(mock_pull))
+        .route("/v1/sync/push", post(mock_push))
+        .route("/v1/keys", get(mock_keys_get).post(mock_keys_post))
+        .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let dir_a = temp_dir("reg_a");
+    let dir_rec = temp_dir("reg_rec");
+    let dir_peer = temp_dir("reg_peer");
+    let dir_daemon = temp_dir("reg_daemon");
+
+    // === 1. BLOCKER #4: Disaster Recovery Path #1 ===
+    let mut store_a = LocalStore::open(&dir_a).unwrap();
+    let words_24 = store_a.initial_recovery_words.clone().expect("24 recovery words");
+    RelayClient::bootstrap_device(&relay_url, "rec-bootstrap-secret", &store_a, "lost-laptop", false)
+        .await
+        .unwrap();
+    let creds_a = store_a.load_credentials().unwrap().unwrap();
+    let client_a = RelayClient::from_credentials(&creds_a).unwrap();
+
+    let note1 = store_a
+        .add_block(
+            "scratch",
+            "gen1 important note",
+            Some("plain"),
+            None,
+            "human",
+            None,
+        )
+        .unwrap();
+    let (gen2, _kid2) = store_a.rotate_smk().unwrap();
+    assert_eq!(gen2, 2);
+    let note2 = store_a
+        .add_block(
+            "scratch",
+            "gen2 important note",
+            Some("plain"),
+            None,
+            "human",
+            None,
+        )
+        .unwrap();
+    client_a.run_sync_round(&mut store_a, false).await.unwrap();
+
+    // All old devices lost! Brand-new empty `dir_rec` registers with --revoke-existing, probes
+    // GET /v1/keys, initializes in recovery mode without generating a conflicting gen-1 keyring!
+    let rec_dev_id = DeviceId::from_random_bytes([0x55; 10]);
+    let (_receipt, rec_creds) = RelayClient::bootstrap_register(
+        &relay_url,
+        "rec-bootstrap-secret",
+        &rec_dev_id,
+        "replacement-laptop",
+        true,
+    )
+    .await
+    .unwrap();
+    let client_rec = RelayClient::from_credentials(&rec_creds).unwrap();
+    let (_recs, _marks, remote_kr, _vh) = client_rec.fetch_remote_keys().await.unwrap();
+    let (kr_gen, kr_blob) = remote_kr.expect("relay must return existing gen-2 keyring");
+    assert_eq!(kr_gen, 2);
+
+    // Lost device A must now be revoked by `revoke_existing = true`
+    assert_eq!(
+        client_a
+            .run_sync_round(&mut store_a, false)
+            .await
+            .unwrap_err()
+            .code(),
+        ErrorCode::DeviceRevoked
+    );
+
+    let mut store_rec = LocalStore::open_for_recovery_bootstrap(
+        &dir_rec,
+        rec_dev_id,
+        &rec_creds.sync_url,
+        &rec_creds.device_token,
+        &rec_creds.scope,
+        kr_gen,
+        &kr_blob,
+    )
+    .unwrap();
+    assert_eq!(store_rec.unlock_keyring_with_words(&words_24).unwrap(), 2);
+    client_rec.run_sync_round(&mut store_rec, false).await.unwrap();
+
+    let r1 = store_rec.get_block(&note1.block_id).unwrap();
+    let r2 = store_rec.get_block(&note2.block_id).unwrap();
+    assert_eq!(r1.content.as_deref(), Some("gen1 important note"));
+    assert_eq!(r2.content.as_deref(), Some("gen2 important note"));
+    // Both recovered blocks must be immediately editable!
+    store_rec
+        .update_block(
+            &note2.block_id,
+            "edited after disaster recovery",
+            &r2.head_op_ids,
+            false,
+            "human",
+        )
+        .unwrap();
+    client_rec.run_sync_round(&mut store_rec, false).await.unwrap();
+
+    // === 2. HIGH #2: sync_key_table GET-before-POST when peer holds older keyring_gen ===
+    let pair = client_rec
+        .create_pairing_ticket("peer-desktop", "read-write", store_rec.current_smks_for_pairing())
+        .await
+        .unwrap();
+    RelayClient::claim_pairing_code(&pair.pairing_code, &dir_peer)
+        .await
+        .unwrap();
+    let mut store_peer = LocalStore::open(&dir_peer).unwrap();
+    let creds_peer = store_peer.load_credentials().unwrap().unwrap();
+    let client_peer = RelayClient::from_credentials(&creds_peer).unwrap();
+    client_peer.run_sync_round(&mut store_peer, false).await.unwrap();
+
+    // `store_rec` rotates to keyring_gen = 3 and syncs to relay
+    let (gen3, _kid3) = store_rec.rotate_smk().unwrap();
+    assert_eq!(gen3, 3);
+    client_rec.run_sync_round(&mut store_rec, false).await.unwrap();
+
+    // `store_peer` still locally holds keyring_gen = 2, writes a brand-new block with a new BDEK,
+    // and syncs. GET-before-POST must omit the stale gen-2 keyring and upload ONLY the new BDEK
+    // without triggering 409 CAS_MISMATCH!
+    let peer_blk = store_peer
+        .add_block(
+            "scratch",
+            "written by peer at older keyring_gen",
+            Some("plain"),
+            None,
+            "human",
+            None,
+        )
+        .unwrap();
+    client_peer.run_sync_round(&mut store_peer, false).await.unwrap();
+    assert_eq!(store_peer.pending_op_count(), 0);
+
+    client_rec.run_sync_round(&mut store_rec, false).await.unwrap();
+    assert_eq!(
+        store_rec
+            .get_block(&peer_blk.block_id)
+            .unwrap()
+            .content
+            .as_deref(),
+        Some("written by peer at older keyring_gen")
+    );
+
+    // === 3. HIGH #4: build_pending_push enforces 4 MiB JSON byte budget ===
+    // 8 blocks of ~600 KiB incompressible-ish pattern (~4.8 MiB raw -> > 6 MiB base64 JSON).
+    // Even with zstd compression inside MNB1, pseudo-random hex ensures compressed envelopes stay large.
+    for i in 0..8usize {
+        let mut s = String::with_capacity(620_000);
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15 ^ (i as u64 + 1).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        while s.len() < 600_000 {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            let v = x.wrapping_mul(0x2545_f491_4f6c_dd1d);
+            s.push_str(&format!("{v:016x}"));
+        }
+        store_rec
+            .add_block("scratch", &s, Some("plain"), None, "human", None)
+            .unwrap();
+    }
+    let snap = store_rec.export_engine_snapshot().unwrap();
+    let first_batch = snap.build_pending_push().expect("pending batch");
+    assert!(
+        first_batch.ops.len() < 8,
+        "byte-budget chunking must split 8 x 600 KiB incompressible ops into multiple HTTP batches (got {})",
+        first_batch.ops.len()
+    );
+    client_rec.run_sync_round(&mut store_rec, false).await.unwrap();
+    assert_eq!(
+        store_rec.pending_op_count(),
+        0,
+        "multi-batch push must drain all 8 large ops cleanly under 4 MiB limit"
+    );
+
+    // === 4. HIGH #8 & HIGH #9: Live daemon SMK hot-reload on Poke + error clears "syncing" ===
+    let pair_d = client_rec
+        .create_pairing_ticket(
+            "daemon-desktop",
+            "read-write",
+            store_rec.current_smks_for_pairing(),
+        )
+        .await
+        .unwrap();
+    RelayClient::claim_pairing_code(&pair_d.pairing_code, &dir_daemon)
+        .await
+        .unwrap();
+
+    let daemon = start_daemon(DaemonConfig {
+        data_dir: dir_daemon.clone(),
+        port: 0,
+        enable_cloud_sync: false,
+    })
+    .await
+    .expect("start daemon");
+
+    // Complete initial bootstrap sync on the daemon so `scratch` buffer & remote keys are pulled
+    daemon
+        .state
+        .run_cloud_sync_now()
+        .await
+        .expect("initial daemon sync");
+
+    // External CLI process rotates SMK on disk while daemon is already running
+    let rotated_kid = {
+        let mut cli_store = LocalStore::open(&dir_daemon).unwrap();
+        let (_g, new_kid) = cli_store.rotate_smk().unwrap();
+        new_kid
+    };
+
+    // Send UdsRequest::Poke -> daemon MUST hot-reload SMKs from disk
+    let dir_d_poke = dir_daemon.clone();
+    let poke_resp = tokio::task::spawn_blocking(move || {
+        try_send_uds(
+            &dir_d_poke,
+            &UdsRequest::Poke { fast_flush: false },
+            Duration::from_secs(3),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .expect("daemon UDS reachable");
+    assert!(poke_resp.ok);
+
+    // Add a block via daemon UDS Apply -> new op MUST be encrypted with rotated_kid!
+    let dir_d_apply = dir_daemon.clone();
+    let apply_resp = tokio::task::spawn_blocking(move || {
+        try_send_uds(
+            &dir_d_apply,
+            &UdsRequest::Apply {
+                meta: ApplyMeta {
+                    actor: "human".into(),
+                    idempotency_key: None,
+                    allow_empty: false,
+                    force: false,
+                },
+                request: ApplyRequest::AddBlock {
+                    buffer: "scratch".into(),
+                    content: "encrypted under hot-reloaded SMK".into(),
+                    lang: Some("plain".into()),
+                    after_id: None,
+                },
+            },
+            Duration::from_secs(3),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .expect("daemon UDS apply reachable");
+    assert!(apply_resp.ok, "apply failed: {:?}", apply_resp.error);
+
+    let last_op_smk = {
+        let guard = daemon.state.store.lock().unwrap();
+        let d_snap = guard.export_engine_snapshot().unwrap();
+        let pending = d_snap.build_pending_push().expect("new pending push batch");
+        let last_op = pending.ops.last().expect("new pending op");
+        LocalStore::peek_op_smk_kid(&last_op.envelope).unwrap()
+    };
+    assert_eq!(
+        last_op_smk, rotated_kid,
+        "daemon must encrypt new ops under the hot-reloaded SMK after UdsRequest::Poke"
+    );
+
+    // HIGH #9: Revoke daemon's device on relay, subscribe to daemon WS broadcast, invoke
+    // `run_cloud_sync_now()`, verify Err(DeviceRevoked), DEVICE_REVOKED alert, AND final
+    // sync_status state is NOT stuck on "syncing"!
+    let daemon_dev_id = {
+        let guard = daemon.state.store.lock().unwrap();
+        guard.device_id().to_string()
+    };
+    client_rec.revoke_device(&daemon_dev_id).await.unwrap();
+
+    let mut ws_rx = daemon.state.ws_tx.subscribe();
+    let sync_err = daemon
+        .state
+        .run_cloud_sync_now()
+        .await
+        .expect_err("revoked daemon must return Err");
+    assert_eq!(sync_err.code(), ErrorCode::DeviceRevoked);
+
+    let mut seen_syncing = false;
+    let mut seen_revoked_alert = false;
+    let mut final_sync_state: Option<String> = None;
+    while let Ok(raw) = ws_rx.try_recv() {
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        match v["type"].as_str() {
+            Some("sync_status") => {
+                let st = v["state"].as_str().unwrap_or("").to_string();
+                if st == "syncing" {
+                    seen_syncing = true;
+                }
+                final_sync_state = Some(st);
+            }
+            Some("alert") if v["code"].as_str() == Some("DEVICE_REVOKED") => {
+                seen_revoked_alert = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(seen_syncing, "expected initial syncing broadcast");
+    assert!(seen_revoked_alert, "expected DEVICE_REVOKED alert broadcast");
+    assert_ne!(
+        final_sync_state.as_deref(),
+        Some("syncing"),
+        "sync_status must NOT remain stuck in 'syncing' after sync failure (got {:?})",
+        final_sync_state
+    );
+
+    daemon.shutdown();
+    server.abort();
+    for d in [&dir_a, &dir_rec, &dir_peer, &dir_daemon] {
+        let _ = Path::new(d).exists().then(|| std::fs::remove_dir_all(d));
+    }
 }

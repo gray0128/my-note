@@ -10,11 +10,45 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct DeviceCredentials {
     pub sync_url: String,
     pub device_token: String,
     pub scope: String,
+}
+
+impl std::fmt::Debug for DeviceCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCredentials")
+            .field("sync_url", &self.sync_url)
+            .field("device_token", &"<redacted>")
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn command_in_path(bin: &str) -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(bin);
+        if candidate.is_file() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if std::fs::metadata(&candidate).is_ok_and(|m| m.permissions().mode() & 0o111 != 0) {
+                    return true;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn should_use_os_keychain(data_dir: &Path) -> bool {
@@ -37,13 +71,7 @@ fn should_use_os_keychain(data_dir: &Path) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok()
-            && Command::new("which")
-                .arg("secret-tool")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|st| st.success())
+        std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok() && command_in_path("secret-tool")
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -58,21 +86,34 @@ fn keychain_account(data_dir: &Path) -> String {
 
 #[cfg(target_os = "macos")]
 fn os_store_secret(service: &str, account: &str, payload: &str) -> bool {
-    Command::new("/usr/bin/security")
-        .args([
-            "add-generic-password",
-            "-U",
-            "-s",
-            service,
-            "-a",
-            account,
-            "-w",
-            payload,
-        ])
+    use std::io::Write;
+    // Pass secret via `security -i` stdin with `-X <hex>` so the device token NEVER appears in `ps` argv.
+    // Guard against `security -i`'s 4096-byte line buffer cap and unsafe characters in service/account.
+    if service.contains(char::is_whitespace) || account.contains(char::is_whitespace) {
+        return false;
+    }
+    let hex_payload: String = payload.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let cmd = format!("add-generic-password -U -s {service} -a {account} -X {hex_payload}\n");
+    if cmd.len() >= 3900 {
+        return false;
+    }
+    let Ok(mut child) = Command::new("/usr/bin/security")
+        .arg("-i")
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(cmd.as_bytes()).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+    }
+    child.wait().is_ok_and(|s| s.success())
 }
 
 /// Decodes secret output from OS keychain tools; handles macOS `security find-generic-password -w`
@@ -168,21 +209,63 @@ fn os_load_secret(_service: &str, _account: &str) -> Option<String> {
     None
 }
 
-fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).map_err(|e| {
+/// Atomically create a `0600` secret file (zero world-readable TOCTOU window), fsync, and rename into place.
+pub fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
+    use std::io::Write;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut rnd = [0u8; 8];
+    getrandom::fill(&mut rnd).map_err(|e| {
         CoreError::new(
             ErrorCode::IntegrityError,
-            format!("failed writing '{}': {e}", path.display()),
+            format!("OS CSPRNG failure creating temp file: {e}"),
+            "Check OS entropy source",
+        )
+    })?;
+    let suffix: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+    let base_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "secret".to_string());
+    let tmp = parent.join(format!(".{base_name}.{}.{suffix}.tmp", std::process::id()));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp).map_err(|e| {
+        CoreError::new(
+            ErrorCode::IntegrityError,
+            format!("failed creating '{}': {e}", tmp.display()),
             "Verify data directory permissions",
         )
     })?;
+    if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CoreError::new(
+            ErrorCode::IntegrityError,
+            format!("failed writing '{}': {e}", path.display()),
+            "Verify disk space and data directory permissions",
+        ));
+    }
+    drop(file);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("failed setting 0600 on '{}': {e}", tmp.display()),
+                "Verify data directory permissions",
+            ));
+        }
     }
     std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
         CoreError::new(
             ErrorCode::IntegrityError,
             format!("failed renaming '{}': {e}", path.display()),
@@ -196,13 +279,17 @@ pub fn save_device_credentials(data_dir: &Path, creds: &DeviceCredentials) -> Re
     // Compact single-line JSON avoids macOS `security find-generic-password -w` hex-encoding multiline secrets.
     let json = serde_json::to_string(creds)
         .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "serialize credentials"))?;
+    let fallback_path = data_dir.join("device_credentials.local.json");
     if should_use_os_keychain(data_dir) {
         let acct = keychain_account(data_dir);
         if os_store_secret("mynote.device_credentials", &acct, &json) {
+            if fallback_path.exists() {
+                let _ = std::fs::remove_file(&fallback_path);
+            }
             return Ok(());
         }
     }
-    write_atomic_0600(&data_dir.join("device_credentials.local.json"), json.as_bytes())
+    write_atomic_0600(&fallback_path, json.as_bytes())
 }
 
 pub fn load_device_credentials(data_dir: &Path) -> Result<Option<DeviceCredentials>, CoreError> {

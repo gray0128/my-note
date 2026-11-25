@@ -301,7 +301,10 @@ describe("cloud-cf M1 Thin Blind Sync Relay Contract Suite (real workerd)", () =
     const ran = await runDurableObjectAlarm(stub);
     expect(ran).toBe(true);
 
-    const opsObj = await env.ARCHIVE_BUCKET.get(`archives/ops/${boot.epoch}/${seqStr}-${seqStr}.mna1`);
+    const opsList = await env.ARCHIVE_BUCKET.list({ prefix: `archives/ops/${boot.epoch}/` });
+    const latestOpsKey = opsList.objects.map((o) => o.key).find((k) => k.endsWith(`-${seqStr}.mna1`));
+    expect(latestOpsKey).toBeDefined();
+    const opsObj = await env.ARCHIVE_BUCKET.get(latestOpsKey!);
     expect(opsObj).not.toBeNull();
     const opsBytes = new Uint8Array(await opsObj!.arrayBuffer());
     expect(new TextDecoder().decode(opsBytes.slice(0, 4))).toBe("MNA1");
@@ -321,5 +324,91 @@ describe("cloud-cf M1 Thin Blind Sync Relay Contract Suite (real workerd)", () =
     await runDurableObjectAlarm(stub);
     const afterCount = (await env.ARCHIVE_BUCKET.list({ prefix: "archives/ops/" })).objects.length;
     expect(afterCount).toBe(beforeCount);
+  });
+
+  it("does NOT starve daily archive alarm on DO hibernation wakeups and chunks >500 ops into bounded MNA1 segments", async () => {
+    const token = "tok-hibernation-chunk";
+    const boot = await bootstrapDevice("MacBook", token);
+    const stub = env.SYNC_DO.get(env.SYNC_DO.idFromName("primary"));
+
+    // Reset virtual clock to 0 and establish a fresh daily schedule baseline via alarm
+    await runInDurableObject(stub, (inst) => (inst as SyncJournalDO).setClockOffsetMs(0));
+    await runDurableObjectAlarm(stub);
+    const existingKeys = new Set(
+      (await env.ARCHIVE_BUCKET.list({ prefix: `archives/ops/${boot.epoch}/` })).objects.map((o) => o.key),
+    );
+
+    // Record initial scheduled daily alarm timestamp
+    const alarm0 = await runInDurableObject(stub, (inst) => (inst as SyncJournalDO).simulateWakeupReschedule());
+    expect(alarm0).not.toBeNull();
+
+    // Advance virtual clock by 12 hours and simulate DO hibernation wakeup reschedule:
+    // the scheduled alarm MUST move 12h closer in wall-clock (same virtual target), NOT push 24h forward!
+    await runInDurableObject(stub, (inst) => (inst as SyncJournalDO).setClockOffsetMs(12 * 3_600_000));
+    const alarm12h = await runInDurableObject(stub, (inst) => (inst as SyncJournalDO).simulateWakeupReschedule());
+    expect(alarm12h!).toBeLessThan(alarm0! - 11 * 3_600_000);
+
+    // Push 620 ops across two batches (> 500 MAX_PUSH_OPS) to verify chunked MNA1 archiving
+    let firstSeq = 0;
+    let lastSeq = 0;
+    for (let batch = 0; batch < 2; batch++) {
+      const count = batch === 0 ? 500 : 120;
+      const ops = Array.from({ length: count }, (_, i) => ({
+        op_id: `01JDF920A2B3C4D5${batch}${String(i).padStart(9, "0")}`,
+        key_id: null,
+        envelope_b64: b64(`chunk_op_${batch}_${i}`),
+      }));
+      const r = await SELF.fetch("https://relay.test/v1/sync/push", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify({ expected_epoch: boot.epoch, ops }),
+      });
+      expect(r.status).toBe(200);
+      const j = (await r.json()) as { acked: { seq: number }[] };
+      if (batch === 0) firstSeq = j.acked[0].seq;
+      lastSeq = j.acked[j.acked.length - 1].seq;
+    }
+
+    // Create an unclaimed ticket expiring in 10m; expiring it at +12h11m MUST clean up ticket WITHOUT triggering early daily archive
+    const ghostRes = await SELF.fetch("https://relay.test/v1/devices", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        device_name: "Ghost2",
+        scope: "read",
+        token_sha256_hex: await sha256Hex("tok-ghost2"),
+        ciphertext_b64: b64("ghost2_ct"),
+      }),
+    });
+    expect(ghostRes.status).toBe(200);
+    const ghostJson = (await ghostRes.json()) as { pair_id: string };
+    await runInDurableObject(stub, (inst) => (inst as SyncJournalDO).setClockOffsetMs(12 * 3_600_000 + 11 * 60_000));
+    await runDurableObjectAlarm(stub);
+    const afterTicketKeys = (await env.ARCHIVE_BUCKET.list({ prefix: `archives/ops/${boot.epoch}/` })).objects
+      .map((o) => o.key)
+      .filter((k) => !existingKeys.has(k));
+    expect(afterTicketKeys).toHaveLength(0);
+    expect(
+      (
+        await SELF.fetch("https://relay.test/v1/devices/pair-claim", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ pair_id: ghostJson.pair_id }),
+        })
+      ).status,
+    ).toBe(404);
+
+    // Advance past 24h -> daily archive fires and splits 620 ops into 2 bounded segments (500 + 120)
+    await runInDurableObject(stub, (inst) => (inst as SyncJournalDO).setClockOffsetMs(25 * 3_600_000));
+    await runDurableObjectAlarm(stub);
+    const newSegs = (await env.ARCHIVE_BUCKET.list({ prefix: `archives/ops/${boot.epoch}/` })).objects
+      .map((o) => o.key)
+      .filter((k) => !existingKeys.has(k))
+      .sort();
+    const pad = (n: number) => String(n).padStart(12, "0");
+    expect(newSegs).toEqual([
+      `archives/ops/${boot.epoch}/${pad(firstSeq)}-${pad(firstSeq + 499)}.mna1`,
+      `archives/ops/${boot.epoch}/${pad(firstSeq + 500)}-${pad(lastSeq)}.mna1`,
+    ]);
   });
 });

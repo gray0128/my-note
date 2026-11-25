@@ -110,14 +110,8 @@ async fn parse_relay_json(res: reqwest::Response) -> Result<serde_json::Value, C
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let text = res.text().await.map_err(|e| {
-        CoreError::new(
-            ErrorCode::SyncOffline,
-            format!("failed reading relay response body: {e}"),
-            "Retry once network stabilizes; local outbox preserved",
-        )
-    })?;
-    if !ct.contains("application/json") {
+    let media_type = ct.split(';').next().unwrap_or("").trim();
+    if media_type != "application/json" {
         return Err(CoreError::new(
             ErrorCode::SyncOffline,
             format!(
@@ -127,6 +121,13 @@ async fn parse_relay_json(res: reqwest::Response) -> Result<serde_json::Value, C
             "Check sync URL or proxy/captive portal; local outbox preserved",
         ));
     }
+    let text = res.text().await.map_err(|e| {
+        CoreError::new(
+            ErrorCode::SyncOffline,
+            format!("failed reading relay response body: {e}"),
+            "Retry once network stabilizes; local outbox preserved",
+        )
+    })?;
     let val: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
         CoreError::new(
             ErrorCode::SyncOffline,
@@ -310,21 +311,21 @@ impl RelayClient {
         r
     }
 
-    /// `POST /v1/devices/bootstrap`: registers first (or recovery) desktop with `BOOTSTRAP_TOKEN`.
+    /// `POST /v1/devices/bootstrap` without requiring an already-initialized `LocalStore`.
     /// Generates random 256-bit `device_token` locally and sends ONLY `SHA-256(device_token)`.
-    pub async fn bootstrap_device(
+    pub async fn bootstrap_register(
         url: &str,
         bootstrap_token: &str,
-        store: &LocalStore,
+        device_id: &DeviceId,
         device_name: &str,
         revoke_existing: bool,
-    ) -> Result<BootstrapReceipt, CoreError> {
+    ) -> Result<(BootstrapReceipt, DeviceCredentials), CoreError> {
         let client = Self::new(url, Some(bootstrap_token.to_string()))?;
         let raw_token = Zeroizing::new(rand_bytes::<32>()?);
         let device_token = format!("mnt_{}", hex_encode(raw_token.as_ref()));
         let token_hash = sha256_hex(&device_token);
         let body = serde_json::json!({
-            "device_id": store.device_id().as_str(),
+            "device_id": device_id.as_str(),
             "device_name": device_name,
             "token_sha256_hex": token_hash,
             "revoke_existing": revoke_existing,
@@ -346,23 +347,46 @@ impl RelayClient {
                 )
             })?;
         let val = parse_relay_json(res).await?;
-        let device_id = val["device_id"]
+        let resp_device_id = val["device_id"]
             .as_str()
-            .unwrap_or(store.device_id().as_str())
+            .unwrap_or(device_id.as_str())
             .to_string();
         let scope = val["scope"].as_str().unwrap_or("read-write").to_string();
         let epoch = val["epoch"].as_str().unwrap_or_default().to_string();
-        store.save_credentials(&DeviceCredentials {
+        let creds = DeviceCredentials {
             sync_url: client.base_url.clone(),
             device_token,
             scope: scope.clone(),
-        })?;
-        Ok(BootstrapReceipt {
-            device_id,
-            scope,
-            epoch,
-            sync_url: client.base_url,
-        })
+        };
+        Ok((
+            BootstrapReceipt {
+                device_id: resp_device_id,
+                scope,
+                epoch,
+                sync_url: client.base_url,
+            },
+            creds,
+        ))
+    }
+
+    /// `POST /v1/devices/bootstrap`: registers an already-initialized desktop with `BOOTSTRAP_TOKEN`.
+    pub async fn bootstrap_device(
+        url: &str,
+        bootstrap_token: &str,
+        store: &LocalStore,
+        device_name: &str,
+        revoke_existing: bool,
+    ) -> Result<BootstrapReceipt, CoreError> {
+        let (receipt, creds) = Self::bootstrap_register(
+            url,
+            bootstrap_token,
+            store.device_id(),
+            device_name,
+            revoke_existing,
+        )
+        .await?;
+        store.save_credentials(&creds)?;
+        Ok(receipt)
     }
 
     /// `POST /v1/devices`: pre-register a new device and upload `K_pair`-encrypted one-time ticket.
@@ -716,10 +740,9 @@ impl RelayClient {
         }
     }
 
-    pub async fn sync_key_table(
+    /// Fetch authoritative remote key table (`GET /v1/keys`) without mutating server state.
+    pub async fn fetch_remote_keys(
         &self,
-        dto: &KeyTableSyncDto,
-        read_only: bool,
     ) -> Result<
         (
             Vec<KeyRecordRow>,
@@ -730,59 +753,6 @@ impl RelayClient {
         CoreError,
     > {
         let b64 = base64::engine::general_purpose::STANDARD;
-        if !read_only
-            && (!dto.push_records.is_empty()
-                || dto.keyring_material.is_some()
-                || dto.vault_header_material.is_some())
-        {
-            let key_records: Vec<serde_json::Value> = dto
-                .push_records
-                .iter()
-                .filter_map(|k| {
-                    let raw = k.key_record.as_ref()?;
-                    Some(serde_json::json!({
-                        "key_id": k.key_id.to_string(),
-                        "wrap_gen": k.wrap_gen,
-                        "key_record_b64": b64.encode(raw),
-                    }))
-                })
-                .collect();
-            let mut km = serde_json::Map::new();
-            if let Some((gen, blob)) = &dto.keyring_material {
-                km.insert(
-                    "keyring".into(),
-                    serde_json::json!({ "gen": gen, "blob_b64": b64.encode(blob) }),
-                );
-            }
-            if let Some((gen, blob)) = &dto.vault_header_material {
-                km.insert(
-                    "vault_header".into(),
-                    serde_json::json!({ "gen": gen, "blob_b64": b64.encode(blob) }),
-                );
-            }
-            let body = serde_json::json!({
-                "key_records": key_records,
-                "key_material": km,
-            });
-            let res = self
-                .add_headers(self.http.post(self.endpoint("/v1/keys")).json(&body))
-                .send()
-                .await
-                .map_err(|e| {
-                    CoreError::new(
-                        ErrorCode::SyncOffline,
-                        format!("POST /v1/keys failed: {e}"),
-                        "Retry online",
-                    )
-                })?;
-            // If server already has a newer keyring/vault_header gen (409 CAS_MISMATCH), still fall through to GET /v1/keys
-            if let Err(err) = parse_relay_json(res).await {
-                if err.code() != ErrorCode::CasMismatch {
-                    return Err(err);
-                }
-            }
-        }
-
         let res = self
             .add_headers(self.http.get(self.endpoint("/v1/keys")))
             .send()
@@ -829,12 +799,115 @@ impl RelayClient {
         Ok((records, Vec::new(), keyring, vault_header))
     }
 
+    /// Synchronize key table using GET-before-POST diffing so a stale local `keyring`/`vault_header`
+    /// generation NEVER triggers an atomic `409 CAS_MISMATCH` rollback of new local `key_records`.
+    pub async fn sync_key_table(
+        &self,
+        dto: &KeyTableSyncDto,
+        read_only: bool,
+    ) -> Result<
+        (
+            Vec<KeyRecordRow>,
+            Vec<ShredMarkRow>,
+            Option<(u32, Vec<u8>)>,
+            Option<(i64, Vec<u8>)>,
+        ),
+        CoreError,
+    > {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let mut remote = self.fetch_remote_keys().await?;
+        if read_only {
+            return Ok(remote);
+        }
+
+        // Up to 2 attempts in case a peer bumps keyring/vault_header concurrently between GET and POST.
+        for attempt in 0..2 {
+            let mut remote_map: std::collections::BTreeMap<KeyId, (u32, bool)> =
+                std::collections::BTreeMap::new();
+            for r in &remote.0 {
+                remote_map.insert(r.key_id, (r.wrap_gen, r.key_record.is_none()));
+            }
+
+            let key_records: Vec<serde_json::Value> = dto
+                .push_records
+                .iter()
+                .filter_map(|k| {
+                    let raw = k.key_record.as_ref()?;
+                    let should_upload = match remote_map.get(&k.key_id) {
+                        None => true,
+                        Some((_, true)) => false, // Terminal shred on server
+                        Some((r_gen, false)) => k.wrap_gen > *r_gen,
+                    };
+                    if !should_upload {
+                        return None;
+                    }
+                    Some(serde_json::json!({
+                        "key_id": k.key_id.to_string(),
+                        "wrap_gen": k.wrap_gen,
+                        "key_record_b64": b64.encode(raw),
+                    }))
+                })
+                .collect();
+
+            let mut km = serde_json::Map::new();
+            if let Some((l_gen, l_blob)) = &dto.keyring_material {
+                if remote.2.as_ref().is_none_or(|(r_gen, _)| l_gen > r_gen) {
+                    km.insert(
+                        "keyring".into(),
+                        serde_json::json!({ "gen": l_gen, "blob_b64": b64.encode(l_blob) }),
+                    );
+                }
+            }
+            if let Some((l_gen, l_blob)) = &dto.vault_header_material {
+                if remote.3.as_ref().is_none_or(|(r_gen, _)| l_gen > r_gen) {
+                    km.insert(
+                        "vault_header".into(),
+                        serde_json::json!({ "gen": l_gen, "blob_b64": b64.encode(l_blob) }),
+                    );
+                }
+            }
+
+            if key_records.is_empty() && km.is_empty() {
+                return Ok(remote);
+            }
+
+            let body = serde_json::json!({
+                "key_records": key_records,
+                "key_material": km,
+            });
+            let res = self
+                .add_headers(self.http.post(self.endpoint("/v1/keys")).json(&body))
+                .send()
+                .await
+                .map_err(|e| {
+                    CoreError::new(
+                        ErrorCode::SyncOffline,
+                        format!("POST /v1/keys failed: {e}"),
+                        "Retry online",
+                    )
+                })?;
+            match parse_relay_json(res).await {
+                Ok(_) => {
+                    return self.fetch_remote_keys().await;
+                }
+                Err(err) if err.code() == ErrorCode::CasMismatch && attempt == 0 => {
+                    remote = self.fetch_remote_keys().await?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(remote)
+    }
+
     /// Execute a full Sans-I/O sync round against Cloudflare relay (pull -> key diff -> push -> PITR reconcile).
     pub async fn run_sync_round(
         &self,
         store: &mut LocalStore,
         read_only: bool,
     ) -> Result<SyncRoundReport, CoreError> {
+        const MAX_SYNC_STEPS: usize = 10_000;
+        const MAX_STALLED_STEPS: usize = 8;
+
         let mut report = SyncRoundReport::default();
         let mut queue: Vec<SyncCommand> = {
             let snap = store.export_engine_snapshot()?;
@@ -844,7 +917,17 @@ impl RelayClient {
         };
 
         let mut steps = 0usize;
-        while !queue.is_empty() && steps < 64 {
+        let mut stalled_steps = 0usize;
+        let mut prev_progress = (
+            store.get_local_meta("last_seq"),
+            store.get_local_meta("bootstrap_completed"),
+            store.get_local_meta("reconciling_epoch"),
+            report.pulled_ops,
+            report.pushed_ops,
+            report.keys_synced,
+        );
+
+        while !queue.is_empty() && steps < MAX_SYNC_STEPS {
             steps += 1;
             let cmd = queue.remove(0);
             match cmd {
@@ -935,6 +1018,36 @@ impl RelayClient {
                     }
                 }
             }
+
+            let cur_progress = (
+                store.get_local_meta("last_seq"),
+                store.get_local_meta("bootstrap_completed"),
+                store.get_local_meta("reconciling_epoch"),
+                report.pulled_ops,
+                report.pushed_ops,
+                report.keys_synced,
+            );
+            if cur_progress == prev_progress {
+                stalled_steps += 1;
+                if stalled_steps >= MAX_STALLED_STEPS && !queue.is_empty() {
+                    return Err(CoreError::new(
+                        ErrorCode::SyncOffline,
+                        "sync round stopped making progress (stalled loop detected)",
+                        "Inspect relay status and retry 'mynote sync pull'",
+                    ));
+                }
+            } else {
+                stalled_steps = 0;
+                prev_progress = cur_progress;
+            }
+        }
+
+        if !queue.is_empty() {
+            return Err(CoreError::new(
+                ErrorCode::SyncOffline,
+                "sync round reached step safety limit before draining all pending operations",
+                "Re-run 'mynote sync pull' to continue syncing remaining operations",
+            ));
         }
         Ok(report)
     }
@@ -954,7 +1067,8 @@ fn merge_summary(dst: &mut SyncApplySummary, src: SyncApplySummary) {
 
 /// Long-running WebSocket Hibernation wakeup listener (`GET /v1/sync/ws`).
 /// Sends `"ping"` every 30s (Cloudflare edge auto-responds `"pong"` without waking DO) and notifies
-/// `on_wake` whenever `{ type: "wake" }` arrives; backs off exponentially (`1s -> 60s`) on disconnect.
+/// `on_wake` whenever `{ type: "wake" }` arrives; backs off exponentially (`1s -> 60s`) on disconnect,
+/// and stops immediately on HTTP 401 / WS 4401 revocation.
 pub async fn run_cloud_ws_loop<F>(creds: DeviceCredentials, mut on_wake: F)
 where
     F: FnMut(Option<i64>) + Send + 'static,
@@ -976,49 +1090,59 @@ where
         if let Ok(val) = format!("Bearer {}", creds.device_token).parse() {
             req.headers_mut().insert("Authorization", val);
         }
+        if let Ok(proto) = "1".parse() {
+            req.headers_mut().insert("X-Mynote-Protocol", proto);
+        }
 
-        if let Ok((ws_stream, _)) = tokio_tungstenite::connect_async(req).await {
-            backoff_secs = 1;
-            let (mut sink, mut stream) = ws_stream.split();
-            let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
-            ping_interval.tick().await;
-            loop {
-                tokio::select! {
-                    _ = ping_interval.tick() => {
-                        if sink.send(Message::Text("ping".into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    maybe_msg = stream.next() => {
-                        match maybe_msg {
-                            Some(Ok(Message::Text(txt))) => {
-                                if txt == "pong" {
-                                    continue;
-                                }
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                                    match v["type"].as_str() {
-                                        Some("wake") => {
-                                            on_wake(v["head_seq"].as_i64());
-                                        }
-                                        Some("device_revoked") => {
-                                            return;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            Some(Ok(Message::Close(frame))) => {
-                                if frame.as_ref().is_some_and(|f| u16::from(f.code) == 4401) {
-                                    return;
-                                }
+        match tokio_tungstenite::connect_async(req).await {
+            Ok((ws_stream, _)) => {
+                backoff_secs = 1;
+                let (mut sink, mut stream) = ws_stream.split();
+                let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+                ping_interval.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = ping_interval.tick() => {
+                            if sink.send(Message::Text("ping".into())).await.is_err() {
                                 break;
                             }
-                            Some(Ok(_)) => {}
-                            _ => break,
+                        }
+                        maybe_msg = stream.next() => {
+                            match maybe_msg {
+                                Some(Ok(Message::Text(txt))) => {
+                                    if txt == "pong" {
+                                        continue;
+                                    }
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                                        match v["type"].as_str() {
+                                            Some("wake") => {
+                                                on_wake(v["head_seq"].as_i64());
+                                            }
+                                            Some("device_revoked") => {
+                                                return;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                Some(Ok(Message::Close(frame))) => {
+                                    if frame.as_ref().is_some_and(|f| u16::from(f.code) == 4401) {
+                                        return;
+                                    }
+                                    break;
+                                }
+                                Some(Ok(_)) => {}
+                                _ => break,
+                            }
                         }
                     }
                 }
             }
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) if resp.status().as_u16() == 401 => {
+                // Device revoked or unauthenticated: stop hammering the relay until credentials update.
+                return;
+            }
+            Err(_) => {}
         }
 
         tokio::time::sleep(Duration::from_secs(backoff_secs)).await;

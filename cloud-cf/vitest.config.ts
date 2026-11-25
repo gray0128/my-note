@@ -8,6 +8,7 @@ export default defineConfig({
       miniflare: {
         bindings: {
           BOOTSTRAP_TOKEN: "test-bootstrap-secret-token",
+          ALLOW_TEST_HOOKS: "1",
         },
       },
     }),

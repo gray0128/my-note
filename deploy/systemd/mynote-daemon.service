@@ -1,17 +1,18 @@
 [Unit]
 Description=my-note local daemon (single-writer SQLite + localhost UI + E2EE cloud sync)
-After=network-online.target graphical-session.target
-Wants=network-online.target
+After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/mynote daemon
+# Installed to root-owned /usr/bin/mynote via AUR/pacman (ADR-09 / threat-model.md §5.2).
+# Adjust if you installed via `cargo install` to %h/.cargo/bin/mynote.
+ExecStart=/usr/bin/mynote daemon
 Restart=on-failure
 RestartSec=2
 Environment=RUST_LOG=info
-# Harden filesystem and privilege surface
+# Harden privilege surface & default file mode (PrivateTmp=true is omitted because systemd --user
+# lacks mount namespace privileges on most setups and isolates /tmp fallback sockets)
 NoNewPrivileges=true
-PrivateTmp=true
 UMask=0077
 
 [Install]

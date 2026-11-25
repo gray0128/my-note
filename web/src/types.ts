@@ -95,7 +95,14 @@ export interface ApiErrorBody {
 
 export interface AlertFrame {
   type: "alert";
-  code: "KEY_MISSING" | "SHRED_PENDING_CONFIRM" | "NEEDS_VAULT_REKEY" | "CLOCK_SKEW" | "RECOVERY_DRILL_DUE";
+  code:
+    | "KEY_MISSING"
+    | "SHRED_PENDING_CONFIRM"
+    | "NEEDS_VAULT_REKEY"
+    | "CLOCK_SKEW"
+    | "RECOVERY_DRILL_DUE"
+    | "AUTH_REQUIRED"
+    | "DEVICE_REVOKED";
   details: Record<string, unknown>;
 }
 

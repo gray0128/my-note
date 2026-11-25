@@ -9,9 +9,8 @@ pub const CURRENT_SCHEMA_VERSION: i64 = 1;
 pub const MIN_READER_SCHEMA_VERSION: i64 = 1;
 
 pub const INIT_PRAGMAS: &str = "
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
 PRAGMA busy_timeout = 5000;
+PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
 PRAGMA secure_delete = ON;
 ";
@@ -163,6 +162,7 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 "#;
 
 pub fn init_connection(conn: &Connection, backups_dir: Option<&Path>) -> Result<(), CoreError> {
+    // busy_timeout MUST be set BEFORE inspecting or enabling WAL so concurrent opens wait instead of SQLITE_BUSY.
     conn.execute_batch(INIT_PRAGMAS).map_err(|e| {
         CoreError::new(
             ErrorCode::IntegrityError,
@@ -170,6 +170,19 @@ pub fn init_connection(conn: &Connection, backups_dir: Option<&Path>) -> Result<
             "Verify database file permissions and SQLite integrity",
         )
     })?;
+
+    let journal_mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap_or_default();
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        conn.execute_batch("PRAGMA journal_mode = WAL;").map_err(|e| {
+            CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("SQLite WAL initialization failed: {e}"),
+                "Verify database file permissions and SQLite integrity",
+            )
+        })?;
+    }
 
     let existing_ver: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -200,6 +213,10 @@ pub fn init_connection(conn: &Connection, backups_dir: Option<&Path>) -> Result<
                     "Upgrade mynote via your package manager, or restore a pre-migration backup (see 'mynote help upgrade')",
                 ));
             }
+        }
+        // Already at current schema version: avoid acquiring SQLite write locks on read-only opens.
+        if existing_ver == CURRENT_SCHEMA_VERSION {
+            return Ok(());
         }
         // Pre-migration VACUUM INTO consistency snapshot
         if existing_ver < CURRENT_SCHEMA_VERSION {
@@ -249,6 +266,26 @@ pub fn init_connection(conn: &Connection, backups_dir: Option<&Path>) -> Result<
 
 /// Generate a consistent single-file SQLite backup via `VACUUM INTO` (`0600` on Unix).
 pub fn vacuum_into(conn: &Connection, dest: &Path) -> Result<(), CoreError> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("cannot create backup parent '{}': {e}", parent.display()),
+                "Verify backup directory permissions",
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+                CoreError::new(
+                    ErrorCode::IntegrityError,
+                    format!("failed setting 0700 on '{}': {e}", parent.display()),
+                    "Verify backup directory ownership and permissions",
+                )
+            })?;
+        }
+    }
     if dest.exists() {
         let _ = std::fs::remove_file(dest);
     }
@@ -264,7 +301,13 @@ pub fn vacuum_into(conn: &Connection, dest: &Path) -> Result<(), CoreError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("failed setting 0600 on backup '{}': {e}", dest.display()),
+                "Verify backup directory ownership and permissions",
+            )
+        })?;
     }
     Ok(())
 }

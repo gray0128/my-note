@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
 
@@ -13,6 +14,7 @@ jobs:
     name: Enforce Immutable Verifier Rule (evals/)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,7 +26,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          CHANGED=$(git -c core.quotePath=false diff --name-only "$BASE_SHA...$HEAD_SHA")
           if printf '%s\n' "$PR_TITLE" | grep -q '^\[eval-only\]'; then
             DISALLOWED=$(printf '%s\n' "$CHANGED" | grep -vE '^(evals/|docs/eval-framework\.md$)' || true)
             if [ -n "$DISALLOWED" ]; then
@@ -42,8 +44,14 @@ jobs:
   web-checks:
     name: Web UI (TypeScript + Vite + Vitest)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Pin evals/ to PR base commit on non-[eval-only] PRs
+        if: github.event_name == 'pull_request' && !startsWith(github.event.pull_request.title, '[eval-only]')
+        run: rm -rf evals/ && git checkout "${{ github.event.pull_request.base.sha }}" -- evals/
       - uses: pnpm/action-setup@v4
         with:
           version: "12"
@@ -64,8 +72,14 @@ jobs:
   cloud-cf-checks:
     name: Cloudflare Relay (workerd contract + shared scenarios)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Pin evals/ to PR base commit on non-[eval-only] PRs
+        if: github.event_name == 'pull_request' && !startsWith(github.event.pull_request.title, '[eval-only]')
+        run: rm -rf evals/ && git checkout "${{ github.event.pull_request.base.sha }}" -- evals/
       - uses: pnpm/action-setup@v4
         with:
           version: "12"
@@ -79,8 +93,8 @@ jobs:
       - name: Enforce M1 LOC budget (< 500 lines in cloud-cf/src/)
         shell: bash
         run: |
-          LOC=$(wc -l cloud-cf/src/*.ts | tail -n 1 | awk '{print $1}')
-          echo "cloud-cf/src/*.ts total lines = ${LOC}"
+          LOC=$(find cloud-cf/src -type f \( -name '*.ts' -o -name '*.mts' -o -name '*.js' -o -name '*.mjs' \) -print0 | xargs -0 cat | wc -l | awk '{print $1}')
+          echo "cloud-cf/src total lines = ${LOC}"
           if [ "$LOC" -ge 500 ]; then
             echo "ERROR: cloud-cf/src/ exceeded M1 < 500 LOC target ($LOC lines)"
             exit 1
@@ -93,6 +107,7 @@ jobs:
   rust-checks:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -103,7 +118,7 @@ jobs:
           fetch-depth: 0
       - name: Pin evals/ to PR base commit on non-[eval-only] PRs
         if: github.event_name == 'pull_request' && !startsWith(github.event.pull_request.title, '[eval-only]')
-        run: git checkout "${{ github.event.pull_request.base.sha }}" -- evals/
+        run: rm -rf evals/ && git checkout "${{ github.event.pull_request.base.sha }}" -- evals/
       - uses: pnpm/action-setup@v4
         with:
           version: "12"

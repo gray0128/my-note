@@ -3,7 +3,8 @@
 <!--
   my-note macOS LaunchAgent (D5' unified CLI + Daemon + embedded HTML architecture)
   Install (adjust ProgramArguments to /usr/local/bin/mynote on Intel Macs if needed):
-    cp deploy/launchd/com.mynote.daemon.plist ~/Library/LaunchAgents/
+    mkdir -p ~/Library/Logs/mynote && chmod 700 ~/Library/Logs/mynote
+    sed "s|__HOME__|$HOME|g" deploy/launchd/com.mynote.daemon.plist > ~/Library/LaunchAgents/com.mynote.daemon.plist
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mynote.daemon.plist
   Open UI anytime:
     mynote open
@@ -31,16 +32,22 @@
     <key>ProcessType</key>
     <string>Interactive</string>
 
+    <!-- 0077 octal = 63 decimal: keep SQLite DB, backups, mirror, and logs owner-only -->
+    <key>Umask</key>
+    <integer>63</integer>
+
     <key>StandardOutPath</key>
-    <string>/tmp/mynote-daemon.out.log</string>
+    <string>__HOME__/Library/Logs/mynote/daemon.out.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/tmp/mynote-daemon.err.log</string>
+    <string>__HOME__/Library/Logs/mynote/daemon.err.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>RUST_LOG</key>
         <string>info</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
 </dict>
 </plist>

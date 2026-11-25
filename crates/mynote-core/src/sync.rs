@@ -15,6 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use zeroize::Zeroizing;
 
 pub const MAX_PUSH_BATCH_OPS: usize = 500;
+/// Conservative estimated JSON wire size cap per push batch (< 4 MiB Cloudflare relay limit).
+pub const MAX_PUSH_BATCH_JSON_BYTES: usize = 3_600_000;
 pub const DEFAULT_PULL_LIMIT: u16 = 500;
 
 /// Stored local op record (in `sync_ops` table).
@@ -338,11 +340,30 @@ impl EngineSnapshot {
             return None;
         }
         pending.sort_by_key(|a| (a.created_at_ms, a.op_id));
-        pending.truncate(MAX_PUSH_BATCH_OPS);
 
         let mut needed_keys = BTreeSet::new();
-        let mut ops = Vec::with_capacity(pending.len());
+        let mut ops = Vec::with_capacity(pending.len().min(MAX_PUSH_BATCH_OPS));
+        let mut est_json_bytes: usize = 256;
+
         for o in pending {
+            if ops.len() >= MAX_PUSH_BATCH_OPS {
+                break;
+            }
+            let op_bytes = 160 + (o.envelope.len().saturating_mul(4)).div_ceil(3);
+            let key_bytes = match o.key_id {
+                Some(kid) if !needed_keys.contains(&kid) => self
+                    .keys
+                    .records
+                    .get(&kid)
+                    .and_then(|r| r.key_record.as_ref())
+                    .map_or(0, |kr| 160 + (kr.len().saturating_mul(4)).div_ceil(3)),
+                _ => 0,
+            };
+            let added = op_bytes.saturating_add(key_bytes);
+            if !ops.is_empty() && est_json_bytes.saturating_add(added) > MAX_PUSH_BATCH_JSON_BYTES {
+                break;
+            }
+            est_json_bytes = est_json_bytes.saturating_add(added);
             if let Some(kid) = o.key_id {
                 needed_keys.insert(kid);
             }
@@ -520,11 +541,11 @@ pub fn step(
     match event {
         SyncEvent::StartSync => {
             if !state.bootstrap_completed {
+                commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
                 commands.push(SyncCommand::HttpPull {
                     since_seq: 0,
                     limit: DEFAULT_PULL_LIMIT,
                 });
-                commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
             } else {
                 commands.push(SyncCommand::HttpPull {
                     since_seq: state.last_seq,
@@ -540,11 +561,11 @@ pub fn step(
             let epoch_changed = state.journal_epoch.is_some_and(|e| e != epoch);
             if epoch_changed || head_seq < state.last_seq {
                 mutations.push(StoreMutation::ClearServerSeqsForReconcile { new_epoch: epoch });
+                commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
                 commands.push(SyncCommand::HttpPull {
                     since_seq: 0,
                     limit: DEFAULT_PULL_LIMIT,
                 });
-                commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
             } else if head_seq > state.last_seq {
                 commands.push(SyncCommand::HttpPull {
                     since_seq: state.last_seq,
@@ -557,11 +578,11 @@ pub fn step(
             mutations.push(StoreMutation::ClearServerSeqsForReconcile {
                 new_epoch: remote_epoch,
             });
+            commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
             commands.push(SyncCommand::HttpPull {
                 since_seq: 0,
                 limit: DEFAULT_PULL_LIMIT,
             });
-            commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
         }
 
         SyncEvent::PullResponse {
@@ -578,11 +599,11 @@ pub fn step(
             let is_seq_rollback = state.reconciling_epoch.is_none() && head_seq < state.last_seq;
             if is_epoch_mismatch || is_seq_rollback {
                 mutations.push(StoreMutation::ClearServerSeqsForReconcile { new_epoch: epoch });
+                commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
                 commands.push(SyncCommand::HttpPull {
                     since_seq: 0,
                     limit: DEFAULT_PULL_LIMIT,
                 });
-                commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
                 return Ok((mutations, commands));
             }
 
@@ -642,8 +663,15 @@ pub fn step(
                 }
             }
 
-            let next_reconciling = if has_more { state.reconciling_epoch } else { None };
-            let next_bootstrapped = state.bootstrap_completed || !has_more;
+            let next_reconciling = if has_more {
+                state
+                    .reconciling_epoch
+                    .or_else(|| (!state.bootstrap_completed).then_some(epoch))
+            } else {
+                None
+            };
+            let keys_match = keys_digest == state.keys.digest();
+            let next_bootstrapped = state.bootstrap_completed || (!has_more && keys_match);
 
             mutations.push(StoreMutation::SetSyncMeta {
                 bootstrap_completed: next_bootstrapped,
@@ -659,7 +687,7 @@ pub fn step(
                     limit: DEFAULT_PULL_LIMIT,
                 });
             } else {
-                if keys_digest != state.keys.digest() {
+                if !keys_match {
                     commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
                 }
                 // Apply our own mutations on a scratch clone to compute exact pending ops to push
@@ -678,6 +706,7 @@ pub fn step(
         } => {
             if state.journal_epoch.is_some_and(|e| e != epoch) {
                 mutations.push(StoreMutation::ClearServerSeqsForReconcile { new_epoch: epoch });
+                commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
                 commands.push(SyncCommand::HttpPull {
                     since_seq: 0,
                     limit: DEFAULT_PULL_LIMIT,
@@ -740,6 +769,23 @@ pub fn step(
                         blob,
                         updated_at_ms: server_now_ms,
                     });
+                }
+            }
+            if !state.bootstrap_completed
+                && state.journal_epoch.is_some()
+                && state.reconciling_epoch.is_none()
+            {
+                mutations.push(StoreMutation::SetSyncMeta {
+                    bootstrap_completed: true,
+                    journal_epoch: state.journal_epoch,
+                    last_seq: state.last_seq,
+                    reconciling_epoch: None,
+                    hlc: state.hlc.clone(),
+                });
+                let mut next_state = state.clone();
+                next_state.apply_mutations(&mutations);
+                if let Some(push) = next_state.build_pending_push() {
+                    commands.push(SyncCommand::HttpPush(push));
                 }
             }
         }

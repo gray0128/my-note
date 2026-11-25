@@ -1,11 +1,13 @@
 import { LocalApiError, type LocalApiClient } from "./api";
-import { BlockStreamController } from "./editor";
+import { BlockStreamController, type SaveContentResult } from "./editor";
 import type { AlertFrame, BlockDto, BufferDto, LocalWsFrame, SyncStateLabel, SyncStatusDto, TrashItemDto } from "./types";
 
 export class MyNoteApp {
   private buffers: BufferDto[] = [];
   private activeBufferId: string | null = null;
   private syncStatus: SyncStatusDto | null = null;
+  private wsConnected = true;
+  private switchSeq = 0;
   private alerts = new Map<string, AlertFrame>();
   private trashItems: TrashItemDto[] = [];
   private trashOpen = false;
@@ -46,13 +48,39 @@ export class MyNoteApp {
     this.updateTrashCount(boot.trash_count);
     this.stream.setBlocks(boot.blocks);
 
-    this.disconnectWs = this.api.connectWs((frame) => this.handleWsFrame(frame));
+    this.disconnectWs = this.api.connectWs(
+      (frame) => this.handleWsFrame(frame),
+      (connected, reconnected) => {
+        this.wsConnected = connected;
+        this.renderSyncPill();
+        if (connected && reconnected) {
+          void this.resyncAfterReconnect();
+        }
+      },
+      () => {
+        this.wsConnected = false;
+        this.alerts.set("AUTH_REQUIRED", {
+          type: "alert",
+          code: "AUTH_REQUIRED",
+          details: { message: "Local session expired — run 'mynote open' to re-authenticate." },
+        });
+        this.renderAlerts();
+        this.renderSyncPill();
+      },
+    );
   }
 
   destroy(): void {
     this.disconnectWs?.();
+    if (this.toastTimer !== null) {
+      window.clearTimeout(this.toastTimer);
+      this.toastTimer = null;
+    }
     this.stream.destroy();
     window.removeEventListener("keydown", this.onWindowKeyDown);
+    document.removeEventListener("visibilitychange", this.onVisibilityChange);
+    window.removeEventListener("pagehide", this.onPageHide);
+    window.removeEventListener("beforeunload", this.onBeforeUnload);
   }
 
   private buildShell(): void {
@@ -113,7 +141,12 @@ export class MyNoteApp {
     this.syncPillEl.type = "button";
     this.syncPillEl.className = "sync-pill";
     this.syncPillEl.dataset.state = "unconfigured";
-    this.syncPillEl.innerHTML = `<span class="sync-dot"></span><span class="sync-label">Local Only</span>`;
+    const syncDot = document.createElement("span");
+    syncDot.className = "sync-dot";
+    const syncLabel = document.createElement("span");
+    syncLabel.className = "sync-label";
+    syncLabel.textContent = "Local Only";
+    this.syncPillEl.append(syncDot, syncLabel);
     this.syncPillEl.title = "Click to sync now";
     this.syncPillEl.addEventListener("click", () => void this.triggerSyncNow());
 
@@ -129,7 +162,16 @@ export class MyNoteApp {
     this.findInputEl = document.createElement("input");
     this.findInputEl.className = "input";
     this.findInputEl.placeholder = "Find across buffer...";
-    this.findInputEl.addEventListener("input", () => this.runFind(0));
+    this.findInputEl.addEventListener("input", () => {
+      this.findIndex = 0;
+      this.runFind(0);
+    });
+    this.findInputEl.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        this.runFind(ev.shiftKey ? -1 : 1);
+      }
+    });
     this.replaceInputEl = document.createElement("input");
     this.replaceInputEl.className = "input";
     this.replaceInputEl.placeholder = "Replace with...";
@@ -159,7 +201,8 @@ export class MyNoteApp {
     const streamEl = document.createElement("div");
     streamEl.className = "block-stream";
     this.stream = new BlockStreamController(streamEl, {
-      onSaveContent: (blk, content, opts) => this.saveBlockContent(blk, content, opts),
+      onSaveContent: (blk, content, expectedHeads, opts) =>
+        this.saveBlockContent(blk, content, expectedHeads, opts),
       onChangeLang: (blk, lang) => this.changeBlockLang(blk, lang),
       onInsertAfter: (afterId) => this.insertBlockAfter(afterId),
       onFormatBlock: (blk) => this.formatBlock(blk),
@@ -226,9 +269,33 @@ export class MyNoteApp {
 
   private bindGlobalKeys(): void {
     window.addEventListener("keydown", this.onWindowKeyDown);
+    document.addEventListener("visibilitychange", this.onVisibilityChange);
+    window.addEventListener("pagehide", this.onPageHide);
+    window.addEventListener("beforeunload", this.onBeforeUnload);
   }
 
+  private onVisibilityChange = (): void => {
+    if (document.visibilityState === "hidden" && this.stream.hasDirtyBlocks()) {
+      void this.stream.flushAllDirty({ keepalive: true });
+    }
+  };
+
+  private onPageHide = (): void => {
+    if (this.stream.hasDirtyBlocks()) {
+      void this.stream.flushAllDirty({ keepalive: true });
+    }
+  };
+
+  private onBeforeUnload = (ev: BeforeUnloadEvent): void => {
+    if (this.stream.hasDirtyBlocks()) {
+      void this.stream.flushAllDirty({ keepalive: true });
+      ev.preventDefault();
+      ev.returnValue = "";
+    }
+  };
+
   private onWindowKeyDown = (ev: KeyboardEvent): void => {
+    if (ev.defaultPrevented) return;
     const mod = ev.metaKey || ev.ctrlKey;
     if (!mod) {
       if (ev.key === "Escape") {
@@ -254,7 +321,9 @@ export class MyNoteApp {
       ev.preventDefault();
       const id = this.stream.getActiveBlockId();
       const blk = this.stream.getBlocks().find((b) => b.id === id);
-      if (blk && !blk.is_locked) void this.copyBlockContent(this.stream.getBlockDraftContent(blk.id));
+      if (blk && !blk.is_locked && blk.content !== null) {
+        void this.copyBlockContent(this.stream.getBlockDraftContent(blk.id));
+      }
     } else if (key === "f" && !ev.shiftKey) {
       ev.preventDefault();
       this.toggleFindBar(true);
@@ -284,10 +353,15 @@ export class MyNoteApp {
   }
 
   private renderSyncPill(): void {
+    const label = this.syncPillEl.querySelector(".sync-label")!;
+    if (!this.wsConnected) {
+      this.syncPillEl.dataset.state = "pending_offline";
+      label.textContent = this.alerts.has("AUTH_REQUIRED") ? "Session Expired" : "Daemon Disconnected";
+      return;
+    }
     const state: SyncStateLabel = this.syncStatus?.sync_state ?? "unconfigured";
     const pending = this.syncStatus?.pending_ops ?? 0;
     this.syncPillEl.dataset.state = state;
-    const label = this.syncPillEl.querySelector(".sync-label")!;
     switch (state) {
       case "synced":
         label.textContent = "Synced";
@@ -335,10 +409,17 @@ export class MyNoteApp {
       const div = document.createElement("div");
       div.className = "alert-banner";
       div.dataset.code = alert.code;
-      div.dataset.severity = alert.code === "KEY_MISSING" ? "error" : "warn";
+      div.dataset.severity =
+        alert.code === "KEY_MISSING" || alert.code === "AUTH_REQUIRED" || alert.code === "DEVICE_REVOKED"
+          ? "error"
+          : "warn";
       const text = document.createElement("span");
       if (alert.code === "KEY_MISSING") {
         text.textContent = "KEY_MISSING: Active block missing encryption key — run 'mynote sync pull' and do not delete data.";
+      } else if (alert.code === "AUTH_REQUIRED") {
+        text.textContent = "AUTH_REQUIRED: Local daemon session expired — run 'mynote open' to obtain a fresh login ticket.";
+      } else if (alert.code === "DEVICE_REVOKED") {
+        text.textContent = "DEVICE_REVOKED: This device token was revoked on the relay — re-pair or re-bootstrap before syncing.";
       } else if (alert.code === "CLOCK_SKEW") {
         text.textContent = `CLOCK_SKEW: Remote clock skew detected (${JSON.stringify(alert.details)}). All versions preserved safely.`;
       } else if (alert.code === "RECOVERY_DRILL_DUE") {
@@ -348,6 +429,35 @@ export class MyNoteApp {
       }
       div.appendChild(text);
       this.alertStackEl.appendChild(div);
+    }
+  }
+
+  private async resyncAfterReconnect(): Promise<void> {
+    try {
+      const boot = await this.api.bootstrap();
+      this.buffers = boot.buffers;
+      this.syncStatus = boot.sync_status;
+      this.alerts.delete("AUTH_REQUIRED");
+      this.updateAlertsFromStatus(boot.sync_status);
+      this.updateTrashCount(boot.trash_count);
+      if (this.activeBufferId && this.buffers.some((b) => b.id === this.activeBufferId)) {
+        const blocks = await this.api.listBlocks(this.activeBufferId);
+        this.stream.upsertBlocks(
+          blocks,
+          this.stream
+            .getBlocks()
+            .filter((b) => !blocks.some((n) => n.id === b.id))
+            .map((b) => b.id),
+          this.activeBufferId,
+        );
+      } else {
+        this.activeBufferId = boot.initial_buffer_id ?? boot.buffers[0]?.id ?? null;
+        this.stream.setBlocks(boot.blocks);
+      }
+      this.renderBuffers();
+      this.renderSyncPill();
+    } catch {
+      // keep existing UI state until next reconnect
     }
   }
 
@@ -364,6 +474,15 @@ export class MyNoteApp {
       }
       next.sort((a, b) => (a.position < b.position ? -1 : a.position > b.position ? 1 : a.id < b.id ? -1 : 1));
       this.buffers = next;
+      if (this.activeBufferId && del.has(this.activeBufferId)) {
+        const fallback = next[0]?.id ?? null;
+        if (fallback) {
+          void this.switchBuffer(fallback);
+        } else {
+          this.activeBufferId = null;
+          this.stream.setBlocks([]);
+        }
+      }
       this.renderBuffers();
     } else if (frame.type === "trash_changed") {
       this.updateTrashCount(frame.count);
@@ -382,10 +501,18 @@ export class MyNoteApp {
   }
 
   private async switchBuffer(bufferId: string): Promise<void> {
-    this.activeBufferId = bufferId;
-    this.renderBuffers();
-    const blocks = await this.api.listBlocks(bufferId);
-    this.stream.setBlocks(blocks);
+    const reqSeq = ++this.switchSeq;
+    await this.stream.flushAllDirty();
+    if (reqSeq !== this.switchSeq) return;
+    try {
+      const blocks = await this.api.listBlocks(bufferId);
+      if (reqSeq !== this.switchSeq) return;
+      this.activeBufferId = bufferId;
+      this.renderBuffers();
+      this.stream.setBlocks(blocks);
+    } catch (e) {
+      this.handleErr(e);
+    }
   }
 
   private async insertBlockAfter(afterId: string | null): Promise<void> {
@@ -405,24 +532,40 @@ export class MyNoteApp {
     }
   }
 
-  private async saveBlockContent(block: BlockDto, content: string, opts: { fastSync: boolean; isMerge: boolean }): Promise<void> {
+  private async saveBlockContent(
+    block: BlockDto,
+    content: string,
+    expectedHeads: string[],
+    opts: { fastSync: boolean; isMerge: boolean; keepalive?: boolean },
+  ): Promise<SaveContentResult> {
     try {
-      const updated = await this.api.patchBlock(block.id, {
-        expected_heads: block.head_op_ids,
-        content,
-        fast_sync: opts.fastSync,
-      });
-      this.stream.upsertBlocks([updated], [], this.activeBufferId);
+      const updated = await this.api.patchBlock(
+        block.id,
+        {
+          expected_heads: expectedHeads,
+          content,
+          fast_sync: opts.fastSync,
+        },
+        { keepalive: opts.keepalive },
+      );
       if (opts.isMerge) this.showToast("Merged versions cleanly");
+      return { status: "ok", updated };
     } catch (e) {
       if (e instanceof LocalApiError && e.body.code === "HEAD_MISMATCH") {
-        this.showToast("Concurrent update detected — refreshed versions", true);
+        this.showToast("Concurrent update detected — your draft is preserved; choose Save Over or Reload", true);
         if (this.activeBufferId) {
-          this.stream.setBlocks(await this.api.listBlocks(this.activeBufferId));
+          try {
+            const latest = await this.api.listBlocks(this.activeBufferId);
+            // Upsert latest metadata/versions WITHOUT destroying the user's dirty draft!
+            this.stream.upsertBlocks(latest, [], this.activeBufferId);
+          } catch {
+            // ignore refresh failure; mismatch banner still protects draft
+          }
         }
-        return;
+        return { status: "head_mismatch" };
       }
       this.handleErr(e);
+      return { status: "error" };
     }
   }
 
@@ -440,19 +583,24 @@ export class MyNoteApp {
       this.showToast("Locked Tier 2 blocks cannot be sent to external formatters", true);
       return;
     }
+    if (block.content === null) {
+      this.showToast("Cannot format an unreadable block until its key is available", true);
+      return;
+    }
     if (block.has_conflict) {
       this.showToast("Resolve concurrent versions before formatting", true);
       return;
     }
     try {
       const content = this.stream.getBlockDraftContent(block.id);
+      const expectedHeads = this.stream.getExpectedHeadsForBlock(block.id);
       const { formatted } = await this.api.formatSnippet({ content, lang: block.lang });
       const updated = await this.api.patchBlock(block.id, {
-        expected_heads: block.head_op_ids,
+        expected_heads: expectedHeads,
         content: formatted,
         fast_sync: true,
       });
-      this.stream.upsertBlocks([updated], [], this.activeBufferId);
+      this.stream.applyAuthoritativeBlock(updated, this.activeBufferId);
       this.showToast(`Formatted (${block.lang})`);
     } catch (e) {
       this.handleErr(e);
@@ -498,7 +646,7 @@ export class MyNoteApp {
         expected_heads: block.head_op_ids,
         keep_op_id: opId,
       });
-      this.stream.upsertBlocks([updated], [], this.activeBufferId);
+      this.stream.applyAuthoritativeBlock(updated, this.activeBufferId);
       this.showToast("Conflict resolved to selected version");
     } catch (e) {
       this.handleErr(e);
@@ -631,7 +779,7 @@ export class MyNoteApp {
     if (matches.length === 0) return;
     this.findIndex = (this.findIndex + delta + matches.length) % matches.length;
     const hit = matches[this.findIndex];
-    this.stream.focusBlock(hit.blockId, hit.from);
+    this.stream.highlightBlockMatch(hit.blockId, hit.from, hit.to);
   }
 
   private async runReplaceAll(): Promise<void> {

@@ -12,6 +12,25 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
+#[cfg(unix)]
+pub fn current_uid() -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(uid_s) = std::env::var("UID") {
+        if let Ok(u) = uid_s.parse::<u32>() {
+            return u;
+        }
+    }
+    if let Ok(meta) = std::fs::metadata("/proc/self") {
+        return meta.uid();
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        if let Ok(meta) = std::fs::metadata(home) {
+            return meta.uid();
+        }
+    }
+    0
+}
+
 pub fn socket_path_for(data_dir: &Path) -> PathBuf {
     // Keep socket inside explicit / test data dirs for hermetic multi-instance isolation.
     let s = data_dir.to_string_lossy();
@@ -45,14 +64,29 @@ pub fn socket_path_for(data_dir: &Path) -> PathBuf {
     };
 
     // macOS sockaddr_un.sun_path is strictly 104 bytes (Linux 108); deterministically hash long paths
-    // into /tmp/mn-<16hex>.sock so deep data dirs (e.g. macOS /var/folders/.../T) never hit ENAMETOOLONG.
+    // into a UID-scoped private directory (`0700`) so deep data dirs never hit ENAMETOOLONG or /tmp squatting.
     if candidate.as_os_str().len() >= 96 {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(data_dir.to_string_lossy().as_bytes());
         let digest = h.finalize();
         let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
-        return PathBuf::from("/tmp").join(format!("mn-{hex}.sock"));
+        #[cfg(unix)]
+        {
+            if let Ok(xdg_rt) = std::env::var("XDG_RUNTIME_DIR") {
+                let xdg = xdg_rt.trim();
+                if !xdg.is_empty() && xdg.len() < 64 {
+                    return PathBuf::from(xdg).join("mn").join(format!("{hex}.sock"));
+                }
+            }
+            return PathBuf::from("/tmp")
+                .join(format!("mn-{}", current_uid()))
+                .join(format!("{hex}.sock"));
+        }
+        #[cfg(not(unix))]
+        {
+            return std::env::temp_dir().join(format!("mn-{hex}.sock"));
+        }
     }
     candidate
 }
@@ -266,6 +300,13 @@ pub fn try_send_uds(
         )
     })?;
     if n == 0 {
+        if matches!(req, UdsRequest::Apply { .. }) {
+            return Err(CoreError::new(
+                ErrorCode::SyncOffline,
+                "daemon closed connection after receiving apply request; refusing blind SQLite fallback to prevent duplicate write",
+                "Check local state and retry with --idempotency-key if needed",
+            ));
+        }
         return Ok(None);
     }
     let resp: UdsResponse = serde_json::from_str(resp_line.trim()).map_err(|e| {

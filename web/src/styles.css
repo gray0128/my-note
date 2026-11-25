@@ -369,6 +369,14 @@ body {
   justify-content: space-between;
 }
 
+.unreadable-card {
+  padding: 14px 12px;
+  color: var(--red);
+  background: var(--red-bg);
+  font-size: 13px;
+  border-top: 1px solid rgba(242, 109, 109, 0.35);
+}
+
 .conflict-panel {
   border-top: 1px solid rgba(245, 166, 35, 0.4);
   background: var(--amber-bg);
@@ -376,6 +384,14 @@ body {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.mismatch-panel {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--amber);
+  font-size: 12px;
 }
 
 .conflict-title {

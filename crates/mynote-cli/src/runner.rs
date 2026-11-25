@@ -13,11 +13,14 @@ use crate::sync_client::{render_terminal_qr, RelayClient};
 use crate::uds::{try_send_uds, ApplyMeta, ApplyRequest, UdsRequest, UdsResponse};
 use clap::Parser;
 use mynote_core::error::{CoreError, ErrorCode};
+use mynote_core::ids::DeviceId;
+use mynote_core::model::KeyMaterialKind;
+use mynote_core::sync::StoreMutation;
 use mynote_store::store::{DeleteReceipt, LocalStore, WriteReceipt};
 use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn run_async<F, T>(fut: F) -> Result<T, CoreError>
 where
@@ -267,6 +270,19 @@ fn execute(cli: Cli, mode: OutputMode, started: Instant) -> i32 {
         } => {
             return handle_device_claim(&data_dir, non_interactive, mode, started, quiet);
         }
+        Commands::Device {
+            action: DeviceCommand::Bootstrap { url, revoke_existing },
+        } => {
+            return handle_device_bootstrap(
+                &data_dir,
+                url,
+                *revoke_existing,
+                non_interactive,
+                mode,
+                started,
+                quiet,
+            );
+        }
         _ => {}
     }
 
@@ -363,20 +379,184 @@ fn handle_open(data_dir: &Path, mode: OutputMode, started: Instant, quiet: bool)
         }
         Ok(Some(resp)) => emit_error(&resp.into_core_error(), mode, empty_meta(started), quiet),
         Ok(None) => {
-            let msg = serde_json::json!({
-                "status": "daemon_not_running",
-                "hint": "Start the local daemon via 'mynote daemon' to open http://localhost:<port>"
-            });
-            match mode {
-                OutputMode::Json | OutputMode::Jsonl => emit_json(msg, empty_meta(started)),
-                OutputMode::Human => {
-                    println!("mynote daemon is not running. Start it with: mynote daemon");
-                }
-            }
-            0
+            let err = CoreError::new(
+                ErrorCode::SyncOffline,
+                "mynote daemon is not running",
+                "Start the local daemon via 'mynote daemon' before running 'mynote open'",
+            );
+            emit_error(&err, mode, empty_meta(started), quiet)
         }
         Err(err) => emit_error(&err, mode, empty_meta(started), quiet),
     }
+}
+
+fn handle_device_bootstrap(
+    data_dir: &Path,
+    url: &str,
+    revoke_existing: bool,
+    non_interactive: bool,
+    mode: OutputMode,
+    started: Instant,
+    quiet: bool,
+) -> i32 {
+    if let Err(err) = require_tty(non_interactive, "device bootstrap") {
+        return emit_error(&err, mode, empty_meta(started), quiet);
+    }
+    let token = match std::env::var("MYNOTE_BOOTSTRAP_TOKEN") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => match read_tty_line("Enter Cloudflare BOOTSTRAP_TOKEN: ") {
+            Ok(t) => t,
+            Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+        },
+    };
+    if token.trim().is_empty() {
+        let err = CoreError::new(
+            ErrorCode::InvalidArgument,
+            "BOOTSTRAP_TOKEN cannot be empty",
+            "Provide the secret set via 'wrangler secret put BOOTSTRAP_TOKEN'",
+        );
+        return emit_error(&err, mode, empty_meta(started), quiet);
+    }
+    let dev_name = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "desktop".to_string());
+
+    let db_exists = data_dir.join("mynote.db").exists();
+    if db_exists {
+        let mut store = match LocalStore::open(data_dir) {
+            Ok(s) => s,
+            Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+        };
+        let receipt = match run_async(RelayClient::bootstrap_device(
+            url,
+            &token,
+            &store,
+            &dev_name,
+            revoke_existing,
+        )) {
+            Ok(r) => r,
+            Err(err) => return emit_error(&err, mode, store_meta(&store, started, None), quiet),
+        };
+        if let Ok(Some(creds)) = store.load_credentials() {
+            if let Ok(client) = RelayClient::from_credentials(&creds) {
+                let _ = run_async(client.run_sync_round(&mut store, false));
+            }
+        }
+        let _ = try_send_uds(
+            store.data_dir(),
+            &UdsRequest::Poke { fast_flush: true },
+            Duration::from_secs(2),
+        );
+        match mode {
+            OutputMode::Json | OutputMode::Jsonl => {
+                emit_json(&receipt, store_meta(&store, started, None));
+            }
+            OutputMode::Human => println!(
+                "bootstrapped device {} (scope={}, epoch={}) -> {}",
+                receipt.device_id, receipt.scope, receipt.epoch, receipt.sync_url
+            ),
+        }
+        return 0;
+    }
+
+    // Empty data_dir: register with relay and probe GET /v1/keys BEFORE creating LocalStore
+    // so Disaster Recovery Path #1 detects an existing remote keyring instead of minting a conflicting gen=1 keyring!
+    let mut rnd = [0u8; 10];
+    if let Err(e) = getrandom::fill(&mut rnd) {
+        let err = CoreError::new(
+            ErrorCode::IntegrityError,
+            format!("OS CSPRNG error: {e}"),
+            "Check system entropy",
+        );
+        return emit_error(&err, mode, empty_meta(started), quiet);
+    }
+    let preset_device_id = DeviceId::from_random_bytes(rnd);
+    let (receipt, creds) = match run_async(RelayClient::bootstrap_register(
+        url,
+        &token,
+        &preset_device_id,
+        &dev_name,
+        revoke_existing,
+    )) {
+        Ok(v) => v,
+        Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+    };
+    let client = match RelayClient::from_credentials(&creds) {
+        Ok(c) => c,
+        Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+    };
+    let (_records, _marks, remote_keyring, _vh) = match run_async(client.fetch_remote_keys()) {
+        Ok(k) => k,
+        Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+    };
+
+    let (store, recovery_required) = if let Some((kr_gen, kr_blob)) = remote_keyring {
+        let s = match LocalStore::open_for_recovery_bootstrap(
+            data_dir,
+            preset_device_id,
+            &creds.sync_url,
+            &creds.device_token,
+            &creds.scope,
+            kr_gen,
+            &kr_blob,
+        ) {
+            Ok(s) => s,
+            Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+        };
+        (s, true)
+    } else {
+        let mut s = match LocalStore::open_with_device_id(data_dir, Some(preset_device_id)) {
+            Ok(s) => s,
+            Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+        };
+        if let Some(words) = &s.initial_recovery_words {
+            if !quiet && mode == OutputMode::Human {
+                let mut err_out = io::stderr().lock();
+                let _ = writeln!(
+                    err_out,
+                    "Initialized new vault at {}. Record your 24-word recovery bundle safely:\n  {words}",
+                    data_dir.display()
+                );
+            }
+        }
+        if let Err(err) = s.save_credentials(&creds) {
+            return emit_error(&err, mode, store_meta(&s, started, None), quiet);
+        }
+        let _ = run_async(client.run_sync_round(&mut s, false));
+        (s, false)
+    };
+
+    let _ = try_send_uds(
+        store.data_dir(),
+        &UdsRequest::Poke { fast_flush: true },
+        Duration::from_secs(2),
+    );
+    match mode {
+        OutputMode::Json | OutputMode::Jsonl => {
+            emit_json(
+                serde_json::json!({
+                    "device_id": receipt.device_id,
+                    "scope": receipt.scope,
+                    "epoch": receipt.epoch,
+                    "sync_url": receipt.sync_url,
+                    "recovery_required": recovery_required,
+                }),
+                store_meta(&store, started, None),
+            );
+        }
+        OutputMode::Human => {
+            println!(
+                "bootstrapped device {} (scope={}, epoch={}) -> {}",
+                receipt.device_id, receipt.scope, receipt.epoch, receipt.sync_url
+            );
+            if recovery_required {
+                println!(
+                    "Existing cloud vault detected. Run 'mynote keyring unlock' with your 24-word recovery bundle to unseal SMKs and restore your notes."
+                );
+            }
+        }
+    }
+    0
 }
 
 fn handle_device_claim(
@@ -405,6 +585,12 @@ fn handle_device_claim(
             }
         }
     }
+    // Notify any already-running local daemon to hot-reload SMKs, credentials, and WS loop
+    let _ = try_send_uds(
+        data_dir,
+        &UdsRequest::Poke { fast_flush: true },
+        Duration::from_secs(2),
+    );
     match mode {
         OutputMode::Json | OutputMode::Jsonl => emit_json(&receipt, empty_meta(started)),
         OutputMode::Human => println!(
@@ -1373,7 +1559,13 @@ fn handle_format_block(
         })));
     }
 
-    let current = detail.content.unwrap_or_default();
+    let current = detail.content.ok_or_else(|| {
+        CoreError::new(
+            ErrorCode::KeyMissing,
+            format!("block '{id}' content is unreadable; refusing to format unavailable body"),
+            "Sync missing keys or unlock keyring before formatting this block",
+        )
+    })?;
     let lang = args.lang.as_deref().unwrap_or(&detail.lang);
     let formatted = format_content(&current, lang, args.action.as_deref())?;
     if let Some(resp) = try_daemon_apply(
@@ -1567,51 +1759,7 @@ fn handle_device(
     started: Instant,
 ) -> Result<i32, CoreError> {
     match action {
-        DeviceCommand::Bootstrap { url, revoke_existing } => {
-            require_tty(non_interactive, "device bootstrap")?;
-            let token = match std::env::var("MYNOTE_BOOTSTRAP_TOKEN") {
-                Ok(v) if !v.trim().is_empty() => v,
-                _ => read_tty_line("Enter Cloudflare BOOTSTRAP_TOKEN: ")?,
-            };
-            if token.trim().is_empty() {
-                return Err(CoreError::new(
-                    ErrorCode::InvalidArgument,
-                    "BOOTSTRAP_TOKEN cannot be empty",
-                    "Provide the secret set via 'wrangler secret put BOOTSTRAP_TOKEN'",
-                ));
-            }
-            let dev_name = std::env::var("HOSTNAME")
-                .or_else(|_| std::env::var("USER"))
-                .unwrap_or_else(|_| "desktop".to_string());
-            let receipt = run_async(RelayClient::bootstrap_device(
-                &url,
-                &token,
-                store,
-                &dev_name,
-                revoke_existing,
-            ))?;
-            // Immediately run initial sync round to publish local keys/ops or pull remote history
-            if let Ok(Some(creds)) = store.load_credentials() {
-                if let Ok(client) = RelayClient::from_credentials(&creds) {
-                    let _ = run_async(client.run_sync_round(store, false));
-                }
-            }
-            let _ = try_send_uds(
-                store.data_dir(),
-                &UdsRequest::Poke { fast_flush: true },
-                Duration::from_secs(2),
-            );
-            match mode {
-                OutputMode::Json | OutputMode::Jsonl => {
-                    emit_json(&receipt, store_meta(store, started, None));
-                }
-                OutputMode::Human => println!(
-                    "bootstrapped device {} (scope={}, epoch={}) -> {}",
-                    receipt.device_id, receipt.scope, receipt.epoch, receipt.sync_url
-                ),
-            }
-            Ok(0)
-        }
+        DeviceCommand::Bootstrap { .. } => unreachable!("handled prior to opening store"),
         DeviceCommand::Add { name, scope } => {
             require_tty(non_interactive, "device add")?;
             if mode != OutputMode::Human {
@@ -1748,6 +1896,8 @@ fn handle_keyring(
                 ));
             };
             let client = RelayClient::from_credentials(&creds)?;
+            // Pre-flight relay reachability BEFORE mutating local keys or SMK generations.
+            let _ = run_async(client.fetch_remote_keys())?;
             let (new_gen, new_kid) = store.rotate_smk()?;
             // Push updated block_keys + RecoveryKeyringV1 immediately to the relay
             let report = run_async(client.run_sync_round(store, false))?;
@@ -1778,9 +1928,28 @@ fn handle_keyring(
         KeyringCommand::Unlock => {
             require_tty(non_interactive, "keyring unlock")?;
             let words = read_tty_line("Enter 24-word recovery bundle: ")?;
+            // Pull latest remote keyring before unsealing so rotated generations are included immediately.
+            let maybe_creds = store.load_credentials().ok().flatten();
+            if let Some(creds) = &maybe_creds {
+                if let Ok(client) = RelayClient::from_credentials(creds) {
+                    if let Ok((_recs, _marks, Some((gen, blob)), _vh)) = run_async(client.fetch_remote_keys())
+                    {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(1);
+                        let _ = store.apply_store_mutations(&[StoreMutation::UpsertKeyMaterial {
+                            kind: KeyMaterialKind::Keyring,
+                            gen: gen as i64,
+                            blob,
+                            updated_at_ms: now_ms,
+                        }]);
+                    }
+                }
+            }
             let gens = store.unlock_keyring_with_words(&words)?;
-            if let Ok(Some(creds)) = store.load_credentials() {
-                if let Ok(client) = RelayClient::from_credentials(&creds) {
+            if let Some(creds) = &maybe_creds {
+                if let Ok(client) = RelayClient::from_credentials(creds) {
                     let _ = run_async(client.run_sync_round(store, creds.scope == "read"));
                 }
             }
