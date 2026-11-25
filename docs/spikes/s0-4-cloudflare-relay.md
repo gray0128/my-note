@@ -1,6 +1,6 @@
 # S0-4 实测报告：Cloudflare Paid 最小回声中继、DO Alarm 与 R2 生命周期（Issue #35）
 
-- **当前状态**：**本地 `workerd` 实测全部通过（3/3 绿灯，`297 LOC` TS [已测]）；真实 Cloudflare Paid 控制台项（Spend Management 告警、R2 前缀 30 天生命周期、R2 Bucket Lock）已备好部署脚本，待在个人 CF 账号执行一次并回填**。`ADR-02` / `ADR-05` 保持 `Proposed (workerd 已测，待真账号补测)`。
+- **当前状态**：**本地 `workerd` 实测全部通过（3/3 绿灯，`297 LOC` TS [已测]）；2026-11-26 已在真实个人 Cloudflare Paid 账号（`workers_paid` \$5/月 + `r2_paid`）完成生产 R2 桶 `mynote-archive` 创建、`archives/keys/history/` 30 天前缀生命周期配置与回读、`archives/ops/` 前缀 Bucket Lock 兼容性实测、账户 `billing_budget_alert` 核验与 GitHub Actions `production` 环境就绪；剩余「真实边缘 5 分钟 WS Hibernation 计费核验」与「控制台 Spend Management 仅告警核对」待配置最小权限 Scoped `CLOUDFLARE_API_TOKEN` 经 CI 部署 `cloud-cf` 后收尾**。`ADR-05` 已升级为 `Accepted`，`ADR-02` 保持 `Proposed`（待 CI 真部署补齐边缘 Hibernation 实测）。
 - **复现路径**：[`spikes/s0-4-cf-echo-relay/`](../../spikes/s0-4-cf-echo-relay/)（`pnpm typecheck && pnpm test` 运行于真实 `workerd 1.20260815.1` + Vitest 4.1）。
 
 ---
@@ -27,25 +27,23 @@
 
 ---
 
-## 3. 真实 Cloudflare Paid 账号验证清单（5 分钟部署执行后回填）
+## 3. 真实 Cloudflare Paid 账号验证清单（2026-11-26 实测回填）
 
 ```bash
-cd spikes/s0-4-cf-echo-relay
-npx wrangler r2 bucket create mynote-s0-4-spike-archive
-# 配置仅针对 archives/keys/history/ 前缀的 30 天自动删除规则（验证不影响 latest.mnks 与 archives/ops/）
-npx wrangler r2 bucket lifecycle add mynote-s0-4-spike-archive \
-  --id "expire-key-history-30d" --prefix "archives/keys/history/" --expire-days 30
-npx wrangler r2 bucket lifecycle list mynote-s0-4-spike-archive
-# 检查 R2 Bucket Lock（防删锁）可用性
-npx wrangler r2 bucket lock list mynote-s0-4-spike-archive
-# 临时部署回声 Worker 验证真实边缘 Hibernation（验证完后 wrangler delete 清理）
-npx wrangler secret put BOOTSTRAP_TOKEN
-npx wrangler deploy
+# 生产 R2 归档桶（与 cloud-cf/wrangler.jsonc 一致）及仅针对 archives/keys/history/ 的 30 天生命周期规则
+cf r2 buckets create-by-name mynote-archive
+cf r2 buckets lifecycle update mynote-archive --rules @lifecycle.json -f
+cf r2 buckets lifecycle get mynote-archive
+# 在临时探针桶实测 archives/ops/ 前缀 Bucket Lock 不阻断 archives/keys/latest.mnks 每日覆写，测完即销毁
+cf r2 buckets locks update mynote-s0-4-lock-probe --rules @lock.json -f
+cf r2 objects put archives/keys/latest.mnks --bucket-name mynote-s0-4-lock-probe --file v1.bin
+cf r2 objects put archives/keys/latest.mnks --bucket-name mynote-s0-4-lock-probe --file v2.bin
 ```
 
-| 真账号核验项 | 配置要求 | 实测结论（待个人 CF 账号填写） |
-| --- | --- | :---: |
-| Spend Management 支出告警 | Cloudflare 控制台 → Billing → Spend Management：Workers & DO **仅开告警**（如超额 \$5 / \$20 通知），不设过紧拦截上限以防停摆 DO Alarm | ⏳ `[待实测]` |
-| R2 前缀生命周期规则 | `archives/keys/history/` 30 天过期；核验 `archives/keys/latest.mnks` 与 `archives/ops/` 无过期规则 | ⏳ `[待实测]` |
-| R2 Bucket Lock 可用性 | 确认能否对 `archives/ops/` 前缀设置保留锁而不影响 `archives/keys/latest.mnks` 每日覆写 | ⏳ `[待实测]` |
-| 真实边缘 WS Hibernation | 保持连接静置 5 分钟发 `"ping"` 收到 `"pong"`，查看 DO Metrics 无持续 Duration 计费 | ⏳ `[待实测]` |
+| 真账号核验项 | 配置要求 | 实测结论（2026-11-26 真实 CF Paid 账号） |
+| --- | --- | --- |
+| 订阅基线（Workers Paid + R2 Paid） | 核验 `workers_paid`（含 SQLite DO）与 `r2_paid` 订阅激活 | ✅ `[已测]` `cf accounts subscriptions get` 确认 `workers_paid`（\$5/月，`Paid`，含 `worker_durable_objects_*` / `worker_durable_objects_srs_*`）与 `r2_paid`（PAYGO，`Paid`）均有效 |
+| 账单预算告警 / Spend Management | Workers & DO **仅开告警**，不设过紧硬拦截以防停摆 DO Alarm | ⚠️ `[部分已测]` `cf alerting policies list` 确认账户已启用 2 条纯通知 `billing_budget_alert` 邮件告警（\$1 与 \$10 阈值，无硬拦截）；`cf` CLI 未暴露 Dashboard → Billing → Spend Management 面板，需在控制台人工确认未设过紧 DO 硬上限 |
+| R2 前缀生命周期规则 | `archives/keys/history/` 30 天过期；核验 `archives/keys/latest.mnks` 与 `archives/ops/` 无过期规则 | ✅ `[已测]` 已创建生产桶 `mynote-archive`（`APAC` / `Standard`）并写入规则 `expire-key-history-30d`（`conditions.prefix: "archives/keys/history/"`，`deleteObjectsTransition: { type: "Age", maxAge: 2592000 }`），与默认 7 天分片中止规则并存；`cf r2 buckets lifecycle get mynote-archive` 回读确认 `archives/keys/latest.mnks` 与 `archives/ops/` 均无过期规则 |
+| R2 Bucket Lock 可用性 | 确认能否对 `archives/ops/` 前缀设置保留锁而不影响 `archives/keys/latest.mnks` 每日覆写 | ✅ `[已测]` 在临时探针桶实测 `cf r2 buckets locks update` 成功设置 `prefix: "archives/ops/"`（`Age: 86400s`）并回读确认；锁生效期间连续两次上传覆写 `archives/keys/latest.mnks`（`2 B` → `14 B`）及删除均正常成功，探针桶已清理 |
+| 真实边缘 WS Hibernation | 通过 CI Scoped Token 部署后静置 5 分钟发 `"ping"` 收 `"pong"`，核验 DO Metrics 无持续 Duration 计费 | ⏳ `[待补测]` GitHub Actions `production` 环境与 `CLOUDFLARE_ACCOUNT_ID` Secret 已配置；依 `AGENTS.md` §6 严禁本机直推生产，待在 CF 控制台签发最小权限 `CLOUDFLARE_API_TOKEN` 触发 `.github/workflows/deploy-cloud.yml` 后完成 5 分钟实测 |
