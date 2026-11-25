@@ -36,10 +36,12 @@ jobs:
           node-version: "22"
           cache: "pnpm"
           cache-dependency-path: web/pnpm-lock.yaml
-      - name: Build WASM and Mobile Read-Only PWA static assets (web/dist-pwa)
+      - name: Build WASM, test web, and build Mobile Read-Only PWA static assets (web/dist-pwa)
         run: |
           ./scripts/build-wasm.sh
           pnpm --dir web install --frozen-lockfile
+          pnpm --dir web typecheck
+          pnpm --dir web test
           pnpm --dir web build:pwa
       - name: Install cloud-cf dependencies
         run: pnpm --dir cloud-cf install --frozen-lockfile

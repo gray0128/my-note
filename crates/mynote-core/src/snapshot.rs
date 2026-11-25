@@ -93,13 +93,25 @@ pub struct SnapshotBufferV1 {
     pub id: BufferId,
     pub position: String,
     pub key_id: KeyId,
+    #[serde(default)]
+    pub name_key_id: Option<KeyId>,
     pub name_op_id: OpId,
     pub name_mnb1: Vec<u8>,
     pub field_hlc: BufferFieldHlc,
     #[serde(default)]
+    pub position_op_id: Option<OpId>,
+    #[serde(default)]
     pub leaves: Vec<SnapshotBufferLeafV1>,
     #[serde(default)]
     pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockFieldOpIds {
+    pub buffer_id: OpId,
+    pub position: OpId,
+    pub lang: OpId,
+    pub public_hint: OpId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +122,10 @@ pub struct SnapshotBlockV1 {
     pub lang: String,
     pub public_hint: Option<String>,
     pub field_hlc: BlockFieldHlc,
+    #[serde(default)]
+    pub field_op_ids: Option<BlockFieldOpIds>,
+    #[serde(default)]
+    pub known_key_ids: Vec<KeyId>,
     pub leaves: Vec<SnapshotLeafV1>,
     #[serde(default)]
     pub updated_at_ms: i64,
@@ -204,9 +220,15 @@ pub fn decode_mnp1(
     let mut hdr_nonce = [0u8; 24];
     hdr_nonce.copy_from_slice(&raw[45..69]);
     let hdr_ct_len = u32::from_le_bytes(raw[69..73].try_into().unwrap()) as usize;
+    if hdr_ct_len < AEAD_TAG_LEN {
+        return Err(integrity_err("MNP1 header ciphertext shorter than AEAD tag"));
+    }
     let hdr_end = MNP1_PREFIX_LEN
         .checked_add(hdr_ct_len)
-        .filter(|&e| e + 24 + AEAD_TAG_LEN <= raw.len())
+        .filter(|&e| {
+            e.checked_add(24 + AEAD_TAG_LEN)
+                .is_some_and(|min_len| min_len <= raw.len())
+        })
         .ok_or_else(|| integrity_err("MNP1 header length out of bounds"))?;
 
     let smk = smks.get(&smk_kid).ok_or_else(|| {
@@ -272,6 +294,13 @@ pub fn pack_state_snapshot(
     hdr_nonce: [u8; 24],
     body_nonce: [u8; 24],
 ) -> Result<(SnapshotHeaderV1, Vec<u8>), CoreError> {
+    if !engine.bootstrap_completed || engine.reconciling_epoch.is_some() {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            "cannot pack state snapshot while bootstrap or epoch reconciliation is incomplete",
+            "Complete sync bootstrap/reconciliation before publishing a mobile snapshot",
+        ));
+    }
     let journal_epoch = engine.journal_epoch.ok_or_else(|| {
         CoreError::new(
             ErrorCode::InvalidArgument,
@@ -279,6 +308,16 @@ pub fn pack_state_snapshot(
             "Complete sync bootstrap before publishing a mobile snapshot",
         )
     })?;
+    if covers_seq < 0 || covers_seq > engine.last_seq {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "covers_seq ({covers_seq}) must be within [0, last_seq ({})]",
+                engine.last_seq
+            ),
+            "Pack snapshot at or below current synced last_seq",
+        ));
+    }
 
     // Restrict to ops with server_seq <= covers_seq so `covers_seq` is exact!
     let mut scoped = engine.clone();
@@ -286,39 +325,42 @@ pub fn pack_state_snapshot(
         .ops
         .retain(|_, o| o.server_seq.is_some_and(|s| s <= covers_seq));
 
-    // Pre-decode all scoped ops once (grouped by entity)
+    // Pre-decode all scoped ops once (grouped by entity); fail closed if any op cannot be decrypted.
     let mut buf_ops: BTreeMap<BufferId, Vec<(OpId, DeviceId, InnerOpV1)>> = BTreeMap::new();
     let mut blk_ops: BTreeMap<BlockId, Vec<(OpId, DeviceId, InnerOpV1)>> = BTreeMap::new();
     for rec in scoped.ops.values() {
-        let Some(op_smk) = scoped.smks.get(&rec.smk_kid) else {
-            continue;
-        };
-        let Ok(inner) = decrypt_mns1(
+        let op_smk = scoped.smks.get(&rec.smk_kid).ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::KeyMissing,
+                format!(
+                    "cannot pack complete snapshot: op {} requires unknown SMK {}",
+                    rec.op_id, rec.smk_kid
+                ),
+                "Unlock/refresh all SMK generations before publishing a mobile snapshot",
+            )
+        })?;
+        let inner = decrypt_mns1(
             rec.smk_kid,
             op_smk,
             rec.op_id,
             &rec.device_id,
             rec.key_id,
             &rec.envelope,
-        ) else {
-            continue;
-        };
+        )?;
         match inner.entity_type {
             EntityType::Buffer => {
-                if let Ok(id) = BufferId::parse(&inner.entity_id) {
-                    buf_ops
-                        .entry(id)
-                        .or_default()
-                        .push((rec.op_id, rec.device_id.clone(), inner));
-                }
+                let id = BufferId::parse(&inner.entity_id)?;
+                buf_ops
+                    .entry(id)
+                    .or_default()
+                    .push((rec.op_id, rec.device_id.clone(), inner));
             }
             EntityType::Block => {
-                if let Ok(id) = BlockId::parse(&inner.entity_id) {
-                    blk_ops
-                        .entry(id)
-                        .or_default()
-                        .push((rec.op_id, rec.device_id.clone(), inner));
-                }
+                let id = BlockId::parse(&inner.entity_id)?;
+                blk_ops
+                    .entry(id)
+                    .or_default()
+                    .push((rec.op_id, rec.device_id.clone(), inner));
             }
         }
     }
@@ -339,17 +381,23 @@ pub fn pack_state_snapshot(
             }
         }
         let mut best_name: Option<(Hlc, OpId, KeyId, Vec<u8>)> = None;
+        let mut best_pos: Option<(Hlc, OpId)> = None;
         let mut leaves = Vec::new();
         for (op_id, _, inner) in ops {
             let k = (&inner.hlc, *op_id);
             match &inner.body {
                 OpBodyV1::BufferMeta {
-                    key_id, name_mnb1, ..
+                    key_id,
+                    name_mnb1,
+                    position,
                 } => {
                     if let Some(mnb1) = name_mnb1 {
                         if best_name.as_ref().is_none_or(|c| k > (&c.0, c.1)) {
                             best_name = Some((inner.hlc.clone(), *op_id, *key_id, mnb1.clone()));
                         }
+                    }
+                    if position.is_some() && best_pos.as_ref().is_none_or(|c| k > (&c.0, c.1)) {
+                        best_pos = Some((inner.hlc.clone(), *op_id));
                     }
                     if !referenced.contains(op_id) {
                         leaves.push(SnapshotBufferLeafV1 {
@@ -374,14 +422,15 @@ pub fn pack_state_snapshot(
         let Some((_, name_op_id, name_key_id, name_mnb1)) = best_name else {
             continue;
         };
-        let _ = name_key_id;
         snap_buffers.push(SnapshotBufferV1 {
             id: mat.id,
             position: mat.position,
             key_id: mat.key_id,
+            name_key_id: Some(name_key_id),
             name_op_id,
             name_mnb1,
             field_hlc: mat.field_hlc,
+            position_op_id: best_pos.map(|(_, oid)| oid),
             leaves,
             updated_at_ms: mat.updated_at_ms,
         });
@@ -397,6 +446,48 @@ pub fn pack_state_snapshot(
         let Some(ops) = blk_ops.get(&mat.id) else {
             continue;
         };
+        let mut known_key_ids: BTreeSet<KeyId> = BTreeSet::new();
+        let mut best_buf: Option<(Hlc, OpId)> = None;
+        let mut best_pos: Option<(Hlc, OpId)> = None;
+        let mut best_lang: Option<(Hlc, OpId)> = None;
+        let mut best_hint: Option<(Hlc, OpId)> = None;
+        for (op_id, _, inner) in ops {
+            if let Some(kid) = inner.key_id() {
+                if !scoped.keys.is_shredded(&kid) {
+                    known_key_ids.insert(kid);
+                }
+            }
+            let k = (&inner.hlc, *op_id);
+            match &inner.body {
+                OpBodyV1::BlockContent {
+                    buffer_id,
+                    position,
+                    lang,
+                    public_hint,
+                    ..
+                }
+                | OpBodyV1::BlockMeta {
+                    buffer_id,
+                    position,
+                    lang,
+                    public_hint,
+                } => {
+                    if buffer_id.is_some() && best_buf.as_ref().is_none_or(|c| k > (&c.0, c.1)) {
+                        best_buf = Some((inner.hlc.clone(), *op_id));
+                    }
+                    if position.is_some() && best_pos.as_ref().is_none_or(|c| k > (&c.0, c.1)) {
+                        best_pos = Some((inner.hlc.clone(), *op_id));
+                    }
+                    if lang.is_some() && best_lang.as_ref().is_none_or(|c| k > (&c.0, c.1)) {
+                        best_lang = Some((inner.hlc.clone(), *op_id));
+                    }
+                    if public_hint.is_some() && best_hint.as_ref().is_none_or(|c| k > (&c.0, c.1)) {
+                        best_hint = Some((inner.hlc.clone(), *op_id));
+                    }
+                }
+                _ => {}
+            }
+        }
         let op_lookup: BTreeMap<OpId, &(OpId, DeviceId, InnerOpV1)> =
             ops.iter().map(|tuple| (tuple.0, tuple)).collect();
         let mut snap_leaves = Vec::with_capacity(mat.leaves.len());
@@ -426,6 +517,7 @@ pub fn pack_state_snapshot(
             });
         }
         leaf_count = leaf_count.saturating_add(snap_leaves.len() as u32);
+        let zero_op = OpId::from_bytes([0u8; 16]);
         snap_blocks.push(SnapshotBlockV1 {
             id: mat.id,
             buffer_id: mat.buffer_id,
@@ -433,6 +525,13 @@ pub fn pack_state_snapshot(
             lang: mat.lang,
             public_hint: mat.public_hint,
             field_hlc: mat.field_hlc,
+            field_op_ids: Some(BlockFieldOpIds {
+                buffer_id: best_buf.map_or(zero_op, |(_, o)| o),
+                position: best_pos.map_or(zero_op, |(_, o)| o),
+                lang: best_lang.map_or(zero_op, |(_, o)| o),
+                public_hint: best_hint.map_or(zero_op, |(_, o)| o),
+            }),
+            known_key_ids: known_key_ids.into_iter().collect(),
             leaves: snap_leaves,
             updated_at_ms: mat.updated_at_ms,
         });
@@ -496,7 +595,9 @@ impl MobileReadState {
     /// Monotonically install a decoded `MNP1` snapshot (`covers_seq` must strictly increase within same epoch).
     /// Returns `true` if installed, `false` if ignored as stale.
     pub fn install_snapshot(&mut self, header: SnapshotHeaderV1, body: SnapshotBodyV1) -> bool {
-        if self.journal_epoch == Some(header.journal_epoch) && header.covers_seq <= self.snapshot_covers_seq {
+        if self.journal_epoch == Some(header.journal_epoch)
+            && header.covers_seq <= self.snapshot_covers_seq.max(self.last_seq)
+        {
             return false;
         }
         self.reset_for_epoch(header.journal_epoch);
@@ -504,14 +605,18 @@ impl MobileReadState {
         self.last_seq = header.covers_seq;
 
         for buf in body.buffers {
-            self.entity_keys
-                .entry(buf.id.to_string())
-                .or_default()
-                .insert(buf.key_id);
+            let ek = self.entity_keys.entry(buf.id.to_string()).or_default();
+            ek.insert(buf.key_id);
+            if let Some(nk) = buf.name_key_id {
+                ek.insert(nk);
+            }
             self.buffers.insert(buf.id, buf);
         }
         for blk in body.blocks {
             let ek = self.entity_keys.entry(blk.id.to_string()).or_default();
+            for kid in &blk.known_key_ids {
+                ek.insert(*kid);
+            }
             for leaf in &blk.leaves {
                 if let SnapshotLeafBody::Content { key_id, .. } = &leaf.body {
                     ek.insert(*key_id);
@@ -548,14 +653,19 @@ impl MobileReadState {
     }
 
     /// Remove fully shredded blocks/buffers from mobile read-only cache (`INV-SHRED-BOUND`).
+    /// Never evicts a `Trashed` block whose `entity_keys` have not yet been populated (C9).
     pub fn prune_shredded_cache(&mut self) {
         let shredded_blocks: Vec<BlockId> = self
             .blocks
             .keys()
             .copied()
             .filter(|id| {
-                self.materialize_block(*id, &BTreeMap::new())
-                    .is_some_and(|m| m.state == BlockState::Shredded)
+                let id_s = id.to_string();
+                let has_known_keys = self.entity_keys.get(&id_s).is_some_and(|ks| !ks.is_empty());
+                has_known_keys
+                    && self
+                        .materialize_block(*id, &BTreeMap::new())
+                        .is_some_and(|m| m.state == BlockState::Shredded)
             })
             .collect();
         for id in shredded_blocks {
@@ -618,6 +728,7 @@ impl MobileReadState {
                 }
                 let already_superseded = refs.contains(&op_id);
                 let z = zero_hlc();
+                let zero_op = OpId::from_bytes([0u8; 16]);
 
                 match inner.body {
                     OpBodyV1::BufferMeta {
@@ -629,29 +740,35 @@ impl MobileReadState {
                             id: buf_id,
                             position: String::new(),
                             key_id,
-                            name_op_id: OpId::from_bytes([0u8; 16]),
+                            name_key_id: None,
+                            name_op_id: zero_op,
                             name_mnb1: Vec::new(),
                             field_hlc: BufferFieldHlc {
                                 name: z.clone(),
                                 position: z.clone(),
                             },
+                            position_op_id: Some(zero_op),
                             leaves: Vec::new(),
                             updated_at_ms: 0,
                         });
                         entry.updated_at_ms = entry.updated_at_ms.max(inner.hlc.wall_ms as i64);
+                        if entry.key_id == KeyId::from_bytes([0u8; 16]) {
+                            entry.key_id = key_id;
+                        }
                         if let Some(mnb1) = name_mnb1 {
-                            if inner.hlc > entry.field_hlc.name
-                                || (inner.hlc == entry.field_hlc.name && op_id > entry.name_op_id)
-                            {
+                            if (&inner.hlc, op_id) > (&entry.field_hlc.name, entry.name_op_id) {
                                 entry.field_hlc.name = inner.hlc.clone();
                                 entry.name_op_id = op_id;
                                 entry.name_mnb1 = mnb1;
+                                entry.name_key_id = Some(key_id);
                                 entry.key_id = key_id;
                             }
                         }
                         if let Some(pos) = position {
-                            if inner.hlc >= entry.field_hlc.position {
+                            let cur_pos_op = entry.position_op_id.unwrap_or(zero_op);
+                            if (&inner.hlc, op_id) > (&entry.field_hlc.position, cur_pos_op) {
                                 entry.field_hlc.position = inner.hlc.clone();
+                                entry.position_op_id = Some(op_id);
                                 entry.position = pos;
                             }
                         }
@@ -670,12 +787,14 @@ impl MobileReadState {
                             id: buf_id,
                             position: String::new(),
                             key_id: KeyId::from_bytes([0u8; 16]),
-                            name_op_id: OpId::from_bytes([0u8; 16]),
+                            name_key_id: None,
+                            name_op_id: zero_op,
                             name_mnb1: Vec::new(),
                             field_hlc: BufferFieldHlc {
                                 name: z.clone(),
                                 position: z.clone(),
                             },
+                            position_op_id: Some(zero_op),
                             leaves: Vec::new(),
                             updated_at_ms: 0,
                         });
@@ -703,6 +822,7 @@ impl MobileReadState {
                 }
                 let already_superseded = refs.contains(&op_id);
                 let z = zero_hlc();
+                let zero_op = OpId::from_bytes([0u8; 16]);
 
                 match inner.body {
                     OpBodyV1::BlockContent {
@@ -726,11 +846,29 @@ impl MobileReadState {
                                 lang: z.clone(),
                                 public_hint: z.clone(),
                             },
+                            field_op_ids: Some(BlockFieldOpIds {
+                                buffer_id: zero_op,
+                                position: zero_op,
+                                lang: zero_op,
+                                public_hint: zero_op,
+                            }),
+                            known_key_ids: Vec::new(),
                             leaves: Vec::new(),
                             updated_at_ms: 0,
                         });
+                        if !entry.known_key_ids.contains(&key_id) {
+                            entry.known_key_ids.push(key_id);
+                        }
                         entry.updated_at_ms = entry.updated_at_ms.max(inner.hlc.wall_ms as i64);
-                        apply_block_field_lww(entry, &inner.hlc, buffer_id, position, lang, public_hint);
+                        apply_block_field_lww(
+                            entry,
+                            &inner.hlc,
+                            op_id,
+                            buffer_id,
+                            position,
+                            lang,
+                            public_hint,
+                        );
                         entry.leaves.retain(|l| !refs.contains(&l.op_id));
                         if !already_superseded && !entry.leaves.iter().any(|l| l.op_id == op_id) {
                             entry.leaves.push(SnapshotLeafV1 {
@@ -763,11 +901,26 @@ impl MobileReadState {
                                 lang: z.clone(),
                                 public_hint: z.clone(),
                             },
+                            field_op_ids: Some(BlockFieldOpIds {
+                                buffer_id: zero_op,
+                                position: zero_op,
+                                lang: zero_op,
+                                public_hint: zero_op,
+                            }),
+                            known_key_ids: Vec::new(),
                             leaves: Vec::new(),
                             updated_at_ms: 0,
                         });
                         entry.updated_at_ms = entry.updated_at_ms.max(inner.hlc.wall_ms as i64);
-                        apply_block_field_lww(entry, &inner.hlc, buffer_id, position, lang, public_hint);
+                        apply_block_field_lww(
+                            entry,
+                            &inner.hlc,
+                            op_id,
+                            buffer_id,
+                            position,
+                            lang,
+                            public_hint,
+                        );
                     }
                     OpBodyV1::Tombstone { deleted_at_ms } => {
                         let entry = self.blocks.entry(blk_id).or_insert_with(|| SnapshotBlockV1 {
@@ -782,6 +935,13 @@ impl MobileReadState {
                                 lang: z.clone(),
                                 public_hint: z.clone(),
                             },
+                            field_op_ids: Some(BlockFieldOpIds {
+                                buffer_id: zero_op,
+                                position: zero_op,
+                                lang: zero_op,
+                                public_hint: zero_op,
+                            }),
+                            known_key_ids: Vec::new(),
                             leaves: Vec::new(),
                             updated_at_ms: 0,
                         });
@@ -823,9 +983,12 @@ impl MobileReadState {
     }
 
     fn entity_has_unshredded_key(&self, entity_id: &str) -> bool {
-        self.entity_keys
-            .get(entity_id)
-            .is_some_and(|ks| ks.iter().any(|k| !self.keys.is_shredded(k)))
+        match self.entity_keys.get(entity_id) {
+            Some(ks) if !ks.is_empty() => ks.iter().any(|k| !self.keys.is_shredded(k)),
+            // If entity came from snapshot with no indexed keys yet (pre-MergeKeyTable),
+            // preserve it as Trashed rather than prematurely classifying as Shredded (C9).
+            _ => true,
+        }
     }
 
     pub fn materialize_buffer(
@@ -834,8 +997,16 @@ impl MobileReadState {
         smks: &BTreeMap<SmkKid, Zeroizing<[u8; 32]>>,
     ) -> Option<MaterializedBuffer> {
         let buf = self.buffers.get(&buffer_id)?;
-        let has_unshredded_key =
-            !self.keys.is_shredded(&buf.key_id) || self.entity_has_unshredded_key(&buffer_id.to_string());
+        if buf.field_hlc.name.wall_ms == 0 && buf.name_mnb1.is_empty() {
+            return None;
+        }
+        let name_kid = buf.name_key_id.unwrap_or(buf.key_id);
+        let has_unshredded_key = !self.keys.is_shredded(&buf.key_id)
+            || !self.keys.is_shredded(&name_kid)
+            || self
+                .entity_keys
+                .get(&buffer_id.to_string())
+                .is_some_and(|ks| ks.iter().any(|k| !self.keys.is_shredded(k)));
         let has_live_leaf = if buf.leaves.is_empty() {
             has_unshredded_key
         } else {
@@ -851,7 +1022,7 @@ impl MobileReadState {
         let name = if state == BlockState::Shredded {
             String::new()
         } else {
-            self.unwrap_key_record(buf.key_id, smks)
+            self.unwrap_key_record(name_kid, smks)
                 .and_then(|kr| {
                     if kr.bdek.len() != 32 {
                         return None;
@@ -861,7 +1032,7 @@ impl MobileReadState {
                     decrypt_mnb1(
                         buffer_id.as_bytes(),
                         buf.name_op_id,
-                        buf.key_id,
+                        name_kid,
                         &bdek,
                         &buf.name_mnb1,
                     )
@@ -918,11 +1089,32 @@ impl MobileReadState {
                             shredded: true,
                         }
                     } else if *tier == 2 {
-                        LeafBody::Sealed {
-                            key_id: *key_id,
-                            mnb1: mnb1.clone(),
+                        if !self.keys.is_key_available(key_id) {
+                            LeafBody::KeyUnavailable {
+                                key_id: *key_id,
+                                shredded: false,
+                            }
+                        } else if !smks.is_empty() {
+                            match self.unwrap_key_record(*key_id, smks) {
+                                Some(kr) if kr.tier == 2 => LeafBody::Sealed {
+                                    key_id: *key_id,
+                                    mnb1: mnb1.clone(),
+                                },
+                                Some(_) => LeafBody::DecryptFailed {
+                                    error_code: ErrorCode::IntegrityError.as_str().to_string(),
+                                },
+                                None => LeafBody::KeyUnavailable {
+                                    key_id: *key_id,
+                                    shredded: false,
+                                },
+                            }
+                        } else {
+                            LeafBody::Sealed {
+                                key_id: *key_id,
+                                mnb1: mnb1.clone(),
+                            }
                         }
-                    } else {
+                    } else if *tier == 1 {
                         match self.unwrap_key_record(*key_id, smks) {
                             Some(kr) if kr.tier == 1 && kr.bdek.len() == 32 => {
                                 let mut bdek = Zeroizing::new([0u8; 32]);
@@ -941,6 +1133,10 @@ impl MobileReadState {
                                 key_id: *key_id,
                                 shredded: false,
                             },
+                        }
+                    } else {
+                        LeafBody::DecryptFailed {
+                            error_code: ErrorCode::IntegrityError.as_str().to_string(),
                         }
                     };
                     (Some(*tier), body)
@@ -994,10 +1190,7 @@ impl MobileReadState {
             latest_tombstone_ms.or(Some(blk.updated_at_ms))
         };
 
-        let mut field_hlc = blk.field_hlc.clone();
-        if field_hlc.public_hint.wall_ms == 0 {
-            field_hlc.public_hint = field_hlc.buffer_id.clone();
-        }
+        let field_hlc = blk.field_hlc.clone();
         if field_hlc.buffer_id.wall_ms == 0 || blk.leaves.is_empty() {
             return None;
         }
@@ -1060,32 +1253,44 @@ fn zero_hlc() -> Hlc {
 fn apply_block_field_lww(
     entry: &mut SnapshotBlockV1,
     hlc: &Hlc,
+    op_id: OpId,
     buffer_id: Option<BufferId>,
     position: Option<String>,
     lang: Option<String>,
     public_hint: Option<Option<String>>,
 ) {
+    let zero_op = OpId::from_bytes([0u8; 16]);
+    let op_ids = entry.field_op_ids.get_or_insert(BlockFieldOpIds {
+        buffer_id: zero_op,
+        position: zero_op,
+        lang: zero_op,
+        public_hint: zero_op,
+    });
     if let Some(v) = buffer_id {
-        if hlc >= &entry.field_hlc.buffer_id {
+        if (hlc, op_id) > (&entry.field_hlc.buffer_id, op_ids.buffer_id) {
             entry.field_hlc.buffer_id = hlc.clone();
+            op_ids.buffer_id = op_id;
             entry.buffer_id = v;
         }
     }
     if let Some(v) = position {
-        if hlc >= &entry.field_hlc.position {
+        if (hlc, op_id) > (&entry.field_hlc.position, op_ids.position) {
             entry.field_hlc.position = hlc.clone();
+            op_ids.position = op_id;
             entry.position = v;
         }
     }
     if let Some(v) = lang {
-        if hlc >= &entry.field_hlc.lang {
+        if (hlc, op_id) > (&entry.field_hlc.lang, op_ids.lang) {
             entry.field_hlc.lang = hlc.clone();
+            op_ids.lang = op_id;
             entry.lang = v;
         }
     }
     if let Some(v) = public_hint {
-        if hlc >= &entry.field_hlc.public_hint {
+        if (hlc, op_id) > (&entry.field_hlc.public_hint, op_ids.public_hint) {
             entry.field_hlc.public_hint = hlc.clone();
+            op_ids.public_hint = op_id;
             entry.public_hint = v;
         }
     }
@@ -1533,5 +1738,266 @@ mod tests {
                 .collect();
             prop_assert_eq!(mobile.all_non_shredded_buffers(&engine.smks), desktop_bufs);
         }
+    }
+
+    #[test]
+    fn c10_malformed_mnp1_overflow_length_rejected_without_panic() {
+        let smk_kid = SmkKid::from_bytes([1u8; 16]);
+        let mut smks = BTreeMap::new();
+        smks.insert(smk_kid, Zeroizing::new([0x42u8; 32]));
+        // Craft a 129-byte MNP1 where hdr_ct_len = u32::MAX - 20 (would wrap 32-bit usize arithmetic!)
+        let mut crafted = vec![0u8; 129];
+        crafted[0..4].copy_from_slice(MAGIC_MNP1);
+        crafted[4] = 1;
+        crafted[5..21].copy_from_slice(&[1u8; 16]);
+        crafted[69..73].copy_from_slice(&(u32::MAX - 20).to_le_bytes());
+        let err = decode_mnp1(&smks, &crafted).expect_err("must fail cleanly");
+        assert_eq!(err.code(), ErrorCode::IntegrityError);
+    }
+
+    #[test]
+    fn c9_trashed_block_in_mnp1_revives_via_tail_update_wins_and_h5_public_hint_lww() {
+        let mut g = MonotonicUlidGen::new();
+        let dev_a = DeviceId::parse("dev_snap_c9_a").unwrap();
+        let dev_b = DeviceId::parse("dev_snap_c9_b").unwrap();
+        let smk_kid = SmkKid::from_ulid(g.next(5_000, [1; 10]));
+        let smk = [0x66u8; 32];
+        let epoch = JournalEpoch::from_random_bytes([0x99; 16]);
+
+        let mut engine = EngineSnapshot::new(dev_a.clone(), 5_000);
+        engine.bootstrap_completed = true;
+        engine.journal_epoch = Some(epoch);
+        engine.smks.insert(smk_kid, Zeroizing::new(smk));
+
+        let buf_id = BufferId::from_ulid(g.next(5_001, [2; 10]));
+        let buf_kid = KeyId::from_ulid(g.next(5_001, [3; 10]));
+        let buf_bdek = [0x11u8; 32];
+        let blk_id = BlockId::from_ulid(g.next(5_002, [4; 10]));
+        let blk_kid = KeyId::from_ulid(g.next(5_002, [5; 10]));
+        let blk_bdek = [0x22u8; 32];
+
+        let mut push_key = |kid: KeyId, eid: crate::ids::Ulid, bdek: [u8; 32], n: u8| {
+            let mnr1 = encrypt_mnr1(
+                smk_kid,
+                &smk,
+                1,
+                &KeyRecordV1 {
+                    v: 1,
+                    key_id: kid,
+                    block_id: eid,
+                    tier: 1,
+                    created_hlc: Hlc::new(5_000, 0, dev_a.clone()).canonical_string(),
+                    created_by: dev_a.clone(),
+                    bdek: bdek.to_vec(),
+                },
+                [n; 24],
+            )
+            .unwrap();
+            engine.keys.insert_record(KeyRecordRow {
+                key_id: kid,
+                wrap_gen: 1,
+                key_record: Some(mnr1),
+                created_at_ms: 5_000,
+            });
+        };
+        push_key(buf_kid, buf_id.0, buf_bdek, 1);
+        push_key(blk_kid, blk_id.0, blk_bdek, 2);
+
+        let op_buf = OpId::from_ulid(g.next(5_001, [10; 10]));
+        let op_create = OpId::from_ulid(g.next(5_002, [11; 10]));
+        let op_del = OpId::from_ulid(g.next(5_003, [12; 10]));
+        let op_revive = OpId::from_ulid(g.next(5_004, [13; 10]));
+        let op_hint_old = OpId::from_ulid(g.next(5_002, [14; 10]));
+
+        let ops_before_snap = vec![
+            (
+                1i64,
+                op_buf,
+                dev_a.clone(),
+                InnerOpV1 {
+                    v: 1,
+                    entity_type: EntityType::Buffer,
+                    entity_id: buf_id.to_string(),
+                    op_type: OpType::Create,
+                    parent_op_ids: vec![],
+                    hlc: Hlc::new(5_001, 0, dev_a.clone()),
+                    actor: "human".into(),
+                    body: OpBodyV1::BufferMeta {
+                        key_id: buf_kid,
+                        name_mnb1: Some(
+                            encrypt_mnb1(buf_id.as_bytes(), op_buf, buf_kid, &buf_bdek, "main", [10; 24])
+                                .unwrap(),
+                        ),
+                        position: Some("a0".into()),
+                    },
+                },
+                20u8,
+            ),
+            (
+                2i64,
+                op_create,
+                dev_a.clone(),
+                InnerOpV1 {
+                    v: 1,
+                    entity_type: EntityType::Block,
+                    entity_id: blk_id.to_string(),
+                    op_type: OpType::Create,
+                    parent_op_ids: vec![],
+                    hlc: Hlc::new(5_002, 0, dev_a.clone()),
+                    actor: "human".into(),
+                    body: OpBodyV1::BlockContent {
+                        buffer_id: Some(buf_id),
+                        position: Some("b0".into()),
+                        lang: Some("text".into()),
+                        public_hint: None, // H5: NO public_hint set on create -> public_hint_hlc must stay 0!
+                        tier: 1,
+                        key_id: blk_kid,
+                        mnb1: encrypt_mnb1(
+                            blk_id.as_bytes(),
+                            op_create,
+                            blk_kid,
+                            &blk_bdek,
+                            "base",
+                            [11; 24],
+                        )
+                        .unwrap(),
+                    },
+                },
+                21u8,
+            ),
+            (
+                3i64,
+                op_del,
+                dev_a.clone(),
+                InnerOpV1 {
+                    v: 1,
+                    entity_type: EntityType::Block,
+                    entity_id: blk_id.to_string(),
+                    op_type: OpType::Delete,
+                    parent_op_ids: vec![op_create],
+                    hlc: Hlc::new(5_003, 0, dev_a.clone()),
+                    actor: "human".into(),
+                    body: OpBodyV1::Tombstone { deleted_at_ms: 5_003 },
+                },
+                22u8,
+            ),
+        ];
+
+        for (seq, op_id, dev, inner, n) in ops_before_snap {
+            let env = encrypt_mns1(smk_kid, &smk, op_id, &dev, &inner, [n; 24]).unwrap();
+            engine.ops.insert(
+                op_id,
+                LocalOpRecord {
+                    op_id,
+                    server_seq: Some(seq),
+                    sync_blocked_reason: None,
+                    device_id: dev,
+                    entity_type: inner.entity_type,
+                    entity_id: inner.entity_id.clone(),
+                    parent_op_ids: inner.parent_op_ids.clone(),
+                    op_type: inner.op_type,
+                    hlc: inner.hlc.clone(),
+                    actor: inner.actor.clone(),
+                    key_id: inner.key_id(),
+                    smk_kid,
+                    envelope: env,
+                    created_at_ms: inner.hlc.wall_ms as i64,
+                },
+            );
+            engine.last_seq = seq;
+        }
+
+        // Pack MNP1 at seq=3 while blk_id is TRASHED!
+        let snap_id = SnapshotId::from_ulid(g.next(5_003, [50; 10]));
+        let (_, raw_snap) =
+            pack_state_snapshot(&engine, snap_id, 3, smk_kid, &smk, 5_003, [40; 24], [41; 24]).unwrap();
+        let (hdr, body) = decode_mnp1(&engine.smks, &raw_snap).unwrap();
+        let mut mobile = MobileReadState::new();
+        mobile.install_snapshot(hdr, body);
+        mobile.merge_key_table(&engine.keys, &engine.smks);
+        // C9: Trashed block MUST still exist in MobileReadState (in Trashed state) waiting for tail revival!
+        assert_eq!(
+            mobile.materialize_block(blk_id, &engine.smks).unwrap().state,
+            BlockState::Trashed
+        );
+
+        // Tail op 4: Concurrent Update-Wins revival with NO metadata (inherits buffer_id/position/lang from snapshot!)
+        // Tail op 5: Older HLC SetMeta setting public_hint (H5: MUST win because Create did NOT set public_hint!)
+        let revive_inner = InnerOpV1 {
+            v: 1,
+            entity_type: EntityType::Block,
+            entity_id: blk_id.to_string(),
+            op_type: OpType::Update,
+            parent_op_ids: vec![op_create],
+            hlc: Hlc::new(5_004, 0, dev_b.clone()),
+            actor: "human".into(),
+            body: OpBodyV1::BlockContent {
+                buffer_id: None,
+                position: None,
+                lang: None,
+                public_hint: None,
+                tier: 1,
+                key_id: blk_kid,
+                mnb1: encrypt_mnb1(
+                    blk_id.as_bytes(),
+                    op_revive,
+                    blk_kid,
+                    &blk_bdek,
+                    "revived!",
+                    [13; 24],
+                )
+                .unwrap(),
+            },
+        };
+        let revive_env = encrypt_mns1(smk_kid, &smk, op_revive, &dev_b, &revive_inner, [23; 24]).unwrap();
+        let hint_inner = InnerOpV1 {
+            v: 1,
+            entity_type: EntityType::Block,
+            entity_id: blk_id.to_string(),
+            op_type: OpType::SetMeta,
+            parent_op_ids: vec![],
+            hlc: Hlc::new(5_001, 0, dev_b.clone()), // wall_ms 5001 < create's 5002!
+            actor: "human".into(),
+            body: OpBodyV1::BlockMeta {
+                buffer_id: None,
+                position: None,
+                lang: None,
+                public_hint: Some(Some("real hint".into())),
+            },
+        };
+        let hint_env = encrypt_mns1(smk_kid, &smk, op_hint_old, &dev_b, &hint_inner, [24; 24]).unwrap();
+
+        mobile
+            .apply_tail_envelope(
+                &RemoteEnvelopeRow {
+                    seq: 4,
+                    op_id: op_revive,
+                    key_id: Some(blk_kid),
+                    device_id: dev_b.clone(),
+                    created_at: 5_004,
+                    envelope: revive_env,
+                },
+                &engine.smks,
+            )
+            .unwrap();
+        mobile
+            .apply_tail_envelope(
+                &RemoteEnvelopeRow {
+                    seq: 5,
+                    op_id: op_hint_old,
+                    key_id: None,
+                    device_id: dev_b,
+                    created_at: 5_001,
+                    envelope: hint_env,
+                },
+                &engine.smks,
+            )
+            .unwrap();
+
+        let revived = mobile.materialize_block(blk_id, &engine.smks).unwrap();
+        assert_eq!(revived.state, BlockState::Active);
+        assert_eq!(revived.buffer_id, buf_id);
+        assert_eq!(revived.position, "b0");
+        assert_eq!(revived.public_hint.as_deref(), Some("real hint"));
     }
 }

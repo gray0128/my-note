@@ -186,9 +186,11 @@ export function connectCloudWs(
     onWake: () => void;
     onRevoked: () => void;
     onStateChange: (connected: boolean) => void;
+    onAbnormalClose?: () => void;
   },
 ): () => void {
   let closed = false;
+  let hasOpenedOnce = false;
   let ws: WebSocket | null = null;
   let pingTimer: number | null = null;
   let retryTimer: number | null = null;
@@ -216,8 +218,11 @@ export function connectCloudWs(
       return;
     }
     ws.onopen = () => {
+      const reconnected = hasOpenedOnce;
+      hasOpenedOnce = true;
       retryMs = 1500;
       callbacks.onStateChange(true);
+      if (reconnected) callbacks.onWake();
       if (pingTimer !== null) window.clearInterval(pingTimer);
       pingTimer = window.setInterval(() => {
         if (ws && ws.readyState === WebSocket.OPEN) ws.send("ping");
@@ -250,6 +255,9 @@ export function connectCloudWs(
         return;
       }
       if (!closed) {
+        if (ev.code === 1006 || ev.code === 1008) {
+          callbacks.onAbnormalClose?.();
+        }
         retryTimer = window.setTimeout(open, retryMs);
         retryMs = Math.min(30_000, retryMs * 2);
       }

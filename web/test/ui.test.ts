@@ -814,4 +814,196 @@ describe("M1 Embedded Desktop Web UI (Candidate A CM6)", () => {
 
     app.destroy();
   });
+
+  it("PR #38 regressions: C4 mid-PATCH Vault lock never queues empty draft, H18 mid-format lock never leaks plaintext, H17 concurrent Tier 1 leaf fetch, and Shift+L lock shortcut", async () => {
+    const fsMod = (await import(/* @vite-ignore */ "node:" + "fs")) as { readFileSync(p: string): Uint8Array };
+    const wasmBytes = fsMod.readFileSync("src/wasm/pkg/mynote_wasm_bg.wasm");
+    const { bytesToB64, initDesktopWasmSync } = await import("../src/wasm/desktop");
+    initDesktopWasmSync(new Uint8Array(wasmBytes));
+
+    const { api } = makeMockApi();
+    const blk1 = "01JREG00000000000000000001";
+    let storedHeader: { gen: number; blob_b64: string; updated_at_ms: number } | null = null;
+    const recoveryPkB64 = bytesToB64(new Uint8Array(32).fill(9));
+    let releasePatch!: () => void;
+    let holdNextPatch = false;
+    let patchCount = 0;
+    const lockedMap = new Map<string, BlockDto>();
+
+    const initialBlk: BlockDto = {
+      id: blk1,
+      buffer_id: "01BUF000000000000000000001",
+      position: "a1",
+      lang: "json",
+      is_locked: false,
+      has_unlocked_concurrent_version: false,
+      public_hint: null,
+      head_op_ids: ["01JREG00000000000000000011"],
+      display_op_id: "01JREG00000000000000000011",
+      has_conflict: false,
+      content: '{"secret":"v1"}',
+      versions: [
+        {
+          op_id: "01JREG00000000000000000011",
+          hlc: "000000000001000-00000-dev_mac0000000001",
+          device_id: "dev_mac0000000001",
+          actor: "human",
+          is_display: true,
+          is_locked: false,
+          key_id: "01JREG00000000000000000021",
+          content: '{"secret":"v1"}',
+        },
+      ],
+      updated_at_ms: 1000,
+    };
+    lockedMap.set(blk1, initialBlk);
+
+    const origBootstrap = api.bootstrap.bind(api);
+    api.bootstrap = async () => {
+      const b = await origBootstrap();
+      return { ...b, blocks: [initialBlk, ...b.blocks], vault_header: storedHeader, recovery_pk_b64: recoveryPkB64 };
+    };
+    api.putVaultHeader = async (gen, blob_b64) => {
+      storedHeader = { gen, blob_b64, updated_at_ms: Date.now() };
+      return storedHeader;
+    };
+    api.listBlockedOps = async () => [];
+    api.getTier1LeafPlaintext = async (blockId, opId) => ({
+      block_id: blockId,
+      op_id: opId,
+      content: "CONCURRENT_TIER1_LEAF_SECRET",
+    });
+    api.lockBlock = async (id, input) => {
+      const cur = lockedMap.get(id)!;
+      const locked: BlockDto = {
+        ...cur,
+        is_locked: true,
+        has_unlocked_concurrent_version: true,
+        has_conflict: true,
+        public_hint: input.public_hint ?? null,
+        head_op_ids: [input.op_id, "01JREG00000000000000000099"],
+        display_op_id: input.op_id,
+        content: null,
+        versions: [
+          {
+            op_id: input.op_id,
+            hlc: "000000000009000-00000-dev_mac0000000001",
+            device_id: "dev_mac0000000001",
+            actor: "human",
+            is_display: true,
+            is_locked: true,
+            key_id: input.key_id,
+            content: null,
+            mnb1_b64: input.mnb1_b64,
+            mnw1_b64: input.mnw1_b64,
+          },
+          {
+            op_id: "01JREG00000000000000000099",
+            hlc: "000000000008000-00000-dev_other000001",
+            device_id: "dev_other000001",
+            actor: "human",
+            is_display: false,
+            is_locked: false,
+            key_id: "01JREG00000000000000000021",
+            content: null,
+          },
+        ],
+      };
+      lockedMap.set(id, locked);
+      return locked;
+    };
+    const origPatch = api.patchBlock.bind(api);
+    api.patchBlock = async (id, input, opts) => {
+      patchCount++;
+      if (holdNextPatch) {
+        holdNextPatch = false;
+        await new Promise<void>((res) => {
+          releasePatch = res;
+        });
+      }
+      const cur = lockedMap.get(id);
+      if (cur && input.mnb1_b64 && input.op_id && input.key_id) {
+        const next: BlockDto = {
+          ...cur,
+          has_conflict: false,
+          head_op_ids: [input.op_id],
+          display_op_id: input.op_id,
+          versions: [
+            {
+              ...cur.versions[0],
+              op_id: input.op_id,
+              key_id: input.key_id,
+              mnb1_b64: input.mnb1_b64,
+            },
+          ],
+        };
+        lockedMap.set(id, next);
+        return next;
+      }
+      return origPatch(id, input, opts);
+    };
+
+    const app = new MyNoteApp(root, api);
+    await app.start();
+
+    // 1. Setup Vault
+    root.querySelector<HTMLButtonElement>('[data-testid="vault-btn"]')!.click();
+    root.querySelector<HTMLInputElement>('[data-testid="vault-passphrase-input"]')!.value = "regression-vault-pass";
+    root.querySelector<HTMLInputElement>('[data-testid="vault-passphrase-confirm"]')!.value = "regression-vault-pass";
+    root.querySelector<HTMLFormElement>(".dialog-form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await new Promise((r) => setTimeout(r, 150));
+    expect(app.isVaultUnlocked()).toBe(true);
+
+    // 2. Cmd/Ctrl+Shift+L on active Tier 1 block opens Lock Block modal (NOT lang selector!)
+    app.stream.focusBlock(blk1, 0);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "L", ctrlKey: true, shiftKey: true, cancelable: true }));
+    expect(root.querySelector('[data-testid="lock-hint-input"]')).not.toBeNull();
+    root.querySelector<HTMLInputElement>('[data-testid="lock-hint-input"]')!.value = "C4 Hint";
+    root.querySelector<HTMLFormElement>(".dialog-form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await new Promise((r) => setTimeout(r, 60));
+
+    // H17: Unlock Vault again -> concurrent Tier 1 leaf plaintext is fetched on demand into RAM, then scrubbed on lock!
+    app.lockVaultNow({ skipFlush: true, silent: true });
+    expect(root.textContent).not.toContain("CONCURRENT_TIER1_LEAF_SECRET");
+    root.querySelector<HTMLButtonElement>('[data-testid="vault-btn"]')!.click();
+    root.querySelector<HTMLInputElement>('[data-testid="vault-passphrase-input"]')!.value = "regression-vault-pass";
+    root.querySelector<HTMLFormElement>(".dialog-form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await new Promise((r) => setTimeout(r, 160));
+    expect(root.textContent).toContain("CONCURRENT_TIER1_LEAF_SECRET");
+
+    // 3. C4: Edit unlocked Tier 2 block, start PATCH, immediately lock Vault while PATCH is in flight!
+    // When PATCH resolves after lock, dirty map MUST stay empty (NEVER store "" over the saved content!).
+    const mounted = (app.stream as unknown as { mounted: Map<string, { view: import("@codemirror/view").EditorView }> }).mounted.get(blk1)!;
+    mounted.view.dispatch({ changes: { from: 0, to: mounted.view.state.doc.length, insert: '{"secret":"v2-saved"}' } });
+    holdNextPatch = true;
+    const inflight = app.stream.flushDirtyBlock(blk1, { fastSync: true, isMerge: true });
+    // Lock Vault while PATCH is still awaiting!
+    app.lockVaultNow({ skipFlush: true, silent: true });
+    releasePatch();
+    await inflight;
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(app.stream.hasDirtyBlocks()).toBe(false);
+    const patchesAfterLock = patchCount;
+    // Re-unlock Vault -> MUST restore '{"secret":"v2-saved"}' and NOT trigger any empty-string PATCH!
+    root.querySelector<HTMLButtonElement>('[data-testid="vault-btn"]')!.click();
+    root.querySelector<HTMLInputElement>('[data-testid="vault-passphrase-input"]')!.value = "regression-vault-pass";
+    root.querySelector<HTMLFormElement>(".dialog-form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await new Promise((r) => setTimeout(r, 160));
+    expect(app.stream.getBlockDraftContent(blk1)).toBe('{"secret":"v2-saved"}');
+    expect(patchCount).toBe(patchesAfterLock);
+
+    // 4. H18: If page becomes hidden BEFORE unlock resolves, Vault MUST stay locked with zero plaintext in DOM!
+    app.lockVaultNow({ skipFlush: true, silent: true });
+    root.querySelector<HTMLButtonElement>('[data-testid="vault-btn"]')!.click();
+    root.querySelector<HTMLInputElement>('[data-testid="vault-passphrase-input"]')!.value = "regression-vault-pass";
+    Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+    root.querySelector<HTMLFormElement>(".dialog-form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await new Promise((r) => setTimeout(r, 160));
+    expect(app.isVaultUnlocked()).toBe(false);
+    expect(root.textContent).not.toContain("v2-saved");
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+
+    app.destroy();
+  });
 });

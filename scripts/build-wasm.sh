@@ -9,7 +9,7 @@ wasm_opt_supports_externref() {
     return 1
   fi
   local ver
-  ver="$(wasm-opt --version 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) {print $i; exit}}')"
+  ver="$(wasm-opt --version 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+(\.[0-9]+)*$/) {split($i, a, "."); print a[1]; exit}}')"
   # Binaryen < 117 (including Ubuntu 24.04 apt binaryen v108) corrupts wasm-bindgen externref tables.
   [ -n "$ver" ] && [ "$ver" -ge 117 ]
 }
@@ -18,6 +18,7 @@ build_target() {
   local label="$1"
   local features="$2"
   local out_dir="$3"
+  local target_dir="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
   mkdir -p "$out_dir"
 
   echo "[build-wasm] Compiling mynote-wasm ($label: --no-default-features --features $features)..."
@@ -25,7 +26,7 @@ build_target() {
     --target wasm32-unknown-unknown --profile wasm-release \
     --no-default-features --features "$features"
 
-  local wasm_in="$ROOT_DIR/target/wasm32-unknown-unknown/wasm-release/mynote_wasm.wasm"
+  local wasm_in="$target_dir/wasm32-unknown-unknown/wasm-release/mynote_wasm.wasm"
   wasm-bindgen "$wasm_in" --target web --out-dir "$out_dir" --out-name mynote_wasm
 
   local wasm_out="$out_dir/mynote_wasm_bg.wasm"
@@ -34,14 +35,19 @@ build_target() {
       --enable-sign-ext --enable-mutable-globals \
       "$wasm_out" -o "${wasm_out}.opt"
     mv "${wasm_out}.opt" "$wasm_out"
+  else
+    echo "[build-wasm] [$label] skipping wasm-opt (not installed or version < 117)"
   fi
 
   # Runtime instantiation smoke check (catches externref table corruption immediately)
-  node --input-type=module -e "
-    import fs from 'node:fs';
-    import { initSync } from '${out_dir}/mynote_wasm.js';
-    initSync({ module: fs.readFileSync('${wasm_out}') });
-  "
+  node --input-type=module -e '
+    import fs from "node:fs";
+    import path from "node:path";
+    import { pathToFileURL } from "node:url";
+    const [outDir, wasmOut] = process.argv.slice(1);
+    const mod = await import(pathToFileURL(path.join(outDir, "mynote_wasm.js")).href);
+    mod.initSync({ module: fs.readFileSync(wasmOut) });
+  ' "$out_dir" "$wasm_out"
 
   local raw_bytes gzip_bytes gzip_kib
   raw_bytes=$(wc -c < "$wasm_out")

@@ -19,9 +19,14 @@ export function initDesktopWasmSync(bytes: BufferSource): void {
 export async function ensureDesktopWasm(): Promise<void> {
   if (initialized) return;
   if (!initPromise) {
-    initPromise = initDesktopWasm().then(() => {
-      initialized = true;
-    });
+    initPromise = initDesktopWasm()
+      .then(() => {
+        initialized = true;
+      })
+      .catch((err) => {
+        initPromise = null;
+        throw err;
+      });
   }
   await initPromise;
 }
@@ -92,9 +97,14 @@ export function detectSecretPatternFast(text: string): string | null {
   }
   // Lightweight fallback before WASM initializes; mirrors `mynote_core::vault::detect_secret_pattern`
   if (text.includes("-----BEGIN ") && text.includes("PRIVATE KEY-----")) return "pem_private_key";
-  if (/\b(AKIA|ASIA)[0-9A-Z]{16}\b/.test(text)) return "aws_access_key";
-  if (/\bgh[pousr]_[A-Za-z0-9]{20,}\b/.test(text)) return "github_token";
-  if (/\bsk-(?:live|test|proj)-[A-Za-z0-9_-]{16,}\b/.test(text)) return "api_secret_key";
-  if (/\bxox[baprs]-[A-Za-z0-9-]{16,}\b/.test(text)) return "slack_token";
+  for (const raw of text.split(/[^A-Za-z0-9_.-]+/)) {
+    const tok = raw.replace(/^\.+|\.+$/g, "");
+    if (!tok) continue;
+    if (/^(AKIA|ASIA)[0-9A-Z]{16}$/.test(tok)) return "aws_access_key";
+    if (/^github_pat_[A-Za-z0-9_]{20,}$/.test(tok) || /^gh[pousr]_[A-Za-z0-9]{20,}$/.test(tok)) return "github_token";
+    if (/^xox[baprs]-[A-Za-z0-9-]{10,}$/.test(tok)) return "slack_token";
+    if (/^sk-[A-Za-z0-9_-]{20,}$/.test(tok)) return "api_key";
+    if (/^eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{16,}$/.test(tok)) return "jwt_token";
+  }
   return null;
 }

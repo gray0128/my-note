@@ -192,7 +192,21 @@ def main():
             dom_text = page.evaluate("() => document.body.innerText")
             assert t2_canary not in dom_text, "SEC-03 VIOLATION: Tier 2 canary remained in DOM after visibilitychange hidden!"
             assert "SEC03 Vault Hint" in dom_text, "Expected public_hint on locked card!"
-            print("[sec-03] 6. visibilitychange hidden locked Vault & scrubbed DOM OK")
+            # Restore visibility, re-unlock Vault, and verify formatted Tier 2 canary is intact (C4 anti-empty-overwrite check)
+            page.evaluate(
+                """() => {
+                    delete document.visibilityState;
+                    document.dispatchEvent(new Event('visibilitychange'));
+                }"""
+            )
+            page.click('[data-testid="vault-btn"]')
+            page.fill('[data-testid="vault-passphrase-input"]', passphrase)
+            page.click('[data-testid="vault-submit-btn"]')
+            page.wait_for_function(
+                f"() => document.querySelector('[data-block-id=\"{blk_id}\"] .cm-content')?.innerText?.includes('{t2_canary}')",
+                timeout=15000,
+            )
+            print("[sec-03] 6. visibilitychange hidden locked Vault, scrubbed DOM, and re-unlock preserved content (C4) OK")
 
             assert not console_errors, f"Unexpected page errors in Chromium: {console_errors}"
             browser.close()

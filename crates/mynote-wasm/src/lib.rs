@@ -29,11 +29,11 @@ use mynote_core::ids::{BlockId, KeyId, OpId};
 #[cfg(feature = "pwa")]
 use mynote_core::ids::{DeviceId, SmkKid};
 #[cfg(feature = "desktop")]
-use mynote_core::ids::{MonotonicUlidGen, VkekKid};
+use mynote_core::ids::{MonotonicUlidGen, Ulid, VkekKid};
 #[cfg(feature = "pwa")]
 use mynote_core::model::{BlockState, KeyRecordRow, LeafBody, ShredMarkRow};
 #[cfg(feature = "pwa")]
-use mynote_core::snapshot::{decode_mnp1, MobileReadState};
+use mynote_core::snapshot::{decode_mnp1, MobileReadState, SnapshotLeafBody};
 #[cfg(feature = "pwa")]
 use mynote_core::sync::RemoteEnvelopeRow;
 #[cfg(feature = "desktop")]
@@ -48,10 +48,7 @@ use serde::Serialize;
 #[cfg(feature = "pwa")]
 use std::collections::BTreeMap;
 use wasm_bindgen::prelude::*;
-#[cfg(feature = "pwa")]
-use zeroize::Zeroize;
-#[cfg(any(feature = "desktop", feature = "pwa"))]
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(all(target_arch = "wasm32", feature = "desktop"))]
 #[wasm_bindgen]
@@ -178,6 +175,12 @@ impl DecryptedBlockPayload {
     }
 }
 
+impl Drop for DecryptedBlockPayload {
+    fn drop(&mut self) {
+        self.content.zeroize();
+    }
+}
+
 /// Opaque Tier 2 Vault session holding `VKEK` strictly in Rust WASM linear memory (`Zeroizing<[u8; 32]>`).
 #[wasm_bindgen]
 pub struct WasmVaultSession {
@@ -248,9 +251,9 @@ impl WasmVaultSession {
         let mut recovery_pk = [0u8; 32];
         recovery_pk.copy_from_slice(recovery_pk_bytes);
         let now = now_ms();
-        let mut ugen = MonotonicUlidGen::new();
-        let vkek_kid = VkekKid::from_ulid(ugen.next(now, fill_random::<10>()?));
+        let vkek_kid = VkekKid::from_ulid(Ulid::from_parts(now, fill_random::<10>()?));
         let vkek = Zeroizing::new(fill_random::<32>()?);
+        let eph_sk = Zeroizing::new(fill_random::<32>()?);
         let header = create_vault_header(
             passphrase.as_bytes(),
             &recovery_pk,
@@ -258,7 +261,7 @@ impl WasmVaultSession {
             &vkek,
             fill_random::<16>()?,
             fill_random::<24>()?,
-            fill_random::<32>()?,
+            *eph_sk,
             fill_random::<24>()?,
             now as i64,
         )?;
@@ -336,10 +339,10 @@ impl WasmVaultSession {
                     "Pass block_id in OpContextJson",
                 ));
             }
-            _ => BlockId::from_ulid(self.ulid_gen.next(now, fill_random::<10>()?)),
+            _ => BlockId::from_ulid(Ulid::from_parts(now, fill_random::<10>()?)),
         };
         let op_id = OpId::from_ulid(self.ulid_gen.next(now, fill_random::<10>()?));
-        let key_id = KeyId::from_ulid(self.ulid_gen.next(now, fill_random::<10>()?));
+        let key_id = KeyId::from_ulid(Ulid::from_parts(now, fill_random::<10>()?));
         let bdek = Zeroizing::new(fill_random::<32>()?);
         let mnw1 = {
             let keys = self.require_keys()?;
@@ -611,6 +614,10 @@ struct MobileLeafView {
     content: Option<String>,
     mnb1_b64: Option<String>,
     mnw1_b64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wrap_gen: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mnr1_b64: Option<String>,
     body_state: String,
 }
 
@@ -662,13 +669,13 @@ impl WasmSyncEngine {
         let mut smks = BTreeMap::new();
         for e in entries {
             let kid = SmkKid::parse(&e.smk_kid)?;
-            let raw = B64.decode(&e.smk_b64).map_err(|err| {
+            let raw = Zeroizing::new(B64.decode(&e.smk_b64).map_err(|err| {
                 CoreError::new(
                     ErrorCode::InvalidArgument,
                     format!("invalid base64 SMK: {err}"),
                     "Re-pair or refresh device keys",
                 )
-            })?;
+            })?);
             if raw.len() != 32 {
                 return Err(CoreError::new(
                     ErrorCode::IntegrityError,
@@ -722,13 +729,13 @@ impl WasmSyncEngine {
         k_pair_b64u: &str,
         ciphertext: &[u8],
     ) -> Result<String, CoreError> {
-        let raw_k = B64U.decode(k_pair_b64u).map_err(|e| {
+        let raw_k = Zeroizing::new(B64U.decode(k_pair_b64u).map_err(|e| {
             CoreError::new(
                 ErrorCode::InvalidArgument,
                 format!("invalid k_pair base64url: {e}"),
                 "Check pairing code",
             )
-        })?;
+        })?);
         if raw_k.len() != 32 {
             return Err(CoreError::new(
                 ErrorCode::IntegrityError,
@@ -848,6 +855,7 @@ impl WasmSyncEngine {
         let mut installed = false;
         let mut applied_ops = 0usize;
         let mut needs_reset = false;
+        let mut integrity_alerts: Vec<serde_json::Value> = Vec::new();
 
         match event {
             MobileStepEvent::InstallSnapshot { snapshot_b64 } => {
@@ -872,23 +880,44 @@ impl WasmSyncEngine {
                         state.journal_epoch = Some(remote_epoch);
                     }
                     for op in ops {
-                        let env = B64.decode(&op.envelope_b64).map_err(|e| {
-                            CoreError::new(
-                                ErrorCode::IntegrityError,
-                                format!("bad envelope b64: {e}"),
-                                "Re-pull",
-                            )
-                        })?;
-                        let row = RemoteEnvelopeRow {
-                            seq: op.seq,
-                            op_id: OpId::parse(&op.op_id)?,
-                            key_id: op.key_id.as_deref().map(KeyId::parse).transpose()?,
-                            device_id: DeviceId::parse(&op.device_id)?,
-                            created_at: op.created_at,
-                            envelope: env,
-                        };
-                        state.apply_tail_envelope(&row, &self.smks)?;
-                        applied_ops += 1;
+                        let parsed = (|| -> Result<RemoteEnvelopeRow, CoreError> {
+                            let env = B64.decode(&op.envelope_b64).map_err(|e| {
+                                CoreError::new(
+                                    ErrorCode::IntegrityError,
+                                    format!("bad envelope b64: {e}"),
+                                    "Re-pull",
+                                )
+                            })?;
+                            Ok(RemoteEnvelopeRow {
+                                seq: op.seq,
+                                op_id: OpId::parse(&op.op_id)?,
+                                key_id: op.key_id.as_deref().map(KeyId::parse).transpose()?,
+                                device_id: DeviceId::parse(&op.device_id)?,
+                                created_at: op.created_at,
+                                envelope: env,
+                            })
+                        })();
+                        match parsed {
+                            Ok(row) => match state.apply_tail_envelope(&row, &self.smks) {
+                                Ok(()) => applied_ops += 1,
+                                Err(err) => {
+                                    state.last_seq = state.last_seq.max(row.seq);
+                                    integrity_alerts.push(serde_json::json!({
+                                        "op_id": op.op_id,
+                                        "code": err.code().as_str(),
+                                        "reason": err.message(),
+                                    }));
+                                }
+                            },
+                            Err(err) => {
+                                state.last_seq = state.last_seq.max(op.seq);
+                                integrity_alerts.push(serde_json::json!({
+                                    "op_id": op.op_id,
+                                    "code": err.code().as_str(),
+                                    "reason": err.message(),
+                                }));
+                            }
+                        }
                     }
                     state.prune_shredded_cache();
                 }
@@ -926,14 +955,24 @@ impl WasmSyncEngine {
                     remote.insert_mark(m);
                 }
                 if let (Some(g), Some(b)) = (keyring_gen, keyring_b64) {
-                    if let Ok(raw) = B64.decode(&b) {
-                        remote.update_keyring_material(g, raw);
-                    }
+                    let raw = B64.decode(&b).map_err(|e| {
+                        CoreError::new(
+                            ErrorCode::IntegrityError,
+                            format!("bad keyring b64: {e}"),
+                            "Re-fetch keys",
+                        )
+                    })?;
+                    remote.update_keyring_material(g, raw);
                 }
                 if let (Some(g), Some(b)) = (vault_header_gen, vault_header_b64) {
-                    if let Ok(raw) = B64.decode(&b) {
-                        remote.update_vault_header_material(g, raw);
-                    }
+                    let raw = B64.decode(&b).map_err(|e| {
+                        CoreError::new(
+                            ErrorCode::IntegrityError,
+                            format!("bad vault_header b64: {e}"),
+                            "Re-fetch keys",
+                        )
+                    })?;
+                    remote.update_vault_header_material(g, raw);
                 }
                 state.merge_key_table(&remote, &self.smks);
             }
@@ -961,6 +1000,7 @@ impl WasmSyncEngine {
             .into_iter()
             .filter(|b| b.state == BlockState::Active)
             .map(|b| {
+                let raw_blk = state.blocks.get(&b.id);
                 let versions: Vec<MobileLeafView> = b
                     .leaves
                     .iter()
@@ -968,19 +1008,55 @@ impl WasmSyncEngine {
                     .map(|l| {
                         let is_display = b.display_op_id == Some(l.op_id);
                         match &l.body {
-                            LeafBody::Plaintext(text) => MobileLeafView {
-                                op_id: l.op_id.to_string(),
-                                hlc: l.hlc.canonical_string(),
-                                device_id: l.device_id.to_string(),
-                                actor: l.actor.clone(),
-                                is_display,
-                                is_locked: false,
-                                key_id: None,
-                                content: Some(text.clone()),
-                                mnb1_b64: None,
-                                mnw1_b64: None,
-                                body_state: "PLAINTEXT".into(),
-                            },
+                            LeafBody::Plaintext(text) => {
+                                if b.is_locked {
+                                    let raw_leaf = raw_blk
+                                        .and_then(|sb| sb.leaves.iter().find(|sl| sl.op_id == l.op_id));
+                                    let (kid_s, mnb1_b64, wrap_gen, mnr1_b64) =
+                                        match raw_leaf.map(|sl| &sl.body) {
+                                            Some(SnapshotLeafBody::Content { key_id, mnb1, .. }) => {
+                                                let rec = state.keys.records.get(key_id);
+                                                let wg = rec.map(|r| r.wrap_gen);
+                                                let mnr1 = rec
+                                                    .and_then(|r| r.key_record.as_ref())
+                                                    .map(|bytes| B64.encode(bytes));
+                                                (Some(key_id.to_string()), Some(B64.encode(mnb1)), wg, mnr1)
+                                            }
+                                            _ => (None, None, None, None),
+                                        };
+                                    MobileLeafView {
+                                        op_id: l.op_id.to_string(),
+                                        hlc: l.hlc.canonical_string(),
+                                        device_id: l.device_id.to_string(),
+                                        actor: l.actor.clone(),
+                                        is_display,
+                                        is_locked: false,
+                                        key_id: kid_s,
+                                        content: None,
+                                        mnb1_b64,
+                                        mnw1_b64: None,
+                                        wrap_gen,
+                                        mnr1_b64,
+                                        body_state: "PLAINTEXT".into(),
+                                    }
+                                } else {
+                                    MobileLeafView {
+                                        op_id: l.op_id.to_string(),
+                                        hlc: l.hlc.canonical_string(),
+                                        device_id: l.device_id.to_string(),
+                                        actor: l.actor.clone(),
+                                        is_display,
+                                        is_locked: false,
+                                        key_id: None,
+                                        content: Some(text.clone()),
+                                        mnb1_b64: None,
+                                        mnw1_b64: None,
+                                        wrap_gen: None,
+                                        mnr1_b64: None,
+                                        body_state: "PLAINTEXT".into(),
+                                    }
+                                }
+                            }
                             LeafBody::Sealed { key_id, mnb1 } => {
                                 // Unwrap outer MNR1 using SMK to yield inner MNW1 for WasmVaultSession!
                                 let mnw1_b64 = state
@@ -993,6 +1069,9 @@ impl WasmSyncEngine {
                                             SmkKid::from_bytes(peek_envelope_kid(MAGIC_MNR1, mnr1).ok()?);
                                         let smk = self.smks.get(&sk)?;
                                         let kr = decrypt_mnr1(sk, smk, *key_id, wg, mnr1).ok()?;
+                                        if kr.tier != 2 {
+                                            return None;
+                                        }
                                         Some(B64.encode(&kr.bdek))
                                     });
                                 MobileLeafView {
@@ -1006,6 +1085,8 @@ impl WasmSyncEngine {
                                     content: None,
                                     mnb1_b64: Some(B64.encode(mnb1)),
                                     mnw1_b64,
+                                    wrap_gen: None,
+                                    mnr1_b64: None,
                                     body_state: "SEALED".into(),
                                 }
                             }
@@ -1020,6 +1101,8 @@ impl WasmSyncEngine {
                                 content: None,
                                 mnb1_b64: None,
                                 mnw1_b64: None,
+                                wrap_gen: None,
+                                mnr1_b64: None,
                                 body_state: "KEY_UNAVAILABLE".into(),
                             },
                             LeafBody::DecryptFailed { .. } => MobileLeafView {
@@ -1033,6 +1116,8 @@ impl WasmSyncEngine {
                                 content: None,
                                 mnb1_b64: None,
                                 mnw1_b64: None,
+                                wrap_gen: None,
+                                mnr1_b64: None,
                                 body_state: "DECRYPT_FAILED".into(),
                             },
                             LeafBody::Tombstone { .. } => MobileLeafView {
@@ -1046,6 +1131,8 @@ impl WasmSyncEngine {
                                 content: None,
                                 mnb1_b64: None,
                                 mnw1_b64: None,
+                                wrap_gen: None,
+                                mnr1_b64: None,
                                 body_state: "TOMBSTONE".into(),
                             },
                         }
@@ -1078,6 +1165,7 @@ impl WasmSyncEngine {
             "installed": installed,
             "applied_ops": applied_ops,
             "needs_reset": needs_reset,
+            "integrity_alerts": integrity_alerts,
             "keys_digest": state.keys.digest(),
             "vault_header_b64": vault_header_b64,
             "view": {
@@ -1331,6 +1419,7 @@ mod tests {
         let epoch = JournalEpoch::from_random_bytes([0xAB; 16]);
         let mut desk = EngineSnapshot::new(dev_mac.clone(), 1000);
         desk.bootstrap_completed = true;
+        desk.last_seq = 2;
         desk.journal_epoch = Some(epoch);
         desk.smks.insert(smk_kid, Zeroizing::new(smk));
         desk.keys.update_vault_header_material(vh_gen, vh_bytes.clone());

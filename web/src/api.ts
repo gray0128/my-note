@@ -117,19 +117,23 @@ export interface LocalApiClient {
     id: string,
     input: { expected_heads: string[]; content: string; lang?: string; shred_old_key?: boolean },
   ): Promise<BlockDto>;
+  getTier1LeafPlaintext?(
+    blockId: string,
+    opId: string,
+  ): Promise<{ block_id: string; op_id: string; content: string }>;
   deleteBlock(id: string, expectedHeads: string[]): Promise<{ in_trash: boolean; shred_state: string; shred_not_before_ms: number | null }>;
   createBuffer(input: { name: string; after_id?: string }): Promise<BufferDto>;
   renameBuffer(id: string, name: string): Promise<BufferDto>;
   deleteBuffer(id: string): Promise<BufferDto>;
   listTrash(): Promise<TrashItemDto[]>;
   getTrashTier2Blob?(id: string): Promise<{ op_id: string; key_id: string; mnb1_b64: string; mnw1_b64: string }>;
-  restoreTrash(id: string, tier2?: { op_id: string; key_id: string; mnb1_b64: string }): Promise<BlockDto>;
+  restoreTrash(id: string, tier2?: { op_id: string; key_id: string; mnb1_b64: string; mnw1_b64?: string }): Promise<BlockDto>;
   prepareTrashAction?(input: {
     action: "expedite" | "confirm_pending" | "purge_history";
     block_ids?: string[];
     grace_ms?: number;
   }): Promise<TrashActionPrepareResponse>;
-  commitTrashAction?(input: { confirm_nonce: string; tier2?: Tier2WritePayload }): Promise<unknown>;
+  commitTrashAction?(input: { confirm_nonce: string; tier2?: Tier2WritePayload; expected_heads?: string[] }): Promise<unknown>;
   putVaultHeader?(gen: number, blobB64: string): Promise<VaultHeaderDto>;
   listBlockedOps?(): Promise<BlockedTier2OpDto[]>;
   rekeyBlockedOp?(opId: string, payload: Tier2WritePayload): Promise<BlockDto>;
@@ -157,6 +161,10 @@ export function createLocalApiClient(): LocalApiClient {
     resolveBlock: (id, input) => reqJson<BlockDto>(`/v1/local/blocks/${encodeURIComponent(id)}/resolve`, { method: "POST", body: JSON.stringify(input) }),
     lockBlock: (id, input) => reqJson<BlockDto>(`/v1/local/blocks/${encodeURIComponent(id)}/lock`, { method: "POST", body: JSON.stringify(input) }),
     unlockBlock: (id, input) => reqJson<BlockDto>(`/v1/local/blocks/${encodeURIComponent(id)}/unlock`, { method: "POST", body: JSON.stringify(input) }),
+    getTier1LeafPlaintext: (blockId, opId) =>
+      reqJson<{ block_id: string; op_id: string; content: string }>(
+        `/v1/local/blocks/${encodeURIComponent(blockId)}/tier1-leaf/${encodeURIComponent(opId)}`,
+      ),
     deleteBlock: (id, expectedHeads) =>
       reqJson(`/v1/local/blocks/${encodeURIComponent(id)}`, { method: "DELETE", body: JSON.stringify({ expected_heads: expectedHeads }) }),
     createBuffer: (input) => reqJson<BufferDto>("/v1/local/buffers", { method: "POST", body: JSON.stringify(input) }),

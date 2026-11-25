@@ -24,7 +24,7 @@ use crate::sync::{
     StoreMutation, SyncCommand, SyncEvent,
 };
 use crate::vault::{SHRED_BATCH_LIMIT_24H, T_GRACE_MIN_MS};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,8 +218,11 @@ impl SimRelay {
             }
         }
 
-        // 3. ops validation against staged_keys
+        // 3. ops validation against staged_keys (check op_id idempotency FIRST so retries succeed — H10)
         for op in &req.ops {
+            if self.op_index.contains_key(&op.op_id) {
+                continue;
+            }
             if let Some(kid) = op.key_id {
                 if staged_keys.is_shredded(&kid) {
                     return Err(SimRelayError::new(ErrorCode::KeyShredded, Some(kid)));
@@ -233,10 +236,21 @@ impl SimRelay {
             }
         }
 
-        // 4. shred_marks validation & scheduling
+        // 4. shred_marks validation & scheduling (check mark_id idempotency BEFORE SHRED_STALE — H10)
         let mut shred_results = Vec::with_capacity(req.shred_marks.len());
         let mut rolling_count = Self::rolling_24h_scheduled_count(&staged_keys, now_ms);
         for m in &req.shred_marks {
+            if let Some(existing) = staged_keys.marks.get(&m.mark_id) {
+                if existing.key_id != m.key_id {
+                    return Err(SimRelayError::new(ErrorCode::IntegrityError, Some(m.key_id)));
+                }
+                shred_results.push(ShredResultDto {
+                    key_id: existing.key_id,
+                    state: existing.state,
+                    not_before_ms: existing.not_before_ms,
+                });
+                continue;
+            }
             if m.grace_ms < self.t_grace_min_ms {
                 return Err(SimRelayError::new(ErrorCode::GraceTooShort, Some(m.key_id)));
             }
@@ -258,14 +272,6 @@ impl SimRelay {
                 .any(|o| o.seq > req.seen_seq && o.seq <= pre_batch_head_seq && o.key_id == Some(m.key_id));
             if stale {
                 return Err(SimRelayError::new(ErrorCode::ShredStale, Some(m.key_id)));
-            }
-            if let Some(existing) = staged_keys.marks.get(&m.mark_id) {
-                shred_results.push(ShredResultDto {
-                    key_id: existing.key_id,
-                    state: existing.state,
-                    not_before_ms: existing.not_before_ms,
-                });
-                continue;
             }
             let (state, not_before_ms) = if rolling_count >= self.shred_batch_limit_24h {
                 (ShredMarkState::PendingConfirm, None)
@@ -463,6 +469,9 @@ impl SimRelay {
         let mut staged = self.keys.clone();
         let mut results = Vec::new();
         for &kid in key_ids {
+            if !staged.records.contains_key(&kid) {
+                return Err(SimRelayError::new(ErrorCode::KeyUnknown, Some(kid)));
+            }
             if staged.is_shredded(&kid) {
                 return Err(SimRelayError::new(ErrorCode::KeyShredded, Some(kid)));
             }
@@ -1153,10 +1162,10 @@ impl SimCluster {
             return 0;
         }
         let mut tamper_alerts = 0usize;
-        let mut queue = vec![SyncEvent::StartSync];
+        let mut queue = VecDeque::from([SyncEvent::StartSync]);
         let mut guard = 0usize;
 
-        while let Some(ev) = queue.pop() {
+        while let Some(ev) = queue.pop_front() {
             guard += 1;
             if guard > 64 {
                 break;
@@ -1183,7 +1192,7 @@ impl SimCluster {
                             // Deliver tampered copy first; real copy also present -> tampered rejected, real succeeds
                             page.insert(0, corrupted);
                         }
-                        queue.push(SyncEvent::PullResponse {
+                        queue.push_back(SyncEvent::PullResponse {
                             now_ms: self.node_now(node_idx),
                             epoch,
                             ops: page,
@@ -1197,7 +1206,7 @@ impl SimCluster {
                         let cancelled_keys = req.cancel_key_ids.clone();
                         match self.relay.handle_push(&dev, &req, self.now_ms as i64) {
                             Ok(ok) => {
-                                queue.push(SyncEvent::PushAcked {
+                                queue.push_back(SyncEvent::PushAcked {
                                     epoch: ok.epoch,
                                     acked: ok.acked,
                                     shred_results: ok.shred_results,
@@ -1206,7 +1215,7 @@ impl SimCluster {
                                 });
                             }
                             Err(err) if err.code == ErrorCode::CasMismatch => {
-                                queue.push(SyncEvent::PushEpochMismatch {
+                                queue.push_back(SyncEvent::PushEpochMismatch {
                                     remote_epoch: self.relay.epoch,
                                 });
                             }
@@ -1216,10 +1225,9 @@ impl SimCluster {
                                     ErrorCode::ShredStale
                                         | ErrorCode::KeyPendingShred
                                         | ErrorCode::KeyShredded
-                                        | ErrorCode::KeyUnknown
                                 ) =>
                             {
-                                queue.push(SyncEvent::PushKeyRaceError {
+                                queue.push_back(SyncEvent::PushKeyRaceError {
                                     code: err.code,
                                     key_id: err.key_id,
                                 });
@@ -1240,7 +1248,7 @@ impl SimCluster {
                         if let Some((gen, blob)) = dto.vault_header_material {
                             self.relay.keys.update_vault_header_material(gen, blob);
                         }
-                        queue.push(SyncEvent::KeyTableResponse {
+                        queue.push_back(SyncEvent::KeyTableResponse {
                             records: self.relay.keys.records.values().cloned().collect(),
                             marks: self.relay.keys.marks.values().cloned().collect(),
                             keyring: self.relay.keys.keyring_material.clone(),
@@ -2397,6 +2405,274 @@ mod tests {
                 }
                 other => panic!("unexpected m2 scenario action: {other}"),
             }
+        }
+    }
+
+    #[test]
+    fn c6_c7_c11_h10_sync_push_deferral_live_key_guard_race_order_and_idempotent_replay() {
+        let mut cluster = SimCluster::new(SimSeed(0x2026_1125_C6C7_0001));
+        let b1 = cluster.create_block_on_node(0, "block-1");
+        let b2 = cluster.create_block_on_node(0, "block-2");
+        cluster.sync_node(0, &mut false);
+        cluster.sync_node(1, &mut false);
+
+        // C7: Even if a stale unacked shred mark exists for an ACTIVE block's live key, build_pending_push() MUST NOT send it!
+        let b1_live_kid = cluster.nodes[0]
+            .engine
+            .all_blocks()
+            .into_iter()
+            .find(|b| b.id == b1)
+            .and_then(|b| b.leaves.into_iter().find_map(|l| l.op_id.into()))
+            .and_then(|oid: OpId| cluster.nodes[0].engine.ops.get(&oid).and_then(|o| o.key_id))
+            .unwrap();
+        let dev0 = cluster.nodes[0].engine.device_id.clone();
+        let bogus_mark_id = MarkId::from_ulid(
+            cluster.nodes[0]
+                .ulid_gen
+                .next(cluster.now_ms, cluster.rng.bytes_10()),
+        );
+        let seen0 = cluster.nodes[0].engine.last_seq;
+        cluster.nodes[0].engine.pending_shred_marks.push(ShredMarkRow {
+            mark_id: bogus_mark_id,
+            key_id: b1_live_kid,
+            seen_seq: seen0,
+            requested_by: dev0.clone(),
+            requested_at_ms: cluster.now_ms as i64,
+            grace_ms: T_GRACE_DEFAULT_MS,
+            not_before_ms: None,
+            state: ShredMarkState::PendingConfirm,
+            confirmed_at_ms: None,
+            cancelled_by: None,
+            executed_at_ms: None,
+        });
+        assert!(
+            cluster.nodes[0].engine.build_pending_push().is_none(),
+            "C7: build_pending_push must never attach shred mark for a key still live on an active block"
+        );
+        cluster.nodes[0].engine.pending_shred_marks.clear();
+
+        // C6: Delete b2 + add 505 ops so push spans >1 batch (>500 ops). Batch 1 MUST defer b2's shred mark!
+        let b2_kid = cluster.nodes[0]
+            .engine
+            .ops
+            .values()
+            .find(|o| o.entity_id == b2.to_string())
+            .and_then(|o| o.key_id)
+            .unwrap();
+        assert!(cluster.delete_block_on_node(0, b2));
+        for i in 0..505usize {
+            cluster.create_block_on_node(0, &format!("bulk-{i}"));
+        }
+        let mark_b2 = MarkId::from_ulid(
+            cluster.nodes[0]
+                .ulid_gen
+                .next(cluster.now_ms, cluster.rng.bytes_10()),
+        );
+        let seen1 = cluster.nodes[0].engine.last_seq;
+        cluster.nodes[0].engine.pending_shred_marks.push(ShredMarkRow {
+            mark_id: mark_b2,
+            key_id: b2_kid,
+            seen_seq: seen1,
+            requested_by: dev0.clone(),
+            requested_at_ms: cluster.now_ms as i64,
+            grace_ms: T_GRACE_DEFAULT_MS,
+            not_before_ms: None,
+            state: ShredMarkState::PendingConfirm,
+            confirmed_at_ms: None,
+            cancelled_by: None,
+            executed_at_ms: None,
+        });
+        let batch1 = cluster.nodes[0].engine.build_pending_push().expect("batch 1");
+        assert!(
+            batch1.shred_marks.is_empty(),
+            "C6: multi-batch push MUST defer all shred_marks until the final batch"
+        );
+
+        // C11: PushKeyRaceError MUST emit HttpPull FIRST without premature SyncKeyTable!
+        let (_, cmds) = step(
+            &cluster.nodes[0].engine,
+            SyncEvent::PushKeyRaceError {
+                code: ErrorCode::KeyPendingShred,
+                key_id: Some(b2_kid),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            cmds.len(),
+            1,
+            "C11: PushKeyRaceError must emit only HttpPull so remote ops settle before key table sync (got {cmds:?})"
+        );
+        assert!(
+            matches!(cmds.first(), Some(SyncCommand::HttpPull { .. })),
+            "C11: PushKeyRaceError must pull remote ops first (got {cmds:?})"
+        );
+
+        // H10: SimRelay idempotent push replay succeeds even when op's key now has a scheduled shred mark
+        let mut relay = SimRelay::new(JournalEpoch::from_random_bytes([0x55; 16]));
+        let kid = KeyId::from_ulid(cluster.nodes[0].ulid_gen.next(cluster.now_ms, [1; 10]));
+        let oid = OpId::from_ulid(cluster.nodes[0].ulid_gen.next(cluster.now_ms, [2; 10]));
+        let mid = MarkId::from_ulid(cluster.nodes[0].ulid_gen.next(cluster.now_ms, [3; 10]));
+        let req = PushRequestDto {
+            expected_epoch: relay.epoch,
+            seen_seq: 0,
+            key_records: vec![KeyRecordRow {
+                key_id: kid,
+                wrap_gen: 1,
+                key_record: Some(vec![1, 2, 3]),
+                created_at_ms: 1000,
+            }],
+            cancel_key_ids: vec![],
+            ops: vec![crate::sync::PushOpDto {
+                op_id: oid,
+                device_id: dev0.clone(),
+                key_id: Some(kid),
+                envelope: vec![4, 5, 6],
+            }],
+            shred_marks: vec![ShredMarkRow {
+                mark_id: mid,
+                key_id: kid,
+                seen_seq: 0,
+                requested_by: dev0.clone(),
+                requested_at_ms: 1000,
+                grace_ms: T_GRACE_DEFAULT_MS,
+                not_before_ms: None,
+                state: ShredMarkState::PendingConfirm,
+                confirmed_at_ms: None,
+                cancelled_by: None,
+                executed_at_ms: None,
+            }],
+        };
+        let r1 = relay.handle_push(&dev0, &req, 1000).unwrap();
+        let r2 = relay.handle_push(&dev0, &req, 1000).unwrap();
+        assert_eq!(r1.acked[0].seq, r2.acked[0].seq);
+        assert_eq!(r2.shred_results[0].state, ShredMarkState::Scheduled);
+    }
+
+    #[test]
+    fn dst_m2_multi_seed_random_shred_cancel_pitr_and_mobile_snapshot_convergence() {
+        for i in 1..=20u64 {
+            let mut cluster = SimCluster::new(SimSeed(
+                0x2026_1125_A000_0000 ^ i.wrapping_mul(0x517C_C1B7_2722_0A95),
+            ));
+            let mut ids = Vec::new();
+            for j in 0..4 {
+                ids.push(cluster.create_block_on_node((j % 2) as usize, &format!("seed-{i}-blk-{j}")));
+            }
+            cluster.sync_node(0, &mut false);
+            cluster.sync_node(1, &mut false);
+            cluster.sync_node(0, &mut false);
+            cluster.sync_node(2, &mut false);
+
+            // Partition node 1; node 1 updates ids[0] while node 0 deletes ids[0] and ids[1]
+            cluster.nodes[1].partitioned = true;
+            assert!(cluster.update_block_on_node(1, ids[0], &format!("revived-{i}")));
+            assert!(cluster.delete_block_on_node(0, ids[0]));
+            assert!(cluster.delete_block_on_node(0, ids[1]));
+            let dev0 = cluster.nodes[0].engine.device_id.clone();
+            for target in [ids[0], ids[1]] {
+                let kids: BTreeSet<KeyId> = cluster.nodes[0]
+                    .engine
+                    .ops
+                    .values()
+                    .filter(|o| o.entity_id == target.to_string())
+                    .filter_map(|o| o.key_id)
+                    .collect();
+                for kid in kids {
+                    let mid = MarkId::from_ulid(
+                        cluster.nodes[0]
+                            .ulid_gen
+                            .next(cluster.now_ms, cluster.rng.bytes_10()),
+                    );
+                    let seen_m2 = cluster.nodes[0].engine.last_seq;
+                    cluster.nodes[0].engine.pending_shred_marks.push(ShredMarkRow {
+                        mark_id: mid,
+                        key_id: kid,
+                        seen_seq: seen_m2,
+                        requested_by: dev0.clone(),
+                        requested_at_ms: cluster.now_ms as i64,
+                        grace_ms: T_GRACE_DEFAULT_MS,
+                        not_before_ms: None,
+                        state: ShredMarkState::PendingConfirm,
+                        confirmed_at_ms: None,
+                        cancelled_by: None,
+                        executed_at_ms: None,
+                    });
+                }
+            }
+            cluster.sync_node(0, &mut false);
+
+            // Take MNP1 snapshot while BOTH ids[0] and ids[1] are Trashed (tests C9 across seeds!)
+            let snap_id = SnapshotId::from_ulid(
+                cluster.nodes[0]
+                    .ulid_gen
+                    .next(cluster.now_ms, cluster.rng.bytes_10()),
+            );
+            let (_, snap_bytes) = pack_state_snapshot(
+                &cluster.nodes[0].engine,
+                snap_id,
+                cluster.relay.head_seq(),
+                cluster.current_smk.0,
+                &cluster.current_smk.1,
+                cluster.now_ms as i64,
+                cluster.rng.bytes_24(),
+                cluster.rng.bytes_24(),
+            )
+            .unwrap();
+            cluster
+                .relay
+                .handle_snapshot_put(cluster.relay.epoch, cluster.relay.head_seq(), snap_id, snap_bytes)
+                .unwrap();
+
+            // Heal node 1 -> Update-Wins auto-cancels ids[0] shred mark before alarm executes!
+            cluster.nodes[1].partitioned = false;
+            cluster.sync_node(1, &mut false);
+            cluster.sync_node(0, &mut false);
+
+            // Advance past T_grace -> alarm shreds ONLY ids[1], keeping ids[0] alive!
+            cluster.now_ms += (T_GRACE_DEFAULT_MS + 60_000) as u64;
+            cluster.relay.run_shred_alarm(cluster.now_ms as i64);
+            cluster.sync_node(0, &mut false);
+            cluster.sync_node(1, &mut false);
+            cluster.sync_node(2, &mut false);
+
+            // Verify INV-KEY-LIVENESS on all nodes + MobileReadState parity (INV-SYNC-7)
+            for n in &cluster.nodes {
+                let all_blks = n.engine.all_blocks();
+                let (ok, missing) = crate::keys::self_check_key_liveness(&all_blks, &n.engine.keys);
+                assert!(ok && missing.is_empty(), "INV-KEY-LIVENESS failed: {missing:?}");
+            }
+            let ref_blocks: Vec<crate::model::MaterializedBlock> = cluster.nodes[0]
+                .engine
+                .all_blocks()
+                .into_iter()
+                .filter(|b| b.state != BlockState::Shredded)
+                .collect();
+            assert_eq!(
+                cluster.nodes[1]
+                    .engine
+                    .all_blocks()
+                    .into_iter()
+                    .filter(|b| b.state != BlockState::Shredded)
+                    .collect::<Vec<_>>(),
+                ref_blocks
+            );
+
+            let snap_rec = cluster.relay.handle_snapshot_get().unwrap();
+            let (hdr, body) = decode_mnp1(&cluster.nodes[0].engine.smks, &snap_rec.bytes).unwrap();
+            let mut mobile = MobileReadState::new();
+            mobile.install_snapshot(hdr, body);
+            let (_, tail, _, _, _) = cluster.relay.handle_pull(mobile.last_seq, 500);
+            for r in &tail {
+                mobile
+                    .apply_tail_envelope(r, &cluster.nodes[0].engine.smks)
+                    .unwrap();
+            }
+            mobile.merge_key_table(&cluster.relay.keys, &cluster.nodes[0].engine.smks);
+            assert_eq!(
+                mobile.all_non_shredded_blocks(&cluster.nodes[0].engine.smks),
+                ref_blocks,
+                "INV-SYNC-7 mobile parity failed on M2 seed {i}"
+            );
         }
     }
 }

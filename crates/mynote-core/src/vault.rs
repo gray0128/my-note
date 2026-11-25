@@ -220,6 +220,23 @@ pub fn change_vault_passphrase(
     retired_nonces: &[[u8; 24]],
     now_ms: i64,
 ) -> Result<VaultHeaderV1, CoreError> {
+    if header.v != 1 {
+        return Err(CoreError::new(
+            ErrorCode::IntegrityError,
+            format!("unsupported VaultHeaderV1 version {}", header.v),
+            "Upgrade mynote to read this Vault header",
+        ));
+    }
+    if keys.active_kid != header.vkek_kid {
+        return Err(CoreError::new(
+            ErrorCode::IntegrityError,
+            format!(
+                "unlocked active_kid {} does not match VaultHeaderV1 vkek_kid {}",
+                keys.active_kid, header.vkek_kid
+            ),
+            "Re-unlock against the latest VaultHeaderV1 before changing passphrase",
+        ));
+    }
     if new_passphrase.is_empty() {
         return Err(CoreError::new(
             ErrorCode::InvalidArgument,
@@ -282,6 +299,44 @@ pub fn rotate_vault_vkek(
     mnrs_nonce: [u8; 24],
     now_ms: i64,
 ) -> Result<VaultHeaderV1, CoreError> {
+    if header.v != 1 {
+        return Err(CoreError::new(
+            ErrorCode::IntegrityError,
+            format!("unsupported VaultHeaderV1 version {}", header.v),
+            "Upgrade mynote to read this Vault header",
+        ));
+    }
+    if old_keys.active_kid != header.vkek_kid {
+        return Err(CoreError::new(
+            ErrorCode::IntegrityError,
+            format!(
+                "unlocked active_kid {} does not match VaultHeaderV1 vkek_kid {}",
+                old_keys.active_kid, header.vkek_kid
+            ),
+            "Re-unlock against the latest VaultHeaderV1 before rotating VKEK",
+        ));
+    }
+    if passphrase.is_empty() {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            "Vault passphrase cannot be empty",
+            "Provide a non-empty passphrase",
+        ));
+    }
+    let cutoff = now_ms.saturating_sub(T_SNAP_MS);
+    let surviving_retired: Vec<&RetiredVkekV1> = header
+        .retired
+        .iter()
+        .filter(|r| r.retired_at_ms >= cutoff)
+        .collect();
+    if retired_nonces.len() < surviving_retired.len() {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            "insufficient nonces for surviving retired VKEK entries",
+            "Provide one 24-byte nonce per non-expired retired VKEK",
+        ));
+    }
+
     let kdf = KdfParamsV1::argon2id_default(new_salt);
     let pass_key = derive_passphrase_key(passphrase, &kdf)?;
     let wrapped_vkek = encrypt_mnvh(new_vkek_kid, &pass_key, &kdf, new_vkek, active_nonce)?;
@@ -294,7 +349,7 @@ pub fn rotate_vault_vkek(
         mnrs_nonce,
     )?;
 
-    let mut retired = Vec::new();
+    let mut retired = Vec::with_capacity(1 + surviving_retired.len());
     let prev_wrapped = encrypt_mnvh(
         old_keys.active_kid,
         &pass_key,
@@ -309,20 +364,21 @@ pub fn rotate_vault_vkek(
         retired_at_ms: now_ms,
     });
 
-    let cutoff = now_ms.saturating_sub(T_SNAP_MS);
-    for (idx, r) in header.retired.iter().enumerate() {
-        if r.retired_at_ms < cutoff {
-            continue;
-        }
-        if let (Some(rk), Some(nonce)) = (old_keys.find_vkek(r.vkek_kid), retired_nonces.get(idx)) {
-            let wrapped = encrypt_mnvh(r.vkek_kid, &pass_key, &kdf, rk, *nonce)?;
-            retired.push(RetiredVkekV1 {
-                vkek_kid: r.vkek_kid,
-                wrapped_vkek: wrapped,
-                sealed_vkek: r.sealed_vkek.clone(),
-                retired_at_ms: r.retired_at_ms,
-            });
-        }
+    for (r, nonce) in surviving_retired.iter().zip(retired_nonces.iter()) {
+        let rk = old_keys.find_vkek(r.vkek_kid).ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::KeyMissing,
+                format!("missing retired VKEK {}", r.vkek_kid),
+                "Unlock all non-expired retired VKEK generations before rotating VKEK",
+            )
+        })?;
+        let wrapped = encrypt_mnvh(r.vkek_kid, &pass_key, &kdf, rk, *nonce)?;
+        retired.push(RetiredVkekV1 {
+            vkek_kid: r.vkek_kid,
+            wrapped_vkek: wrapped,
+            sealed_vkek: r.sealed_vkek.clone(),
+            retired_at_ms: r.retired_at_ms,
+        });
     }
 
     Ok(VaultHeaderV1 {
@@ -366,7 +422,10 @@ pub fn detect_secret_pattern(text: &str) -> Option<&'static str> {
         if start == i {
             break;
         }
-        let tok = &text[start..i];
+        let tok = text[start..i].trim_matches('.');
+        if tok.is_empty() {
+            continue;
+        }
         if let Some(kind) = classify_secret_token(tok) {
             return Some(kind);
         }
@@ -550,11 +609,150 @@ mod tests {
             detect_secret_pattern("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"),
             Some("jwt_token")
         );
+        // Trailing sentence punctuation must not defeat secret detection
+        assert_eq!(
+            detect_secret_pattern("Leaked key AKIAIOSFODNN7EXAMPLE."),
+            Some("aws_access_key")
+        );
         // Normal developer text must not trigger false positives
         assert_eq!(detect_secret_pattern("SELECT * FROM users WHERE id = 42;"), None);
         assert_eq!(
             detect_secret_pattern("{\"hello\": \"world\", \"sk\": \"short\"}"),
             None
         );
+    }
+
+    #[test]
+    fn h3_argon2_bounds_and_h4_vkek_rotation_retains_retired_and_checks_active_kid() {
+        let mut g = MonotonicUlidGen::new();
+        let (kp, _) = RecoveryKeypair::from_entropy(&[0x44u8; 32]).unwrap();
+        let kid1 = VkekKid::from_ulid(g.next(1_795_521_600_000, [1; 10]));
+        let kid2 = VkekKid::from_ulid(g.next(1_795_521_600_100, [2; 10]));
+        let kid3 = VkekKid::from_ulid(g.next(1_795_521_600_200, [3; 10]));
+        let vkek1 = [0x11u8; 32];
+        let vkek2 = [0x22u8; 32];
+        let vkek3 = [0x33u8; 32];
+
+        let mut hdr1 = create_vault_header(
+            b"pass-1",
+            &kp.recovery_pk,
+            kid1,
+            &vkek1,
+            [1; 16],
+            [2; 24],
+            [3; 32],
+            [4; 24],
+            1_795_521_600_000,
+        )
+        .unwrap();
+
+        // H3: Out-of-bounds Argon2id m_kib / t / p MUST fail closed with IntegrityError!
+        let mut bad_hdr = hdr1.clone();
+        bad_hdr.kdf.m_kib = 1024 * 1024; // 1 GiB OOM DoS attempt
+        assert_eq!(
+            unlock_vault_with_passphrase(b"pass-1", &bad_hdr)
+                .err()
+                .unwrap()
+                .code(),
+            ErrorCode::IntegrityError
+        );
+        bad_hdr.kdf.m_kib = 512; // too weak
+        assert_eq!(
+            unlock_vault_with_passphrase(b"pass-1", &bad_hdr)
+                .err()
+                .unwrap()
+                .code(),
+            ErrorCode::IntegrityError
+        );
+        bad_hdr = hdr1.clone();
+        bad_hdr.kdf.t = 99;
+        assert_eq!(
+            unlock_vault_with_passphrase(b"pass-1", &bad_hdr)
+                .err()
+                .unwrap()
+                .code(),
+            ErrorCode::IntegrityError
+        );
+        bad_hdr = hdr1.clone();
+        bad_hdr.kdf.p = 0;
+        assert_eq!(
+            unlock_vault_with_passphrase(b"pass-1", &bad_hdr)
+                .err()
+                .unwrap()
+                .code(),
+            ErrorCode::IntegrityError
+        );
+
+        // H4: Rotating VKEK twice retains BOTH kid1 and kid2 in retired and all 3 decrypt!
+        let u1 = unlock_vault_with_passphrase(b"pass-1", &hdr1).unwrap();
+        let hdr2 = rotate_vault_vkek(
+            &hdr1,
+            &u1,
+            b"pass-1",
+            &kp.recovery_pk,
+            kid2,
+            &vkek2,
+            [5; 16],
+            [6; 24],
+            [9; 24],
+            &[],
+            [7; 32],
+            [8; 24],
+            1_795_521_600_100,
+        )
+        .unwrap();
+        assert_eq!(hdr2.retired.len(), 1);
+        assert_eq!(hdr2.retired[0].vkek_kid, kid1);
+
+        let u2 = unlock_vault_with_passphrase(b"pass-1", &hdr2).unwrap();
+        let hdr3 = rotate_vault_vkek(
+            &hdr2,
+            &u2,
+            b"pass-1",
+            &kp.recovery_pk,
+            kid3,
+            &vkek3,
+            [10; 16],
+            [11; 24],
+            [14; 24],
+            &[[15; 24]],
+            [12; 32],
+            [13; 24],
+            1_795_521_600_200,
+        )
+        .unwrap();
+        assert_eq!(hdr3.retired.len(), 2);
+        let u3 = unlock_vault_with_passphrase(b"pass-1", &hdr3).unwrap();
+        assert_eq!(*u3.active_vkek, vkek3);
+        assert!(u3.retired.iter().any(|(k, v)| *k == kid1 && **v == vkek1));
+        assert!(u3.retired.iter().any(|(k, v)| *k == kid2 && **v == vkek2));
+
+        // H4: change_vault_passphrase MUST reject mismatched active_kid (u1 against hdr3)
+        let mismatch = change_vault_passphrase(
+            &hdr3,
+            &u1,
+            b"new-pass",
+            [20; 16],
+            [21; 24],
+            &[[22; 24], [23; 24]],
+            1_795_521_600_300,
+        );
+        assert_eq!(mismatch.err().unwrap().code(), ErrorCode::IntegrityError);
+
+        // Passing valid u3 succeeds and re-wraps all retired VKEKs under new passphrase
+        let hdr4 = change_vault_passphrase(
+            &hdr3,
+            &u3,
+            b"new-pass",
+            [20; 16],
+            [21; 24],
+            &[[22; 24], [23; 24]],
+            1_795_521_600_300,
+        )
+        .unwrap();
+        let u4 = unlock_vault_with_passphrase(b"new-pass", &hdr4).unwrap();
+        assert!(u4.retired.iter().any(|(k, v)| *k == kid1 && **v == vkek1));
+        assert!(u4.retired.iter().any(|(k, v)| *k == kid2 && **v == vkek2));
+        hdr1.updated_at_ms = 0; // silence unused mut if needed
     }
 }

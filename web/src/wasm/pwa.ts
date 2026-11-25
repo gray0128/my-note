@@ -15,9 +15,14 @@ export function initPwaWasmSync(bytes: BufferSource): void {
 export async function ensurePwaWasm(): Promise<void> {
   if (initialized) return;
   if (!initPromise) {
-    initPromise = initPwaWasm().then(() => {
-      initialized = true;
-    });
+    initPromise = initPwaWasm()
+      .then(() => {
+        initialized = true;
+      })
+      .catch((err) => {
+        initPromise = null;
+        throw err;
+      });
   }
   await initPromise;
 }

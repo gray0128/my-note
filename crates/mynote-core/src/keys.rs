@@ -17,9 +17,11 @@ pub struct KeyTableState {
 }
 
 impl KeyTableState {
-    pub fn insert_record(&mut self, row: KeyRecordRow) {
+    pub fn insert_record(&mut self, mut row: KeyRecordRow) {
         if row.key_record.is_none() {
             self.executed_tombstones.insert(row.key_id);
+        } else if self.executed_tombstones.contains(&row.key_id) {
+            row.key_record = None;
         }
         self.records
             .entry(row.key_id)
@@ -242,33 +244,54 @@ fn merge_mark(a: &ShredMarkRow, b: &ShredMarkRow) -> ShredMarkRow {
 }
 
 /// Daily INV-KEY-LIVENESS self-check (`docs/sync-protocol.md` §5.6 #8).
-/// Returns `(ok, missing_key_ids)` where any missing key for an Active block triggers `KEY_MISSING`
-/// and halts shred issuance on this device.
+/// Returns `(ok, missing_key_ids)` where any missing or retiring key for an Active block
+/// triggers `KEY_MISSING` and halts shred issuance on this device.
 pub fn self_check_key_liveness(blocks: &[MaterializedBlock], keys: &KeyTableState) -> (bool, Vec<KeyId>) {
     let mut missing = BTreeSet::new();
+    let mut has_decrypt_failed = false;
     for block in blocks {
         if block.state != BlockState::Active {
             continue;
         }
+        let has_readable_live_leaf = block.leaves.iter().any(|leaf| {
+            leaf.is_live()
+                && match &leaf.body {
+                    LeafBody::Plaintext(_) => true,
+                    LeafBody::Sealed { key_id, .. } => {
+                        keys.is_key_available(key_id) && !keys.has_pending_or_scheduled_mark(key_id)
+                    }
+                    _ => false,
+                }
+        });
         for leaf in &block.leaves {
             if !leaf.is_live() {
                 continue;
             }
             match &leaf.body {
-                LeafBody::KeyUnavailable {
-                    key_id,
-                    shredded: false,
-                } => {
+                LeafBody::KeyUnavailable { key_id, shredded } => {
+                    // Only exempt a shredded concurrent branch when the active block retains
+                    // at least one other readable live leaf; an active block with ZERO readable
+                    // leaves is always an INV-KEY-LIVENESS violation.
+                    if !*shredded || !has_readable_live_leaf {
+                        missing.insert(*key_id);
+                    }
+                }
+                LeafBody::Sealed { key_id, .. }
+                    if !keys.is_key_available(key_id) || keys.has_pending_or_scheduled_mark(key_id) =>
+                {
                     missing.insert(*key_id);
                 }
-                LeafBody::Sealed { key_id, .. } if !keys.is_key_available(key_id) => {
-                    missing.insert(*key_id);
+                LeafBody::DecryptFailed { .. } => {
+                    has_decrypt_failed = true;
                 }
                 _ => {}
             }
         }
     }
-    (missing.is_empty(), missing.into_iter().collect())
+    (
+        missing.is_empty() && !has_decrypt_failed,
+        missing.into_iter().collect(),
+    )
 }
 
 #[cfg(test)]

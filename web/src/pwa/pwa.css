@@ -204,6 +204,33 @@ body {
   color: var(--red);
 }
 
+.banner-info {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.pwa-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.pwa-row-end {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.pwa-row-wrap {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pwa-unpair-btn {
+  margin-left: 6px;
+}
+
 .pwa-main {
   flex: 1;
   padding: 12px;

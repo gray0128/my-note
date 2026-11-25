@@ -25,6 +25,7 @@ import {
 
 const MOBILE_VAULT_IDLE_MS = 5 * 60 * 1000;
 const PWA_BUILD_VERSION = "M2-0.2.0";
+const isPageHidden = (): boolean => document.visibilityState === "hidden";
 
 interface MobileLeafView {
   op_id: string;
@@ -37,6 +38,8 @@ interface MobileLeafView {
   content: string | null;
   mnb1_b64: string | null;
   mnw1_b64: string | null;
+  wrap_gen?: number | null;
+  mnr1_b64?: string | null;
   body_state: string;
 }
 
@@ -75,6 +78,21 @@ interface WasmStepOutput {
   };
 }
 
+function validateSyncUrl(raw: string): string {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error("Invalid sync_url in pairing code");
+  }
+  const isHttps = u.protocol === "https:";
+  const isLocalHttp = u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1");
+  if (!isHttps && !isLocalHttp) {
+    throw new Error(`Refused insecure sync_url protocol '${u.protocol}' (HTTPS required)`);
+  }
+  return u.toString().replace(/\/+$/, "");
+}
+
 /**
  * Mobile Read-Only PWA (`#19 [M2-5]`, D1, `SEC-08`).
  * - Strictly read-only (zero editing, zero outbox, zero CM6, zero soft keyboard on note cards).
@@ -103,9 +121,13 @@ export class MobilePwaApp {
   private disconnectWs: (() => void) | null = null;
   private revoked = false;
   private pairingErrorBanner: string | null = null;
+  private syncTruncatedBanner: string | null = null;
+  private pendingSwWorker: ServiceWorker | null = null;
+  private swReloadWired = false;
   private statusText = "Idle";
   private toastTimer: number | null = null;
   private activeMediaStream: MediaStream | null = null;
+  private qrCancelToken = 0;
 
   private headerEl!: HTMLElement;
   private bannerEl!: HTMLElement;
@@ -122,6 +144,15 @@ export class MobilePwaApp {
     window.addEventListener("pagehide", this.onPageHide);
     window.addEventListener("pageshow", this.onPageShow);
     window.addEventListener("online", this.onOnline);
+  }
+
+  setPendingSwUpdate(worker: ServiceWorker): void {
+    this.pendingSwWorker = worker;
+    this.renderBanner();
+  }
+
+  private isVaultUnlocked(): boolean {
+    return this.vaultSession !== null && !this.vaultSession.isLocked();
   }
 
   async start(): Promise<void> {
@@ -146,8 +177,10 @@ export class MobilePwaApp {
   destroy(): void {
     this.syncAbort?.abort();
     this.stopCamera();
+    this.closeModal();
     this.lockVaultNow(true);
     this.disconnectWs?.();
+    this.disconnectWs = null;
     if (this.engine) {
       this.engine.zeroizeSmk();
       this.engine.free();
@@ -185,25 +218,37 @@ export class MobilePwaApp {
 
   private onVisibilityChange = (): void => {
     if (document.visibilityState === "hidden") {
-      // SEC-08: Immediately zeroize VKEK and scrub ALL Tier 2 plaintext from RAM & DOM on hide!
+      // SEC-08 / H18: Immediately zeroize VKEK, scrub inputs/modals, stop camera, and scrub ALL Tier 2 plaintext from RAM & DOM on hide!
+      this.stopCamera();
+      this.closeModal();
       this.lockVaultNow(true);
     } else if (document.visibilityState === "visible" && this.creds && !this.revoked) {
+      if (!this.disconnectWs) this.connectWs();
       void this.syncNow();
     }
   };
 
   private onPageHide = (): void => {
     this.syncAbort?.abort();
+    this.stopCamera();
+    this.closeModal();
     this.disconnectWs?.();
+    this.disconnectWs = null;
     this.lockVaultNow(true);
   };
 
   private onPageShow = (): void => {
-    if (this.creds && !this.revoked) void this.syncNow();
+    if (this.creds && !this.revoked) {
+      if (!this.disconnectWs) this.connectWs();
+      void this.syncNow();
+    }
   };
 
   private onOnline = (): void => {
-    if (this.creds && !this.revoked) void this.syncNow();
+    if (this.creds && !this.revoked) {
+      if (!this.disconnectWs) this.connectWs();
+      void this.syncNow();
+    }
   };
 
   private initEngine(): void {
@@ -217,10 +262,14 @@ export class MobilePwaApp {
 
   private connectWs(): void {
     this.disconnectWs?.();
+    this.disconnectWs = null;
     if (!this.creds || this.revoked) return;
     this.disconnectWs = connectCloudWs(this.creds.sync_url, this.creds.device_token, {
       onWake: () => void this.syncNow(),
       onRevoked: () => this.handleDeviceRevoked(),
+      onAbnormalClose: () => {
+        if (this.creds && !this.revoked) void this.syncNow();
+      },
       onStateChange: (connected) => {
         this.wsConnected = connected;
         this.renderHeader();
@@ -248,7 +297,7 @@ export class MobilePwaApp {
     if (!this.activeBufferId || !this.buffers.some((b) => b.id === this.activeBufferId)) {
       this.activeBufferId = this.buffers[0]?.id ?? null;
     }
-    if (this.vaultSession && !this.vaultSession.isLocked()) {
+    if (this.isVaultUnlocked()) {
       this.decryptVaultBlocksInRam();
     }
     return out;
@@ -273,6 +322,7 @@ export class MobilePwaApp {
     this.syncInFlight = true;
     this.syncAbort = new AbortController();
     const signal = this.syncAbort.signal;
+    this.syncTruncatedBanner = null;
     this.statusText = "Syncing…";
     this.renderHeader();
     try {
@@ -280,13 +330,22 @@ export class MobilePwaApp {
       let parsedState = JSON.parse(this.stateJson || "{}") as { journal_epoch?: string | null; last_seq?: number };
       let lastOut: WasmStepOutput | null = null;
 
-      // 1. Bootstrap from latest MNP1 mobile state snapshot if cache is empty
-      if (!parsedState.journal_epoch || (parsedState.last_seq ?? 0) === 0) {
+      const tryInstallSnapshot = async () => {
         const snap = await fetchCloudStateSnapshot(sync_url, device_token, signal);
-        if (snap) {
+        if (!snap) return;
+        try {
           lastOut = this.applyStep({ type: "install_snapshot", snapshot_b64: snap.snapshot_b64 });
           parsedState = lastOut.state;
+        } catch {
+          // INV-SYNC-7 / H20: Corrupt or unknown-SMK snapshot MUST fall back cleanly to full pull from seq=0!
+          this.stateJson = "{}";
+          parsedState = {};
         }
+      };
+
+      // 1. Bootstrap from latest MNP1 mobile state snapshot if cache is empty
+      if (!parsedState.journal_epoch || (parsedState.last_seq ?? 0) === 0) {
+        await tryInstallSnapshot();
       }
 
       // 2. Pull key table first if we have no keys yet (or later if digest changed)
@@ -301,32 +360,45 @@ export class MobilePwaApp {
           vault_header_gen: kr.key_material.vault_header?.gen ?? null,
           vault_header_b64: kr.key_material.vault_header?.blob_b64 ?? null,
         });
+        parsedState = lastOut.state;
       };
 
       if (!this.keysDigest) {
         await fetchAndMergeKeys();
       }
 
-      // 3. Pull tail ops strictly advancing cursor from PullResponse
+      // 3. Pull tail ops strictly advancing cursor from PullResponse (with rollback detection & explicit cap reporting)
       let since = parsedState.last_seq ?? 0;
       let remoteDigest: string | null = null;
-      for (let page = 0; page < 50; page++) {
+      let resetAttempts = 0;
+      let truncated = false;
+      const MAX_PAGES = 500;
+      for (let page = 0; page < MAX_PAGES; page++) {
         const pull = await pullCloudOps(sync_url, device_token, since, 200, signal);
         remoteDigest = pull.keys_digest;
+        if (pull.head_seq < since && resetAttempts < 2) {
+          // H20: Server head_seq regressed below local cursor -> full re-bootstrap from snapshot/seq 0
+          resetAttempts++;
+          this.stateJson = "{}";
+          parsedState = {};
+          await tryInstallSnapshot();
+          await fetchAndMergeKeys();
+          since = parsedState.last_seq ?? 0;
+          continue;
+        }
         if (pull.ops.length > 0 || !parsedState.journal_epoch || parsedState.journal_epoch !== pull.epoch) {
           lastOut = this.applyStep({
             type: "apply_tail_ops",
             epoch: pull.epoch,
             ops: pull.ops,
           });
-          if (lastOut.needs_reset) {
+          if (lastOut.needs_reset && resetAttempts < 2) {
             // Epoch changed on server (e.g. DO PITR) — re-bootstrap cleanly from snapshot + keys + seq 0
-            const snap = await fetchCloudStateSnapshot(sync_url, device_token, signal);
-            if (snap) {
-              lastOut = this.applyStep({ type: "install_snapshot", snapshot_b64: snap.snapshot_b64 });
-            }
+            resetAttempts++;
+            this.stateJson = "{}";
+            parsedState = {};
+            await tryInstallSnapshot();
             await fetchAndMergeKeys();
-            parsedState = lastOut.state;
             since = parsedState.last_seq ?? 0;
             continue;
           }
@@ -334,6 +406,7 @@ export class MobilePwaApp {
           since = parsedState.last_seq ?? since;
         }
         if (!pull.has_more) break;
+        if (page === MAX_PAGES - 1) truncated = true;
       }
 
       if (remoteDigest && remoteDigest !== this.keysDigest) {
@@ -343,7 +416,12 @@ export class MobilePwaApp {
       if (lastOut) {
         await saveEngineState(lastOut.state, lastOut.keys_digest);
       }
-      this.statusText = `Synced #${parsedState.last_seq ?? 0}`;
+      if (truncated) {
+        this.syncTruncatedBanner = "Sync reached page limit with more updates on relay — tap Sync to continue.";
+        this.statusText = `Partial #${parsedState.last_seq ?? 0}`;
+      } else {
+        this.statusText = `Synced #${parsedState.last_seq ?? 0}`;
+      }
     } catch (e) {
       if (signal.aborted || (e instanceof DOMException && e.name === "AbortError")) {
         return;
@@ -377,12 +455,31 @@ export class MobilePwaApp {
         pair_id: string;
         k_pair_b64u: string;
       };
-      const claimed = await claimPairing(parsed.sync_url, parsed.pair_id);
+      const cleanCodeUrl = validateSyncUrl(parsed.sync_url);
+      const claimed = await claimPairing(cleanCodeUrl, parsed.pair_id);
+      // H19: Strictly enforce read-only scope and expected ticket kind before decrypting/saving credentials!
+      if (claimed.scope !== "read") {
+        throw new Error(`Refused pairing ticket with scope '${claimed.scope}' — Mobile PWA strictly requires scope 'read'`);
+      }
+      const expectedKind = isRefresh ? "refresh" : "add";
+      if (claimed.kind !== expectedKind) {
+        throw new Error(`Unexpected pairing ticket kind '${claimed.kind}' (expected '${expectedKind}')`);
+      }
       const payload = JSON.parse(
         WasmSyncEngine.decryptPairingTicket(parsed.pair_id, parsed.k_pair_b64u, b64ToBytes(claimed.ciphertext_b64)),
       ) as PwaCredentials;
+      const cleanPayloadUrl = validateSyncUrl(payload.sync_url);
+      if (cleanPayloadUrl !== cleanCodeUrl) {
+        throw new Error("Pairing ticket sync_url mismatch");
+      }
+      if (payload.device_id !== claimed.device_id) {
+        throw new Error("Pairing ticket device_id mismatch");
+      }
 
       if (isRefresh && this.creds) {
+        if (payload.device_id !== this.creds.device_id || cleanPayloadUrl !== validateSyncUrl(this.creds.sync_url)) {
+          throw new Error("Refresh ticket does not match this paired mobile device");
+        }
         // Merge new SMK generations while preserving existing device token
         const mergedMap = new Map(this.creds.smks.map((s) => [s.smk_kid, s.smk_b64]));
         for (const s of payload.smks) mergedMap.set(s.smk_kid, s.smk_b64);
@@ -398,11 +495,11 @@ export class MobilePwaApp {
         return;
       }
 
-      this.creds = payload;
+      this.creds = { ...payload, sync_url: cleanPayloadUrl };
       this.revoked = false;
       this.stateJson = "{}";
       this.keysDigest = null;
-      await saveCredentials(payload);
+      await saveCredentials(this.creds);
       this.initEngine();
       this.stopCamera();
       this.render();
@@ -410,6 +507,7 @@ export class MobilePwaApp {
       this.showToast("Paired read-only device — syncing…");
       await this.syncNow();
     } catch (e) {
+      this.stopCamera();
       if (e instanceof CloudApiError && (e.status === 404 || e.status === 410)) {
         this.pairingErrorBanner =
           "Pairing ticket missing, expired, or ALREADY CLAIMED! If you did not claim it, run 'mynote device ls' and 'mynote device revoke' on your desktop immediately.";
@@ -448,7 +546,7 @@ export class MobilePwaApp {
 
   private decryptVaultBlocksInRam(): void {
     const sess = this.vaultSession;
-    if (!sess || sess.isLocked()) return;
+    if (!sess || sess.isLocked() || isPageHidden()) return;
     this.unlockedPlaintext.clear();
     for (const blk of this.blocks) {
       if (!blk.is_locked) continue;
@@ -470,6 +568,28 @@ export class MobilePwaApp {
           } catch {
             // keep locked
           }
+        } else if (
+          !v.is_locked &&
+          v.key_id &&
+          v.mnb1_b64 &&
+          v.mnr1_b64 &&
+          typeof v.wrap_gen === "number" &&
+          this.engine
+        ) {
+          // H17: Concurrent Tier 1 leaf on a locked block is decrypted ONLY while Vault is unlocked, strictly into RAM!
+          try {
+            const plain = this.engine.decryptTier1Content(
+              blk.id,
+              v.op_id,
+              v.key_id,
+              v.wrap_gen,
+              b64ToBytes(v.mnr1_b64),
+              b64ToBytes(v.mnb1_b64),
+            );
+            map.set(v.op_id, plain);
+          } catch {
+            // keep unavailable
+          }
         }
       }
       if (map.size > 0) this.unlockedPlaintext.set(blk.id, map);
@@ -490,9 +610,7 @@ export class MobilePwaApp {
     note.textContent =
       "VKEK is decrypted in browser WASM RAM only (never written to IndexedDB) and auto-locks immediately when you switch apps.";
     const form = document.createElement("form");
-    form.style.display = "flex";
-    form.style.flexDirection = "column";
-    form.style.gap = "10px";
+    form.className = "pwa-form";
     const pass = document.createElement("input");
     pass.type = "password";
     pass.className = "input";
@@ -500,9 +618,7 @@ export class MobilePwaApp {
     pass.dataset.testid = "pwa-vault-passphrase";
     pass.autocomplete = "current-password";
     const row = document.createElement("div");
-    row.style.display = "flex";
-    row.style.justifyContent = "flex-end";
-    row.style.gap = "8px";
+    row.className = "pwa-row-end";
     const cancel = document.createElement("button");
     cancel.type = "button";
     cancel.className = "btn";
@@ -518,12 +634,25 @@ export class MobilePwaApp {
     form.addEventListener("submit", (ev) => {
       ev.preventDefault();
       if (!this.vaultHeaderB64) return;
+      const passphrase = pass.value;
+      pass.value = "";
       submit.disabled = true;
       submit.textContent = "Deriving key…";
       window.setTimeout(() => {
+        if (isPageHidden() || !this.vaultHeaderB64) {
+          this.closeModal();
+          return;
+        }
         try {
-          this.vaultSession = WasmVaultSession.unlockWithPassphrase(pass.value, b64ToBytes(this.vaultHeaderB64!));
-          pass.value = "";
+          const sess = WasmVaultSession.unlockWithPassphrase(passphrase, b64ToBytes(this.vaultHeaderB64));
+          // H18 / SEC-08: If tab/app backgrounded during Argon2id derivation, zeroize immediately and refuse to unlock!
+          if (isPageHidden()) {
+            sess.lockAndZeroize();
+            sess.free();
+            this.closeModal();
+            return;
+          }
+          this.vaultSession = sess;
           this.decryptVaultBlocksInRam();
           this.resetVaultIdleTimer();
           this.closeModal();
@@ -551,16 +680,12 @@ export class MobilePwaApp {
     note.className = "muted";
     note.textContent = "Paste the refresh code from 'mynote device refresh <device_id>' on your desktop:";
     const form = document.createElement("form");
-    form.style.display = "flex";
-    form.style.flexDirection = "column";
-    form.style.gap = "10px";
+    form.className = "pwa-form";
     const input = document.createElement("input");
     input.className = "input";
     input.placeholder = "mynote-pair:v1:...";
     const row = document.createElement("div");
-    row.style.display = "flex";
-    row.style.justifyContent = "flex-end";
-    row.style.gap = "8px";
+    row.className = "pwa-row-end";
     const cancel = document.createElement("button");
     cancel.type = "button";
     cancel.className = "btn";
@@ -582,11 +707,15 @@ export class MobilePwaApp {
   }
 
   private closeModal(): void {
+    for (const el of this.modalCardEl.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("input, textarea")) {
+      el.value = "";
+    }
     this.modalBackdropEl.classList.add("hidden");
     this.modalCardEl.innerHTML = "";
   }
 
   private stopCamera(): void {
+    this.qrCancelToken++;
     if (this.activeMediaStream) {
       for (const t of this.activeMediaStream.getTracks()) t.stop();
       this.activeMediaStream = null;
@@ -708,6 +837,33 @@ export class MobilePwaApp {
     }
   }
 
+  private resetLocalStateSync(): void {
+    this.syncAbort?.abort();
+    this.syncAbort = null;
+    this.syncQueued = false;
+    this.stopCamera();
+    this.closeModal();
+    this.disconnectWs?.();
+    this.disconnectWs = null;
+    this.wsConnected = false;
+    this.lockVaultNow(true);
+    if (this.engine) {
+      this.engine.zeroizeSmk();
+      this.engine.free();
+      this.engine = null;
+    }
+    this.creds = null;
+    this.revoked = false;
+    this.stateJson = "{}";
+    this.keysDigest = null;
+    this.vaultHeaderB64 = null;
+    this.buffers = [];
+    this.blocks = [];
+    this.activeBufferId = null;
+    this.selectedVersionByBlock.clear();
+    this.syncTruncatedBanner = null;
+  }
+
   private renderBanner(): void {
     this.bannerEl.innerHTML = "";
     if (this.revoked) {
@@ -721,12 +877,8 @@ export class MobilePwaApp {
       resetBtn.className = "btn btn-danger btn-sm";
       resetBtn.textContent = "Reset & Re-Pair";
       resetBtn.addEventListener("click", () => {
+        this.resetLocalStateSync();
         void clearAllPwaStorage().then(() => {
-          this.creds = null;
-          this.revoked = false;
-          this.stateJson = "{}";
-          this.buffers = [];
-          this.blocks = [];
           this.render();
         });
       });
@@ -737,6 +889,36 @@ export class MobilePwaApp {
       b.className = "banner banner-error";
       b.dataset.testid = "pwa-snatch-warning";
       b.textContent = this.pairingErrorBanner;
+      this.bannerEl.appendChild(b);
+    }
+    if (this.syncTruncatedBanner) {
+      const b = document.createElement("div");
+      b.className = "banner banner-warn";
+      b.dataset.testid = "pwa-truncated-banner";
+      b.textContent = this.syncTruncatedBanner;
+      this.bannerEl.appendChild(b);
+    }
+    if (this.pendingSwWorker) {
+      const worker = this.pendingSwWorker;
+      const b = document.createElement("div");
+      b.className = "banner banner-info";
+      b.dataset.testid = "pwa-sw-update-banner";
+      const msg = document.createElement("span");
+      msg.textContent = "New app version available.";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn btn-primary btn-sm";
+      btn.textContent = "Update & Reload";
+      btn.addEventListener("click", () => {
+        if (!this.swReloadWired && "serviceWorker" in navigator) {
+          this.swReloadWired = true;
+          navigator.serviceWorker.addEventListener("controllerchange", () => {
+            window.location.reload();
+          });
+        }
+        worker.postMessage({ type: "SKIP_WAITING" });
+      });
+      b.append(msg, btn);
       this.bannerEl.appendChild(b);
     }
   }
@@ -786,17 +968,13 @@ export class MobilePwaApp {
       "Run 'mynote device add --name iPhone --scope read' on your desktop and paste or scan the pairing code below. Keys stay encrypted in IndexedDB; zero plaintext is ever persisted.";
 
     const form = document.createElement("form");
-    form.style.display = "flex";
-    form.style.flexDirection = "column";
-    form.style.gap = "10px";
+    form.className = "pwa-form";
     const input = document.createElement("input");
     input.className = "input";
     input.placeholder = "mynote-pair:v1:...";
     input.dataset.testid = "pwa-pair-input";
     const btnRow = document.createElement("div");
-    btnRow.style.display = "flex";
-    btnRow.style.gap = "8px";
-    btnRow.style.flexWrap = "wrap";
+    btnRow.className = "pwa-row-wrap";
     const pairBtn = document.createElement("button");
     pairBtn.type = "submit";
     pairBtn.className = "btn btn-primary";
@@ -820,6 +998,7 @@ export class MobilePwaApp {
 
   private async startQrScanner(host: HTMLElement, targetInput: HTMLInputElement): Promise<void> {
     this.stopCamera();
+    const token = this.qrCancelToken;
     host.innerHTML = "";
     const BD = (globalThis as unknown as { BarcodeDetector?: new (opts: { formats: string[] }) => { detect(v: HTMLVideoElement): Promise<{ rawValue: string }[]> } }).BarcodeDetector;
     if (!navigator.mediaDevices?.getUserMedia || !BD) {
@@ -831,21 +1010,40 @@ export class MobilePwaApp {
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+      if (token !== this.qrCancelToken || isPageHidden()) {
+        for (const t of stream.getTracks()) t.stop();
+        return;
+      }
       this.activeMediaStream = stream;
       const video = document.createElement("video");
       video.className = "qr-video";
+      video.muted = true;
+      video.setAttribute("muted", "true");
       video.setAttribute("playsinline", "true");
       video.srcObject = stream;
       await video.play();
-      host.appendChild(video);
+      if (token !== this.qrCancelToken || isPageHidden()) {
+        this.stopCamera();
+        return;
+      }
+      const stopBtn = document.createElement("button");
+      stopBtn.type = "button";
+      stopBtn.className = "btn btn-sm";
+      stopBtn.textContent = "Stop Camera";
+      stopBtn.addEventListener("click", () => {
+        this.stopCamera();
+        host.innerHTML = "";
+      });
+      host.append(video, stopBtn);
       const detector = new BD({ formats: ["qr_code"] });
       const tick = async () => {
-        if (!this.activeMediaStream) return;
+        if (token !== this.qrCancelToken || !this.activeMediaStream) return;
         try {
           const hits = await detector.detect(video);
           const found = hits.find((h) => h.rawValue.startsWith("mynote-pair:v1:"));
           if (found) {
             this.stopCamera();
+            host.innerHTML = "";
             targetInput.value = found.rawValue;
             await this.handlePairSubmit(found.rawValue, false);
             return;
@@ -853,10 +1051,11 @@ export class MobilePwaApp {
         } catch {
           // continue scanning
         }
-        if (this.activeMediaStream) window.setTimeout(() => void tick(), 250);
+        if (token === this.qrCancelToken && this.activeMediaStream) window.setTimeout(() => void tick(), 250);
       };
       void tick();
     } catch {
+      this.stopCamera();
       const msg = document.createElement("p");
       msg.className = "muted";
       msg.textContent = "Camera permission denied — paste the pairing code directly above.";
@@ -869,11 +1068,17 @@ export class MobilePwaApp {
     card.className = `ro-block${blk.is_locked ? " locked" : ""}`;
     card.dataset.blockId = blk.id;
 
+    const vaultOpen = this.isVaultUnlocked();
     const selectedOpId = this.selectedVersionByBlock.get(blk.id) ?? blk.display_op_id ?? blk.versions[0]?.op_id;
     const selectedLeaf = blk.versions.find((v) => v.op_id === selectedOpId) ?? blk.versions[0];
-    const ramPlain = selectedLeaf ? (this.unlockedPlaintext.get(blk.id)?.get(selectedLeaf.op_id) ?? null) : null;
-    const effectiveText = selectedLeaf ? (selectedLeaf.content ?? ramPlain) : null;
-    const isUnlockedTier2 = blk.is_locked && effectiveText !== null;
+    // H17: When a block is locked and Vault is locked, NEVER expose ANY version (including concurrent Tier 1 leaves)!
+    const ramPlain =
+      selectedLeaf && (!blk.is_locked || vaultOpen)
+        ? (this.unlockedPlaintext.get(blk.id)?.get(selectedLeaf.op_id) ?? null)
+        : null;
+    const effectiveText =
+      blk.is_locked && !vaultOpen ? null : selectedLeaf ? (selectedLeaf.content ?? ramPlain) : null;
+    const isUnlockedTier2 = blk.is_locked && vaultOpen && effectiveText !== null;
 
     const head = document.createElement("div");
     head.className = "ro-block-head";
@@ -907,7 +1112,7 @@ export class MobilePwaApp {
     }
     card.appendChild(head);
 
-    if (blk.versions.length > 1) {
+    if (blk.versions.length > 1 && (!blk.is_locked || vaultOpen)) {
       const vbar = document.createElement("div");
       vbar.className = "version-bar";
       const lbl = document.createElement("span");
@@ -927,7 +1132,7 @@ export class MobilePwaApp {
       card.appendChild(vbar);
     }
 
-    if (blk.is_locked && effectiveText === null) {
+    if (blk.is_locked && !vaultOpen) {
       const locked = document.createElement("div");
       locked.className = "ro-locked-body";
       const txt = document.createElement("span");
@@ -966,23 +1171,11 @@ export class MobilePwaApp {
       const sep = document.createTextNode(" · ");
       const unpair = document.createElement("button");
       unpair.type = "button";
-      unpair.className = "btn btn-sm btn-danger";
-      unpair.style.marginLeft = "6px";
+      unpair.className = "btn btn-sm btn-danger pwa-unpair-btn";
       unpair.textContent = "Unpair";
       unpair.addEventListener("click", () => {
+        this.resetLocalStateSync();
         void clearAllPwaStorage().then(() => {
-          this.disconnectWs?.();
-          this.disconnectWs = null;
-          this.lockVaultNow(true);
-          if (this.engine) {
-            this.engine.zeroizeSmk();
-            this.engine.free();
-            this.engine = null;
-          }
-          this.creds = null;
-          this.stateJson = "{}";
-          this.buffers = [];
-          this.blocks = [];
           this.render();
           this.showToast("Unpaired and wiped local IndexedDB");
         });

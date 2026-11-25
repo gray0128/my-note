@@ -820,10 +820,7 @@ impl RelayClient {
             Err(err)
                 if matches!(
                     err.code(),
-                    ErrorCode::ShredStale
-                        | ErrorCode::KeyPendingShred
-                        | ErrorCode::KeyShredded
-                        | ErrorCode::KeyUnknown
+                    ErrorCode::ShredStale | ErrorCode::KeyPendingShred | ErrorCode::KeyShredded
                 ) =>
             {
                 Ok(PushOutcome::KeyRace { code: err.code() })
@@ -937,9 +934,9 @@ impl RelayClient {
                 self.http
                     .put(self.endpoint("/v1/snapshots/state"))
                     .header(CONTENT_TYPE, "application/octet-stream")
-                    .header("X-Mynote-Epoch", epoch)
-                    .header("X-Mynote-Covers-Seq", covers_seq.to_string())
-                    .header("X-Mynote-Snapshot-Id", snapshot_id)
+                    .header("X-Journal-Epoch", epoch)
+                    .header("X-Covers-Seq", covers_seq.to_string())
+                    .header("X-Snapshot-Id", snapshot_id)
                     .body(mnp1_bytes.to_vec()),
             )
             .send()
@@ -984,19 +981,19 @@ impl RelayClient {
         }
         let epoch = res
             .headers()
-            .get("X-Mynote-Epoch")
+            .get("X-Journal-Epoch")
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_string();
         let covers_seq = res
             .headers()
-            .get("X-Mynote-Covers-Seq")
+            .get("X-Covers-Seq")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
         let snapshot_id = res
             .headers()
-            .get("X-Mynote-Snapshot-Id")
+            .get("X-Snapshot-Id")
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_string();
@@ -1010,60 +1007,85 @@ impl RelayClient {
         Ok(Some((epoch, covers_seq, snapshot_id, bytes.to_vec())))
     }
 
-    /// Publish an encrypted `MNP1` mobile state snapshot if due (first bootstrap, >= 1000 ops, daily, or immediately after ExecuteShred).
+    /// Publish an encrypted `MNP1` mobile state snapshot if due (first bootstrap, >= 1000 ops, daily,
+    /// or immediately after ExecuteShred when `last_seq > last_snapshot_seq`).
+    /// Resets watermark whenever `journal_epoch` changes (H22).
     pub async fn maybe_publish_state_snapshot(
         &self,
         store: &mut LocalStore,
         force_after_shred: bool,
     ) -> Result<bool, CoreError> {
         let snap_info = {
-            if store.get_local_meta("bootstrap_completed").as_deref() != Some("1") {
+            if store.get_local_meta("bootstrap_completed").as_deref() != Some("1")
+                || store.get_local_meta("reconciling_epoch").is_some()
+            {
                 return Ok(false);
             }
+            let Some(cur_epoch) = store.get_local_meta("journal_epoch") else {
+                return Ok(false);
+            };
             let last_seq = store
                 .get_local_meta("last_seq")
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0);
-            if last_seq <= 0 && !force_after_shred {
+            if last_seq <= 0 {
                 return Ok(false);
             }
-            let last_snap_seq = store
-                .get_local_meta("last_snapshot_seq")
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(-1);
-            let last_snap_at = store
-                .get_local_meta("last_snapshot_at_ms")
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
+            let same_epoch =
+                store.get_local_meta("last_snapshot_epoch").as_deref() == Some(cur_epoch.as_str());
+            let last_snap_seq = if same_epoch {
+                store
+                    .get_local_meta("last_snapshot_seq")
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(-1)
+            } else {
+                -1
+            };
+            let last_snap_at = if same_epoch {
+                store
+                    .get_local_meta("last_snapshot_at_ms")
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if last_seq <= last_snap_seq {
+                return Ok(false);
+            }
             let now = now_ms() as i64;
             let due = force_after_shred
                 || last_snap_seq < 0
                 || last_seq.saturating_sub(last_snap_seq) >= 1000
-                || (now.saturating_sub(last_snap_at) >= 86_400_000 && last_seq > last_snap_seq);
+                || now.saturating_sub(last_snap_at) >= 86_400_000;
             if !due {
                 return Ok(false);
             }
             store.build_state_snapshot()?
         };
         let (hdr, bytes) = snap_info;
+        let epoch_s = hdr.journal_epoch.to_string();
         match self
-            .put_state_snapshot(
-                &hdr.journal_epoch.to_string(),
-                hdr.covers_seq,
-                &hdr.snapshot_id.to_string(),
-                &bytes,
-            )
+            .put_state_snapshot(&epoch_s, hdr.covers_seq, &hdr.snapshot_id.to_string(), &bytes)
             .await
         {
             Ok(_) => {
+                let _ = store.set_local_meta("last_snapshot_epoch", &epoch_s);
                 let _ = store.set_local_meta("last_snapshot_seq", &hdr.covers_seq.to_string());
                 let _ = store.set_local_meta("last_snapshot_at_ms", &(now_ms() as i64).to_string());
                 Ok(true)
             }
             Err(e) if e.code() == ErrorCode::CasMismatch => {
-                // Another desktop already uploaded a newer snapshot covering >= covers_seq
-                let _ = store.set_local_meta("last_snapshot_seq", &hdr.covers_seq.to_string());
-                let _ = store.set_local_meta("last_snapshot_at_ms", &(now_ms() as i64).to_string());
+                // Only advance watermark if CAS rejected covers_seq (not an epoch mismatch).
+                let is_epoch_mismatch = e
+                    .details()
+                    .and_then(|d| d.get("remote_epoch"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|re| re != epoch_s);
+                if !is_epoch_mismatch {
+                    let _ = store.set_local_meta("last_snapshot_epoch", &epoch_s);
+                    let _ = store.set_local_meta("last_snapshot_seq", &hdr.covers_seq.to_string());
+                    let _ = store.set_local_meta("last_snapshot_at_ms", &(now_ms() as i64).to_string());
+                }
                 Ok(false)
             }
             Err(e) => Err(e),
@@ -1119,21 +1141,63 @@ impl RelayClient {
         let mut marks = Vec::new();
         if let Some(arr) = val["shred_marks"].as_array() {
             for item in arr {
-                if let Ok(m) = parse_shred_mark_json(item) {
-                    marks.push(m);
-                }
+                marks.push(parse_shred_mark_json(item)?);
             }
         }
-        let keyring = val["key_material"]["keyring"].as_object().and_then(|o| {
-            let gen = o.get("gen")?.as_u64()? as u32;
-            let blob = b64.decode(o.get("blob_b64")?.as_str()?).ok()?;
-            Some((gen, blob))
-        });
-        let vault_header = val["key_material"]["vault_header"].as_object().and_then(|o| {
-            let gen = o.get("gen")?.as_i64()?;
-            let blob = b64.decode(o.get("blob_b64")?.as_str()?).ok()?;
-            Some((gen, blob))
-        });
+        let keyring = match val["key_material"]["keyring"].as_object() {
+            Some(o) => {
+                let gen = o.get("gen").and_then(|v| v.as_u64()).ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::IntegrityError,
+                        "remote keyring missing valid 'gen'",
+                        "Check relay key_material",
+                    )
+                })? as u32;
+                let blob_s = o.get("blob_b64").and_then(|v| v.as_str()).ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::IntegrityError,
+                        "remote keyring missing 'blob_b64'",
+                        "Check relay key_material",
+                    )
+                })?;
+                let blob = b64.decode(blob_s).map_err(|e| {
+                    CoreError::new(
+                        ErrorCode::IntegrityError,
+                        format!("bad keyring blob_b64: {e}"),
+                        "Check relay key_material",
+                    )
+                })?;
+                Some((gen, blob))
+            }
+            None => None,
+        };
+        let vault_header = match val["key_material"]["vault_header"].as_object() {
+            Some(o) => {
+                let gen = o.get("gen").and_then(|v| v.as_i64()).ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::IntegrityError,
+                        "remote vault_header missing valid 'gen'",
+                        "Check relay key_material",
+                    )
+                })?;
+                let blob_s = o.get("blob_b64").and_then(|v| v.as_str()).ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::IntegrityError,
+                        "remote vault_header missing 'blob_b64'",
+                        "Check relay key_material",
+                    )
+                })?;
+                let blob = b64.decode(blob_s).map_err(|e| {
+                    CoreError::new(
+                        ErrorCode::IntegrityError,
+                        format!("bad vault_header blob_b64: {e}"),
+                        "Check relay key_material",
+                    )
+                })?;
+                Some((gen, blob))
+            }
+            None => None,
+        };
         Ok((records, marks, keyring, vault_header))
     }
 
@@ -1265,6 +1329,7 @@ impl RelayClient {
             report.pushed_ops,
             report.keys_synced,
             shred_acks,
+            report.apply_summary.rekeyed_tier1_ops,
         );
 
         while !queue.is_empty() && steps < MAX_SYNC_STEPS {
@@ -1297,12 +1362,25 @@ impl RelayClient {
                     }) {
                         report.reconciled_epoch_change = true;
                     }
-                    merge_summary(&mut report.apply_summary, store.apply_store_mutations(&muts)?);
+                    let applied = store.apply_store_mutations(&muts)?;
+                    let rekeyed_now = applied.rekeyed_tier1_ops;
+                    merge_summary(&mut report.apply_summary, applied);
                     for c in next_cmds {
                         if matches!(c, SyncCommand::SyncKeyTable(_)) {
                             queue.insert(0, c);
                         } else {
                             queue.push(c);
+                        }
+                    }
+                    if rekeyed_now > 0
+                        && !read_only
+                        && !queue.iter().any(|c| matches!(c, SyncCommand::HttpPush(_)))
+                    {
+                        let post_snap = store.export_engine_snapshot()?;
+                        if post_snap.bootstrap_completed && post_snap.reconciling_epoch.is_none() {
+                            if let Some(req) = post_snap.build_pending_push() {
+                                queue.push(SyncCommand::HttpPush(req));
+                            }
                         }
                     }
                 }
@@ -1321,8 +1399,21 @@ impl RelayClient {
                             server_now_ms: now_ms() as i64,
                         },
                     )?;
-                    merge_summary(&mut report.apply_summary, store.apply_store_mutations(&muts)?);
+                    let applied = store.apply_store_mutations(&muts)?;
+                    let rekeyed_now = applied.rekeyed_tier1_ops;
+                    merge_summary(&mut report.apply_summary, applied);
                     queue.extend(next_cmds);
+                    if rekeyed_now > 0
+                        && !read_only
+                        && !queue.iter().any(|c| matches!(c, SyncCommand::HttpPush(_)))
+                    {
+                        let post_snap = store.export_engine_snapshot()?;
+                        if post_snap.bootstrap_completed && post_snap.reconciling_epoch.is_none() {
+                            if let Some(req) = post_snap.build_pending_push() {
+                                queue.push(SyncCommand::HttpPush(req));
+                            }
+                        }
+                    }
                 }
                 SyncCommand::HttpPush(push_req) => {
                     if read_only {
@@ -1383,6 +1474,7 @@ impl RelayClient {
                 report.pushed_ops,
                 report.keys_synced,
                 shred_acks,
+                report.apply_summary.rekeyed_tier1_ops,
             );
             if cur_progress == prev_progress {
                 stalled_steps += 1;
@@ -1407,21 +1499,27 @@ impl RelayClient {
             ));
         }
 
-        // One-time M1 -> M2 trash migration (`sync-protocol.md` §5.9): submit pre-existing trashed blocks with `migration_exempt: true`
+        // One-time M1 -> M2 trash migration (`sync-protocol.md` §5.9): submit pre-existing trashed items
+        // with `migration_exempt: true` and persist `m2_trash_migrated = 1` ONLY after HTTP success!
         if !read_only && store.get_local_meta("bootstrap_completed").as_deref() == Some("1") {
-            if let Ok(mig_marks) = store.migrate_m1_trashed_blocks_if_needed() {
-                if !mig_marks.is_empty() {
-                    let seen_seq = store
-                        .get_local_meta("last_seq")
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .unwrap_or(0);
-                    if let Ok(results) = self.post_keys_shred(seen_seq, false, true, &mig_marks).await {
-                        let _ = store.apply_store_mutations(&[
-                            mynote_core::sync::StoreMutation::MarkShredMarksAcked {
-                                results,
-                                cancelled_keys: Vec::new(),
-                            },
-                        ]);
+            if let Ok((self_check_ok, mig_marks)) = store.collect_m1_trashed_migration_marks() {
+                if self_check_ok {
+                    if mig_marks.is_empty() {
+                        let _ = store.mark_m1_trash_migrated();
+                    } else {
+                        let seen_seq = store
+                            .get_local_meta("last_seq")
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        if let Ok(results) = self.post_keys_shred(seen_seq, false, true, &mig_marks).await {
+                            let _ = store.apply_store_mutations(&[
+                                mynote_core::sync::StoreMutation::MarkShredMarksAcked {
+                                    results,
+                                    cancelled_keys: Vec::new(),
+                                },
+                            ]);
+                            let _ = store.mark_m1_trash_migrated();
+                        }
                     }
                 }
             }
@@ -1447,6 +1545,8 @@ fn merge_summary(dst: &mut SyncApplySummary, src: SyncApplySummary) {
     dst.executed_shreds.extend(src.executed_shreds);
     dst.needs_vault_rekey.extend(src.needs_vault_rekey);
     dst.pending_confirm_count += src.pending_confirm_count;
+    dst.vault_header_changed |= src.vault_header_changed;
+    dst.rekeyed_tier1_ops += src.rekeyed_tier1_ops;
 }
 
 /// Long-running WebSocket Hibernation wakeup listener (`GET /v1/sync/ws`).

@@ -228,9 +228,29 @@ impl EngineSnapshot {
                     };
                 }
                 if tier == 2 {
-                    return LeafBody::Sealed {
-                        key_id: kid,
-                        mnb1: mnb1.to_vec(),
+                    if !self.keys.is_key_available(&kid) {
+                        return LeafBody::KeyUnavailable {
+                            key_id: kid,
+                            shredded: false,
+                        };
+                    }
+                    return match self.unwrap_key_record(kid) {
+                        Some(krec) if krec.tier == 2 => LeafBody::Sealed {
+                            key_id: kid,
+                            mnb1: mnb1.to_vec(),
+                        },
+                        Some(_) => LeafBody::DecryptFailed {
+                            error_code: ErrorCode::IntegrityError.as_str().to_string(),
+                        },
+                        None => LeafBody::KeyUnavailable {
+                            key_id: kid,
+                            shredded: false,
+                        },
+                    };
+                }
+                if tier != 1 {
+                    return LeafBody::DecryptFailed {
+                        error_code: ErrorCode::IntegrityError.as_str().to_string(),
                     };
                 }
                 match self.unwrap_key_record(kid) {
@@ -368,16 +388,24 @@ impl EngineSnapshot {
     }
 
     /// Returns true if the remote-confirmed (`server_seq.is_some()`) projection of `(entity_type, entity_id)`
-    /// is `Trashed`. Used to distinguish Delete-intent shred marks from Rekey-intent shred marks (`§5.7`).
-    pub fn is_remote_entity_trashed(&self, entity_type: EntityType, entity_id: &str) -> bool {
+    /// is `Trashed` AND `kid` was directly superseded by a remote `DELETE` leaf (not replaced earlier by
+    /// `LOCK` / `purge_history` prior to deletion, per `docs/sync-protocol.md` §5.7).
+    pub fn is_remote_key_trashed_by_delete(
+        &self,
+        entity_type: EntityType,
+        entity_id: &str,
+        kid: KeyId,
+    ) -> bool {
         let mut decoded = Vec::new();
         let mut referenced_keys = BTreeSet::new();
+        let mut op_keys: BTreeMap<OpId, Option<KeyId>> = BTreeMap::new();
         for rec in self.ops.values() {
             if rec.server_seq.is_none() || rec.entity_type != entity_type || rec.entity_id != entity_id {
                 continue;
             }
-            if let Some(kid) = rec.key_id {
-                referenced_keys.insert(kid);
+            op_keys.insert(rec.op_id, rec.key_id);
+            if let Some(k) = rec.key_id {
+                referenced_keys.insert(k);
             }
             let Some(smk) = self.smks.get(&rec.smk_kid) else {
                 continue;
@@ -402,20 +430,20 @@ impl EngineSnapshot {
             return false;
         }
         let has_unshredded = referenced_keys.iter().any(|k| !self.keys.is_shredded(k));
-        match entity_type {
+        let is_trashed = match entity_type {
             EntityType::Block => {
                 let Ok(bid) = BlockId::parse(entity_id) else {
                     return false;
                 };
-                materialize_block(bid, &decoded, has_unshredded, |_, kid, tier, mnb1| {
-                    if self.keys.is_shredded(&kid) {
+                materialize_block(bid, &decoded, has_unshredded, |_, k, tier, mnb1| {
+                    if self.keys.is_shredded(&k) {
                         LeafBody::KeyUnavailable {
-                            key_id: kid,
+                            key_id: k,
                             shredded: true,
                         }
                     } else if tier == 2 {
                         LeafBody::Sealed {
-                            key_id: kid,
+                            key_id: k,
                             mnb1: mnb1.to_vec(),
                         }
                     } else {
@@ -428,12 +456,50 @@ impl EngineSnapshot {
                 let Ok(bid) = BufferId::parse(entity_id) else {
                     return false;
                 };
-                materialize_buffer(bid, &decoded, has_unshredded, |_, kid, _| {
-                    (!self.keys.is_shredded(&kid)).then(String::new)
+                materialize_buffer(bid, &decoded, has_unshredded, |_, k, _| {
+                    (!self.keys.is_shredded(&k)).then(String::new)
                 })
                 .is_some_and(|m| m.state == crate::model::BlockState::Trashed)
             }
+        };
+        if !is_trashed {
+            return false;
         }
+        // Only treat `kid` as delete-intent if it was live on a direct parent of a remote DELETE op.
+        let mut referenced_parents: BTreeSet<OpId> = BTreeSet::new();
+        for op in &decoded {
+            if op.inner.op_type.is_dag_op() {
+                for p in &op.inner.parent_op_ids {
+                    referenced_parents.insert(*p);
+                }
+            }
+        }
+        let mut saw_tombstone_with_parents = false;
+        for op in &decoded {
+            if !referenced_parents.contains(&op.op_id)
+                && matches!(op.inner.body, crate::model::OpBodyV1::Tombstone { .. })
+            {
+                if !op.inner.parent_op_ids.is_empty() {
+                    saw_tombstone_with_parents = true;
+                }
+                for parent_id in &op.inner.parent_op_ids {
+                    if op_keys.get(parent_id).copied().flatten() == Some(kid) {
+                        return true;
+                    }
+                }
+            }
+        }
+        !saw_tombstone_with_parents
+    }
+
+    /// Returns true if the remote-confirmed (`server_seq.is_some()`) projection of `(entity_type, entity_id)`
+    /// is `Trashed`.
+    pub fn is_remote_entity_trashed(&self, entity_type: EntityType, entity_id: &str) -> bool {
+        self.ops
+            .values()
+            .find(|r| r.server_seq.is_some() && r.entity_type == entity_type && r.entity_id == entity_id)
+            .and_then(|r| r.key_id)
+            .is_some_and(|k| self.is_remote_key_trashed_by_delete(entity_type, entity_id, k))
     }
 
     /// Classify an unpushed local op against current key table & remote entity state (`§5.7`).
@@ -446,7 +512,7 @@ impl EngineSnapshot {
         }
         if self.keys.has_pending_or_scheduled_mark(&kid) {
             if self.pending_cancel_key_ids.contains(&kid)
-                || self.is_remote_entity_trashed(op.entity_type, &op.entity_id)
+                || self.is_remote_key_trashed_by_delete(op.entity_type, &op.entity_id, kid)
             {
                 return OutboxKeyAction::CancelAndPush;
             }
@@ -455,11 +521,41 @@ impl EngineSnapshot {
         OutboxKeyAction::PushNormal
     }
 
+    /// Collect keys currently referenced by live leaves of any `ACTIVE` block or `ACTIVE` buffer.
+    fn active_live_keys(&self) -> BTreeSet<KeyId> {
+        let mut live = BTreeSet::new();
+        for buf in self.all_buffers() {
+            if buf.state == crate::model::BlockState::Active {
+                live.insert(buf.key_id);
+            }
+        }
+        for blk in self.all_blocks() {
+            if blk.state != crate::model::BlockState::Active {
+                continue;
+            }
+            for leaf in &blk.leaves {
+                if !leaf.is_live() {
+                    continue;
+                }
+                if let Some(op) = self.ops.get(&leaf.op_id) {
+                    if let Some(kid) = op.key_id {
+                        live.insert(kid);
+                    }
+                }
+            }
+        }
+        live
+    }
+
     /// Build next push batch if bootstrapped and not mid-reconciliation.
     ///
     /// Enforces DO atomic order (`key_records -> cancel_key_ids -> ops -> shred_marks`) and
-    /// guarantees a `pending_shred_mark` is never attached before all unpushed ops for that `key_id`
-    /// have been included or synced.
+    /// guarantees (`INV-KEY-LIVENESS` #3):
+    /// 1. `pending_shred_marks` are NEVER attached while any pending ops are deferred to a later batch
+    ///    (otherwise a deferred `DELETE` (`key_id: None`) or `LOCK`/`UNLOCK` (`key_id: K_new`) could
+    ///    allow `K_old`'s shred mark to land on DO before the superseding op!).
+    /// 2. `pending_shred_marks` are NEVER attached for a key still referenced by a live leaf of any
+    ///    `ACTIVE` block or `ACTIVE` buffer (Update-Wins defense-in-depth).
     pub fn build_pending_push(&self) -> Option<PushRequestDto> {
         if !self.bootstrap_completed || self.reconciling_epoch.is_some() {
             return None;
@@ -526,29 +622,40 @@ impl EngineSnapshot {
             });
         }
 
-        // Keys still referenced by unpushed ops NOT included in this batch
-        let mut deferred_op_keys = BTreeSet::new();
-        for o in &pending {
-            if !included_op_ids.contains(&o.op_id) {
-                if let Some(kid) = o.key_id {
-                    deferred_op_keys.insert(kid);
+        // Only attach shred marks once ALL non-blocked pending ops fit in this batch (C6).
+        // Also exclude any key still referenced by an unpushed blocked/rekey op or an ACTIVE live leaf (C7).
+        let mut shred_marks = Vec::new();
+        if included_op_ids.len() == pending.len() && !self.pending_shred_marks.is_empty() {
+            let mut blocked_entities: BTreeSet<(EntityType, &str)> = BTreeSet::new();
+            let mut blocked_keys: BTreeSet<KeyId> = BTreeSet::new();
+            for o in self.ops.values() {
+                if o.server_seq.is_none() && !included_op_ids.contains(&o.op_id) {
+                    blocked_entities.insert((o.entity_type, o.entity_id.as_str()));
+                    if let Some(kid) = o.key_id {
+                        blocked_keys.insert(kid);
+                    }
                 }
             }
-        }
-
-        // Attach pending shred marks whose key_id is known, not shredded, not being cancelled,
-        // and has no deferred unpushed ops waiting for a later batch.
-        let mut shred_marks = Vec::new();
-        for m in &self.pending_shred_marks {
-            if self.keys.is_shredded(&m.key_id)
-                || cancel_set.contains(&m.key_id)
-                || deferred_op_keys.contains(&m.key_id)
-            {
-                continue;
-            }
-            if self.keys.records.contains_key(&m.key_id) {
-                needed_keys.insert(m.key_id);
-                shred_marks.push(m.clone());
+            let active_live = self.active_live_keys();
+            for m in &self.pending_shred_marks {
+                if self.keys.is_shredded(&m.key_id)
+                    || cancel_set.contains(&m.key_id)
+                    || blocked_keys.contains(&m.key_id)
+                    || active_live.contains(&m.key_id)
+                {
+                    continue;
+                }
+                let belongs_to_blocked_entity = self.ops.values().any(|o| {
+                    o.key_id == Some(m.key_id)
+                        && blocked_entities.contains(&(o.entity_type, o.entity_id.as_str()))
+                });
+                if belongs_to_blocked_entity {
+                    continue;
+                }
+                if self.keys.records.contains_key(&m.key_id) {
+                    needed_keys.insert(m.key_id);
+                    shred_marks.push(m.clone());
+                }
             }
         }
 
@@ -610,7 +717,9 @@ impl EngineSnapshot {
                         self.pending_shred_marks.retain(|pm| {
                             if pm.key_id == res.key_id {
                                 let mut updated = pm.clone();
-                                updated.state = res.state;
+                                if res.state >= updated.state {
+                                    updated.state = res.state;
+                                }
                                 updated.not_before_ms = res.not_before_ms;
                                 acked_marks.push(updated);
                                 false
@@ -621,6 +730,12 @@ impl EngineSnapshot {
                         for am in acked_marks {
                             self.keys.insert_mark(am);
                         }
+                        if res.state == ShredMarkState::Executed {
+                            self.keys.executed_tombstones.insert(res.key_id);
+                            if let Some(rec) = self.keys.records.get_mut(&res.key_id) {
+                                rec.key_record = None;
+                            }
+                        }
                         for existing in self.keys.marks.values_mut() {
                             if existing.key_id == res.key_id
                                 && matches!(
@@ -628,7 +743,9 @@ impl EngineSnapshot {
                                     ShredMarkState::PendingConfirm | ShredMarkState::Scheduled
                                 )
                             {
-                                existing.state = res.state;
+                                if res.state >= existing.state {
+                                    existing.state = res.state;
+                                }
                                 if res.not_before_ms.is_some() {
                                     existing.not_before_ms = match (existing.not_before_ms, res.not_before_ms)
                                     {
@@ -733,7 +850,7 @@ pub enum SyncEvent {
         remote_epoch: JournalEpoch,
     },
     /// Server rejected a push batch due to key/shred concurrency (`SHRED_STALE`, `KEY_PENDING_SHRED`,
-    /// `KEY_SHREDDED`, `KEY_UNKNOWN`): pull latest ops and key table to reconcile and retry.
+    /// `KEY_SHREDDED`): pull latest ops first, then reconcile key table and retry.
     PushKeyRaceError {
         code: ErrorCode,
         key_id: Option<KeyId>,
@@ -807,26 +924,22 @@ pub fn step(
 
     match event {
         SyncEvent::StartSync => {
-            if !state.bootstrap_completed {
-                commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
-                commands.push(SyncCommand::HttpPull {
-                    since_seq: 0,
-                    limit: DEFAULT_PULL_LIMIT,
-                });
-            } else {
-                // Always pull before pushing so `seen_seq` & `keys_digest` are fresh for M2 shred marks!
-                commands.push(SyncCommand::HttpPull {
-                    since_seq: state.last_seq,
-                    limit: DEFAULT_PULL_LIMIT,
-                });
-            }
+            // Always pull ops BEFORE syncing the key table so remote DELETE/LOCK ops land
+            // prior to evaluating `ExecuteShred` and `classify_unpushed_op` (C3, C11).
+            commands.push(SyncCommand::HttpPull {
+                since_seq: if state.bootstrap_completed {
+                    state.last_seq
+                } else {
+                    0
+                },
+                limit: DEFAULT_PULL_LIMIT,
+            });
         }
 
         SyncEvent::WsWake { epoch, head_seq } => {
             let epoch_changed = state.journal_epoch.is_some_and(|e| e != epoch);
             if epoch_changed || head_seq < state.last_seq {
                 mutations.push(StoreMutation::ClearServerSeqsForReconcile { new_epoch: epoch });
-                commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
                 commands.push(SyncCommand::HttpPull {
                     since_seq: 0,
                     limit: DEFAULT_PULL_LIMIT,
@@ -843,7 +956,6 @@ pub fn step(
             mutations.push(StoreMutation::ClearServerSeqsForReconcile {
                 new_epoch: remote_epoch,
             });
-            commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
             commands.push(SyncCommand::HttpPull {
                 since_seq: 0,
                 limit: DEFAULT_PULL_LIMIT,
@@ -851,7 +963,8 @@ pub fn step(
         }
 
         SyncEvent::PushKeyRaceError { .. } => {
-            commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
+            // Pull remote ops FIRST so remote DELETE/LOCK/UPDATE ops settle before `PullResponse`
+            // triggers `SyncKeyTable` on `keys_digest` diff (C11, §5.7).
             commands.push(SyncCommand::HttpPull {
                 since_seq: state.last_seq,
                 limit: DEFAULT_PULL_LIMIT,
@@ -872,7 +985,6 @@ pub fn step(
             let is_seq_rollback = state.reconciling_epoch.is_none() && head_seq < state.last_seq;
             if is_epoch_mismatch || is_seq_rollback {
                 mutations.push(StoreMutation::ClearServerSeqsForReconcile { new_epoch: epoch });
-                commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
                 commands.push(SyncCommand::HttpPull {
                     since_seq: 0,
                     limit: DEFAULT_PULL_LIMIT,
@@ -960,7 +1072,7 @@ pub fn step(
                     limit: DEFAULT_PULL_LIMIT,
                 });
             } else if !keys_match {
-                // Sync key table FIRST so shred marks & new keys settle before deciding push/cancel/rekey!
+                // Sync key table AFTER remote ops landed so shred marks & new keys settle cleanly!
                 commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
             } else {
                 // Apply our own mutations on a scratch clone to compute exact pending ops to push
@@ -981,7 +1093,6 @@ pub fn step(
         } => {
             if state.journal_epoch.is_some_and(|e| e != epoch) {
                 mutations.push(StoreMutation::ClearServerSeqsForReconcile { new_epoch: epoch });
-                commands.push(SyncCommand::SyncKeyTable(build_key_sync_dto(state)));
                 commands.push(SyncCommand::HttpPull {
                     since_seq: 0,
                     limit: DEFAULT_PULL_LIMIT,
@@ -991,21 +1102,29 @@ pub fn step(
             if !acked.is_empty() {
                 mutations.push(StoreMutation::MarkOpsSynced { epoch, acked });
             }
+            let executed_shred_keys: BTreeSet<KeyId> = shred_results
+                .iter()
+                .filter(|r| r.state == ShredMarkState::Executed && !state.keys.is_shredded(&r.key_id))
+                .map(|r| r.key_id)
+                .collect();
             if !shred_results.is_empty() || !cancelled_keys.is_empty() {
                 mutations.push(StoreMutation::MarkShredMarksAcked {
                     results: shred_results,
                     cancelled_keys,
                 });
             }
+            for key_id in executed_shred_keys {
+                mutations.push(StoreMutation::ExecuteShred { key_id });
+            }
             let mut next_state = state.clone();
             next_state.apply_mutations(&mutations);
             if head_seq > next_state.last_seq {
+                // Pull first to advance `last_seq` before sending Batch 2 so `seen_seq` is fresh (M1).
                 commands.push(SyncCommand::HttpPull {
                     since_seq: next_state.last_seq,
                     limit: DEFAULT_PULL_LIMIT,
                 });
-            }
-            if let Some(push) = next_state.build_pending_push() {
+            } else if let Some(push) = next_state.build_pending_push() {
                 commands.push(SyncCommand::HttpPush(push));
             }
         }
@@ -1020,17 +1139,21 @@ pub fn step(
             // HARD INVARIANT (`sync-protocol.md` §5.2):
             // ONLY server-reported `key_record == None` or `mark.state == Executed` triggers
             // local `ExecuteShred` — client local clock NEVER decides expiration.
+            let mut exec_shreds = BTreeSet::new();
             for rec in records {
                 if rec.key_record.is_none() && !state.keys.is_shredded(&rec.key_id) {
-                    mutations.push(StoreMutation::ExecuteShred { key_id: rec.key_id });
+                    exec_shreds.insert(rec.key_id);
                 }
                 mutations.push(StoreMutation::UpsertBlockKey(rec));
             }
             for mark in marks {
                 if mark.state == ShredMarkState::Executed && !state.keys.is_shredded(&mark.key_id) {
-                    mutations.push(StoreMutation::ExecuteShred { key_id: mark.key_id });
+                    exec_shreds.insert(mark.key_id);
                 }
                 mutations.push(StoreMutation::UpsertShredMark(mark));
+            }
+            for key_id in exec_shreds {
+                mutations.push(StoreMutation::ExecuteShred { key_id });
             }
             if let Some((gen, blob)) = keyring {
                 if state.keys.keyring_material.as_ref().is_none_or(|(g, _)| gen > *g) {

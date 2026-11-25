@@ -5,7 +5,7 @@ const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ", LOWER_B32 = "0123456789abc
 const CROCKFORD_MAP = new Int8Array(128).fill(-1);
 for (let i = 0; i < 32; i++) CROCKFORD_MAP[CROCKFORD.charCodeAt(i)] = i;
 
-export const b64ToBytes = (b64: string): Uint8Array => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+export const b64ToBytes = (b64: unknown): Uint8Array => { if (typeof b64 !== "string") throw new TypeError("base64 payload must be a string"); return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)); };
 export const bytesToB64 = (b: Uint8Array): string => { let s = ""; for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]); return btoa(s); };
 export const toU8 = (v: unknown): Uint8Array => (v instanceof Uint8Array ? v : new Uint8Array(v as ArrayBuffer));
 export const hexEncode = (b: Uint8Array): string => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
@@ -19,12 +19,7 @@ export function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   return d === 0;
 }
 
-export function timingSafeEqualStr(a: string, b: string): boolean {
-  const ab = TE.encode(a), bb = TE.encode(b);
-  let d = ab.length ^ bb.length;
-  for (let i = 0; i < Math.max(ab.length, bb.length); i++) d |= (ab[i] ?? 0) ^ (bb[i] ?? 0);
-  return d === 0;
-}
+export const timingSafeEqualStr = (a: string, b: string): boolean => bytesEqual(blake3(TE.encode(a)), blake3(TE.encode(b)));
 
 export function randomDeviceId(): string {
   let val = 0n;

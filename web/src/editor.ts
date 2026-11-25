@@ -71,6 +71,7 @@ export class BlockStreamController {
   private saveTimers = new Map<string, number>();
   private unlockedPlaintext = new Map<string, string>();
   private unlockedLeafPlaintext = new Map<string, Map<string, string>>();
+  private vaultLockEpoch = 0;
   private activeBlockId: string | null = null;
   private bufferAllSelected = false;
   private vimMode = false;
@@ -123,6 +124,10 @@ export class BlockStreamController {
     return block.content;
   }
 
+  getVaultLockEpoch(): number {
+    return this.vaultLockEpoch;
+  }
+
   setUnlockedPlaintext(blockId: string, content: string, leafMap?: Map<string, string>): void {
     this.unlockedPlaintext.set(blockId, content);
     if (leafMap) {
@@ -131,8 +136,23 @@ export class BlockStreamController {
     this.syncDomAndEditors();
   }
 
+  setUnlockedLeafPlaintext(blockId: string, opId: string, content: string): void {
+    let map = this.unlockedLeafPlaintext.get(blockId);
+    if (!map) {
+      map = new Map<string, string>();
+      this.unlockedLeafPlaintext.set(blockId, map);
+    }
+    map.set(opId, content);
+    const blk = this.blocks.find((b) => b.id === blockId);
+    const card = this.cards.get(blockId);
+    if (blk && card) {
+      this.renderConflictSection(card, blk);
+    }
+  }
+
   /** Immediately wipe all transient Tier 2 plaintext from RAM, destroy Tier 2 CM6 views, and restore locked cards (`SEC-03`). */
   clearUnlockedVaultPlaintext(): void {
+    this.vaultLockEpoch++;
     const lockedIds = new Set(this.blocks.filter((b) => b.is_locked).map((b) => b.id));
     for (const id of [...this.unlockedPlaintext.keys(), ...lockedIds]) {
       this.clearTimer(id);
@@ -343,6 +363,7 @@ export class BlockStreamController {
     }
 
     const draft = this.getBlockDraftContent(id);
+    const lockEpochAtStart = this.vaultLockEpoch;
     // Use ORIGINAL baseHeads captured when editing began (so concurrent remote updates trigger HEAD_MISMATCH
     // rather than silently overwriting!). Explicit merge intentionally passes all current remote head_op_ids.
     const expectedHeads = isMerge ? [...blk.head_op_ids] : [...(entry?.baseHeads ?? blk.head_op_ids)];
@@ -355,7 +376,16 @@ export class BlockStreamController {
           isMerge,
           keepalive: opts.keepalive,
         });
+        const lockedDuringSave =
+          blk.is_locked && (lockEpochAtStart !== this.vaultLockEpoch || !this.unlockedPlaintext.has(id));
         if (res.status === "ok") {
+          if (lockedDuringSave) {
+            // C4: Vault was locked & CM6 view destroyed while PATCH was in flight; NEVER read getBlockDraftContent() -> ""!
+            this.dirty.delete(id);
+            this.pendingResave.delete(id);
+            this.upsertBlocks([res.updated], [], res.updated.buffer_id);
+            return;
+          }
           const currentDraft = this.getBlockDraftContent(id);
           if (currentDraft === draft) {
             this.dirty.delete(id);
@@ -375,8 +405,13 @@ export class BlockStreamController {
           }
           this.upsertBlocks([res.updated], [], res.updated.buffer_id);
         } else if (res.status === "head_mismatch") {
-          // Keep the user's draft intact in the editor, halt auto-save, and offer explicit Merge or Reload!
           this.clearTimer(id);
+          if (lockedDuringSave) {
+            this.dirty.delete(id);
+            this.pendingResave.delete(id);
+            return;
+          }
+          // Keep the user's draft intact in the editor, halt auto-save, and offer explicit Merge or Reload!
           this.dirty.set(id, {
             text: this.getBlockDraftContent(id),
             baseHeads: expectedHeads,
@@ -385,7 +420,12 @@ export class BlockStreamController {
           this.updateDirtyBadge(id, true, "● conflict (unsaved draft)");
           this.renderMismatchNotice(id, true);
         } else {
-          this.updateDirtyBadge(id, true, "● save failed");
+          if (lockedDuringSave) {
+            this.dirty.delete(id);
+            this.pendingResave.delete(id);
+          } else {
+            this.updateDirtyBadge(id, true, "● save failed");
+          }
         }
       } finally {
         this.saving.delete(id);
@@ -393,7 +433,10 @@ export class BlockStreamController {
         const next = this.pendingResave.get(id);
         if (next) {
           this.pendingResave.delete(id);
-          void this.flushDirtyBlock(id, next);
+          const cur = this.blocks.find((x) => x.id === id);
+          if (cur && this.isEditable(cur) && (!cur.is_locked || lockEpochAtStart === this.vaultLockEpoch)) {
+            void this.flushDirtyBlock(id, next);
+          }
         }
       }
     })();
@@ -420,25 +463,30 @@ export class BlockStreamController {
   async replaceAllAcrossBlocks(query: string, replacement: string): Promise<number> {
     if (!query) return 0;
     let total = 0;
-    for (const b of this.blocks) {
-      if (!this.isEditable(b) || b.has_conflict) continue;
-      const text = this.getBlockDraftContent(b.id);
+    const lockEpochAtStart = this.vaultLockEpoch;
+    for (const b of [...this.blocks]) {
+      const cur = this.blocks.find((x) => x.id === b.id);
+      if (!cur || !this.isEditable(cur) || cur.has_conflict) continue;
+      if (cur.is_locked && lockEpochAtStart !== this.vaultLockEpoch) continue;
+      const text = this.getBlockDraftContent(cur.id);
       const parts = text.split(query);
       if (parts.length <= 1) continue;
       total += parts.length - 1;
       const next = parts.join(replacement);
-      const expectedHeads = this.getExpectedHeadsForBlock(b.id);
-      this.clearTimer(b.id);
-      const m = this.mounted.get(b.id);
+      const expectedHeads = this.getExpectedHeadsForBlock(cur.id);
+      this.clearTimer(cur.id);
+      const m = this.mounted.get(cur.id);
       if (m) {
         m.view.dispatch({
           changes: { from: 0, to: m.view.state.doc.length, insert: next },
           annotations: REMOTE_SYNC_ANN.of(true),
         });
       }
-      const res = await this.cb.onSaveContent(b, next, expectedHeads, { fastSync: true, isMerge: false });
+      const res = await this.cb.onSaveContent(cur, next, expectedHeads, { fastSync: true, isMerge: false });
       if (res.status === "ok") {
-        this.applyAuthoritativeBlock(res.updated, b.buffer_id, b.is_locked ? next : undefined);
+        // H18: Never re-insert plaintext into RAM if Vault was locked while PATCH was awaiting!
+        const keepUnlocked = cur.is_locked && lockEpochAtStart === this.vaultLockEpoch && this.unlockedPlaintext.has(cur.id);
+        this.applyAuthoritativeBlock(res.updated, cur.buffer_id, keepUnlocked ? next : undefined);
       }
     }
     return total;

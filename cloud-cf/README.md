@@ -1,12 +1,12 @@
-# `cloud-cf` — M1 Thin Blind Sync Relay (Cloudflare Workers Paid)
+# `cloud-cf` — Thin Blind Sync Relay + Mobile PWA Host (Cloudflare Workers Paid)
 
 Single-tenant zero-knowledge blind sync relay implementing `docs/cloudflare-cloud-architecture.md` and `docs/interface-contracts.md` §4.
 
 ## Architecture & Guarantees
 
-- **Zero plaintext**: DO SQLite (`SyncJournalDO`) and R2 (`ARCHIVE_BUCKET`) store only opaque AEAD envelopes (`MNS1`), wrapped key records (`MNR1`), and encrypted pairing payloads (`MNPR`).
+- **Zero plaintext**: DO SQLite (`SyncJournalDO`) and R2 (`ARCHIVE_BUCKET`) store only opaque AEAD envelopes (`MNS1`), wrapped key records (`MNR1`), encrypted mobile state snapshots (`MNP1`), key material (`RecoveryKeyringV1`, `VaultHeaderV1`), and encrypted pairing payloads (`MNPR`).
 - **Zero `/v1/archive/*` or `/v1/blobs/*` HTTP routes**: R2 archives (`archives/ops/<epoch>/<from>-<to>.mna1`, `archives/keys/latest.mnks`, `archives/keys/history/<yyyy-mm-dd>.mnks`) are written solely by the DO daily `alarm()`. Extreme dual-loss recovery downloads `archives/` via CF dashboard / `wrangler` / `rclone` and runs offline `mynote restore --from-archive <local-dir>`.
-- **M1 safety boundary**: No `shred_marks` table and no physical key deletion during M1. Op ciphertexts are append-only forever.
+- **M2 controlled cryptographic shred & snapshots**: Op ciphertexts remain append-only forever. `shred_marks` enforces `T_grace_min = 24h`, rolling 24h batch limit (`N = 20` → `pending_confirm`), `SHRED_STALE` / `KEY_PENDING_SHRED` race guards, and DO `alarm()` execution (setting `block_keys.key_record = NULL`). `PUT/GET /v1/snapshots/state` stores `MNP1` snapshots in R2 (keeping latest 2 per epoch), and Worker Static Assets serves `web/dist-pwa/` with strict per-origin CSP.
 - **DO platform invariants**: Single-row SQL loops inside `ctx.storage.transactionSync` (respecting the 100 bind-parameter limit); WebSocket Hibernation (`ctx.acceptWebSocket` + `setWebSocketAutoResponse("ping", "pong")` + `serializeAttachment`); single multiplexed `alarm()`.
 
 ## Deployment Policy (Mandatory)

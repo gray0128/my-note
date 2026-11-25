@@ -22,8 +22,9 @@ import {
   type WasmVaultSession,
 } from "./wasm/desktop";
 
-const VAULT_IDLE_MS = 15 * 60 * 1000;
+const VAULT_IDLE_MS = 5 * 60 * 1000;
 const T_GRACE_MIN_MS = 86_400_000;
+const isPageHidden = (): boolean => document.visibilityState === "hidden";
 
 interface SecretNudge {
   blockId: string;
@@ -392,6 +393,10 @@ export class MyNoteApp {
 
   private onVisibilityChange = (): void => {
     if (document.visibilityState === "hidden") {
+      // H18 / SEC-03: Wipe any open passphrase/recovery inputs immediately on hide.
+      if (!this.dialogBackdropEl.classList.contains("hidden")) {
+        this.closeDialog();
+      }
       // Flush dirty blocks synchronously (keepalive) before immediately zeroizing Vault VKEK & scrubbing DOM (`SEC-03`).
       if (this.stream.hasDirtyBlocks()) {
         void this.stream.flushAllDirty({ keepalive: true });
@@ -403,6 +408,9 @@ export class MyNoteApp {
   };
 
   private onPageHide = (): void => {
+    if (!this.dialogBackdropEl.classList.contains("hidden")) {
+      this.closeDialog();
+    }
     if (this.stream.hasDirtyBlocks()) {
       void this.stream.flushAllDirty({ keepalive: true });
     }
@@ -434,7 +442,16 @@ export class MyNoteApp {
     if (key === "p") {
       ev.preventDefault();
       this.openBufferModal();
-    } else if (key === "l") {
+    } else if (key === "l" && ev.shiftKey) {
+      ev.preventDefault();
+      const id = this.stream.getActiveBlockId();
+      const blk = this.stream.getBlocks().find((b) => b.id === id);
+      if (blk && !blk.is_locked) {
+        void this.promptLockBlock(blk);
+      } else {
+        this.openVaultModal();
+      }
+    } else if (key === "l" && !ev.shiftKey) {
       ev.preventDefault();
       const id = this.stream.getActiveBlockId() ?? this.stream.getBlocks()[0]?.id;
       if (id) this.stream.focusLangSelector(id);
@@ -735,6 +752,9 @@ export class MyNoteApp {
     } else if (frame.type === "alert") {
       this.alerts.set(frame.code, frame);
       this.renderAlerts();
+      if (frame.code === "NEEDS_VAULT_REKEY" && this.isVaultUnlocked()) {
+        void this.rescueBlockedTier2Ops();
+      }
     }
   }
 
@@ -775,11 +795,13 @@ export class MyNoteApp {
 
   private decryptVisibleLockedBlocks(): void {
     const session = this.vaultSession;
-    if (!session || session.isLocked()) return;
+    if (!session || session.isLocked() || isPageHidden()) return;
+    const lockEpoch = this.stream.getVaultLockEpoch();
     for (const blk of this.stream.getBlocks()) {
       if (!blk.is_locked) continue;
       const leafMap = new Map<string, string>();
       let displayPlain: string | null = null;
+      const pendingTier1Leaves: { opId: string; isDisplay: boolean }[] = [];
       for (const v of blk.versions) {
         if (v.content !== null) {
           leafMap.set(v.op_id, v.content);
@@ -800,19 +822,40 @@ export class MyNoteApp {
           } catch {
             // leave unreadable leaf absent from leafMap
           }
+        } else if (!v.is_locked && v.content === null && this.api.getTier1LeafPlaintext) {
+          // H17: Concurrent Tier 1 leaf on a locked block is redacted by default; fetch on demand ONLY while Vault is unlocked.
+          pendingTier1Leaves.push({ opId: v.op_id, isDisplay: v.is_display });
         }
       }
       if (displayPlain !== null) {
         this.stream.setUnlockedPlaintext(blk.id, displayPlain, leafMap);
       }
+      for (const item of pendingTier1Leaves) {
+        void this.api
+          .getTier1LeafPlaintext!(blk.id, item.opId)
+          .then((res) => {
+            if (!this.isVaultUnlocked() || isPageHidden() || this.stream.getVaultLockEpoch() !== lockEpoch) {
+              return;
+            }
+            this.stream.setUnlockedLeafPlaintext(blk.id, item.opId, res.content);
+            if (item.isDisplay && displayPlain === null) {
+              this.stream.setUnlockedPlaintext(blk.id, res.content);
+            }
+          })
+          .catch(() => {
+            // keep leaf unavailable if daemon cannot decrypt
+          });
+      }
     }
   }
 
   private async onVaultUnlocked(): Promise<void> {
+    if (!this.isVaultUnlocked() || isPageHidden()) return;
     this.renderVaultBtn();
     this.resetVaultIdleTimer();
     this.decryptVisibleLockedBlocks();
     await this.rescueBlockedTier2Ops();
+    if (!this.isVaultUnlocked() || isPageHidden()) return;
     const pending = this.pendingAfterUnlock;
     this.pendingAfterUnlock = null;
     if (pending) {
@@ -821,7 +864,8 @@ export class MyNoteApp {
   }
 
   private async rescueBlockedTier2Ops(): Promise<void> {
-    if (!this.vaultSession || !this.api.listBlockedOps || !this.api.rekeyBlockedOp) return;
+    if (!this.isVaultUnlocked() || !this.api.listBlockedOps || !this.api.rekeyBlockedOp) return;
+    const lockEpoch = this.stream.getVaultLockEpoch();
     try {
       const blocked = await this.api.listBlockedOps();
       if (blocked.length === 0) {
@@ -830,35 +874,55 @@ export class MyNoteApp {
         return;
       }
       let rescued = 0;
+      let failed = 0;
       for (const op of blocked) {
-        if (!op.mnw1_b64 || !this.vaultSession) continue;
-        const dec = this.vaultSession.decryptBlock(
-          op.block_id,
-          op.op_id,
-          op.old_key_id,
-          b64ToBytes(op.mnb1_b64),
-          b64ToBytes(op.mnw1_b64),
-        );
-        const plaintext = dec.content;
-        dec.free();
-        const enc = this.vaultSession.rekeyToVault(JSON.stringify({ block_id: op.block_id }), plaintext, op.lang);
-        const payload: Tier2WritePayload = {
-          op_id: enc.opId,
-          key_id: enc.keyId,
-          mnb1_b64: bytesToB64(enc.mnb1),
-          mnw1_b64: enc.mnw1 ? bytesToB64(enc.mnw1) : undefined,
-        };
-        enc.free();
-        const updated = await this.api.rekeyBlockedOp(op.op_id, payload);
-        rescued++;
-        if (updated.buffer_id === this.activeBufferId && this.isVaultUnlocked()) {
-          this.stream.applyAuthoritativeBlock(updated, this.activeBufferId, plaintext);
+        const session = this.vaultSession;
+        if (!session || session.isLocked() || isPageHidden() || this.stream.getVaultLockEpoch() !== lockEpoch) {
+          break;
+        }
+        if (!op.mnw1_b64) {
+          failed++;
+          continue;
+        }
+        try {
+          const dec = session.decryptBlock(
+            op.block_id,
+            op.op_id,
+            op.old_key_id,
+            b64ToBytes(op.mnb1_b64),
+            b64ToBytes(op.mnw1_b64),
+          );
+          const plaintext = dec.content;
+          dec.free();
+          const enc = session.rekeyToVault(JSON.stringify({ block_id: op.block_id }), plaintext, op.lang);
+          const payload: Tier2WritePayload = {
+            op_id: enc.opId,
+            key_id: enc.keyId,
+            mnb1_b64: bytesToB64(enc.mnb1),
+            mnw1_b64: enc.mnw1 ? bytesToB64(enc.mnw1) : undefined,
+          };
+          enc.free();
+          const updated = await this.api.rekeyBlockedOp(op.op_id, payload);
+          rescued++;
+          if (
+            updated.buffer_id === this.activeBufferId &&
+            this.isVaultUnlocked() &&
+            !isPageHidden() &&
+            this.stream.getVaultLockEpoch() === lockEpoch
+          ) {
+            this.stream.applyAuthoritativeBlock(updated, this.activeBufferId, plaintext);
+          }
+        } catch (opErr) {
+          failed++;
+          this.handleErr(opErr);
         }
       }
-      if (rescued > 0) {
+      if (rescued === blocked.length && failed === 0) {
         this.alerts.delete("NEEDS_VAULT_REKEY");
         this.renderAlerts();
         this.showToast(`Rescued ${rescued} blocked Tier 2 op(s) with fresh keys`);
+      } else if (rescued > 0) {
+        this.showToast(`Rescued ${rescued}/${blocked.length} blocked Tier 2 op(s); ${blocked.length - rescued} still pending`, true);
       }
     } catch (e) {
       this.handleErr(e);
@@ -883,6 +947,7 @@ export class MyNoteApp {
     expectedHeads: string[],
     opts: { fastSync: boolean; isMerge: boolean; keepalive?: boolean },
   ): Promise<SaveContentResult> {
+    const lockEpoch = this.stream.getVaultLockEpoch();
     try {
       let patchPromise: Promise<BlockDto>;
       if (block.is_locked) {
@@ -932,7 +997,12 @@ export class MyNoteApp {
         );
       }
       const updated = await patchPromise;
-      if (updated.is_locked && this.isVaultUnlocked()) {
+      if (
+        updated.is_locked &&
+        this.isVaultUnlocked() &&
+        !isPageHidden() &&
+        this.stream.getVaultLockEpoch() === lockEpoch
+      ) {
         this.stream.setUnlockedPlaintext(updated.id, content);
       }
       if (opts.isMerge) this.showToast("Merged versions cleanly");
@@ -944,7 +1014,7 @@ export class MyNoteApp {
           try {
             const latest = await this.api.listBlocks(this.activeBufferId);
             this.stream.upsertBlocks(latest, [], this.activeBufferId);
-            if (this.isVaultUnlocked()) this.decryptVisibleLockedBlocks();
+            if (this.isVaultUnlocked() && !isPageHidden()) this.decryptVisibleLockedBlocks();
           } catch {
             // ignore refresh failure; mismatch banner still protects draft
           }
@@ -985,6 +1055,7 @@ export class MyNoteApp {
       if (cur.is_locked) {
         // SEC-03 HARD INVARIANT: Unlocked Tier 2 blocks MUST format strictly in browser WASM (ZERO /v1/local/format HTTP calls!)
         const session = this.vaultSession;
+        const lockEpoch = this.stream.getVaultLockEpoch();
         if (!session || session.isLocked()) {
           this.showToast("Vault is locked", true);
           return;
@@ -995,6 +1066,14 @@ export class MyNoteApp {
           return;
         }
         const formatted = await formatSnippetWasm(content, cur.lang);
+        if (
+          !this.isVaultUnlocked() ||
+          this.vaultSession !== session ||
+          isPageHidden() ||
+          this.stream.getVaultLockEpoch() !== lockEpoch
+        ) {
+          return;
+        }
         const enc = session.encryptUpdate(
           JSON.stringify({ block_id: cur.id }),
           mat.keyId,
@@ -1014,7 +1093,9 @@ export class MyNoteApp {
           mnb1_b64,
           fast_sync: true,
         });
-        this.stream.applyAuthoritativeBlock(updated, this.activeBufferId, this.isVaultUnlocked() ? formatted : undefined);
+        const keepUnlocked =
+          this.isVaultUnlocked() && !isPageHidden() && this.stream.getVaultLockEpoch() === lockEpoch;
+        this.stream.applyAuthoritativeBlock(updated, this.activeBufferId, keepUnlocked ? formatted : undefined);
         this.showToast(`Formatted (${cur.lang}) in WASM`);
         return;
       }
@@ -1071,6 +1152,7 @@ export class MyNoteApp {
     try {
       if (block.is_locked) {
         const session = this.vaultSession;
+        const lockEpoch = this.stream.getVaultLockEpoch();
         if (!session || session.isLocked()) {
           this.openVaultModal();
           return;
@@ -1109,7 +1191,9 @@ export class MyNoteApp {
           expected_heads: block.head_op_ids,
           ...payload,
         });
-        this.stream.applyAuthoritativeBlock(updated, this.activeBufferId, chosen);
+        const keepUnlocked =
+          this.isVaultUnlocked() && !isPageHidden() && this.stream.getVaultLockEpoch() === lockEpoch;
+        this.stream.applyAuthoritativeBlock(updated, this.activeBufferId, keepUnlocked ? chosen : undefined);
         this.showToast("Tier 2 conflict resolved");
         return;
       }
@@ -1127,9 +1211,15 @@ export class MyNoteApp {
 
   // ---------- M2 Tier 2 Vault Modals & Block Lock/Unlock ----------
 
-  private closeDialog(): void {
+  private closeDialog(clearPending = true): void {
+    for (const el of this.dialogModalEl.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("input, textarea")) {
+      el.value = "";
+    }
     this.dialogBackdropEl.classList.add("hidden");
     this.dialogModalEl.innerHTML = "";
+    if (clearPending) {
+      this.pendingAfterUnlock = null;
+    }
   }
 
   private openVaultModal(forceMode?: "init" | "unlock" | "recover" | "unlocked"): void {
@@ -1178,11 +1268,12 @@ export class MyNoteApp {
         ev.preventDefault();
         void (async () => {
           const pass = p1.value;
+          const confirm = p2.value;
           if (pass.length < 8) {
             this.showToast("Passphrase must be at least 8 characters", true);
             return;
           }
-          if (pass !== p2.value) {
+          if (pass !== confirm) {
             this.showToast("Passphrases do not match", true);
             return;
           }
@@ -1190,16 +1281,29 @@ export class MyNoteApp {
             this.showToast("Recovery public key unavailable from local daemon", true);
             return;
           }
+          p1.value = "";
+          p2.value = "";
           submit.disabled = true;
           submit.textContent = "Deriving Argon2id key…";
           try {
             const { gen, blob_b64 } = await createVaultHeaderWasm(pass, this.recoveryPkB64);
             const saved = await this.api.putVaultHeader(gen, blob_b64);
             this.vaultHeader = saved;
-            this.vaultSession = await unlockVaultWithPassphraseWasm(pass, saved.blob_b64);
-            p1.value = "";
-            p2.value = "";
-            this.closeDialog();
+            if (isPageHidden()) {
+              this.closeDialog();
+              this.renderVaultBtn();
+              return;
+            }
+            const sess = await unlockVaultWithPassphraseWasm(pass, saved.blob_b64);
+            if (isPageHidden()) {
+              sess.lockAndZeroize();
+              sess.free();
+              this.closeDialog();
+              this.renderVaultBtn();
+              return;
+            }
+            this.vaultSession = sess;
+            this.closeDialog(false);
             await this.onVaultUnlocked();
             this.showToast("Vault initialized and unlocked in RAM");
           } catch (e) {
@@ -1219,7 +1323,7 @@ export class MyNoteApp {
       title.textContent = "Unlock Tier 2 Vault";
       const note = document.createElement("p");
       note.className = "dialog-note";
-      note.textContent = "VKEK is decrypted in browser WASM RAM only and auto-zeroizes on tab switch or 15 min idle.";
+      note.textContent = "VKEK is decrypted in browser WASM RAM only and auto-zeroizes on tab switch or 5 min idle.";
       const p1 = document.createElement("input");
       p1.type = "password";
       p1.className = "input";
@@ -1244,12 +1348,21 @@ export class MyNoteApp {
         ev.preventDefault();
         void (async () => {
           if (!this.vaultHeader) return;
+          const pass = p1.value;
+          p1.value = "";
           submit.disabled = true;
           submit.textContent = "Unlocking…";
           try {
-            this.vaultSession = await unlockVaultWithPassphraseWasm(p1.value, this.vaultHeader.blob_b64);
-            p1.value = "";
-            this.closeDialog();
+            const sess = await unlockVaultWithPassphraseWasm(pass, this.vaultHeader.blob_b64);
+            // H18 / SEC-03: If tab hid during Argon2id derivation, zeroize immediately and do NOT install session!
+            if (isPageHidden()) {
+              sess.lockAndZeroize();
+              sess.free();
+              this.closeDialog();
+              return;
+            }
+            this.vaultSession = sess;
+            this.closeDialog(false);
             await this.onVaultUnlocked();
             this.showToast("Vault unlocked in browser WASM RAM");
           } catch (e) {
@@ -1296,11 +1409,21 @@ export class MyNoteApp {
         ev.preventDefault();
         void (async () => {
           if (!this.vaultHeader) return;
+          const wordsText = words.value.trim();
+          const nextPass = newPass.value;
+          words.value = "";
+          newPass.value = "";
           submit.disabled = true;
           try {
-            const sess = await unlockVaultWithRecoveryWordsWasm(words.value.trim(), this.vaultHeader.blob_b64);
-            if (newPass.value.length > 0) {
-              if (newPass.value.length < 8) {
+            const sess = await unlockVaultWithRecoveryWordsWasm(wordsText, this.vaultHeader.blob_b64);
+            if (isPageHidden()) {
+              sess.lockAndZeroize();
+              sess.free();
+              this.closeDialog();
+              return;
+            }
+            if (nextPass.length > 0) {
+              if (nextPass.length < 8) {
                 sess.lockAndZeroize();
                 sess.free();
                 this.showToast("New passphrase must be at least 8 characters", true);
@@ -1308,15 +1431,19 @@ export class MyNoteApp {
                 return;
               }
               if (this.api.putVaultHeader) {
-                const updatedRaw = sess.changePassphrase(b64ToBytes(this.vaultHeader.blob_b64), newPass.value);
+                const updatedRaw = sess.changePassphrase(b64ToBytes(this.vaultHeader.blob_b64), nextPass);
                 const parsed = JSON.parse(updatedRaw) as { gen: number; blob_b64: string };
                 this.vaultHeader = await this.api.putVaultHeader(parsed.gen, parsed.blob_b64);
               }
             }
+            if (isPageHidden()) {
+              sess.lockAndZeroize();
+              sess.free();
+              this.closeDialog();
+              return;
+            }
             this.vaultSession = sess;
-            words.value = "";
-            newPass.value = "";
-            this.closeDialog();
+            this.closeDialog(false);
             await this.onVaultUnlocked();
             this.showToast("Vault recovered and unlocked");
           } catch (e) {
@@ -1337,7 +1464,7 @@ export class MyNoteApp {
     const note = document.createElement("p");
     note.className = "dialog-note";
     note.textContent =
-      "Unlocked in browser WASM RAM only. Local daemon never sees VKEK or Tier 2 plaintext. Auto-locks on tab switch or 15 min idle.";
+      "Unlocked in browser WASM RAM only. Local daemon never sees VKEK or Tier 2 plaintext. Auto-locks on tab switch or 5 min idle.";
     const lockBtn = document.createElement("button");
     lockBtn.type = "button";
     lockBtn.className = "btn btn-danger";
@@ -1369,22 +1496,24 @@ export class MyNoteApp {
     form.addEventListener("submit", (ev) => {
       ev.preventDefault();
       void (async () => {
-        if (!this.vaultSession || !this.vaultHeader || !this.api.putVaultHeader) return;
-        if (np1.value.length < 8) {
+        if (!this.isVaultUnlocked() || !this.vaultSession || !this.vaultHeader || !this.api.putVaultHeader) return;
+        const p1 = np1.value;
+        const p2 = np2.value;
+        if (p1.length < 8) {
           this.showToast("New passphrase must be at least 8 characters", true);
           return;
         }
-        if (np1.value !== np2.value) {
+        if (p1 !== p2) {
           this.showToast("Passphrases do not match", true);
           return;
         }
+        np1.value = "";
+        np2.value = "";
         chgBtn.disabled = true;
         try {
-          const raw = this.vaultSession.changePassphrase(b64ToBytes(this.vaultHeader.blob_b64), np1.value);
+          const raw = this.vaultSession.changePassphrase(b64ToBytes(this.vaultHeader.blob_b64), p1);
           const parsed = JSON.parse(raw) as { gen: number; blob_b64: string };
           this.vaultHeader = await this.api.putVaultHeader(parsed.gen, parsed.blob_b64);
-          np1.value = "";
-          np2.value = "";
           this.closeDialog();
           this.showToast("Vault passphrase updated");
         } catch (e) {
@@ -1443,10 +1572,20 @@ export class MyNoteApp {
       ev.preventDefault();
       void (async () => {
         const session = this.vaultSession;
-        if (!session || !this.api.lockBlock) return;
+        const lockEpoch = this.stream.getVaultLockEpoch();
+        if (!session || session.isLocked() || !this.api.lockBlock) return;
         confirmBtn.disabled = true;
         try {
           await this.stream.waitForSaveIdle(block.id);
+          if (
+            !this.isVaultUnlocked() ||
+            this.vaultSession !== session ||
+            isPageHidden() ||
+            this.stream.getVaultLockEpoch() !== lockEpoch
+          ) {
+            this.closeDialog();
+            return;
+          }
           const cur = this.stream.getBlocks().find((b) => b.id === block.id) ?? block;
           const content = this.stream.getBlockDraftContent(cur.id);
           const expectedHeads = this.stream.getExpectedHeadsForBlock(cur.id);
@@ -1465,8 +1604,10 @@ export class MyNoteApp {
             mnw1_b64,
             public_hint,
           });
-          this.resetVaultIdleTimer();
-          this.stream.applyAuthoritativeBlock(updated, this.activeBufferId, content);
+          const keepUnlocked =
+            this.isVaultUnlocked() && !isPageHidden() && this.stream.getVaultLockEpoch() === lockEpoch;
+          if (keepUnlocked) this.resetVaultIdleTimer();
+          this.stream.applyAuthoritativeBlock(updated, this.activeBufferId, keepUnlocked ? content : undefined);
           this.closeDialog();
           this.showToast("Block locked in Tier 2 Vault");
         } catch (e) {
@@ -1507,9 +1648,10 @@ export class MyNoteApp {
     chkLabel.className = "dialog-check";
     const chk = document.createElement("input");
     chk.type = "checkbox";
-    chk.checked = true;
+    // Per docs/sync-protocol.md §4.2, default retains old Tier 2 key unless explicitly opted in.
+    chk.checked = false;
     const chkText = document.createElement("span");
-    chkText.textContent = "Schedule old Tier 2 key for cryptographic shred (24h min grace)";
+    chkText.textContent = "Also schedule old Tier 2 key for cryptographic shred (24h min grace)";
     chkLabel.append(chk, chkText);
     const actions = document.createElement("div");
     actions.className = "dialog-actions";
@@ -1528,9 +1670,14 @@ export class MyNoteApp {
       ev.preventDefault();
       void (async () => {
         if (!this.api.unlockBlock) return;
+        const lockEpoch = this.stream.getVaultLockEpoch();
         confirmBtn.disabled = true;
         try {
           await this.stream.waitForSaveIdle(block.id);
+          if (!this.isVaultUnlocked() || isPageHidden() || this.stream.getVaultLockEpoch() !== lockEpoch) {
+            this.closeDialog();
+            return;
+          }
           const cur = this.stream.getBlocks().find((b) => b.id === block.id) ?? block;
           const content = this.stream.getBlockDraftContent(cur.id);
           const expectedHeads = this.stream.getExpectedHeadsForBlock(cur.id);
@@ -1590,7 +1737,10 @@ export class MyNoteApp {
       );
       this.trashActionsEl.appendChild(confirmBtn);
     }
-    if (this.trashItems.length > 0 && this.api.prepareTrashAction) {
+    const expeditableItems = this.trashItems.filter(
+      (t) => t.shred_state !== "executed" && t.shred_state !== "pending_confirm",
+    );
+    if (expeditableItems.length > 0 && this.api.prepareTrashAction) {
       const expAllBtn = document.createElement("button");
       expAllBtn.type = "button";
       expAllBtn.className = "btn btn-danger btn-icon";
@@ -1598,7 +1748,7 @@ export class MyNoteApp {
       expAllBtn.addEventListener("click", () =>
         void this.openTrashConfirmModal(
           "expedite",
-          this.trashItems.map((x) => x.id),
+          expeditableItems.map((x) => x.id),
           T_GRACE_MIN_MS,
         ),
       );
@@ -1629,7 +1779,7 @@ export class MyNoteApp {
       restoreBtn.textContent = "Restore";
       restoreBtn.addEventListener("click", () => void this.restoreTrashItem(item));
       btns.appendChild(restoreBtn);
-      if (this.api.prepareTrashAction && item.shred_state !== "executed") {
+      if (this.api.prepareTrashAction && item.shred_state !== "executed" && item.shred_state !== "pending_confirm") {
         const expBtn = document.createElement("button");
         expBtn.type = "button";
         expBtn.className = "btn btn-danger btn-icon";
@@ -1657,9 +1807,12 @@ export class MyNoteApp {
       this.showToast("Trash confirmation API unavailable", true);
       return;
     }
-    if (action === "purge_history" && targetBlock?.is_locked && !this.isVaultUnlocked()) {
-      this.openVaultModal();
-      return;
+    if (action === "purge_history" && targetBlock) {
+      if (targetBlock.is_locked && !this.isVaultUnlocked()) {
+        this.openVaultModal();
+        return;
+      }
+      await this.stream.flushAllDirty();
     }
     let prep: TrashActionPrepareResponse;
     try {
@@ -1722,32 +1875,43 @@ export class MyNoteApp {
     confirmBtn.addEventListener("click", () => {
       void (async () => {
         confirmBtn.disabled = true;
+        const lockEpoch = this.stream.getVaultLockEpoch();
         try {
           let tier2: Tier2WritePayload | undefined;
           let plainForRam: string | undefined;
-          if (action === "purge_history" && targetBlock?.is_locked) {
-            const session = this.vaultSession;
-            if (!session || session.isLocked()) {
-              this.showToast("Vault must be unlocked to rekey a locked block", true);
-              confirmBtn.disabled = false;
-              return;
+          let expectedHeads: string[] | undefined;
+          if (action === "purge_history" && targetBlock) {
+            const cur = this.stream.getBlocks().find((b) => b.id === targetBlock.id) ?? targetBlock;
+            expectedHeads = this.stream.getExpectedHeadsForBlock(cur.id);
+            if (cur.is_locked) {
+              const session = this.vaultSession;
+              if (!session || session.isLocked()) {
+                this.showToast("Vault must be unlocked to rekey a locked block", true);
+                confirmBtn.disabled = false;
+                return;
+              }
+              plainForRam = this.stream.getBlockDraftContent(cur.id);
+              const enc = session.rekeyToVault(JSON.stringify({ block_id: cur.id }), plainForRam, cur.lang);
+              tier2 = {
+                op_id: enc.opId,
+                key_id: enc.keyId,
+                mnb1_b64: bytesToB64(enc.mnb1),
+                mnw1_b64: enc.mnw1 ? bytesToB64(enc.mnw1) : undefined,
+              };
+              enc.free();
             }
-            plainForRam = this.stream.getBlockDraftContent(targetBlock.id);
-            const enc = session.rekeyToVault(JSON.stringify({ block_id: targetBlock.id }), plainForRam, targetBlock.lang);
-            tier2 = {
-              op_id: enc.opId,
-              key_id: enc.keyId,
-              mnb1_b64: bytesToB64(enc.mnb1),
-              mnw1_b64: enc.mnw1 ? bytesToB64(enc.mnw1) : undefined,
-            };
-            enc.free();
           }
-          await this.api.commitTrashAction!({ confirm_nonce: prep.confirm_nonce, tier2 });
+          await this.api.commitTrashAction!({ confirm_nonce: prep.confirm_nonce, tier2, expected_heads: expectedHeads });
           this.closeDialog();
           if (action === "purge_history" && targetBlock && this.activeBufferId) {
             const latest = await this.api.listBlocks(this.activeBufferId);
             this.stream.upsertBlocks(latest, [], this.activeBufferId);
-            if (plainForRam !== undefined && this.isVaultUnlocked()) {
+            if (
+              plainForRam !== undefined &&
+              this.isVaultUnlocked() &&
+              !isPageHidden() &&
+              this.stream.getVaultLockEpoch() === lockEpoch
+            ) {
               this.stream.setUnlockedPlaintext(targetBlock.id, plainForRam);
             }
             this.showToast("Current version rekeyed; old history keys scheduled for shred (≥24h)");
@@ -1761,7 +1925,13 @@ export class MyNoteApp {
           }
         } catch (e) {
           this.handleErr(e);
-          confirmBtn.disabled = false;
+          // Re-prepare a fresh single-use confirm_nonce so retry does not fail on consumed nonce.
+          try {
+            prep = await this.api.prepareTrashAction!({ action, block_ids: blockIds, grace_ms: graceMs });
+            confirmBtn.disabled = false;
+          } catch {
+            this.closeDialog();
+          }
         }
       })();
     });
@@ -1775,6 +1945,7 @@ export class MyNoteApp {
     try {
       let restored: BlockDto;
       let restoredPlain: string | undefined;
+      const lockEpoch = this.stream.getVaultLockEpoch();
       if (item.is_locked) {
         if (!this.isVaultUnlocked() || !this.vaultSession || !this.api.getTrashTier2Blob) {
           this.pendingAfterUnlock = () => this.restoreTrashItem(item);
@@ -1782,7 +1953,11 @@ export class MyNoteApp {
           return;
         }
         const blob = await this.api.getTrashTier2Blob(item.id);
-        const dec = this.vaultSession.decryptBlock(
+        const session = this.vaultSession;
+        if (!session || session.isLocked() || document.visibilityState === "hidden" || this.stream.getVaultLockEpoch() !== lockEpoch) {
+          return;
+        }
+        const dec = session.decryptBlock(
           item.id,
           blob.op_id,
           blob.key_id,
@@ -1791,7 +1966,7 @@ export class MyNoteApp {
         );
         restoredPlain = dec.content;
         dec.free();
-        const enc = this.vaultSession.encryptUpdate(
+        const enc = session.encryptUpdate(
           JSON.stringify({ block_id: item.id }),
           blob.key_id,
           b64ToBytes(blob.mnw1_b64),
@@ -1804,7 +1979,12 @@ export class MyNoteApp {
       } else {
         restored = await this.api.restoreTrash(item.id);
       }
-      this.stream.applyAuthoritativeBlock(restored, this.activeBufferId, restoredPlain);
+      const keepUnlocked =
+        item.is_locked &&
+        this.isVaultUnlocked() &&
+        document.visibilityState !== "hidden" &&
+        this.stream.getVaultLockEpoch() === lockEpoch;
+      this.stream.applyAuthoritativeBlock(restored, this.activeBufferId, keepUnlocked ? restoredPlain : undefined);
       await this.refreshTrash();
       this.showToast("Restored block from Recycle Bin");
     } catch (e) {

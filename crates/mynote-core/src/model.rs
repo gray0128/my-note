@@ -7,7 +7,7 @@ fn default_actor() -> String {
 }
 
 /// Entity kind in `InnerOpV1` (`docs/data-structures.md` §2.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EntityType {
     Buffer,

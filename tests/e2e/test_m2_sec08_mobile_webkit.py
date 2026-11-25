@@ -217,16 +217,35 @@ def main():
 
         # 3. Real Playwright WebKit audit!
         page_errors: list[str] = []
+        snapshot_responses: list[tuple[int, str]] = []
         with sync_playwright() as p:
             browser = p.webkit.launch()
             context = browser.new_context(viewport={"width": 390, "height": 844})
             page = context.new_page()
             page.on("pageerror", lambda err: page_errors.append(str(err)))
+            page.on(
+                "response",
+                lambda r: snapshot_responses.append((r.status, r.headers.get("x-covers-seq", "")))
+                if "/v1/snapshots/state" in r.url
+                else None,
+            )
+            page.add_init_script(
+                """() => {
+                    window.__cspViolations = [];
+                    window.addEventListener('securitypolicyviolation', (e) => {
+                        window.__cspViolations.push({ directive: e.violatedDirective, blocked: e.blockedURI });
+                    });
+                }"""
+            )
 
             res = page.goto(base_url, wait_until="networkidle")
             assert res is not None and res.status == 200
             csp = res.headers.get("content-security-policy", "")
-            assert "'wasm-unsafe-eval'" in csp, f"Missing wasm-unsafe-eval in PWA CSP: {csp}"
+            assert "default-src 'none'" in csp, f"Missing default-src 'none' in PWA CSP: {csp}"
+            assert "script-src 'self' 'wasm-unsafe-eval'" in csp, f"Missing wasm-unsafe-eval in PWA CSP: {csp}"
+            assert "style-src 'self'" in csp and "'unsafe-inline'" not in csp, f"Weak style-src in PWA CSP: {csp}"
+            assert "form-action 'none'" in csp, f"Missing form-action 'none' in PWA CSP: {csp}"
+            assert " wss: " not in f"{csp} " and " https: " not in f"{csp} ", f"Over-broad wildcard in PWA CSP: {csp}"
             assert res.headers.get("x-frame-options") == "DENY"
 
             # Pair using the real pairing code
@@ -239,6 +258,10 @@ def main():
                 f"() => document.body.innerText.includes('{t1_canary}')",
                 timeout=20000,
             )
+            # C1 end-to-end verification: Desktop MUST have uploaded MNP1 snapshot with matching headers so mobile gets HTTP 200!
+            assert any(st == 200 and int(seq or "0") > 0 for st, seq in snapshot_responses), (
+                f"Expected HTTP 200 MNP1 snapshot with x-covers-seq > 0, got: {snapshot_responses}"
+            )
             # Strictly read-only: ZERO <textarea> or [contenteditable] on note cards!
             editable_count = page.evaluate("() => document.querySelectorAll('.ro-block textarea, .ro-block [contenteditable]').length")
             assert editable_count == 0, f"Mobile PWA must be strictly read-only, found {editable_count} editable note elements!"
@@ -246,7 +269,7 @@ def main():
             dom_before_unlock = page.evaluate("() => document.body.innerText")
             assert "Mobile Secret" in dom_before_unlock
             assert t2_canary not in dom_before_unlock, "Tier 2 secret visible before Mobile Vault unlock!"
-            print("[sec-08] 3. WebKit paired, synced MNP1+keys+ops, rendered Tier 1 read-only & Tier 2 locked OK")
+            print("[sec-08] 3. WebKit paired, synced MNP1 (HTTP 200) + keys + ops, rendered Tier 1 read-only & Tier 2 locked OK")
 
             # Unlock Mobile Vault in WebKit WASM with real Argon2id
             page.click('[data-testid="pwa-vault-unlock-btn"]')
@@ -256,7 +279,11 @@ def main():
                 f"() => document.body.innerText.includes('{t2_canary}')",
                 timeout=20000,
             )
-            print("[sec-08] 4. WebKit Mobile Vault unlocked via real Argon2id WASM & decrypted Tier 2 OK")
+            # Click one-tap Copy button on unlocked Tier 2 block
+            page.click(f'[data-testid="copy-{t2_blk_id}"]')
+            csp_violations = page.evaluate("() => window.__cspViolations || []")
+            assert len(csp_violations) == 0, f"Unexpected CSP violations in Mobile PWA: {csp_violations}"
+            print("[sec-08] 4. WebKit Mobile Vault unlocked via real Argon2id WASM, decrypted Tier 2, Copy clicked & 0 CSP violations OK")
 
             # Trigger visibilitychange -> hidden => Vault immediately zeroizes & scrubs DOM!
             page.evaluate(
