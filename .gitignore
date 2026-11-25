@@ -1,0 +1,32 @@
+# Rust / Cargo
+target/
+**/*.rs.bk
+*.pdb
+
+# Node / Web / Cloudflare
+node_modules/
+dist/
+pkg/
+.wrangler/
+.dev.vars
+.vite/
+coverage/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local databases & runtime artifacts
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sock
+*.lock
+!Cargo.lock
+!pnpm-lock.yaml
+!package-lock.json
