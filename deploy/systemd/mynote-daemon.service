@@ -1,0 +1,18 @@
+[Unit]
+Description=my-note local daemon (single-writer SQLite + localhost UI + E2EE cloud sync)
+After=network-online.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/mynote daemon
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+# Harden filesystem and privilege surface
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=default.target
