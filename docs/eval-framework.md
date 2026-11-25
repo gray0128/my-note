@@ -128,21 +128,21 @@ flowchart TB
 3. 只能在内存中表达的故障（任意乱序投递等）只在 DST 中跑；PITR 在契约测试中用「换新 DO 实例 + 导入历史前缀 + 更换 epoch」近似。
 4. Worker 的时间源在测试构建中可注入；alarm 用测试工具直接触发（如 `runDurableObjectAlarm`），不依赖真实等待。
 
-**必须覆盖的服务端行为**：幂等追加（同一 `op_id` 重复 push 不重复分配 `seq`）、`seq` 分配与按 `seq` 分页、epoch 变更、设备令牌范围（`read` 令牌的 push 与碎纸请求一律 `403`）、WebSocket 唤醒只发通知不带 op、密钥表与碎纸标记存储及全量比对、每日 op 密文归档与密钥表快照写入 R2（miniflare 的 R2 模拟）、（M2）手机状态快照的 `covers_seq` 单调接受与「只保留最近 2 份」。
+**必须覆盖的服务端行为**：幂等追加（同一 `op_id` 重复 push 不重复分配 `seq`）、`seq` 分配与按 `seq` 分页、epoch 变更、设备令牌范围（`read` 令牌的 push 与写密钥请求一律 `403`）、WebSocket 唤醒只发通知不带 op、密钥表与 `key_material`（密钥环 / Vault 头部）存储及全量比对、未知 `key_id` 拒收（`KEY_UNKNOWN`）、每日 op 密文归档与密钥表快照（`latest.mnks` + `history/`）写入 R2（miniflare 的 R2 模拟）、（M2）手机状态快照在同一 `epoch` 内的 `covers_seq` 单调接受与「只保留最近 2 份」。
 
-**一次性领取配对**（M1 契约测试）：暂存记录 10 分钟 TTL 到期删除；首次领取即删除，第二次领取返回 `404`；`read` 令牌发起配对 → `403`；领取接口无需令牌但只凭 128 位 `pair_id`。
+**一次性领取配对与引导**（M1 契约测试）：`BOOTSTRAP_TOKEN` 注册首台桌面；配对 / 密钥刷新票据 10 分钟 TTL 到期删除（未激活的预注册设备同步清理）；首次领取即删除，第二次领取返回 `404`；服务端不接触明文 `device_token`；`read` 令牌发起配对 → `403`。
 
-**`INV-GRACE`（M2，与碎纸执行器同时进入门禁）**：
+**`INV-GRACE`（M2，与 `shred_marks` 及碎纸执行器同时进入门禁）**：
 
-- 服务端拒绝任何 `not_before < now + T_grace_min` 的碎纸请求；
-- 同一自然日内超过批量阈值 N 的碎纸请求，超出部分进入暂停态、不开始计时，直到桌面 UI 确认；
-- 宽限期内被撤销的碎纸标记，到期时 alarm 不执行；
+- 服务端拒绝任何 `grace_ms < T_grace_min`（或缩短后早于 `requested_at_ms + T_grace_min`）的碎纸请求；
+- 滚动 24 小时内超过批量阈值 N 的碎纸请求，超出部分进入 `pending_confirm`、不开始计时，直到桌面 UI 确认后按 `confirmed_at_ms + max(grace_ms, T_grace_min)` 起算；
+- 宽限期内被撤销的碎纸标记，到期时 alarm 不执行；已执行后再撤销返回 `410 KEY_SHREDDED`；
 - alarm 只置空「已到期且未撤销」的密钥，并且重复触发幂等；
 - `read` 令牌发起碎纸 → `403`；
-- **密钥竞态校验**（与 DST 共用场景）：
-  - 标记的 `seen_seq` 落后于该 `key_id` 下最新 op → `SHRED_STALE`，不落库；
-  - 引用 `pending_confirm` / `scheduled` 密钥的新 op → `KEY_PENDING_SHRED`；同批先撤销再推送 → 接受（Update-Wins 复活）；
-  - 引用已执行碎纸或不存在的 `key_id` → `KEY_SHREDDED` / `KEY_UNKNOWN`；
+- **密钥竞态校验**（与 DST 共用场景，批内顺序固定为「新密钥记录 → 撤销 → op → 新建碎纸标记」）：
+  - 本批之前该 `key_id` 下已存在 `seq > seen_seq` 的远端 op → `SHRED_STALE`，不落库；
+  - 引用 `pending_confirm` / `scheduled` 密钥的新 op → `KEY_PENDING_SHRED`；同批先撤销再推送 → 接受（Update-Wins 复活）；同批先写旧钥历史 op、紧接换钥新 op 再挂旧钥碎纸标记 → 接受；
+  - 引用已执行碎纸或不存在的 `key_id` → `KEY_SHREDDED` / `KEY_UNKNOWN`（无 BDEK 的 op 外层 `key_id` 为 `null`，正常放行）；
   - 任一校验失败整批回滚，不分配 `seq`；同批「新密钥记录 + 引用它的 op」被接受。
 
 参数取值（`T_grace`、`T_grace_min`、N 等）以 [threat-model.md](./threat-model.md) 为准；测试按参数符号编写，并在默认取值下运行。
@@ -151,16 +151,16 @@ flowchart TB
 
 ## 4. INV-RECOVERY：零设备端到端恢复
 
-**断言**：从**零台设备**出发，只凭统一恢复包（24 词）+ R2 中的 op 密文归档 + 最新密钥表快照，执行 `mynote restore --from-archive`，能恢复全部**未删除**数据：块集合、每块叶子集、字段 LWW 结果与原集群字节级一致；回收站中、宽限期未满的块同样可恢复；已碎纸的块不可读（符合 D2′）。
+**断言**：从**零台设备**出发，只凭统一恢复包（24 词）+ R2 导出的本地归档目录（`archives/ops/` 密文归档 + `archives/keys/latest.mnks`），执行纯离线 `mynote restore --from-archive <local-dir> --to <empty-dir>`，能恢复全部已归档且**未删除**的数据：块集合、每块叶子集、字段 LWW 结果与归档时刻状态字节级一致；回收站中、宽限期未满的块同样可恢复；已碎纸的块不可读（符合 D2′）。
 
-**测试步骤**（全部在本地模拟环境中完成，R2 用 miniflare 模拟）：
+**测试步骤**（全部在本地模拟环境中完成，R2 用 miniflare 模拟并导出到本地临时目录）：
 
-1. 用 DST 场景生成一段包含多叶子、加锁、删除、换钥的历史，产出每日归档与密钥快照；
+1. 用 DST 场景生成一段包含多叶子、加锁、删除、换钥的历史，触发 DO alarm 产出 `MNA1` 归档与 `latest.mnks` / `history/*.mnks` 快照；
 2. 删除全部设备的本地数据与 DO 状态；
-3. 恢复包 → Root Seed → `recovery_sk` → 解封恢复密钥环（全部 SMK 代际与 VKEK）→ 读最新密钥快照 → 重放 op 归档；
-4. 与第 1 步保存的期望状态逐块比对。
+3. 恢复包 → Root Seed → `recovery_sk` → 解封 `latest.mnks` 中的恢复密钥环（全部 SMK 代际与 VKEK）→ 重放目录内全部 `MNA1` op 归档；
+4. 与第 1 步归档时刻保存的期望状态逐块比对。
 
-**变体**：密钥环轮换之后恢复（早于轮换的归档仍由旧 SMK 代际解开，旧代际永久保留）；最新密钥快照缺失时回退到上一份并如实报告缺口；本地 `VACUUM INTO` 备份恢复。恢复包与密钥环的格式以 [threat-model.md](./threat-model.md) 与 [data-structures.md](./data-structures.md) 为准。
+**变体**：密钥环轮换之后恢复（早于轮换的归档仍由旧 SMK 代际解开，旧代际永久保留）；停写超过 30 天使 `history/*.mnks` 全部过期后，仍可凭未过期的 `latest.mnks` 完整恢复；本地 `VACUUM INTO` 备份恢复。恢复包与密钥环的格式以 [threat-model.md](./threat-model.md) 与 [data-structures.md](./data-structures.md) 为准。
 
 ---
 
@@ -191,7 +191,7 @@ flowchart TB
 1. **Layer 1 内置格式化双定律**（`proptest` 随机语法树 + 真实开源片段语料）：
    - **幂等律**：对任意合法输入 $x \in \{\text{JSON, SQL, YAML, XML, Markdown}\}$，断言
      $$\text{format}(\text{format}(x)) = \text{format}(x)$$
-   - **语义等价**：格式化前后分别送入独立解析器（如 `serde_json::Value`、`yaml-rust2`、`roxmltree`、`sqlparser-rs`），断言语义结构等价；对语法残缺的输入（如粘贴了一半的 JSON），断言返回 `FORMAT_SYNTAX_ERROR`（退出码 `7`），原块字节与 `head_op_id` 不变。
+   - **语义等价**：格式化前后分别送入独立解析器（如 `serde_json::Value`、`yaml-rust2`、`roxmltree`、`sqlparser-rs`），断言语义结构等价；对语法残缺的输入（如粘贴了一半的 JSON），断言返回 `FORMAT_SYNTAX_ERROR`（退出码 `7`），原块字节与 `head_op_ids` 不变。
 2. **Layer 2 外部 CLI 熔断故障注入**（随 M3 的 Layer 2 格式化进入门禁）：用假桩子进程模拟 5 种异常——① 非零退出码但 `stdout` 有半截输出；② 退出码 `0` 但 `stdout` 为 0 字节；③ 非法 UTF-8；④ 超过 `timeout_ms`；⑤ 尝试读取敏感环境变量。断言全部触发熔断并返回退出码 `7`，数据库零覆写。
 3. **Heynote 导入差分**：
    - 黄金语料覆盖：文件首部没有 `∞∞∞` 前导块、代码中含字符串字面量 `"∞∞∞json"`、`\r\n` 与 UTF-8 BOM 混排、空块、未知语言标识回退，以及一个约 25 MiB、上百块的单文件；
@@ -210,16 +210,16 @@ flowchart TB
 | `G01` | `add` 分别从参数和 `stdin` 写入 | 退出码 `0`；`--json` 信封结构正确并返回新 `block_id`；`op_id` 由 core 生成，调用方无需传入 |
 | `G02` | `ls` / `search --json` | 列表与摘要结构正确；搜索结果不含加锁块正文 |
 | `G03` | `get` 原文输出 | 输出与写入内容字节级相等 |
-| `G04` | 用过期的 `--expected-head` 执行 `update` | 退出码 `4`（`HEAD_MISMATCH`），`details.actual_head` 正确，数据库不变 |
+| `G04` | 用过期的 `--expected-head` 执行 `update` | 退出码 `4`（`HEAD_MISMATCH`），`details.actual_heads` 正确，数据库不变 |
 | `G05` | 非交互 `stdin` 为 0 字节时 `update` 非空块 | 退出码 `2`（`EMPTY_STDIN_REFUSED`），原块不变 |
 | `G06` | 无 Daemon、无网络时 `add` | 退出码 `0`，`meta.sync_state = "pending_offline"`，恰好新增 1 个 op；抓包确认非显式联网命令零外发 DNS / TCP |
 | `G07` | 断网时 `sync` | 退出码 `6`（`SYNC_OFFLINE`），`retryable = true` |
-| `G08` | `delete` 后尝试从 CLI 清空回收站或缩短宽限期 | 块进入回收站且可撤销；清空 / 缩短操作被拒绝：无论是否 TTY 都返回 `UI_CONFIRMATION_REQUIRED`（退出码 `2`），回收站状态不变 |
+| `G08` | `delete` 后尝试从 CLI 清空回收站或缩短宽限期 | 块进入回收站（M1 `shred_state = "unscheduled"`，M2 联机同步后按服务端状态更新）且可经 `trash restore` 撤销；`trash empty` / `expedite` / `confirm` 无论是否 TTY 都返回 `UI_CONFIRMATION_REQUIRED`（退出码 `2`），回收站状态不变 |
 | `G09` | 同一块存在两个叶子 | `get --json` 返回展示版本并列出其他叶子；提交 `parents` = 全部叶子的 `update` 后叶子数为 1 |
 | `G10` | 非 TTY 访问加锁块 | 退出码 `5`（`BLOCK_LOCKED`），`stdout` / `stderr` 中零明文 |
 | `G11` | `format` 过滤器输入残缺 JSON | 退出码 `7`（`FORMAT_SYNTAX_ERROR`），零副作用 |
 
-此外两项廉价的静态检查一并进入黄金测试：`--help-json` 与 `clap` 命令树零漂移（无未文档化的参数）；`skill/SKILL.md` 的 token 数不超过 [interface-contracts.md](./interface-contracts.md) 规定的预算。
+此外两项廉价的静态检查一并进入黄金测试：`clap` `Command::debug_assert()` 与全子命令 `--help` 非空校验（`--help-json` 已推迟至待办）；`skill/SKILL.md` 的 token 数不超过 [architecture-proposal.md](./architecture-proposal.md) 规定的 `< 250 tokens` 预算。
 
 ---
 

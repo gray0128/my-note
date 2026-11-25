@@ -30,8 +30,8 @@
 | --- | --- | --- | --- |
 | `BufferId` | 26 字符大写 ULID | `[u8; 16]` | 笔记工作区 Buffer 主键（默认初始 Buffer 名称为 `"scratch"`，ID 同样为随机生成 ULID） |
 | `BlockId` | 26 字符大写 ULID | `[u8; 16]` | 单个笔记块主键，兼作分数索引平局决胜键（Tie-breaker） |
-| `OpId` | 26 字符大写 ULID | `[u8; 16]` | 不可变同步操作唯一幂等 ID。**由 `mynote-core` 在加密前生成**（见 §3.3），本地 API / CLI / WASM 前端调用方均不传入 |
-| `KeyId` (`key_id`) | 26 字符大写 ULID | `[u8; 16]` | 单把块数据密钥 **BDEK** 的记录 ID（Tier 1 与 Tier 2 通用，见 §3.4） |
+| `OpId` | 26 字符大写 ULID | `[u8; 16]` | 不可变同步操作唯一幂等 ID。**由执行加密的 `mynote-core` 在加密前生成**（见 §3.3）：Tier 1 由 Daemon/CLI 生成；Tier 2 由前端 `WasmVaultSession` 生成并随本地请求显式交给 Daemon 封装 `MNS1` |
+| `KeyId` (`key_id`) | 26 字符大写 ULID | `[u8; 16]` | 单把实体数据密钥 **BDEK** 的记录 ID（Block 与 Buffer 通用、Tier 1 与 Tier 2 通用，见 §3.4） |
 | `SmkKid` (`smk_kid`) / `VkekKid` (`vkek_kid`) | 26 字符大写 ULID | `[u8; 16]` | 密钥环中某一代 `SMK` / `VKEK` 的 ID（见 §3.5） |
 | `MarkId` | 26 字符大写 ULID | `[u8; 16]` | 碎纸标记 ID（见 §3.4） |
 | `DeviceId` | `dev_` + 16 字符小写 Base32 | UTF-8 `String` | 设备唯一标识（注册时生成，只含 `[a-z0-9_]`，严禁包含连字符 `-` 以免干扰 HLC 解析） |
@@ -92,7 +92,7 @@ pub enum LeafBody {
     DecryptFailed { error_code: String },
 }
 
-/// 一个叶子版本（纯函数从 op DAG 计算得出）
+/// 一个叶子版本（纯函数在完整 MNS1 因果 DAG 上计算得出；中间祖先的 BDEK 碎纸不改变叶子拓扑）
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockLeaf {
     pub op_id: OpId,
@@ -105,9 +105,9 @@ pub struct BlockLeaf {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockState {
-    Active,    // 至少一个非墓碑叶子（Update-Wins）
-    Trashed,   // 全部叶子均为墓碑：在回收站中，宽限期内可撤销
-    Shredded,  // 块的所有 BDEK 均已碎纸，不再物化任何正文
+    Active,    // 至少一个非墓碑且密钥未碎纸的叶子（Update-Wins）
+    Trashed,   // 全部叶子均为墓碑（或已碎纸），但该块在 block_keys 中仍有未碎纸的 BDEK：在回收站中，宽限期内可撤销
+    Shredded,  // 全部叶子均为墓碑（或已碎纸），且该块的全部 BDEK 均已碎纸：不再物化任何正文
 }
 
 /// 物化后的单块完整视图
@@ -225,10 +225,12 @@ pub enum SyncEvent {
         acked: Vec<AckedOp>,
         head_seq: i64,
     },
-    /// 密钥表全量比对结果（体量 ≈ 块数 × 约 250 B [估算]，见 §3.4）
+    /// 密钥表与密钥材料全量比对结果（体量 ≈ 块数 × 约 250 B [估算]，见 §3.4、§3.5）
     KeyTableResponse {
         records: Vec<KeyRecordRow>,
         marks: Vec<ShredMarkRow>,
+        keyring: Option<(u32, Vec<u8>)>,       // (keyring_gen, msgpack(RecoveryKeyringV1))
+        vault_header: Option<(i64, Vec<u8>)>,  // (updated_at_ms, msgpack(VaultHeaderV1))
         server_now_ms: i64,
     },
     /// WebSocket 只做唤醒：只携带 head_seq，不携带 op
@@ -249,9 +251,11 @@ pub enum StoreMutation {
     UpsertBlock(MaterializedBlock),    // 同步替换该块的 block_leaves 行与 blocks_fts 条目
     AppendOp(LocalOpRecord),           // 含 MNS1 信封原文
     MarkOpsSynced { epoch: JournalEpoch, acked: Vec<AckedOp> },
+    MarkOpBlocked { op_id: OpId, reason: String }, // 离线 Tier 2 遇旧钥退役且 Vault 未解锁时暂存，不阻塞其他 op
     ClearServerSeqsForReconcile { new_epoch: JournalEpoch },
     UpsertBlockKey(KeyRecordRow),
     UpsertShredMark(ShredMarkRow),
+    UpsertKeyMaterial { kind: KeyMaterialKind, gen: i64, blob: Vec<u8>, updated_at_ms: i64 },
     /// 碎纸到期：删除本地密钥记录、该密钥对应的全部物化明文与 FTS 条目，随后执行 WAL checkpoint(TRUNCATE)
     ExecuteShred { key_id: KeyId },
     SetSyncMeta { bootstrap_completed: bool, journal_epoch: Option<JournalEpoch>, last_seq: i64 },
@@ -261,9 +265,9 @@ pub enum StoreMutation {
 pub enum SyncCommand {
     HttpPush(PushRequestDto),
     HttpPull { since_seq: i64, limit: u16 },
-    SyncKeyTable(KeyTableSyncDto),     // 上送本地新建的密钥记录、碎纸标记与撤销，取回全量
+    SyncKeyTable(KeyTableSyncDto),     // 上送本地新建的密钥记录、密钥材料（keyring/vault_header）、碎纸标记与撤销，取回全量
     FetchSnapshot(SnapshotPointer),    // 仅手机
-    UploadSnapshot { covers_seq: i64, bytes: Vec<u8> }, // 仅桌面；无 prev 指针、无 CAS
+    UploadSnapshot { epoch: JournalEpoch, covers_seq: i64, bytes: Vec<u8> }, // 仅桌面；无 prev 指针、无 CAS
 }
 ```
 
@@ -304,8 +308,8 @@ pub enum SyncCommand {
 
 | 信封 | AAD |
 | --- | --- |
-| `MNS1` | `"MNS1" \|\| ver \|\| smk_kid \|\| op_id \|\| device_id.as_bytes() \|\| key_id`（不涉及 BDEK 的 op 取 16 B 全零） |
-| `MNB1` | `"MNB1" \|\| ver \|\| block_id \|\| op_id \|\| key_id` |
+| `MNS1` | `"MNS1" \|\| ver \|\| smk_kid \|\| op_id \|\| device_id.as_bytes() \|\| key_id`（不涉及 BDEK 的 op 在 AAD 中取 16 B 全零；外层 JSON / SQL 列传 `null`） |
+| `MNB1` | `"MNB1" \|\| ver \|\| entity_id \|\| op_id \|\| key_id`（块正文取 `block_id`，`BufferMeta.name_mnb1` 取 `buffer_id`） |
 | `MNR1` | `"MNR1" \|\| ver \|\| smk_kid \|\| key_id \|\| wrap_gen (u32 LE)` |
 | `MNW1` | `"MNW1" \|\| ver \|\| vkek_kid \|\| key_id \|\| block_id` |
 | `MNRS` | `"MNRS" \|\| ver \|\| recovery_kid \|\| kind \|\| kid` |
@@ -313,22 +317,23 @@ pub enum SyncCommand {
 | `MNP1` 头 | `"MNP1" \|\| ver \|\| smk_kid \|\| snapshot_id \|\| covers_seq (i64 LE)` |
 | `MNP1` 体 | `"MNP1" \|\| ver \|\| smk_kid \|\| hdr_blake3 (32B)` |
 
-**`op_id` 的生成方（修正 F-01）**：
+**`op_id` 的生成方与本地 Tier 2 封装分工（修正 F-01）**：
 
-- `op_id` 由 `mynote-core` 在**加密之前**生成（Monotonic ULID），同一个值同时写入 `MNB1` AAD、`MNS1` AAD 和 DO `ops.op_id` 列。
-- 本地 REST API、CLI、`mynote-wasm` 的调用方**都不传入 `op_id`**；桌面 Daemon 与手机 / 浏览器内的 WASM core 各自在本进程内生成。
-- 由于 `MNB1` 绑定 `op_id`，**同一份密文不能被另一个 op 复用**：任何产生新 op 的路径（合并、换钥、从回收站恢复、UNLOCK）都必须先取得明文再重新加密。对 Tier 2 块，这意味着这些操作必须在 Vault 解锁会话内完成。
-- `MNB1` 同时绑定 `block_id` 与 `key_id`：密文不能被搬到另一个块，也不能被伪装成由另一把密钥加密。
-- **`key_id` 在 op 外层明文可见**：push 请求中每个 op 除 `envelope` 外还携带明文 `key_id`，DO 存入 `ops.key_id` 并建索引，用于服务端的密钥竞态校验（见 [`sync-protocol.md`](./sync-protocol.md) 与 [`cloudflare-cloud-architecture.md`](./cloudflare-cloud-architecture.md)）。由于 `key_id` 进入 `MNS1` AAD，服务端篡改该字段会让客户端解密失败而被发现。
+- `op_id` 由**执行正文加密的 `mynote-core` 实例**在加密之前生成（Monotonic ULID），同一个值同时写入 `MNB1` AAD、`MNS1` AAD 和 DO `ops.op_id` 列。
+- **Tier 1 / 元数据写入**：本地 REST API 与 CLI 调用方不传入 `op_id`，由桌面 Daemon（或离线直写的 CLI 进程）内的 core 生成并封装 `MNS1` / `MNR1`。
+- **Tier 2 写入**：桌面前端 `WasmVaultSession` 只持有 `VKEK`（不持有 `SMK`），因此它在 WASM 内生成 `(op_id, key_id)`、加密 `MNB1`（用 BDEK）并包裹 `MNW1`（用 `VKEK`，新建或换钥时），随本地 REST/UDS 请求**显式传递 `{ op_id, key_id, mnb1_b64, mnw1_b64? }`**；常驻 Daemon **原样采用该 `op_id`**，用 `SMK` 将 `MNW1` 封入 `MNR1`、将 `InnerOpV1` 封入 `MNS1`，绝不重新生成 `op_id`。
+- 由于 `MNB1` 绑定 `op_id`，**同一份密文不能被另一个 op 复用**：任何产生新 op 的路径（合并、换钥、从回收站恢复、`UNLOCK`）都必须先取得明文再重新加密。对 Tier 2 块，这意味着这些操作必须在 Vault 解锁会话内完成。
+- `MNB1` 同时绑定 `entity_id` 与 `key_id`：密文不能被搬到另一个实体，也不能被伪装成由另一把密钥加密。
+- **`key_id` 在 op 外层明文可见**：`BlockContent` 与 `BufferMeta` 均携带非空明文 `key_id`；不涉及 BDEK 的 op（`SET_META`、`DELETE`）在外层 JSON 与 SQL `key_id` 列中统一为 **`null`**（仅在拼装 `MNS1` AAD 字节串时填入 16 B 全零），避免服务端把全零 ID 误判为 `KEY_UNKNOWN`。DO 存入 `ops.key_id` 并建部分索引，用于服务端的密钥竞态校验（见 [`sync-protocol.md`](./sync-protocol.md)）。由于 `key_id` 进入 `MNS1` AAD，服务端篡改该字段会让客户端解密失败而被发现。
 
-### 3.4 块数据密钥（BDEK）与独立密钥表（`block_keys` + `shred_marks`）
+### 3.4 实体数据密钥（BDEK）与独立密钥表（`block_keys` + `shred_marks`）
 
-**这是 M1 线格式，不可推迟**：M1 写入的 op 会进入永久归档，必须从第一天起就用每块独立的 BDEK 加密正文，日后才能单独删除某一块（审查 [§9.3](../review/2026-11-24-first-principles-review.md)）。
+**这是 M1 线格式，不可推迟**：M1 写入的 op 会进入永久归档，必须从第一天起就用每块（及每 Buffer）独立的 BDEK 加密内容，日后才能单独删除某一实体（审查 [§9.3](../review/2026-11-24-first-principles-review.md)；`shred_marks` 状态机与到期执行器在 M2 上线）。
 
 #### 3.4.1 BDEK
 
-- 每块至少一把 32 B 随机 BDEK；一个块的各个版本默认共用同一把。**换钥**（「清除历史」、`LOCK`、`UNLOCK`、碎纸后复活）会为该块新建 BDEK′，因此一个 `block_id` 在密钥表中可能对应多条记录。
-- Tier 1 BDEK：由 SMK 保护（即 `MNR1` 记录的封装本身）。Tier 2 BDEK：先由 VKEK 包裹为 `MNW1`，再放进 `MNR1` 记录。
+- 每块（及每 Buffer）至少一把 32 B 随机 BDEK；同一实体的各个版本默认共用同一把。**换钥**（「清除历史」、`LOCK`、`UNLOCK`、碎纸后复活）会新建 BDEK′，因此一个实体在密钥表中可能对应多条记录。
+- Tier 1 BDEK：由 SMK 保护（即 `MNR1` 记录的封装本身）。Tier 2 BDEK（仅块）：先由 VKEK 包裹为 `MNW1`，再放进 `MNR1` 记录。
 
 #### 3.4.2 密钥记录（只创建、不修改逻辑内容）
 
@@ -338,8 +343,8 @@ pub enum SyncCommand {
 pub struct KeyRecordV1 {
     pub v: u8,                     // 1
     pub key_id: KeyId,
-    pub block_id: BlockId,
-    pub tier: u8,                  // 1 | 2
+    pub block_id: BlockId,         // 归属实体 ID：Block 填 BlockId，Buffer 填 BufferId（同为 16B ULID）
+    pub tier: u8,                  // 1 | 2（Buffer 恒为 1）
     pub created_hlc: String,
     pub created_by: DeviceId,
     pub bdek: Vec<u8>,             // tier 1：32 B 原始 BDEK；tier 2：MNW1 信封（45 + 32 + 16 = 93 B）
@@ -355,10 +360,10 @@ pub struct KeyRecordRow {
 ```
 
 - **逻辑内容不可变**：`key_id → (block_id, tier, BDEK)` 一旦创建永不修改。唯一允许的「替换」是密钥环轮换时用更新的 `wrap_gen` 重新封装同一内容（§3.5）。
-- 单条约 250 B [估算]；1 万块约 2.5 MB [估算]，每次同步全量比对。
-- 服务端可见的元数据：`key_id`、创建时间、`wrap_gen`、碎纸请求的时间与数量。**服务端看不到某把密钥属于哪个块、属于哪一层**（`block_id` 与 `tier` 在 `MNR1` 密文内）。但「新建密钥 + 对旧密钥发 24 小时碎纸」的时序可能暴露「某个块被加锁了」，只是看不出是哪一块（F-18 的诚实表述）。
+- 单条约 250 B [估算]；1 万块约 2.5 MB [估算]，每次同步连同 `key_material` 全量比对。
+- 服务端可见的元数据：`key_id`、创建时间、`wrap_gen`、碎纸请求的时间与数量。**服务端看不到某把密钥属于哪个块、属于哪一层**（`block_id` 与 `tier` 在 `MNR1` 密文内）。但 `ops.key_id` 暴露了哪些 op 共用同一把密钥，且「新建密钥 + 对旧密钥发 24 小时碎纸」的时序可能暴露「某个块被换钥/加锁了」，只是看不出是哪一块（F-18 的诚实表述）。
 
-#### 3.4.3 碎纸标记
+#### 3.4.3 碎纸标记（M2 启用）
 
 ```rust
 pub enum ShredMarkState {
@@ -374,8 +379,10 @@ pub struct ShredMarkRow {
     pub seen_seq: i64,                 // 请求方发出标记时已见到的最大 seq（竞态校验用）
     pub requested_by: DeviceId,
     pub requested_at_ms: i64,
-    pub not_before_ms: i64,            // 请求时 = 服务端时间 + max(请求宽限, T_grace_min)，默认宽限 T_grace = 7 天；
-                                       // 由 PendingConfirm 确认时更新为 max(原值, 确认时刻 + T_grace_min)
+    pub grace_ms: i64,                 // 请求的宽限时长（默认 T_grace = 7 天；>= T_grace_min）
+    pub not_before_ms: Option<i64>,    // PendingConfirm 时为 None；Scheduled 时 = 服务端接收时刻 + max(grace_ms, T_grace_min)；
+                                       // 由 PendingConfirm 确认时设为 confirmed_at_ms + max(grace_ms, T_grace_min)；
+                                       // UI 缩短宽限期（expedite）时更新为 min(原值, 缩短请求时刻 + T_grace_min) 且 >= requested_at_ms + T_grace_min
     pub state: ShredMarkState,
     pub confirmed_at_ms: Option<i64>,  // PendingConfirm → Scheduled 的确认时刻
     pub cancelled_by: Option<DeviceId>,
@@ -383,10 +390,10 @@ pub struct ShredMarkRow {
 }
 ```
 
-- 参数（审查 Q7–Q9，已拍板）：`T_grace` = 7 天；`T_grace_min` = 24 小时（「先写后锁」在 UI 中可缩短到此下限）；批量阈值 N = 20 个/天。
-- **服务端只强制三件事**：`not_before ≥ now + T_grace_min`、每日批量阈值（超出部分进入 `PendingConfirm`）、令牌范围（`read` 令牌一律 403）。到期后（`now ≥ not_before`）的撤销返回 409。
-- 「缩短宽限期、清空回收站、确认 `PendingConfirm` 只能在 UI 交互确认」由**本地 Daemon** 强制：服务端无法区分 UI 与 CLI。CLI 只能把块删进回收站（即以默认 `T_grace` 写碎纸标记）。
-- 新建标记必须携带 `seen_seq`（请求方已见到的最大 `seq`）。服务端据此做三项竞态校验并返回对应错误码：标记的 `seen_seq` 之后该 `key_id` 已有新 op → `SHRED_STALE`；对存在 `PendingConfirm` / `Scheduled` 标记的 `key_id` 推送新 op、且同一批内未先撤销 → `KEY_PENDING_SHRED`；op 引用已执行碎纸或未知的 `key_id` → `KEY_SHREDDED` / `KEY_UNKNOWN`。错误码到 CLI 的映射见 [`interface-contracts.md`](./interface-contracts.md)。
+- 参数（审查 Q7–Q9，已拍板）：`T_grace` = 7 天；`T_grace_min` = 24 小时（「先写后锁」或清空回收站在 UI 中可缩短到此下限）；批量阈值 N = 20 个/天。
+- **服务端只强制三件事**：`grace_ms ≥ T_grace_min`（及任何 `not_before_ms ≥ requested_at_ms + T_grace_min`）、每日批量阈值（超出部分进入 `PendingConfirm`）、令牌范围（`read` 令牌一律 `403`）。已到期置空后（`state = Executed`）的撤销返回 `410 KEY_SHREDDED`。
+- 「缩短宽限期、清空回收站、确认 `PendingConfirm` 只能在 UI 交互确认」由**本地 Daemon** 强制：服务端无法区分 UI 与 CLI。CLI 只能把块删进回收站（M2 起以默认 `T_grace` 写碎纸标记）。
+- 新建标记必须携带 `seen_seq`（请求方已见到的最大 `seq`）。同批 push 按「密钥记录 → 撤销 → op → 碎纸标记」顺序在单事务内执行，服务端做三项竞态校验并返回对应错误码：本批之前该 `key_id` 已存在 `seq > seen_seq` 的其他 op → `SHRED_STALE`；对已存在 `PendingConfirm` / `Scheduled` 标记的 `key_id` 推送新 op、且同批未先撤销 → `KEY_PENDING_SHRED`；op 引用已执行碎纸或未知的 `key_id` → `KEY_SHREDDED` / `KEY_UNKNOWN`。错误码到 CLI 的映射见 [`interface-contracts.md`](./interface-contracts.md)。
 - 端点（`/v1/keys`、`/v1/keys/shred`、`/v1/keys/cancel`、`/v1/keys/confirm`）与 alarm 实现见 [`cloudflare-cloud-architecture.md`](./cloudflare-cloud-architecture.md)；请求流程见 [`sync-protocol.md`](./sync-protocol.md)。
 
 #### 3.4.4 合并规则（2P-Set）
@@ -394,17 +401,17 @@ pub struct ShredMarkRow {
 记密钥记录集合为 $K$，碎纸标记集合为 $M$。各副本（每台桌面、DO、手机缓存）独立保存，合并为逐元素取上确界：
 
 1. **记录**：按 `key_id` 取并集；同一 `key_id` 取 `wrap_gen` 最大者；`key_record = None`（已碎纸）为终态，优先于任何代际。
-2. **标记**：按 `mark_id` 取并集；`state` 按 `PendingConfirm < Scheduled < {Cancelled, Executed}` 取较大者（两个终态互斥，由服务端裁定，客户端以服务端为准）；`not_before_ms` 只在确认时按 `max` 单调增大。
-3. **生效**：标记 $m$ 生效 ⇔ `state = Executed`，或 `state = Scheduled ∧ not_before_ms ≤ now`（权威时间为服务端时间；DO alarm 执行后置为 `Executed`）。`PendingConfirm` 不计时、不生效。
-4. **可用密钥** $= \{ k \in K \mid k.\text{key\_record} \neq \text{None} \land \nexists\, m \in M: m.\text{key\_id} = k \land m \text{ 生效} \}$。
-5. **撤销只在生效前有效**：`now ≥ not_before_ms` 之后到达的撤销返回 409。因此一个标记一旦生效，结果对所有副本都是永久的。
-6. 合并本身不会让任何密钥消失；只有生效的碎纸标记会移除密钥。桌面在本地时间越过 `not_before_ms` 时可以提前删除本地密钥：若实际上该标记已在生效前被撤销，下次同步会从 DO 取回密钥。
+2. **标记**：按 `mark_id` 取并集；`state` 按 `PendingConfirm < Scheduled < {Cancelled, Executed}` 取较大者（两个终态互斥，由服务端唯一裁定，客户端以服务端为准）；`Scheduled` 状态下的 `not_before_ms` 取非空值中的 `min`（缩短宽限期只会将到期日提前，且受服务端 `requested_at_ms + T_grace_min` 下界约束）。
+3. **生效（服务端唯一裁判）**：标记 $m$ 生效 ⇔ `state = Executed`（仅由 DO alarm 在服务端时间越过 `not_before_ms` 后写入；**客户端本地时钟绝不参与生效判定**，防止本机时钟快偏或离线期间远端已撤销而误删本地密钥）。`PendingConfirm` 不计时、不生效。
+4. **可用密钥** $= \{ k \in K \mid k.\text{key\_record} \neq \text{None} \land \nexists\, m \in M: m.\text{key\_id} = k \land m.\text{state} = \text{Executed} \}$。
+5. **撤销只在执行前有效**：DO alarm 置为 `Executed` 之后到达的撤销返回 `410 KEY_SHREDDED`。因此一个标记一旦执行，结果对所有副本都是永久的。
+6. 合并本身不会让任何密钥消失；只有服务端已置为 `Executed` 的碎纸标记会触发各端执行本地 `ExecuteShred` 并将 `key_id` 记入本地已碎纸墓碑集合。
 
 **不变量**（门禁见 [`eval-framework.md`](./eval-framework.md)）：
 
 - **INV-KEY-LIVENESS**：未进入碎纸流程的块，其所有非墓碑叶子引用的 `key_id` 在全部副本中始终属于「可用密钥」。每日自检若发现违反，告警并禁止该设备继续发碎纸请求。
-- 引用某 `key_id` 的 op 被推送之前，对应密钥记录必须已被服务端确认或在同一批次中提交（顺序规则见 [`sync-protocol.md`](./sync-protocol.md)）。
-- 换钥后对旧密钥发碎纸之前，必须确认服务端已确认新 op 与新密钥记录。
+- 引用某 `key_id` 的 op 被推送之前，对应密钥记录必须已被服务端确认或在同一批次中排在前面提交（顺序规则见 [`sync-protocol.md`](./sync-protocol.md)）。
+- 换钥后对旧密钥发碎纸之前，必须确认服务端已确认新 op 与新密钥记录（或在同一批次中置于 op 之后原子提交）。
 - 已碎纸的 `key_id` 永不重新创建；复活一律使用新 `key_id`。离线设备对已碎纸块的编辑，用新 BDEK 重新加密为新版本，`BlockContent` 中必须填写 `buffer_id` / `position` / `lang`（作为该 op HLC 下的字段 LWW 赋值），以便只读快照之外的设备也能重建该块。
 
 ### 3.5 统一恢复包、恢复密钥环与 Vault 头部
@@ -464,15 +471,15 @@ pub struct KdfParamsV1 {
 | `22..38` | `kid` | `16 B` | 被封装的 `smk_kid` / `vkek_kid` |
 | `38..70` | `eph_pk` | `32 B` | 一次性 X25519 公钥 |
 | `70..94` | `nonce` | `24 B` | 随机 Nonce |
-| `94..` | `ciphertext` | `32 + 16 B` | AEAD 密钥 = `HKDF-SHA256(ikm = X25519(eph_sk, recovery_pk), salt = eph_pk ‖ recovery_pk, info = "mynote-seal-v1")`，明文为 32 B 密钥 |
+| `94..` | `ciphertext` | `32 + 16 B` | AEAD 密钥 = `HKDF-SHA256(ikm = X25519(eph_sk, recovery_pk), salt = eph_pk ‖ recovery_pk, info = "mynote-seal-v1")`（实现必须拒绝全零 X25519 共享秘密以排除低阶点），明文为 32 B 密钥 |
 
-- **日常密钥存放**：桌面 Daemon（OS Keychain / Secret Service）**只持有 Tier 1 的 SMK 代际**与恢复公钥；VKEK 只以 `wrapped_vkek`（口令）与 `sealed_vkek`（恢复公钥）两种形式存在于 Vault 头部，**Daemon 不持有任何能解开 VKEK 的材料**（Tier 2 解密只在解锁后的 Vault 会话内存中进行，信任边界见 [`threat-model.md`](./threat-model.md)）。Root Seed 与 `recovery_sk` 只在恢复时由用户输入 24 词临时派生，用后清零。
-- **SMK 代际永久保留**：R2 op 归档永久保留且其中的 `MNS1` 由当时的 SMK 加密，删除旧 SMK 等于让归档不可读，因此 `smk_entries` 只追加，设备 Keychain 中的 SMK 代际也不删除。所谓「旧代际保留 `T_snap`」只适用于**用旧代际封装的密钥表副本**（R2 密钥表快照、本地备份）：轮换时全部 `MNR1` 以新 `wrap_gen` 重新封装，旧封装的副本随 `T_snap` 生命周期自然淘汰。VKEK 只用于包裹 BDEK，因此退役的 VKEK 可在 `T_snap` 后移除。
-- **轮换** = 生成新 SMK（或 VKEK）→ 用恢复公钥封装后追加（VKEK 则写入新 Vault 头部，旧的移入 `retired`）→ `keyring_gen + 1` → 以新代际重新封装全部 `MNR1`（VKEK 轮换需在 Vault 会话内重新包裹 Tier 2 的 `MNW1`）。**不需要重新抄写 24 词**，但仍要求用户确认恢复包有效（例如通过恢复演练校验 `recovery_kid` 与一次试解封）。
+- **日常密钥存放**：桌面 Daemon（OS Keychain / Secret Service）**只持有 Tier 1 的 SMK 代际**与恢复公钥；VKEK 只以 `wrapped_vkek`（口令）与 `sealed_vkek`（恢复公钥）两种形式存在于 Vault 头部，**Daemon 不持有任何能解开 VKEK 的材料**（Tier 2 解密只在解锁后的 Vault 会话内存中进行，信任边界见 [`threat-model.md`](./threat-model.md)）。Root Seed 与 `recovery_sk` 只在恢复或本地解锁新 SMK 代际时由用户输入 24 词临时派生，用后清零。
+- **SMK 代际永久保留**：R2 op 归档永久保留且其中的 `MNS1` 由当时的 SMK 加密，删除旧 SMK 等于让归档不可读，因此 `smk_entries` 只追加，设备 Keychain 中的 SMK 代际也不删除。所谓「旧代际保留 `T_snap`」只适用于**用旧代际封装的历史密钥表快照**（R2 `archives/keys/history/`、本地自动备份）：轮换时全部 `MNR1` 以新 `wrap_gen` 重新封装，旧封装副本随 `T_snap` 生命周期自然淘汰。VKEK 只用于包裹 BDEK，因此退役的 VKEK 可在 `T_snap` 后移除。
+- **轮换与存留设备密钥刷新** = 生成新 SMK（或 VKEK）→ 用恢复公钥封装后追加（VKEK 则写入新 Vault 头部，旧的移入 `retired`）→ `keyring_gen + 1` → 以新代际重新封装全部 `MNR1`（VKEK 轮换需在 Vault 会话内重新包裹 Tier 2 的 `MNW1`）并随 `/v1/keys` 上传更新 `key_material`。**不需要重新抄写 24 词**，轮换后运行 `mynote recovery drill` 确认恢复包有效。其他未吊销的存留设备通过两条低复杂度路径之一获取新 `SMK` 代际（不引入设备级长期公钥树）：(1) 在已轮换桌面上执行 `mynote device refresh <device_id>` 生成复用 `pairing_tickets` 的 10 分钟一次性刷新码，在存留设备上 `claim` 领取；(2) 单机/异地时直接在存留桌面上执行 `mynote keyring unlock` 输入一次 24 词解封 `RecoveryKeyringV1`。
 - **Vault 口令变更**只重新生成 `salt` 与 `wrapped_vkek`，VKEK 不变，不触碰密钥表。Vault 不再有第二套 24 词恢复码：忘记口令时用统一恢复包解开 `sealed_vkek`，再设新口令。
 - KDF 参数只有一套，按最弱设备（iPhone）定，参数和盐存于 Vault 头部；目标单次解锁约 1–2 s [目标]，以 S0 实测为准。
 - 服务端可以截断或替换 `smk_entries` 列表（单条封装本身有 AEAD 认证，伪造的条目只会解封失败）。缓解：每台桌面在本地 `key_material` 保留完整副本并在同步时比对条目数，R2 密钥表快照中也有副本；INV-RECOVERY 演练覆盖。
-- `RecoveryKeyringV1` 与 `VaultHeaderV1` 存放在 DO `key_material`、本地 `key_material`，并随每日密钥表快照进入 R2。手机只缓存 `VaultHeaderV1`。
+- `RecoveryKeyringV1` 与 `VaultHeaderV1` 存放在 DO `key_material`、本地 `key_material`，随 `/v1/keys` 同步（仅接受更大的 `gen`），并随每日密钥表快照进入 R2。手机只缓存 `VaultHeaderV1`。
 
 ### 3.6 手机用当前状态快照（`MNP1`，头体分离双段认证结构）
 
@@ -543,14 +550,15 @@ pub enum SnapshotLeafBody {
 
 ### 3.7 R2 归档与密钥表快照（服务端生成的容器）
 
-两类对象都由 DO 的每日任务生成。容器本身不再加密（内容已是密文），只做完整性校验。
+两类对象都由 DO 的每日任务生成。容器本身不再加密（内容已是密文），只做完整性校验。Worker 不对外暴露归档 HTTP 路由。
 
 | 对象 | R2 键 | 内容 | 保留 |
 | --- | --- | --- | --- |
 | op 密文归档 `MNA1` | `archives/ops/<journal_epoch>/<from_seq:012>-<to_seq:012>.mna1` | 头 `"MNA1" \|\| ver \|\| msgpack({ journal_epoch, from_seq, to_seq, row_count, created_at_ms })`，体 = `msgpack(Vec<{ seq, op_id, key_id, device_id, created_at, envelope }>)`，尾 = 前文 `blake3 (32B)` | **永久、只追加** |
-| 密钥表快照 `MNKS` | `archives/keys/<yyyy-mm-dd>.mnks` | 头 `"MNKS" \|\| ver \|\| msgpack({ created_at_ms, keyring_gen, record_count })`，体 = `msgpack({ keyring: RecoveryKeyringV1, vault_header: Option<VaultHeaderV1>, records: Vec<KeyRecordRow>（仅可用密钥）, marks: Vec<ShredMarkRow> })`，尾 = `blake3` | R2 生命周期规则删除，`T_snap` = 30 天 |
+| 最新密钥表快照 `MNKS` | `archives/keys/latest.mnks` | 头 `"MNKS" \|\| ver \|\| msgpack({ created_at_ms, keyring_gen, record_count })`，体 = `msgpack({ keyring: RecoveryKeyringV1, vault_header: Option<VaultHeaderV1>, records: Vec<KeyRecordRow>（仅可用密钥）, marks: Vec<ShredMarkRow> })`，尾 = `blake3` | **每日覆写、不挂生命周期删除**（碎纸次日即被覆盖移除，停写超 30 天也不会归零） |
+| 历史密钥表快照 `MNKS` | `archives/keys/history/<yyyy-mm-dd>.mnks` | 同上 | R2 生命周期规则删除，`T_snap` = 30 天 |
 
-- 恢复（`mynote restore --from-archive`，契约见 [`interface-contracts.md`](./interface-contracts.md)）= 全部 `MNA1` + 最新一份 `MNKS` + 统一恢复包。最新快照总包含全部可用密钥，因此从归档恢复不受快照轮换影响。
+- 极端双重灾难恢复（`mynote restore --from-archive <local-dir>`，契约见 [`interface-contracts.md`](./interface-contracts.md)）= 本地导出的全部 `MNA1` + `latest.mnks` + 统一恢复包。若仅客户端设备全失而 DO 仍健在，直接凭 `BOOTSTRAP_TOKEN` + 24 词从 DO 全量拉回即可。
 - 彻底不可恢复的上界（`T_grace + max(DO PITR 30 天, T_snap)` ≈ 37 天）的推导与承诺见 [`threat-model.md`](./threat-model.md)。
 
 ---
@@ -575,20 +583,22 @@ CREATE TABLE IF NOT EXISTS local_meta (
 ) STRICT;
 
 -- 2. 工作区 Buffer 表（使用 Fractional Index 排序；字段 LWW）
+--    ExecuteShred 执行时保留行主键（避免旗下仍有存活/待确认块时触发 blocks.buffer_id 外键报错），清空 name 并置 state = 'SHREDDED'
 CREATE TABLE IF NOT EXISTS buffers (
     id            TEXT PRIMARY KEY,          -- 26B ULID
-    name          TEXT NOT NULL,             -- 本地物化明文；碎纸执行时随 key_id 删除
+    name          TEXT NOT NULL,             -- 本地物化明文；state = 'SHREDDED' 时置为 ''
     key_id        TEXT NOT NULL,             -- Buffer 自己的 BDEK（Tier 1）
     position      TEXT NOT NULL,             -- Base62 分数索引
     name_hlc      TEXT NOT NULL,             -- 定长 Canonical HLC
     position_hlc  TEXT NOT NULL,
+    state         TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (state IN ('ACTIVE', 'TRASHED', 'SHREDDED')),
     updated_at_ms INTEGER NOT NULL,
     deleted_at_ms INTEGER                    -- NULL = 存活
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_buffers_active_order
     ON buffers (position COLLATE BINARY ASC, id ASC)
-    WHERE deleted_at_ms IS NULL;
+    WHERE state = 'ACTIVE';
 
 -- 3. 块物化主表：字段 LWW 结果 + 状态；正文在 block_leaves
 CREATE TABLE IF NOT EXISTS blocks (
@@ -602,8 +612,8 @@ CREATE TABLE IF NOT EXISTS blocks (
     lang_hlc           TEXT NOT NULL,
     public_hint_hlc    TEXT NOT NULL,
     state              TEXT NOT NULL CHECK (state IN ('ACTIVE', 'TRASHED', 'SHREDDED')),
-    is_locked          INTEGER NOT NULL CHECK (is_locked IN (0, 1)), -- 任一叶子 tier = 2
-    display_op_id      TEXT,                 -- 非墓碑叶子中 (hlc, op_id) 最大者
+    is_locked          INTEGER NOT NULL CHECK (is_locked IN (0, 1)), -- 任一存活叶子 tier = 2
+    display_op_id      TEXT,                 -- 存活叶子中 (hlc, op_id) 最大者
     leaf_count         INTEGER NOT NULL DEFAULT 1,
     updated_at_ms      INTEGER NOT NULL,
     deleted_at_ms      INTEGER,              -- 进入回收站的时间
@@ -649,35 +659,36 @@ CREATE VIRTUAL TABLE IF NOT EXISTS blocks_fts USING fts5(
     tokenize = 'unicode61 remove_diacritics 2'
 );
 
--- 6. 本地完整操作日志与待同步出站队列（server_seq IS NULL 即为待推 Outbox；永久保留，不截断）
+-- 6. 本地完整操作日志与待同步出站队列（server_seq IS NULL AND sync_blocked_reason IS NULL 即为待推 Outbox；永久保留，不截断）
 --    envelope 为 MNS1 原文；块正文只以 MNB1 密文存在其中，碎纸其 BDEK 即令该段历史不可读
 CREATE TABLE IF NOT EXISTS sync_ops (
-    op_id            TEXT PRIMARY KEY,       -- 26B ULID
-    server_seq       INTEGER,                -- 当前 journal_epoch 下的云端序号；未推送为 NULL
-    device_id        TEXT NOT NULL,
-    entity_type      TEXT NOT NULL CHECK (entity_type IN ('buffer', 'block')),
-    entity_id        TEXT NOT NULL,
-    parent_op_ids    TEXT NOT NULL,          -- JSON 数组字符串，如 '["01J..."]'
-    op_type          TEXT NOT NULL CHECK (op_type IN ('CREATE','UPDATE','SET_META','LOCK','UNLOCK','RESOLVE','DELETE')),
-    hlc              TEXT NOT NULL,
-    actor            TEXT NOT NULL DEFAULT 'human',
-    key_id           TEXT,                   -- BlockContent 所用 BDEK；其他载荷为 NULL
-    smk_kid          TEXT NOT NULL,
-    envelope         BLOB NOT NULL,          -- MNS1 原文
-    created_at_ms    INTEGER NOT NULL
+    op_id                TEXT PRIMARY KEY,       -- 26B ULID
+    server_seq           INTEGER,                -- 当前 journal_epoch 下的云端序号；未推送为 NULL
+    sync_blocked_reason  TEXT,                   -- 如 'NEEDS_VAULT_REKEY'（离线 Tier 2 遇旧钥退役待解锁重加密，不阻塞其他 op）
+    device_id            TEXT NOT NULL,
+    entity_type          TEXT NOT NULL CHECK (entity_type IN ('buffer', 'block')),
+    entity_id            TEXT NOT NULL,
+    parent_op_ids        TEXT NOT NULL,          -- JSON 数组字符串，如 '["01J..."]'
+    op_type              TEXT NOT NULL CHECK (op_type IN ('CREATE','UPDATE','SET_META','LOCK','UNLOCK','RESOLVE','DELETE')),
+    hlc                  TEXT NOT NULL,
+    actor                TEXT NOT NULL DEFAULT 'human',
+    key_id               TEXT,                   -- BlockContent 与 BufferMeta 所用 BDEK；SET_META / DELETE 为 NULL
+    smk_kid              TEXT NOT NULL,
+    envelope             BLOB NOT NULL,          -- MNS1 原文
+    created_at_ms        INTEGER NOT NULL
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_sync_ops_outbox
     ON sync_ops (created_at_ms ASC, op_id ASC)
-    WHERE server_seq IS NULL;
+    WHERE server_seq IS NULL AND sync_blocked_reason IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_sync_ops_entity_history
     ON sync_ops (entity_type, entity_id, hlc ASC);
 
--- 7. 块数据密钥表（§3.4.2；与 DO 侧逐行对应，同步时全量比对）
+-- 7. 实体数据密钥表（§3.4.2；与 DO 侧逐行对应，同步时全量比对）
 CREATE TABLE IF NOT EXISTS block_keys (
     key_id         TEXT PRIMARY KEY,         -- 26B ULID
-    block_id       TEXT NOT NULL,            -- 本地解密 MNR1 后填写，便于自检与 ExecuteShred
+    block_id       TEXT NOT NULL,            -- 本地解密 MNR1 后填写归属 BlockId / BufferId，便于自检与 ExecuteShred
     tier           INTEGER NOT NULL CHECK (tier IN (1, 2)),
     wrap_gen       INTEGER NOT NULL,
     key_record     BLOB,                     -- MNR1；碎纸执行后置 NULL（终态）
@@ -688,7 +699,7 @@ CREATE TABLE IF NOT EXISTS block_keys (
 
 CREATE INDEX IF NOT EXISTS idx_block_keys_block ON block_keys (block_id);
 
--- 8. 碎纸标记（§3.4.3；2P-Set 合并规则见 §3.4.4）
+-- 8. 碎纸标记（§3.4.3，M2 启用；2P-Set 合并规则见 §3.4.4；另存本地已碎纸 key_id 永久墓碑集合于 local_meta 或本表 executed 行）
 CREATE TABLE IF NOT EXISTS shred_marks (
     mark_id          TEXT PRIMARY KEY,
     key_id           TEXT NOT NULL REFERENCES block_keys(key_id),
@@ -727,7 +738,7 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 **删除与碎纸对本地存储的作用**（流程见 [`sync-protocol.md`](./sync-protocol.md)）：
 
 - `DELETE`：块 `state → 'TRASHED'`，`block_leaves` 只剩墓碑叶子，FTS 条目立即删除；`sync_ops` 中的密文原样保留，宽限期内可据此恢复。
-- `ExecuteShred { key_id }`：`block_keys.key_record = NULL`；引用该 `key_id` 的叶子转为 `KEY_UNAVAILABLE`；若该块已无任何可用密钥则 `state → 'SHREDDED'`；随后 `PRAGMA wal_checkpoint(TRUNCATE)`（`secure_delete` 已开启）。门禁 INV-SHRED-BOUND 断言此后本地数据库、WAL、FTS、本地备份中都找不到该密钥与对应明文。
+- `ExecuteShred { key_id }`（仅在收到服务端 `state = 'executed'` 时执行）：`block_keys.key_record = NULL`；引用该 `key_id` 的叶子转为 `KEY_UNAVAILABLE`；若该块全部叶子均为墓碑/已碎纸且已无任何可用密钥则 `state → 'SHREDDED'`（若目标为 Buffer，则 `buffers.name = ''` 且 `state → 'SHREDDED'`，若其下仍有存活块则在 UI 归入「已删除工作区遗留块」视图）；随后 `PRAGMA wal_checkpoint(TRUNCATE)`（`secure_delete` 已开启）。门禁 INV-SHRED-BOUND 断言此后本地数据库、WAL、FTS、本地备份中都找不到该密钥与对应明文。
 
 ### 4.1 本地数据目录、备份与 Schema 版本保护
 
@@ -745,7 +756,7 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 
 ## 5. 云端 Cloudflare DO SQLite 完整 DDL Schema（`cloud-cf`）
 
-服务端保持极薄：幂等追加、分配 `seq`、按 `seq` 分页、`epoch`、令牌范围、WebSocket 唤醒、密钥表与碎纸标记的存储 + 宽限期 / 批量阈值校验 + alarm 执行碎纸、每日归档。基于 Workers Paid（单 SQLite DO 10 GB），**不做 GC**。
+服务端保持极薄：幂等追加、分配 `seq`、按 `seq` 分页、`epoch`、令牌范围、WebSocket 唤醒、密钥表 / 密钥材料存储、M2 起的碎纸标记校验与 alarm 置空、每日归档。基于 Workers Paid（单 SQLite DO 10 GB），**不做 GC**。
 
 > [!NOTE]
 > INV-SYNC-6「每 op 恰好 2 行写入」已放宽：Paid 套餐内含每月 5,000 万行写，本项目约每月 3 万行写 [估算]，占比约 0.06%。`ops` 表仍保持最小列以减少元数据暴露；确有需要时可以加二级索引。批量推送仍须遵守 DO SQL **单语句最多 100 个绑定参数**的平台限制（逐行预编译语句循环执行）。
@@ -758,6 +769,7 @@ CREATE TABLE IF NOT EXISTS journal_meta (
 );
 
 -- 2. 注册设备、令牌哈希、令牌范围与同步水位表
+--    未认领配对票据预注册的设备 claimed_at_ms 为 NULL（尚未激活鉴权），票据超时未领时级联删除该幽灵行
 CREATE TABLE IF NOT EXISTS devices (
     device_id        TEXT PRIMARY KEY,
     device_name      TEXT NOT NULL,
@@ -766,17 +778,20 @@ CREATE TABLE IF NOT EXISTS devices (
     last_pulled_seq  INTEGER NOT NULL DEFAULT 0,
     last_seen_at_ms  INTEGER NOT NULL,
     created_at_ms    INTEGER NOT NULL,
+    claimed_at_ms    INTEGER,                -- bootstrap 直接填激活时间；配对预注册为 NULL，首次 pair-claim 时填激活时间
     revoked_at_ms    INTEGER                 -- 非 NULL 时立即拒绝一切 HTTP/WS 请求
 );
 
--- 3. 一次性领取配对票据表（粘贴配对码 / PWA 内扫码）。
---    配对码只含 pair_id + 一次性包裹密钥（256 bit）+ 服务端地址；发起设备把「Tier 1 SMK 代际 + 新设备令牌」
---    用一次性密钥加密后暂存于此。TTL 10 分钟；首次领取即删除整行；超时由 alarm 删除。只有 read-write 令牌可发起。
+-- 3. 一次性领取配对 / 密钥刷新票据表（粘贴配对码 / PWA 内扫码）。
+--    配对码只含 pair_id + 一次性包裹密钥 K_pair（256 bit）+ 服务端地址；发起桌面生成新 device_token（仅哈希入 devices），
+--    把「Tier 1 SMK 代际 + 新设备令牌（kind='pair'）或仅新 SMK 代际（kind='refresh'）」用 K_pair 加密后暂存于此。
+--    服务端从不接触明文 device_token 或 K_pair。TTL 10 分钟；首次领取即删除整行；超时由 alarm 删除（若 kind='pair' 同步清理未激活的 devices 行）。
 CREATE TABLE IF NOT EXISTS pairing_tickets (
     pair_id          TEXT PRIMARY KEY,
-    device_id        TEXT NOT NULL REFERENCES devices(device_id), -- 预注册的新设备（令牌哈希已写入 devices）
+    kind             TEXT NOT NULL DEFAULT 'pair' CHECK (kind IN ('pair', 'refresh')),
+    device_id        TEXT NOT NULL REFERENCES devices(device_id),
     scope            TEXT NOT NULL CHECK (scope IN ('read', 'read-write')),
-    ciphertext       BLOB NOT NULL,          -- XChaCha20-Poly1305(一次性密钥, msgpack({ smks, device_token, device_id, sync_url }))
+    ciphertext       BLOB NOT NULL,          -- XChaCha20-Poly1305(K_pair, msgpack({ smks, device_token?, device_id, sync_url }))
     created_by       TEXT NOT NULL,
     expires_at_ms    INTEGER NOT NULL        -- created + 10 分钟
 );
@@ -787,13 +802,13 @@ CREATE TABLE IF NOT EXISTS ops (
     op_id      TEXT NOT NULL UNIQUE,
     device_id  TEXT NOT NULL,
     created_at INTEGER NOT NULL,             -- 服务端接收毫秒时间戳（仅用于归档分段）
-    key_id     TEXT,                         -- 明文 key_id（进入 MNS1 AAD）；不涉及 BDEK 的 op 为 NULL
+    key_id     TEXT,                         -- 明文 key_id（进入 MNS1 AAD）；SET_META / DELETE 为 NULL
     envelope   BLOB NOT NULL                 -- MNS1 密文
 );
 
 CREATE INDEX IF NOT EXISTS idx_ops_key ON ops (key_id, seq) WHERE key_id IS NOT NULL;
 
--- 5. 块数据密钥表（§3.4.2）。服务端看不到 block_id 与 tier
+-- 5. 实体数据密钥表（§3.4.2）。服务端看不到 block_id 与 tier
 CREATE TABLE IF NOT EXISTS block_keys (
     key_id             TEXT PRIMARY KEY,
     wrap_gen           INTEGER NOT NULL,     -- 仅接受更大的 wrap_gen 替换 key_record
@@ -803,15 +818,15 @@ CREATE TABLE IF NOT EXISTS block_keys (
     shredded_at_ms     INTEGER
 );
 
--- 6. 碎纸标记（§3.4.3）。服务端强制 not_before >= now + T_grace_min；超出每日批量阈值 N 的进入 pending_confirm
+-- 6. 碎纸标记（§3.4.3，M2 启用）。服务端强制 grace_ms >= T_grace_min；超出每日批量阈值 N 的进入 pending_confirm
 CREATE TABLE IF NOT EXISTS shred_marks (
     mark_id          TEXT PRIMARY KEY,
     key_id           TEXT NOT NULL REFERENCES block_keys(key_id),
-    seen_seq         INTEGER NOT NULL,       -- 竞态校验：该 key_id 存在 seq > seen_seq 的 op 时拒绝（SHRED_STALE）
+    seen_seq         INTEGER NOT NULL,       -- 竞态校验：本批之前该 key_id 存在 seq > seen_seq 的 op 时拒绝（SHRED_STALE）
     requested_by     TEXT NOT NULL,
     requested_at_ms  INTEGER NOT NULL,
     grace_ms         INTEGER NOT NULL,
-    not_before_ms    INTEGER,                -- pending_confirm 时为 NULL；确认后 = max(原值, 确认时刻 + T_grace_min)
+    not_before_ms    INTEGER,                -- pending_confirm 时为 NULL；确认后 = confirmed_at_ms + max(grace_ms, T_grace_min)
     state            TEXT NOT NULL CHECK (state IN ('pending_confirm', 'scheduled', 'cancelled', 'executed')),
     confirmed_by     TEXT,
     confirmed_at_ms  INTEGER,
@@ -824,7 +839,7 @@ CREATE INDEX IF NOT EXISTS idx_shred_marks_due
     ON shred_marks (not_before_ms)
     WHERE state = 'scheduled';
 
--- 7. 密钥环与 Vault 头部（§3.5；服务端只存密文，仅接受更大的 gen 替换）
+-- 7. 密钥环与 Vault 头部（§3.5；服务端只存密文，随 /v1/keys 读写，仅接受更大的 gen 替换）
 CREATE TABLE IF NOT EXISTS key_material (
     kind           TEXT PRIMARY KEY CHECK (kind IN ('keyring', 'vault_header')),
     gen            INTEGER NOT NULL,
@@ -832,14 +847,16 @@ CREATE TABLE IF NOT EXISTS key_material (
     updated_at_ms  INTEGER NOT NULL
 );
 
--- 8. 手机状态快照指针（§3.6；按 covers_seq 单调接受，只保留最近 2 份）
+-- 8. 手机状态快照指针（§3.6，M2 启用；同一 journal_epoch 内按 covers_seq 单调接受，只保留最近 2 份）
 CREATE TABLE IF NOT EXISTS phone_snapshots (
     snapshot_id        TEXT PRIMARY KEY,
-    covers_seq         INTEGER NOT NULL UNIQUE,
+    journal_epoch      TEXT NOT NULL,
+    covers_seq         INTEGER NOT NULL,
     r2_object_key      TEXT NOT NULL,
     byte_size          INTEGER NOT NULL,
     created_by_device  TEXT NOT NULL,
-    created_at_ms      INTEGER NOT NULL
+    created_at_ms      INTEGER NOT NULL,
+    UNIQUE (journal_epoch, covers_seq)
 );
 ```
 

@@ -4,8 +4,8 @@
 
 > **IMMUTABLE VERIFIER RULE (MANDATORY)**:
 > Feature and bugfix PRs **MUST NOT** modify any file inside `evals/`.
-> During CI, `evals/` is always checked out directly from `origin/main` before running checks (`git checkout origin/main -- evals/`).
-> To add or revise evaluation cases, schemas, or regression seeds, open a dedicated **`[eval-only]`** PR touching only `evals/` and [`docs/eval-framework.md`](../docs/eval-framework.md).
+> During CI on non-`[eval-only]` PRs, `evals/` is always checked out directly from `origin/main` before running checks (`git checkout origin/main -- evals/`).
+> To add or revise evaluation cases, schemas, or regression seeds, open a dedicated **`[eval-only]`** PR touching only `evals/` and [`docs/eval-framework.md`](../docs/eval-framework.md) (on `[eval-only]` PRs, CI verifies the diff touches no other paths and runs the PR's `evals/`).
 
 ## Directory Layout
 

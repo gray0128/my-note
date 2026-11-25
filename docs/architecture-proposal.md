@@ -49,7 +49,7 @@
 - **G4 秘密不落明文、不以明文进云端。**
 - **G5 Agent 可读写**（通过 CLI）。
 - **G6 Heynote 式分块与格式化，Markdown / Mermaid 渲染。**
-- **C1 一个人能长期维护**：复杂度预算建议为 M1 结束时云端代码 < 500 行、core 同步部分 < 3k 行 [目标]；任何新机制都需附上触发它的测量数据（F-08）。
+- **C1 一个人能长期维护**：复杂度预算建议为 M1 结束时云端代码 < 500 行 [目标]（M2 加入碎纸状态机与竞态校验后约 500–700 行 [估算]）、core 同步部分 < 3k 行 [目标]；任何新机制都需附上触发它的测量数据（F-08）。
 - **C2 成本约 \$5/月**（Cloudflare Workers Paid）[估算]，并配置支出告警（D4）。
 
 ### 0.2 非目标（Non-goals）
@@ -65,14 +65,14 @@
 ### 0.3 成功指标
 
 - **M1 准出**：Mac 与 Omarchy 日常使用连续 4 周零丢数；Heynote（及其 iCloud 目录）已卸载；热键唤出实测 < 100 ms；[`eval-framework.md`](./eval-framework.md) 中的质量门禁全部通过。
-- **可恢复性**：INV-RECOVERY（零设备 + 恢复包 → 恢复全部未删除数据）在 CI 中持续通过。
+- **可恢复性**：INV-RECOVERY（零设备 + 恢复包 + 本地导出的 R2 归档目录 → 恢复全部已归档未删除数据）在 CI 中持续通过。
 - **M2 准出**：iPhone 单次 Vault 解锁约 1–2 s [目标]；手机端 SEC 取证（IndexedDB / Cache Storage 无明文与 VKEK）与自动上锁测试通过。
 - **成本与复杂度**：月账单约 \$5 [估算]、支出告警未触发；代码量在 C1 预算内。
 
 ### 0.4 数据可移植性
 
 - **只读 Markdown 镜像（M1 默认开启）**：未加密块单向导出为 `~/.local/share/mynote/mirror/<buffer>.md`，加密块只输出占位符；删除（碎纸到期）时同步删文件。它同时服务 G1（独立明文副本）、G5（`rg` / `cat` 直接可用）与反锁定（F-19）。
-- **`mynote restore --from-archive`**：从 R2 op 密文归档 + 最新密钥表快照恢复，不依赖任何现存设备（细节见 [`interface-contracts.md`](./interface-contracts.md) 与 [`cloudflare-cloud-architecture.md`](./cloudflare-cloud-architecture.md)）。
+- **零设备恢复（双层最简路径）**：若仅客户端全失而云端 DO 健在，凭部署级 `BOOTSTRAP_TOKEN` + 24 词恢复包直接从 DO 零丢失拉回全部笔记；若客户端与 DO 同时损毁，从 CF 控制台 / `wrangler` / `rclone` 下载 R2 `archives/` 到本地执行纯离线 `mynote restore --from-archive <local-dir>` 重建，云端不暴露归档 HTTP 接口（细节见 [`interface-contracts.md`](./interface-contracts.md) 与 [`cloudflare-cloud-architecture.md`](./cloudflare-cloud-architecture.md)）。
 - **本地备份**：`VACUUM INTO` 自动备份按 `T_snap` 轮换；SQLite 本身是开放格式。
 - **迁入**：`mynote import heynote <path>` 导入 Heynote 1.x / 2.x 的 `∞∞∞lang` 文本文件。
 
@@ -218,7 +218,7 @@ Heynote（Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js）将每个 Buffe
   - **关键反思：单人多端 Scratchpad 是否需要字符级 CRDT？结论：不需要（路径 γ，D3）**
     - 相比 Heynote 单文件把 50 个笔记块绑在一起，**一旦把同步粒度拆到「块（Block）级」**，两台设备离线并发修改**不同块**时不会冲突。
     - 同时离线改**同一个块**的情况很少（D1 之后会并发写入的只有 Mac 与 Omarchy 两台桌面）。此时采用「全量载荷 op + 所有版本永久保留」：冲突就是同一块出现多个叶子，并列展示为「另一台设备的版本」，由用户手动合并。不引入 Loro / Yjs，也不做 `SPAN_PATCH`；与 CRDT 方案的复杂度对比没有测量依据，不作量化断言。
-    - 复杂度预算（C1）：M1 结束时云端代码 < 500 行、core 同步部分 < 3k 行 [目标]（F-08）。
+    - 复杂度预算（C1）：M1 结束时云端代码 < 500 行 [目标]（M2 含碎纸状态机与竞态校验约 500–700 行 [估算]）、core 同步部分 < 3k 行 [目标]（F-08）。
 
 ---
 
@@ -243,7 +243,7 @@ Heynote（Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js）将每个 Buffe
 - **架构挑战 5A — 「纯文本文件友好」与「可靠同步引擎」的冲突**：
   - 本地 Agent 习惯用 `rg`/`cat` 读纯文件，但如果允许外部进程直接修改同步目录里的原始文本文件，就会回到 Heynote 的竞态老路（部分写入、监听死循环、破坏结构）。
   - **已确认解法：SQLite 为唯一权威数据源 + 「CLI + Skill（渐进披露帮助）」为主入口（明确放弃本地 MCP）**：
-    1. **一等公民 CLI + 极轻 `SKILL.md`**：不引入任何 MCP 协议栈与常驻 Schema 上下文负担。通过完备的 CLI（`--json` / `--jsonl`、Unix 管道、稳定退出码、错误提示 `hint`、乐观锁）配合 **四级渐进披露帮助体系（L0 `SKILL.md` → L1 总览 → L2 子命令帮助 → L3 专题/机读 Schema）**，直接读写本地 SQLite WAL（`busy_timeout=5s`，Daemon 未运行亦照常毫秒级完成），并通过非阻塞 Unix Socket 唤醒 Daemon 即时同步。
+    1. **一等公民 CLI + 极轻 `SKILL.md`**：不引入任何 MCP 协议栈与常驻 Schema 上下文负担。通过完备的 CLI（`--json` / `--jsonl`、Unix 管道、稳定退出码、错误提示 `hint`、乐观锁）配合 **四级渐进披露帮助体系（L0 `SKILL.md` → L1 总览 → L2 子命令帮助 → L3 专题指南）**，严格遵守 SQLite 单写入方契约（Daemon 运行时写命令经 `0600` Unix Socket `apply` 交由 Daemon 执行，Daemon 未运行时直写本地 SQLite WAL；读路径始终直连 WAL，单次命令 `< 15 ms` [目标]）。
     2. **只读纯文本镜像（Read-Only Mirror，M1 默认开启）**：后台单向导出所有**未锁定**块为 `~/.local/share/mynote/mirror/<buffer>.md`，供 `rg`/fzf/编辑器只读检索，同时充当独立明文备份与反锁定出口；严禁反写，加密块只输出 `<!-- LOCKED BLOCK: <id> -->` 占位符，块删除时同步删文件（F-19）。
 - **架构挑战 5B — 「Agent 友好」与「安全（约束 4）」的真实权限边界**：
   - Prompt Injection 已成为本地 Agent 的现实威胁。必须坦诚：**同用户 UID 下运行的 Agent 具备读取本地普通文件与伪造 PTY（`script`/`expect`）的系统能力**，因此 CLI 的 TTY 检测与 `MYNOTE_ACTOR` 仅定位为防误触/防浅层注入的**体验与审计护栏**。
@@ -258,7 +258,7 @@ Heynote（Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js）将每个 Buffe
 
 这一决定直接带来**巨大的架构简化与清晰的信任边界**：
 1. **对被动存储零知识 + 诚实的代码分发边界**：DO SQLite 与 R2 只存盲密文；桌面端只运行本地内嵌资源（不加载远端代码）；手机 PWA 前端由自有 Cloudflare 账号下发，因此在手机上 Tier 1 与 Tier 2（D7 允许手机解锁 Vault）都**不防 CF 账户 / 部署流水线被攻破**。缓解：CF 强 2FA（硬件 FIDO2）、最小权限部署 Token 且只从 CI 部署、Service Worker 固定版本并在 UI 显示版本号（详见 [`threat-model.md`](./threat-model.md)）。
-2. **云端保持极薄**：无需云端 OAuth 2.1 授权服、云端物化视图/FTS5、远端 MCP 路由或内网穿透隧道；服务端只做幂等追加、分配 seq、按 seq 分页、epoch、令牌范围、WebSocket 唤醒、密钥表与碎纸标记存储及校验、每日归档（F-12）。代码量预算 M1 结束时 < 500 行 [目标]；成本为 Workers Paid 约 \$5/月 [估算]（D4）。
+2. **云端保持极薄**：无需云端 OAuth 2.1 授权服、云端物化视图/FTS5、远端 MCP 路由或内网穿透隧道；服务端只做幂等追加、分配 seq、按 seq 分页、epoch、令牌范围、WebSocket 唤醒、密钥表 / `key_material` / 碎纸标记存储及校验、每日归档（F-12）。代码量预算 M1 结束时 < 500 行 [目标]（M2 含碎纸状态机与竞态校验约 500–700 行 [估算]）；成本为 Workers Paid 约 \$5/月 [估算]（D4）。
 3. **客户端更轻更纯**：桌面 Rust 单二进制同样无需引入 MCP SDK 与额外传输层，体积更小、面更窄、更稳固。
 
 > [!TIP]
@@ -286,8 +286,8 @@ flowchart TD
         Keyring["OS Keychain / Secret Service (存 SMK)"]
 
         Agent -->|"Shell + SKILL.md"| CLI
-        CLI -->|"直写 WAL"| DB_L
-        CLI -.->|"0600 Unix Socket 异步唤醒"| Daemon
+        CLI -->|"Daemon 运行时: 0600 UDS apply"| Daemon
+        CLI -.->|"Daemon 未起时: 直写 WAL (只读始终直连 WAL)"| DB_L
         Shell -->|"显示 + 聚焦"| UI_D
         UI_D <-->|"localhost HTTP/WS (Host+Origin+HttpOnly Cookie)"| Daemon
         Daemon <--> DB_L
@@ -306,8 +306,8 @@ flowchart TD
 
     subgraph Cloud["Cloudflare Workers Paid (单 Worker + SQLite DO + R2 + Static Assets)"]
         SyncAPI["盲中继 (幂等追加 / seq / epoch / 令牌范围 / WS 唤醒)"]
-        CloudDB[("DO SQLite (盲 ops 全历史 + block_keys + shred_marks + devices)")]
-        R2[("R2 (op 密文归档永久 + 密钥表快照 T_snap + 手机状态快照 2 份)")]
+        CloudDB[("DO SQLite (盲 ops 全历史 + block_keys + key_material + shred_marks + devices)")]
+        R2[("R2 (op 密文归档永久 + 密钥快照 latest/30天历史 + 手机状态快照 2 份)")]
         SyncAPI --> CloudDB
         SyncAPI --> R2
     end
@@ -345,13 +345,13 @@ erDiagram
     BLOCKS ||--o{ BLOCK_LEAVES : all_leaves
     BLOCKS ||--o{ SYNC_OPS : has_history
     BLOCK_KEYS ||--o{ SYNC_OPS : decrypts
-    BLOCK_KEYS ||--o| SHRED_MARKS : may_be_shredded_by
+    BLOCK_KEYS ||--o{ SHRED_MARKS : may_be_shredded_by
     BUFFERS {
         text id PK "26B ULID"
         text name "Buffer 名称 (同步时以 Buffer 自己的 BDEK 加密)"
         text key_id FK "Buffer 自己的 BDEK (删除时可碎纸)"
         text position "Fractional Indexing 排序键 (LWW)"
-        text hlc "定长可排序混合逻辑时钟"
+        text state "ACTIVE | TRASHED | SHREDDED"
         int deleted_at_ms "软删除时间戳 (NULL=有效)"
     }
     BLOCKS {
@@ -359,18 +359,20 @@ erDiagram
         text buffer_id FK "所属 Buffer (LWW)"
         text position "Fractional Indexing + 随机抖动后缀 (LWW)"
         text lang "语言模式 (LWW)"
-        int is_locked "展示版本是否为 Tier 2 加密块"
-        text key_id FK "当前版本使用的 BDEK"
-        text content "展示版本物化明文 (加锁时为 NULL)"
-        text head_op_id "展示版本 = (hlc, op_id) 最大的叶子"
-        int conflict_count "其他叶子数"
-        int deleted_at_ms "回收站墓碑 (遇并发 UPDATE 自动复活)"
+        text state "ACTIVE | TRASHED | SHREDDED"
+        int is_locked "任一存活叶子为 Tier 2 即为 1"
+        text display_op_id "展示版本 = 存活叶子中 (hlc, op_id) 最大者"
+        int leaf_count "叶子数 (>1 即存在并发版本)"
+        int deleted_at_ms "回收站进入时间"
     }
     BLOCK_LEAVES {
         text block_id PK "所属块"
         text op_id PK "叶子版本"
         text hlc "叶子 HLC (展示排序)"
-        int is_locked "0 | 1"
+        text body_state "PLAINTEXT | SEALED | TOMBSTONE | KEY_UNAVAILABLE | DECRYPT_FAILED"
+        text key_id "加密该叶子的 BDEK"
+        text content "仅 Tier 1 明文"
+        blob ciphertext "仅 Tier 2 的 MNB1 密文"
     }
     BLOCK_KEYS {
         text key_id PK "随机密钥 ID (服务端可见)"
@@ -436,14 +438,14 @@ sequenceDiagram
    - `position`、`lang`、`buffer_id` 走字段 LWW；`DELETE` 遇并发 `UPDATE` 自动复活（Update-Wins）。
    - **无 Lock-Wins 特例**：`LOCK` 是一个普通版本（实现上是换钥，§5.4）；若任一叶子加锁，整块按加锁渲染并提示「存在未加锁的并发版本」。
 3. **防空 `UPDATE` 类型门禁与引导隔离**：未完成首次引导前禁推已有实体变更；`DecryptFailed` / `Unhydrated` 编译期禁止构造 `UPDATE`；外部格式化器与 CLI 非交互 0 字节管道自动熔断。
-4. **完整历史永久保留，不做 GC**：Workers Paid 单 DO 10 GB，按约 220 MB/年 [估算] 不需要 GC（D4）；R2 每日 op 密文归档只追加、永久保留，另存每日密钥表快照（`T_snap` 后由生命周期规则删除），`mynote restore --from-archive` 可从零恢复。
-5. **手机引导用「当前状态快照」**：由任一桌面每日或尾部 op 超过阈值时发布到 R2，内容为每块全部叶子版本 + 字段 LWW 结果 + `covers_seq`（块内容仍用各自 BDEK 加密，不含已碎纸块）；按 `covers_seq` 单调接受、保留最近 2 份、无 CAS，**不参与桌面之间的因果判定**——快照出错的后果只是手机显示不对，重新拉取即可（D1）。
+4. **完整历史永久保留，不做 GC**：Workers Paid 单 DO 10 GB，按约 220 MB/年 [估算] 不需要 GC（D4）；R2 每日 op 密文归档只追加、永久保留，另存每日覆写更新的 `latest.mnks`（不挂生命周期删除）与按日历史密钥快照（`T_snap` = 30 天后由生命周期规则删除），极端灾难下 `mynote restore --from-archive <local-dir>` 可纯离线从零恢复。
+5. **手机引导用「当前状态快照」**：由任一桌面每日或尾部 op 超过阈值时发布到 R2，内容为非 `Shredded` 块（含 `Active` 与 `Trashed`）的全部叶子版本 + 字段 LWW 结果 + `covers_seq`（块内容仍用各自 BDEK 加密）；在同一 `journal_epoch` 内按 `covers_seq` 单调接受、保留最近 2 份、无 CAS，**不参与桌面之间的因果判定**——快照出错的后果只是手机显示不对，重新拉取即可（D1）。
 6. **`epoch` 并集对账**：PITR 回滚或迁移导致 `epoch` 变化时，客户端按 `op_id` 求本地与远端的**集合并集**（不清空本地表），补推远端缺失项。
-7. **密钥表与 op 日志分开同步**：`block_keys` / `shred_marks` 按 2P-Set 合并、每次同步全量比对；删除的唯一路径是带服务端强制宽限期的加密碎纸（§5.4）。
+7. **密钥表与 op 日志分开同步**：`block_keys` / `key_material` / `shred_marks` 按 2P-Set 合并、每次同步全量比对；删除的唯一路径是带服务端强制宽限期的加密碎纸（§5.4）。
 
 #### 跨设备复制粘贴场景（低延迟 × 高可靠）
 
-1. **粘贴快车道（Fast-Flush）**：普通输入防抖 `400–500ms` 本地合并；**粘贴（`paste`）、失焦（`blur`）或剪贴板命令**时立即 HTTP `push`，其他桌面经 WebSocket 唤醒后 `pull`（WebSocket 携带 op 推迟，触发条件见 §7）。
+1. **粘贴快车道（Fast-Flush）**：普通输入防抖 `400–500ms` 本地合并；**粘贴（`paste`）、失焦（`blur`）或 CLI 写入**时立即 HTTP `push`，其他桌面经 WebSocket 唤醒后 `pull`（WebSocket 携带 op 推迟，触发条件见 §7）。
 2. **一键复制**：块顶一键 Copy（桌面 `Cmd/Ctrl+Shift+C`）；手机每块一个「复制」按钮（在用户点击手势内调用 `navigator.clipboard.writeText`），满足「桌面 → 手机」的跨端剪贴板需求。
 3. **手机前台唤醒即拉**：PWA 在 `visibilitychange` / `pageshow` 回到前台时执行 HTTP `pull` 与 WS 重连。
 
@@ -485,7 +487,7 @@ flowchart LR
 
 - **KDF**：`Argon2id` + `HKDF-SHA256`；Vault 口令的 Argon2id **只用一套参数，按最弱设备（iPhone）来定**，参数与盐存于 Vault 头部（D7；具体取值待 S0 在 iPhone 上实测，目标单次解锁约 1–2 s [目标]）。
 - **对称认证加密（AEAD）**：`XChaCha20-Poly1305`（192-bit 随机 Nonce）+ 256B 阶梯填充（保留，因为便宜；不再宣称额外安全收益）。
-- **关联认证数据（AAD）**：只在 [`data-structures.md`](./data-structures.md) 定义一次，必须绑定 `block_id`、`op_id`、`key_id` 与格式版本；`op_id` 由 core 在加密前生成，本地 API / CLI 无需传入（F-01）。
+- **关联认证数据（AAD）**：只在 [`data-structures.md`](./data-structures.md) 定义一次，必须绑定 `block_id`、`op_id`、`key_id` 与格式版本；`op_id` 由执行正文加密的 core 实例在加密前生成（F-01）。
 
 #### 密钥层级：每块数据密钥 + 独立密钥表 + 统一恢复包
 
@@ -500,20 +502,20 @@ flowchart TD
     PW["Vault 口令 → Argon2id (单套参数)"] -->|"派生密钥包裹"| VH["Vault 头部"]
     RPUB -->|"恢复公钥封装"| VH
     VH -->|"解锁时仅在客户端内存"| VKEK["VKEK (Vault 主密钥)"]
-    SMK -->|"包裹 Tier 1"| BK[("独立密钥表 block_keys + shred_marks (2P-Set)")]
-    VKEK -->|"包裹 Tier 2"| BK
+    SMK -->|"包裹外层 MNR1"| BK[("独立密钥表 block_keys + key_material + shred_marks (2P-Set)")]
+    VKEK -->|"包裹 Tier 2 内层 MNW1"| BK
     BK -->|"key_id → BDEK"| BDEK["每块数据密钥 BDEK"]
     BDEK -->|"XChaCha20-Poly1305 + AAD"| OP["op 信封 (只带 key_id, 不带密钥)"]
 ```
 
 **核心机制**：
-1. **每块一把数据密钥（BDEK），信封只带 `key_id`**：一个块的所有版本都用它的 BDEK 加密；Tier 1 的 BDEK 由 SMK 包裹，Tier 2 由 VKEK 包裹。**这是 M1 线格式，不可推迟**：M1 期间写入的 op 会进永久归档，若直接用 SMK 加密，日后除了废掉整个 SMK 就无法单独删掉某一块（D2′）。
-2. **独立密钥表 `block_keys` + 碎纸标记 `shred_marks`**（取代 `vault_keys` / `MNK1` / `key_seq`）：密钥记录只创建、不修改；合并 = 已创建密钥的并集 − 已到期且未撤销的碎纸标记（2P-Set），合并本身不会弄丢密钥。桌面与 DO 各存一份，同步时全量比对（体量约「块数 × 250 B」[估算]）。字段定义见 [`data-structures.md`](./data-structures.md)，同步规则见 [`sync-protocol.md`](./sync-protocol.md)。
-3. **删除优先、有界时延**：`DELETE` → 回收站 + 碎纸标记（`not_before = now + T_grace`，默认 7 天）；宽限期内任一桌面可撤销；到期后 DO alarm 置空密钥，各端删除本地密钥与物化明文。op 日志与 R2 归档中的密文原样保留，只是不再有密钥能解开。服务端强制最短宽限期（24 小时）与批量阈值（20 块/天），CLI 只能删进回收站，只读令牌不能碎纸。**彻底不可恢复上界 ≈ `T_grace + max(DO PITR 30 天, T_snap 30 天)` ≈ 37 天** [保证]（不含 OS 级备份、手动冷备、剪贴板、丢失后离线的手机缓存等代码管不到的副本）。完整流程见 [`threat-model.md`](./threat-model.md) 与 [`sync-protocol.md`](./sync-protocol.md)。
-4. **换钥原语**：用新 BDEK′ 重新加密当前版本写一个普通 op，再对旧 key 发碎纸。「清除历史」与「先写后锁」（换到 VKEK 包裹的新 DEK + 碎纸旧 Tier 1 key）都复用它；碎纸旧钥前必须确认服务端已收下新 op 与新密钥记录。不新增 op 类型。
-5. **统一恢复包 + 恢复密钥环（公钥封装）**：只有一份 24 词恢复包 → Root Seed → X25519 恢复密钥对。设备只存**恢复公钥**，因此可随时把新 SMK 代际 / VKEK 封装追加到恢复密钥环，无需 24 词；解封才需要 24 词。Daemon 只持有 Tier 1 SMK 代际；VKEK 只以「Vault 口令派生密钥包裹」与「恢复公钥封装」两种形式存在于 Vault 头部，Vault 不再有第二套恢复码。轮换 = 封装追加 + 重新包裹密钥表，**不需要重新抄写恢复包**，轮换后用 `mynote recovery drill` 验证；旧 SMK 代际在重包裹后再保留 `T_snap`。**INV-RECOVERY**：零设备 + 恢复包 → 恢复全部未删除数据（op 归档 + 最新密钥快照），进 CI（F-05）。
+1. **每块一把数据密钥（BDEK），信封只带 `key_id`**：块的正文版本用它的 BDEK 加密为 `MNB1`；Tier 1 的 BDEK 直接由 SMK 包裹入 `MNR1`，Tier 2 先由 VKEK 包裹为 `MNW1` 再由 SMK 封装入 `MNR1`。**这是 M1 线格式，不可推迟**：M1 期间写入的 op 会进永久归档，若直接用 SMK 加密，日后除了废掉整个 SMK 就无法单独删掉某一块（D2′）。
+2. **独立密钥表 `block_keys` + `key_material` + 碎纸标记 `shred_marks`**（取代 `vault_keys` / `MNK1` / `key_seq`）：密钥记录只创建（或随轮换提升 `wrap_gen` 重包）、不就地覆写；合并 = 已创建密钥的并集 − 服务端已到期置空的碎纸标记（2P-Set），合并本身不会弄丢密钥。M1 定型 `block_keys` 与 `key_material`（`RecoveryKeyringV1` + `VaultHeaderV1`），M2 上线 `shred_marks` 状态机。桌面与 DO 各存一份，同步时全量比对（体量约「块数 × 250 B」[估算]）。字段定义见 [`data-structures.md`](./data-structures.md)，同步规则见 [`sync-protocol.md`](./sync-protocol.md)。
+3. **删除优先、有界时延**：M1 删除进入软删回收站（随时可恢复）；M2 起 `DELETE` 对该块全部未碎纸 `key_id` 登记碎纸标记（默认 `grace_ms = T_grace` = 7 天），宽限期内任一桌面可撤销，到期后由服务端 DO alarm 置空密钥，客户端**仅在同步观测到服务端 `executed`（`key_record = null`）时**执行本地删钥与明文清理（不受本机快表误触发）。op 日志与 R2 归档中的密文原样保留，只是不再有密钥能解开。服务端强制最短宽限期（24 小时）与批量阈值（20 块/天），CLI 只能删进回收站，只读令牌不能碎纸。**彻底不可恢复上界 ≈ `T_grace + max(DO PITR 30 天, T_snap 30 天)` ≈ 37 天** [保证]（不含 OS 级备份、手动冷备、剪贴板、丢失后离线的手机缓存等代码管不到的副本）。完整流程见 [`threat-model.md`](./threat-model.md) 与 [`sync-protocol.md`](./sync-protocol.md)。
+4. **换钥原语**：用新 BDEK′ 重新加密当前版本写一个普通 op，再对旧 key 发碎纸。「清除历史」与「先写后锁」（换到 VKEK 包裹的新 BDEK + 碎纸旧 Tier 1 key）都复用它；碎纸旧钥前必须确认服务端已收下新 op 与新密钥记录。不新增 op 类型。
+5. **统一恢复包 + 恢复密钥环（公钥封装）**：只有一份 24 词恢复包 → Root Seed → X25519 恢复密钥对。设备只存**恢复公钥**，因此可随时把新 SMK 代际 / VKEK 封装追加到恢复密钥环并经 `/v1/keys` 的 `key_material` 同步，无需 24 词；解封才需要 24 词。Daemon 只持有 Tier 1 SMK 代际；VKEK 只以「Vault 口令派生密钥包裹」与「恢复公钥封装」两种形式存在于 Vault 头部，Vault 不再有第二套恢复码。轮换 = 封装追加 + 重新包裹密钥表，**不需要重新抄写恢复包**，轮换后用 `mynote recovery drill` 验证；**旧 SMK 代际在客户端与恢复密钥环中永久保留**（仅 32B/代，确保未重包的历史记录与本地旧备份永远可解）；其他存活设备可通过 `mynote keyring unlock`（本地输 24 词）或 `mynote device refresh` / `claim`（10 分钟一次性票据）获取新代际。**INV-RECOVERY**：零设备 + 恢复包 + 本地导出的 R2 归档目录 → 恢复全部已归档未删除数据，进 CI（F-05）。
 6. **常驻 Daemon 不持有 Tier 2 明文 + 本地严格鉴权**：Tier 2 解密只发生在当前 Web UI WASM 或单次 CLI 进程内存中，闲置或切后台即 `zeroize`；本地 UI 统一入口 `http://localhost:<port>`，Daemon 接口校验 `Host` + `Origin` + `HttpOnly` Session Cookie。Tier 2 只防被动读取，不防能持久化篡改执行环境的同 UID 攻击者（F-07）。
-7. **配对（一次性领取）与止损**：`mynote device add --scope read|read-write` 生成配对码，只含 `pair_id` + 一次性包裹密钥 + 服务端地址；SMK（Tier 1）与新设备令牌用该一次性密钥加密后暂存服务端，TTL 10 分钟，**首次领取即删除**。iOS 主流程 = PWA 内 `getUserMedia` 扫码或粘贴配对码。设备令牌分 `read` / `read-write`，手机只拿 `read`（服务端对其 push / 碎纸请求返回 403）。协议细节见 [`threat-model.md`](./threat-model.md) 与 [`interface-contracts.md`](./interface-contracts.md)。设备遗失 = 吊销令牌 + 密钥环轮换；已离线的失窃手机缓存不在碎纸覆盖范围内。
+7. **引导、配对（一次性领取）与止损**：首台桌面（或客户端全失而 DO 健在时）凭部署级 `BOOTSTRAP_TOKEN` 走 `mynote device bootstrap` 接入；后续设备由 `mynote device add --scope read|read-write` 在发起端桌面本地生成随机 `device_token` 与一次性密钥 `K_pair`，将 SMK 密钥环与明文 `device_token` 一并用 `K_pair` 加密后暂存服务端（服务端只存未激活的 `SHA-256(device_token)`，全程不接触明文令牌），TTL 10 分钟，**首次领取即删除并激活**。iOS 主流程 = PWA 内 `getUserMedia` 扫码或粘贴配对码。设备令牌分 `read` / `read-write`，手机只拿 `read`（服务端对其 push / 碎纸请求返回 403）。协议细节见 [`threat-model.md`](./threat-model.md) 与 [`interface-contracts.md`](./interface-contracts.md)。设备遗失 = 吊销令牌 + 密钥环轮换；已离线的失窃手机缓存不在碎纸覆盖范围内。
 8. **手机解锁 Vault（D7）**：口令 → Argon2id（WASM）→ VKEK → 解开密钥表中该块 BDEK → 查看 / 复制；VKEK 只在内存，永不写入 IndexedDB / Cache Storage，`visibilitychange` 或闲置 N 分钟自动上锁。复制出的秘密会留在 iOS 剪贴板，并可能经「通用剪贴板」同步到 Mac（UI 提示）。**新信任边界**：手机 PWA 代码由 Cloudflare 下发，Tier 2 在手机上不防 CF 账户 / 部署流水线被攻破（缓解：CF 强 2FA、只从 CI 部署、Service Worker 固定版本并显示版本号）。WebAuthn PRF 推迟。
 
 ---
@@ -529,14 +531,14 @@ flowchart TD
 
 #### 2. 四级渐进披露帮助体系（Progressive Disclosure Help）
 
-帮助信息严格按 **「先路由、后参数、按需展开专题与机读 Schema」** 分为 4 级，绝不在顶层一次性倾倒几千字说明：
+帮助信息严格按 **「先路由、后参数、按需展开专题」** 分级披露，绝不在顶层一次性倾倒几千字说明：
 
 ```mermaid
 flowchart LR
     L0["Level 0: SKILL.md (~200 tokens) - 定位、黄金规则与发现入口"] --> L1["Level 1: mynote --help (~250 tokens) - 分组命令总览与核心示例"]
     L1 --> L2["Level 2: mynote #lt;cmd#gt; --help (~300 tokens) - 参数、默认值、IO 与退出码"]
     L2 --> L3A["Level 3a: mynote help #lt;topic#gt; - 专题深度指南"]
-    L2 --> L3B["Level 3b: mynote #lt;cmd#gt; --help-json - 机读参数与输出 Schema"]
+    L2 -.-> L3B["Level 3b: --help-json (⏸ 已推迟, 由黄金测试守护)"]
 ```
 
 - **Level 0 — 极简 `SKILL.md`（常驻 Agent 技能目录，严格控制在 `< 250 tokens`）**：
@@ -549,28 +551,30 @@ flowchart LR
 
   CAPTURE & BLOCKS:
     add         Create a new block (supports stdin pipe & --format)
-    block       Read, update, append, move, or delete (to trash) a specific block
-    buf         List, create, or rename buffers
+    block       Read, update, append, move, revert, or delete (to trash) a block
+    buf         List, create, rename, reorder, or delete buffers
+    trash       List or restore blocks in the recycle bin
     import      Import existing Heynote buffers (∞∞∞ delimiter migration)
 
-  QUERY & CLIPBOARD:
+  QUERY:
     ls          List recent blocks (summary-first, token-budget safe)
     search      Full-text search across unlocked blocks (FTS5)
-    clip        Copy a block to / create a block from the system clipboard
 
   TRANSFORM & OPS:
     format      Format a block or stdin (json/sql/yaml/xml/md + external CLIs)
     sync        Inspect sync status, force push/pull, view multi-version blocks
     vault       Lock/unlock sensitive blocks (client-side decryption)
-    device      Pair (add --scope read|read-write, one-time claim code), list, or revoke
-    restore     Rebuild from R2 op archive + key snapshot (--from-archive)
+    device      Bootstrap, pair/refresh (one-time claim code), list, or revoke
+    keyring     Rotate SMK generation or unlock synced keyring with recovery words
+    recovery    Show recovery bundle on init or run offline recovery drill
+    restore     Rebuild offline from local R2 archive directory (--from-archive)
     help        Deep topics: formatting, locking, conflict, agent
 
   GLOBAL FLAGS:
-    --json        Structured JSON output envelope {ok, data, error, meta}
-    --jsonl       Line-delimited JSON stream for list/search
-    --quiet       Suppress non-data stderr notices
-    --help-json   Machine-readable command & flag schema
+    --json            Structured JSON output envelope {ok, data, error, meta}
+    --jsonl           Line-delimited JSON stream for list/search
+    --quiet           Suppress non-data stderr notices
+    --non-interactive Never prompt; fail fast with exit code 2 or 5
 
   NEXT STEP:
     Run 'mynote <cmd> --help' for flags & examples.
@@ -580,20 +584,21 @@ flowchart LR
 - **Level 2 — 子命令精准参考（`mynote <cmd> --help`）**：
   - 仅在 Agent 确定要调用某个子命令时按需加载，固定包含 5 个结构化区块：**SYNOPSIS / FLAGS（含类型与默认值）/ STDIN & STDOUT 契约 / EXIT CODES / 2–3 个可直接复制的 EXAMPLES**。
 
-- **Level 3 — 深度专题与机读 Schema（按需按主题展开）**：
+- **Level 3 — 深度专题（按需按主题展开）**：
   - `mynote help <topic>`：内置离线文档专题（如 `mynote help agent`、`mynote help formatting`、`mynote help conflict`、`mynote help locking`），覆盖边界场景与冲突恢复配方；
-  - `mynote <cmd> --help-json`（基于 `clap` 元数据自动生成，避免与实现漂移）：输出该命令所有参数的名称、类型、枚举值、是否必填、退出码表以及返回 JSON 结构，供需要严格 Schema 的自动化脚本/Agent 零歧义解析。
+  - `mynote <cmd> --help-json`：**⏸ 已推迟**（当前由 CLI 黄金测试直接守护 `--json` 输出与退出码契约，待外部自动化集成确有需要时再启用，见 §7 与 §9）。
 
 #### 3. Agent-Native CLI 工程契约（比 `--help` 更关键的 6 条硬规范）
 
-1. **直写本地 SQLite WAL + 统一结构化输出信封（`--json`）**：
-   - CLI 直接读写本地 SQLite WAL（`busy_timeout=5s`），写后通过非阻塞 Unix Socket 唤醒 Daemon 同步；**即使后台 Daemon 未启动，CLI 也能独立完成**（单次命令 `< 15 ms` [目标]）。
-   - 带 `--json` 时，stdout 永远是合法单条 JSON（日志/警告只走 stderr）：
+1. **单写入方本地存储 + 统一结构化输出信封（`--json`）**：
+   - 读命令始终直接读取本地 SQLite WAL；写命令在 Daemon 运行时经 `0600` Unix Socket `apply` 转交 Daemon 执行，**后台 Daemon 未启动时则由 CLI 直接以短事务写 SQLite WAL 独立完成**（单次命令 `< 15 ms` [目标]，协议见 [`interface-contracts.md` §3.0](./interface-contracts.md#30-进程模型daemonmacos-tauri-壳与-cli)）。
+   - 带 `--json` 时，stdout 永远是合法单条 JSON（日志/警告只走 stderr，精确字段见 [`interface-contracts.md` §2](./interface-contracts.md#2-cli-全子命令参数与机读输出契约agent-first)）：
      ```json
      {
        "ok": true,
-       "data": { "id": "01JXYZ...", "buffer": "scratch", "lang": "json", "head_op_id": "01JABC..." },
-       "meta": { "local_seq": 108, "sync_state": "pending_offline", "redacted_count": 1 }
+       "data": { "block_id": "01JXYZ...", "op_id": "01JABC...", "head_op_ids": ["01JABC..."], "buffer_id": "01JBUF..." },
+       "error": null,
+       "meta": { "duration_ms": 4, "sync_state": "pending_offline", "local_op_count_pending": 1, "redacted_locked_count": 0 }
      }
      ```
    - 当检测到 `!isatty(stdout)`（处于管道或 Agent Shell 执行中）时，自动关闭 ANSI 颜色码与交互式分页器（pager）。
@@ -604,11 +609,15 @@ flowchart LR
      ```json
      {
        "ok": false,
+       "data": null,
        "error": {
          "code": "HEAD_MISMATCH",
-         "message": "Block 01JXYZ was modified concurrently (expected 01JAA1, actual 01JBB9)",
-         "hint": "Run 'mynote block get 01JXYZ --json' to inspect latest content, then retry with --expected-head 01JBB9"
-       }
+         "message": "Block 01JXYZ was modified concurrently",
+         "retryable": true,
+         "details": { "expected_heads": ["01JAA1"], "actual_heads": ["01JBB9"] },
+         "hint": "Run 'mynote block get 01JXYZ --json' to inspect latest versions, then retry with --expected-head 01JBB9"
+       },
+       "meta": { "duration_ms": 2, "sync_state": "synced", "local_op_count_pending": 0, "redacted_locked_count": 0 }
      }
      ```
 3. **非交互快速失败（Never Hang）**：
@@ -671,7 +680,7 @@ flowchart LR
 | 单体二进制与内存 | 极佳（8–15MB，无头常驻 ~12–20MB RAM [估算]，无 GC 抖动） | 极佳（12–20MB，空闲 ~15–25MB RAM [估算]） |
 | **Sans-I/O & WASM 复用** | **极强**：`mynote-core` 纯同步状态机零异步存储依赖，同一套解密、解压与渲染所需逻辑（`chacha20poly1305`/`argon2`/`zstd`）编译成 WASM 给手机只读 PWA 复用（D1 后手机只需解密、解压、渲染与 Argon2id；体积待 S0 实测） | 较弱：Go WASM 运行时体积较大（通常数 MB），TinyGo 对完整标准库/密码学生态支持有限 |
 | 密码学与内存安全 | 原生 `zeroize` 自动清零敏感密钥内存，无 GC 副本残留风险 | GC 拷贝可能导致密钥在堆中短时残留，难以彻底擦除 |
-| CLI 与生态成熟度 | `clap`（分组帮助 + `--help-json`）+ `axum` + `rusqlite` + `zstd` + `rust-embed` | `cobra` + `chi`/`echo` + `modernc.org/sqlite` + `embed` |
+| CLI 与生态成熟度 | `clap`（分组帮助；`--help-json` 推迟）+ `axum` + `rusqlite` + `zstd` + `rust-embed` | `cobra` + `chi`/`echo` + `modernc.org/sqlite` + `embed` |
 
 **推荐 Monorepo / Cargo Workspace 目录规划**：
 ```text
@@ -725,27 +734,27 @@ flowchart LR
 
 ### S0：技术 spike（约 1–1.5 周 [估算]，每项限时）
 - [ ] **编辑器形态**：单 CM6 文档 + 原子化块边界装饰 vs 按块挂载 `EditorView`（F-11）。
-- [ ] **macOS Tauri 壳 + 全局热键（必做，D5）**：热键到窗口可输入的延迟实测（目标 < 100 ms）；是否需要「辅助功能」等系统权限；壳与 Daemon 的关系（壳内嵌 Daemon 单进程，或拉起独立 Daemon——无论哪种，CLI 都必须能在 UI 未打开时独立工作，且 SQLite 只有一个写入方）；登录自启、签名与公证（个人自用可先不公证，但记录 Gatekeeper 的处理方式）。
+- [ ] **macOS Tauri 壳 + 全局热键 + Keychain 跨二进制 ACL 验证（必做，D5）**：热键到窗口可输入的延迟实测（目标 < 100 ms）；是否需要「辅助功能」等系统权限；壳与 Daemon 的关系（壳内嵌 Daemon 单进程，或拉起独立 Daemon——无论哪种，CLI 都必须能在 UI 未打开时独立工作，且 SQLite 只有一个写入方）；**实测 Tauri `.app` 与 Homebrew CLI 两个不同代码签名身份访问同一 macOS Keychain 条目（`SMK`）是否触发重复密码授权弹窗**（决定 Keychain 是否只由单一签名主体读写、CLI 经 `daemon.sock` 请求）；登录自启、签名与公证（个人自用可先不公证，但记录 Gatekeeper 的处理方式）。
 - [ ] **WASM**：桌面 WASM 体积；**iPhone 上 Argon2id WASM 的耗时与内存（D7）**，目标单次解锁约 1–2 s [目标]。
 - [ ] **CF Paid echo 中继**（约 100 行 [估算]）：令牌范围、WebSocket Hibernation、Spend Management 告警；顺带验证 DO alarm 定时置空密钥、R2 生命周期规则（D2′）。
 - 「γ vs β（Loro）」spike 已取消（D3）。
 - **产出**：每项一页结论；§8 中对应 ADR 据此由 Proposed 改为 Accepted 或 Rejected。
 
 ### M1：替换 Heynote + iCloud
-- [ ] **core**：块、全量载荷 op、多叶子并列 + 手动合并、字段 LWW、Update-Wins（[`sync-protocol.md`](./sync-protocol.md)）。
-- [ ] **每块数据密钥 BDEK + 信封带 `key_id` + 独立密钥表 `block_keys` / `shred_marks`（D2′ 线格式，必须在 M1 定型）**；删除进回收站、可撤销（彻底删除在 M2 生效，届时对 M1 期间删除的块追溯执行）。
-- [ ] SQLite 存储；CLI：`add` / `ls` / `get` / `update` / `search` / `sync`；最小可用 UI；Heynote 导入。
+- [ ] **core**：块、全量载荷 op、在完整因果图 `G(b)` 上求叶子、多叶子并列 + 手动合并、字段 LWW、Update-Wins（[`sync-protocol.md`](./sync-protocol.md)）。
+- [ ] **每块数据密钥 BDEK + 信封带 `key_id` + 独立密钥表 `block_keys` / `key_material`（D2′ 不可逆线格式，必须在 M1 定型，服务端仅校验 `KEY_UNKNOWN`）**；删除走纯软删回收站（写 `DELETE` 墓碑 op，`shred_state = "unscheduled"`，随时可 `trash restore`，M1 4 周观察期内物理零删钥路径）。
+- [ ] SQLite 存储；CLI：`add` / `ls` / `block` / `buf` / `trash` / `search` / `format`（Layer 1）/ `sync` / `device` / `keyring` / `recovery` / `restore`；最小可用 UI；Heynote 导入。
 - [ ] **macOS Tauri 壳 + 全局热键；Omarchy 用 Hyprland 键绑定唤出 / 聚焦 Chromium webapp**；两端加载同一份前端资源。
-- [ ] Tier 1 E2EE 同步到 CF DO：push / pull / epoch / WebSocket 唤醒（只发通知），**无快照、无 GC**。
-- [ ] R2 每日 op 密文归档（永久、只追加）+ 密钥表快照（`T_snap` = 30 天生命周期）+ `mynote restore --from-archive`；本地 `VACUUM INTO` 自动备份（按 `T_snap` 轮换）+ 只读 Markdown 镜像（默认开启）。
-- [ ] 统一恢复包 + 恢复密钥环（公钥封装追加）+ `mynote recovery drill` + INV-RECOVERY + INV-KEY-LIVENESS + 密钥每日自检。
+- [ ] Tier 1 E2EE 同步到 CF DO：push / pull / `/v1/keys` / `BOOTSTRAP_TOKEN` 首台引导 / 一次性配对与刷新 / epoch / WebSocket 唤醒（只发通知），**无手机快照、无 GC、云端代码 < 500 行 [目标]**。
+- [ ] R2 每日 op 密文归档（永久、只追加）+ 密钥表快照（每日覆写、不挂过期删除的 `latest.mnks` + 30 天生命周期的 `history/<yyyy-mm-dd>.mnks`）+ 纯离线 `mynote restore --from-archive <local-dir>`；本地 `VACUUM INTO` 自动备份（按 `T_snap` 轮换）+ 只读 Markdown 镜像（默认开启）。
+- [ ] 统一恢复包 + 恢复密钥环（公钥封装追加、旧 SMK 代际永久保留）+ `mynote recovery drill` + INV-RECOVERY + INV-KEY-LIVENESS + 密钥每日自检。
 - [ ] 质量门禁（[`eval-framework.md`](./eval-framework.md)）：属性测试、同步核心 DST、针对真实 Worker 的契约测试、CLI 黄金测试、macOS + Linux 双平台 CI；部署时配置 Spend Management 支出告警。
 - **准出条件**：上述门禁全部通过；热键唤出实测 < 100 ms；Mac 与 Omarchy 日常使用 4 周零丢数；Heynote 卸载。
 
 ### M2：手机只读 + Vault + 碎纸
-- [ ] **只读 PWA**：一次性领取配对（PWA 内 `getUserMedia` 扫码或粘贴配对码，`mynote device add --scope read`）、`read` 范围设备令牌、「状态快照 + 尾部 op」引导、多版本只读展示、每块复制按钮。
-- [ ] **加密碎纸执行器**（DO alarm）：服务端强制宽限期、批量阈值、UI 确认清空回收站、换钥（「清除历史」）；INV-SHRED-BOUND、INV-GRACE 进门禁。
-- [ ] **Tier 2 Vault**：口令 + 统一恢复包，VKEK 包裹的 BDEK 存于密钥表；「先写后锁」= 换钥 + 碎纸旧 Tier 1 密钥；**桌面与手机都能解锁、查看、复制**（单套 KDF 参数、仅内存会话、自动上锁）。
+- [ ] **只读 PWA**：一次性领取配对（发起桌面本地生成令牌并用 `K_pair` 加密，PWA 内 `getUserMedia` 扫码或粘贴配对码，`mynote device add --scope read`）、轮换后 `device refresh` 10 分钟票据、`read` 范围设备令牌、「状态快照（含 `Active` + `Trashed`）+ 尾部 op」引导、多版本只读展示、每块复制按钮。
+- [ ] **加密碎纸状态机与执行器**（`shred_marks` + DO alarm）：服务端强制最短宽限期、滚动 24 小时批量阈值、竞态校验（`SHRED_STALE` / `KEY_PENDING_SHRED` / `KEY_SHREDDED`）、UI 确认清空回收站 / 超额确认、换钥（「清除历史」）；M2 升级迁移时对 M1 回收站存量块一次性豁免阈值补建 `not_before_ms = M2_launch + T_grace` 标记；INV-SHRED-BOUND、INV-GRACE 进门禁。
+- [ ] **Tier 2 Vault**：口令 + 统一恢复包，内层 `MNW1`（VKEK 包裹 BDEK）外包 `MNR1`（SMK 封装）存于密钥表；「先写后锁」= 换钥 + 碎纸旧 Tier 1 密钥；**桌面与手机都能解锁、查看、复制**（单套 KDF 参数、仅内存会话、自动上锁）。
 - [ ] 粘贴时的密钥特征提示；SEC 取证测试（桌面 + 手机）。
 - **准出条件新增**：手机端 SEC 取证（IndexedDB / Cache Storage 中无明文与 VKEK）、自动上锁测试、iPhone 上的解锁耗时实测。
 
@@ -759,9 +768,11 @@ flowchart LR
 | 机制 | 触发条件 |
 | --- | --- |
 | 手机追加 / 编辑（届时再引入 outbox、持久化存储申请、写令牌） | 每周多次出现「想在手机上记一条却记不了」 |
+| 加密图片 / 二进制附件（`blobs/`，每个附件独立随机 32B `BlobKey` 存入 `BlockPlaintextV1`，避免块换钥时重传附件） | 纯文本 + Mermaid 不足以承载日常临时截图或文件片段需求 |
 | `SPAN_PATCH` / delta | 单条 op 体积 p95 > 64 KB，或日上行 > 50 MB |
 | WebSocket 携带 op | 跨端粘贴 p95 > 1 s，且瓶颈确认在多出的那一次 pull |
 | WebAuthn PRF | 每天解锁 Vault 超过 N 次，且口令输入成为明显痛点 |
+| `--help-json` 机读参数反射 | `SKILL.md` + L1/L2 `--help` + CLI 黄金测试仍不足以支撑外部自动化工具集成 |
 | Agent 使用 CLI 的统计评测 | CLI 黄金测试都通过，但仍观察到 Agent 系统性用错 CLI |
 | 自升级 | 出现包管理器覆盖不到的分发渠道 |
 
@@ -777,13 +788,13 @@ flowchart LR
 | # | 决策项 | 结论 | 依据 | 状态（待补证据） |
 | --- | --- | --- | --- | --- |
 | ADR-01 | **核心状态机与存储** | Rust Sans-I/O `mynote-core`；桌面 `rusqlite`（SQLite 单写入方）；手机 IndexedDB 仅作只读缓存 | §6.1、D1 | Proposed（S0：桌面 WASM 体积） |
-| ADR-02 | **云端基础设施** | Cloudflare **Workers Paid**（约 \$5/月 [估算]）：单 Worker + SQLite DO + R2 + Static Assets；服务端极薄（幂等追加、分配 seq、按 seq 分页、epoch、令牌范围、WebSocket 唤醒、密钥表与碎纸标记存储 + 宽限期 / 批量阈值校验 + alarm 置空、每日归档）；配置支出告警 | D4、F-12 | Proposed（S0：echo 中继） |
-| ADR-03 | **同步协议（路径 γ）** | 全量载荷 op；冲突 = 同块多叶子，并列展示 + 手动合并；HLC 只决定展示顺序；字段 LWW；Update-Wins；无 `SPAN_PATCH` / Lock-Wins / GC / 快照 CAS | D3 | Proposed（M1：DST + 属性测试 + 4 周实测） |
-| ADR-04 | **加密与密钥** | 每块 BDEK，信封只带 `key_id`；独立密钥表 `block_keys` + `shred_marks`（2P-Set）；统一恢复包 → Root Seed → X25519 恢复密钥对（设备只存公钥，SMK 代际 / VKEK 封装追加）；AAD 只在 `data-structures.md` 定义 | D2′、F-01、F-05 | Proposed（M1 线格式定型前评审；INV-RECOVERY、INV-KEY-LIVENESS） |
-| ADR-05 | **删除语义** | 删除优先、有界时延：回收站 + 服务端强制宽限期（`T_grace` = 7 天）+ 加密碎纸；彻底不可恢复上界约 37 天；op 密文永久保留 | D2′、Q7–Q9 | Proposed（S0：DO alarm、R2 生命周期；M2：INV-SHRED-BOUND、INV-GRACE） |
-| ADR-06 | **平台形态** | macOS：Tauri 壳 + 全局热键（M1 必备）；Omarchy：Hyprland 绑定 Chromium webapp；手机：只读 PWA + Vault 解锁；本地 UI 统一 `http://localhost:<port>` | D1、D5、D7、F-15 | Proposed（S0：热键 < 100 ms、iPhone Argon2id） |
+| ADR-02 | **云端基础设施** | Cloudflare **Workers Paid**（约 \$5/月 [估算]）：单 Worker + SQLite DO + R2 + Static Assets；服务端极薄（幂等追加、分配 seq、按 seq 分页、epoch、令牌范围、WebSocket 唤醒、密钥表 / `key_material` / 碎纸标记存储 + 宽限期 / 批量阈值校验 + alarm 置空、每日归档，不暴露云端归档 HTTP 路由）；配置支出告警 | D4、F-12 | Proposed（S0：echo 中继） |
+| ADR-03 | **同步协议（路径 γ）** | 全量载荷 op；在完整因果图 `G(b)` 上求叶子，冲突 = 同块多存活叶子，并列展示 + 手动合并；HLC 只决定展示顺序；字段 LWW；Update-Wins；无 `SPAN_PATCH` / Lock-Wins / GC / 快照 CAS | D3 | Proposed（M1：DST + 属性测试 + 4 周实测） |
+| ADR-04 | **加密与密钥** | 每块 BDEK，信封只带 `key_id`；独立密钥表 `block_keys` + `key_material` + `shred_marks`（2P-Set）；统一恢复包 → Root Seed → X25519 恢复密钥对（设备只存公钥，SMK 代际 / VKEK 封装追加，旧 SMK 代际永久保留）；AAD 只在 `data-structures.md` 定义 | D2′、F-01、F-05 | Proposed（M1 线格式定型前评审；INV-RECOVERY、INV-KEY-LIVENESS） |
+| ADR-05 | **删除语义** | 删除优先、有界时延：M1 软删回收站，M2 启用服务端强制宽限期（`T_grace` = 7 天）+ 加密碎纸（仅服务端 `executed` 触发本地删钥）；彻底不可恢复上界约 37 天；op 密文永久保留 | D2′、Q7–Q9 | Proposed（S0：DO alarm、R2 生命周期；M2：INV-SHRED-BOUND、INV-GRACE） |
+| ADR-06 | **平台形态** | macOS：Tauri 壳 + 全局热键（M1 必备）；Omarchy：Hyprland 绑定 Chromium webapp；手机：只读 PWA + Vault 解锁；本地 UI 统一 `http://localhost:<port>` | D1、D5、D7、F-15 | Proposed（S0：热键 < 100 ms、Keychain ACL、iPhone Argon2id） |
 | ADR-07 | **编辑器与渲染** | CodeMirror 6（单文档 vs 按块挂载由 S0 决定）+ Markdown 双模 + `Pele` 纯 SVG | F-11 | Proposed（S0：编辑器 spike） |
-| ADR-08 | **Agent 集成** | 纯 CLI（直写 WAL + Socket 唤醒）+ 极轻 `SKILL.md`（L0–L3）；不做本地与云端 MCP；CLI 只能把块删进回收站 | §5.5、D2′ | Proposed（M1：CLI 黄金测试） |
+| ADR-08 | **Agent 集成** | 纯 CLI（Daemon 运行时 UDS `apply` / 未起时直写 WAL）+ 极轻 `SKILL.md`（L0–L3a，`--help-json` 推迟）；不做本地与云端 MCP；CLI 只能把块删进回收站 | §5.5、D2′ | Proposed（M1：CLI 黄金测试） |
 | ADR-09 | **分发与升级** | Homebrew tap / AUR / `cargo install`，二进制装在用户不可写位置；不做自升级；Schema 迁移前 `VACUUM INTO` 备份 | F-14、F-07 | Proposed |
 | ADR-10 | **质量保障** | 只保留 Plane A 确定性门禁（属性测试、DST、真实 Worker 契约测试、INV-RECOVERY、SEC 取证、格式化幂等、CLI 黄金测试、双平台 CI） | D6 | Proposed（M1） |
 
@@ -791,20 +802,23 @@ flowchart LR
 
 ## 9. 已移除 / 推迟的机制（2026-11-24）
 
-依据 [第一性原理审查](../review/2026-11-24-first-principles-review.md)，以下机制已从本方案正文移除或推迟（每条一行；括号内 § 号与 F-xx 均指审查文档）：
+依据 [第一性原理审查](../review/2026-11-24-first-principles-review.md) 及 PR #31 审阅补充决议，以下机制已从本方案正文移除或推迟（每条一行；括号内 § 号与 F-xx 均指审查文档）：
 
 - `SPAN_PATCH` / delta 链 / 每 20 步检查点：改为只用全量载荷；单条 op p95 > 64 KB 时再议（§9.4、§9.11）。
 - Lock-Wins 特例：`LOCK` 是普通版本（实现上是换钥），任一叶子加锁则整块按加锁渲染（§9.4）。
 - HLC 漂移钳制 / 拒收：所有版本都保留，HLC 只决定展示顺序，偏差过大仅本地提示（§9.4、F-03）。
 - DO 滑动窗口 GC：Workers Paid 单 DO 10 GB，不再需要（§9.5）。
-- R2 K=5 多代快照 + CAS：改为只给手机读的「当前状态快照」，按 `covers_seq` 单调接受、保留 2 份（§9.2）。
+- R2 K=5 多代快照 + CAS：改为只给手机读的「当前状态快照」，在同一 `journal_epoch` 内按 `covers_seq` 单调接受、保留 2 份（§9.2）。
 - `purge_op_ids`：op 密文永不删除，删除只作用于密钥（§9.3、F-04）。
-- `vault_keys` + `vault_key_slots` + `MNK1` + `key_seq` + INV-SYNC-4：由独立密钥表 `block_keys` + `shred_marks` 取代（§9.3、§9.7）。
+- `vault_keys` + `vault_key_slots` + `MNK1` + `key_seq` + INV-SYNC-4：由独立密钥表 `block_keys` + `key_material` + `shred_marks` 取代（§9.3、§9.7）。
 - Vault 第二套 24 词恢复码：并入统一恢复包（F-05）。
+- `/v1/archive/*` 云端归档 HTTP 路由与恢复专用挑战-应答鉴权：移除，改为 `BOOTSTRAP_TOKEN`（DO 健在时）+ 从 R2 下载目录本地执行 `mynote restore --from-archive <local-dir>`（§9.12）。
+- `/v1/blobs/:sha256` 加密附件：推迟至「按数据触发的待办」（届时每附件独立随机 `BlobKey`，§9.12）。
 - 瞬态加密剪贴板（`clip push --ephemeral`）：手机复制按钮取代（§9.2）。
 - 移动端编辑器 / outbox / 冲突合并 UI / Layer 3 移动端格式化：手机只读（§9.2）。
 - WebSocket 携带 op（「顺风车」）：推迟，WebSocket 只发通知（§9.11 待办）。
 - WebAuthn PRF 多槽位：推迟，口令为主路径（§9.10）。
+- `--help-json` 机读反射：推迟，由 CLI 黄金测试守护机读契约（§9.9）。
 - 分数索引重平衡：删除，保留随机抖动后缀（F-18、§9.4）。
 - `mynote update` 自升级子系统：交给包管理器（F-14）。
 - Plane B 统计评测与自动爬山：移出路线图（§9.9）。
