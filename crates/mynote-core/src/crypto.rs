@@ -137,7 +137,7 @@ fn decrypt_envelope(
     key: &[u8; 32],
     aad: &[u8],
     data: &[u8],
-) -> Result<Vec<u8>, CoreError> {
+) -> Result<Zeroizing<Vec<u8>>, CoreError> {
     let hdr = parse_header(expected_magic, data)?;
     if &hdr.kid != expected_kid {
         return Err(integrity_err("envelope header kid does not match expected kid"));
@@ -152,6 +152,7 @@ fn decrypt_envelope(
                 aad,
             },
         )
+        .map(Zeroizing::new)
         .map_err(|_| integrity_err("AEAD tag or AAD verification failed"))
 }
 
@@ -274,9 +275,9 @@ pub fn encrypt_mnb1(
     let pt = BlockPlaintextV1 {
         content: content.to_string(),
     };
-    let packed = rmp_serde::to_vec_named(&pt).map_err(|e| integrity_err(e.to_string()))?;
-    let compressed = compress_zstd(&packed);
-    let padded = pad256(&compressed);
+    let packed = Zeroizing::new(rmp_serde::to_vec_named(&pt).map_err(|e| integrity_err(e.to_string()))?);
+    let compressed = Zeroizing::new(compress_zstd(&packed));
+    let padded = Zeroizing::new(pad256(&compressed));
     let aad = aad_mnb1(entity_id, op_id, key_id);
     encrypt_envelope(MAGIC_MNB1, key_id.as_bytes(), bdek, nonce, &aad, &padded)
 }
@@ -291,7 +292,7 @@ pub fn decrypt_mnb1(
     let aad = aad_mnb1(entity_id, op_id, key_id);
     let padded = decrypt_envelope(MAGIC_MNB1, key_id.as_bytes(), bdek, &aad, mnb1)?;
     let compressed = unpad256(&padded)?;
-    let packed = decompress_zstd(compressed)?;
+    let packed = Zeroizing::new(decompress_zstd(compressed)?);
     let pt: BlockPlaintextV1 = rmp_serde::from_slice(&packed).map_err(|e| integrity_err(e.to_string()))?;
     Ok(pt.content)
 }
@@ -319,7 +320,7 @@ pub fn encrypt_mnr1(
     record: &KeyRecordV1,
     nonce: [u8; 24],
 ) -> Result<Vec<u8>, CoreError> {
-    let packed = rmp_serde::to_vec_named(record).map_err(|e| integrity_err(e.to_string()))?;
+    let packed = Zeroizing::new(rmp_serde::to_vec_named(record).map_err(|e| integrity_err(e.to_string()))?);
     let aad = aad_mnr1(smk_kid, record.key_id, wrap_gen);
     encrypt_envelope(MAGIC_MNR1, smk_kid.as_bytes(), smk, nonce, &aad, &packed)
 }
@@ -459,7 +460,7 @@ impl RecoveryKeypair {
                 "Verify all 24 BIP-39 English words and their order",
             )
         })?;
-        let entropy_vec = mnemonic.to_entropy();
+        let entropy_vec = Zeroizing::new(mnemonic.to_entropy());
         if entropy_vec.len() != 32 {
             return Err(CoreError::new(
                 ErrorCode::InvalidArgument,
@@ -545,9 +546,11 @@ impl RecoveryKeypair {
         let aad = aad_mnrs(&rec_kid, kind, &kid);
         let cipher = XChaCha20Poly1305::new((&*aead_key).into());
         let xnonce = XNonce::from(nonce);
-        let pt = cipher
-            .decrypt(&xnonce, Payload { msg: ct, aad: &aad })
-            .map_err(|_| integrity_err("MNRS AEAD decryption failed"))?;
+        let pt = Zeroizing::new(
+            cipher
+                .decrypt(&xnonce, Payload { msg: ct, aad: &aad })
+                .map_err(|_| integrity_err("MNRS AEAD decryption failed"))?,
+        );
         if pt.len() != 32 {
             return Err(integrity_err("MNRS plaintext must be 32 bytes"));
         }
@@ -578,11 +581,12 @@ pub fn seal_mnrs(
     eph_sk_bytes: [u8; 32],
     nonce: [u8; 24],
 ) -> Result<Vec<u8>, CoreError> {
+    let eph_sk_bytes = Zeroizing::new(eph_sk_bytes);
     let digest = blake3::hash(recovery_pk);
     let mut recovery_kid = [0u8; 16];
     recovery_kid.copy_from_slice(&digest.as_bytes()[..16]);
 
-    let eph_sk = StaticSecret::from(eph_sk_bytes);
+    let eph_sk = StaticSecret::from(*eph_sk_bytes);
     let eph_pk = PublicKey::from(&eph_sk);
     let eph_pk_bytes = eph_pk.to_bytes();
     let rec_pk = PublicKey::from(*recovery_pk);
@@ -627,10 +631,27 @@ pub fn seal_mnrs(
     Ok(out)
 }
 
+/// Safe Argon2id KDF parameter bounds (`docs/threat-model.md` §2.1 & WASM DoS protection).
+pub const MIN_ARGON2_M_KIB: u32 = 19_456;
+pub const MAX_ARGON2_M_KIB: u32 = 262_144;
+pub const MIN_ARGON2_T: u32 = 1;
+pub const MAX_ARGON2_T: u32 = 10;
+pub const MIN_ARGON2_P: u32 = 1;
+pub const MAX_ARGON2_P: u32 = 4;
+
 /// Derive a 32-byte key from a Vault passphrase using Argon2id parameters stored in `VaultHeaderV1`.
 pub fn derive_passphrase_key(passphrase: &[u8], kdf: &KdfParamsV1) -> Result<Zeroizing<[u8; 32]>, CoreError> {
     if kdf.alg != "argon2id" {
         return Err(integrity_err(format!("unsupported KDF algorithm '{}'", kdf.alg)));
+    }
+    if !(MIN_ARGON2_M_KIB..=MAX_ARGON2_M_KIB).contains(&kdf.m_kib)
+        || !(MIN_ARGON2_T..=MAX_ARGON2_T).contains(&kdf.t)
+        || !(MIN_ARGON2_P..=MAX_ARGON2_P).contains(&kdf.p)
+    {
+        return Err(integrity_err(format!(
+            "Argon2id params out of safe bounds (m_kib={}, t={}, p={})",
+            kdf.m_kib, kdf.t, kdf.p
+        )));
     }
     let params = argon2::Params::new(kdf.m_kib, kdf.t, kdf.p, Some(32))
         .map_err(|e| integrity_err(format!("invalid Argon2id params: {e}")))?;
@@ -691,7 +712,7 @@ pub fn encrypt_pairing_ticket(
     payload: &PairingPayloadV1,
     nonce: [u8; 24],
 ) -> Result<Vec<u8>, CoreError> {
-    let packed = rmp_serde::to_vec_named(payload).map_err(|e| integrity_err(e.to_string()))?;
+    let packed = Zeroizing::new(rmp_serde::to_vec_named(payload).map_err(|e| integrity_err(e.to_string()))?);
     let mut aad = Vec::with_capacity(5 + pair_id.len());
     aad.extend_from_slice(MAGIC_PAIR);
     aad.push(WIRE_VERSION);
@@ -735,9 +756,11 @@ pub fn decrypt_pairing_ticket(
     aad.extend_from_slice(pair_id.as_bytes());
     let cipher = XChaCha20Poly1305::new(k_pair.into());
     let xnonce = XNonce::from(nonce);
-    let pt = cipher
-        .decrypt(&xnonce, Payload { msg: ct, aad: &aad })
-        .map_err(|_| integrity_err("pairing ticket decryption failed"))?;
+    let pt = Zeroizing::new(
+        cipher
+            .decrypt(&xnonce, Payload { msg: ct, aad: &aad })
+            .map_err(|_| integrity_err("pairing ticket decryption failed"))?,
+    );
     rmp_serde::from_slice(&pt).map_err(|e| integrity_err(e.to_string()))
 }
 

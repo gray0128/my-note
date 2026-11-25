@@ -1,4 +1,15 @@
-import type { ApiErrorBody, BlockDto, BootstrapResponse, BufferDto, LocalWsFrame, SyncStatusDto, TrashItemDto } from "./types";
+import type {
+  ApiErrorBody,
+  BlockDto,
+  BlockedTier2OpDto,
+  BootstrapResponse,
+  BufferDto,
+  LocalWsFrame,
+  SyncStatusDto,
+  TrashActionPrepareResponse,
+  TrashItemDto,
+  VaultHeaderDto,
+} from "./types";
 
 export class LocalApiError extends Error {
   constructor(public status: number, public body: ApiErrorBody) {
@@ -37,23 +48,95 @@ async function reqJson<T>(path: string, init: RequestInit = {}): Promise<T> {
   return parsed as T;
 }
 
+export interface Tier2WritePayload {
+  op_id: string;
+  key_id: string;
+  mnb1_b64: string;
+  mnw1_b64?: string;
+}
+
 export interface LocalApiClient {
   bootstrap(): Promise<BootstrapResponse>;
   getSyncStatus?(): Promise<SyncStatusDto>;
   listBlocks(bufferId: string): Promise<BlockDto[]>;
-  createBlock(input: { buffer_id: string; lang: string; content: string; after_id?: string | null; fast_sync?: boolean }): Promise<BlockDto>;
+  createBlock(input: {
+    buffer_id: string;
+    lang: string;
+    content?: string;
+    after_id?: string | null;
+    block_id?: string;
+    op_id?: string;
+    key_id?: string;
+    mnb1_b64?: string;
+    mnw1_b64?: string;
+    public_hint?: string | null;
+    fast_sync?: boolean;
+  }): Promise<BlockDto>;
   patchBlock(
     id: string,
-    input: { expected_heads?: string[]; content?: string; lang?: string; after_id?: string; before_id?: string; buffer_id?: string; fast_sync?: boolean },
+    input: {
+      expected_heads?: string[];
+      content?: string;
+      op_id?: string;
+      key_id?: string;
+      mnb1_b64?: string;
+      mnw1_b64?: string;
+      public_hint?: string | null;
+      lang?: string;
+      after_id?: string;
+      before_id?: string;
+      buffer_id?: string;
+      fast_sync?: boolean;
+    },
     opts?: { keepalive?: boolean },
   ): Promise<BlockDto>;
-  resolveBlock(id: string, input: { expected_heads: string[]; content?: string; keep_op_id?: string }): Promise<BlockDto>;
+  resolveBlock(
+    id: string,
+    input: {
+      expected_heads: string[];
+      content?: string;
+      keep_op_id?: string;
+      op_id?: string;
+      key_id?: string;
+      mnb1_b64?: string;
+      mnw1_b64?: string;
+    },
+  ): Promise<BlockDto>;
+  lockBlock?(
+    id: string,
+    input: {
+      expected_heads: string[];
+      op_id: string;
+      key_id: string;
+      mnb1_b64: string;
+      mnw1_b64: string;
+      public_hint?: string | null;
+    },
+  ): Promise<BlockDto>;
+  unlockBlock?(
+    id: string,
+    input: { expected_heads: string[]; content: string; lang?: string; shred_old_key?: boolean },
+  ): Promise<BlockDto>;
+  getTier1LeafPlaintext?(
+    blockId: string,
+    opId: string,
+  ): Promise<{ block_id: string; op_id: string; content: string }>;
   deleteBlock(id: string, expectedHeads: string[]): Promise<{ in_trash: boolean; shred_state: string; shred_not_before_ms: number | null }>;
   createBuffer(input: { name: string; after_id?: string }): Promise<BufferDto>;
   renameBuffer(id: string, name: string): Promise<BufferDto>;
   deleteBuffer(id: string): Promise<BufferDto>;
   listTrash(): Promise<TrashItemDto[]>;
-  restoreTrash(id: string): Promise<BlockDto>;
+  getTrashTier2Blob?(id: string): Promise<{ op_id: string; key_id: string; mnb1_b64: string; mnw1_b64: string }>;
+  restoreTrash(id: string, tier2?: { op_id: string; key_id: string; mnb1_b64: string; mnw1_b64?: string }): Promise<BlockDto>;
+  prepareTrashAction?(input: {
+    action: "expedite" | "confirm_pending" | "purge_history";
+    block_ids?: string[];
+    grace_ms?: number;
+  }): Promise<TrashActionPrepareResponse>;
+  commitTrashAction?(input: { confirm_nonce: string; tier2?: Tier2WritePayload; expected_heads?: string[] }): Promise<unknown>;
+  putVaultHeader?(gen: number, blobB64: string): Promise<VaultHeaderDto>;
+  listBlockedOps?(): Promise<BlockedTier2OpDto[]>;
+  rekeyBlockedOp?(opId: string, payload: Tier2WritePayload): Promise<BlockDto>;
   formatSnippet(input: { content: string; lang: string; action?: string }): Promise<{ formatted: string }>;
   syncNow(): Promise<SyncStatusDto>;
   connectWs(
@@ -76,13 +159,36 @@ export function createLocalApiClient(): LocalApiClient {
         keepalive: opts?.keepalive,
       }),
     resolveBlock: (id, input) => reqJson<BlockDto>(`/v1/local/blocks/${encodeURIComponent(id)}/resolve`, { method: "POST", body: JSON.stringify(input) }),
+    lockBlock: (id, input) => reqJson<BlockDto>(`/v1/local/blocks/${encodeURIComponent(id)}/lock`, { method: "POST", body: JSON.stringify(input) }),
+    unlockBlock: (id, input) => reqJson<BlockDto>(`/v1/local/blocks/${encodeURIComponent(id)}/unlock`, { method: "POST", body: JSON.stringify(input) }),
+    getTier1LeafPlaintext: (blockId, opId) =>
+      reqJson<{ block_id: string; op_id: string; content: string }>(
+        `/v1/local/blocks/${encodeURIComponent(blockId)}/tier1-leaf/${encodeURIComponent(opId)}`,
+      ),
     deleteBlock: (id, expectedHeads) =>
       reqJson(`/v1/local/blocks/${encodeURIComponent(id)}`, { method: "DELETE", body: JSON.stringify({ expected_heads: expectedHeads }) }),
     createBuffer: (input) => reqJson<BufferDto>("/v1/local/buffers", { method: "POST", body: JSON.stringify(input) }),
     renameBuffer: (id, name) => reqJson<BufferDto>(`/v1/local/buffers/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ name }) }),
     deleteBuffer: (id) => reqJson<BufferDto>(`/v1/local/buffers/${encodeURIComponent(id)}`, { method: "DELETE" }),
     listTrash: () => reqJson<TrashItemDto[]>("/v1/local/trash"),
-    restoreTrash: (id) => reqJson<BlockDto>(`/v1/local/trash/${encodeURIComponent(id)}/restore`, { method: "POST" }),
+    getTrashTier2Blob: (id) => reqJson(`/v1/local/trash/${encodeURIComponent(id)}/tier2-blob`),
+    restoreTrash: (id, tier2) =>
+      reqJson<BlockDto>(`/v1/local/trash/${encodeURIComponent(id)}/restore`, {
+        method: "POST",
+        body: tier2 ? JSON.stringify(tier2) : undefined,
+      }),
+    prepareTrashAction: (input) =>
+      reqJson<TrashActionPrepareResponse>("/v1/local/trash/actions/prepare", { method: "POST", body: JSON.stringify(input) }),
+    commitTrashAction: (input) =>
+      reqJson("/v1/local/trash/actions/commit", { method: "POST", body: JSON.stringify(input) }),
+    putVaultHeader: (gen, blob_b64) =>
+      reqJson<VaultHeaderDto>("/v1/local/vault/header", { method: "PUT", body: JSON.stringify({ gen, blob_b64 }) }),
+    listBlockedOps: () => reqJson<BlockedTier2OpDto[]>("/v1/local/blocked-ops"),
+    rekeyBlockedOp: (opId, payload) =>
+      reqJson<BlockDto>(`/v1/local/blocked-ops/${encodeURIComponent(opId)}/rekey`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }),
     formatSnippet: (input) => reqJson<{ formatted: string }>("/v1/local/format", { method: "POST", body: JSON.stringify(input) }),
     syncNow: () => reqJson<SyncStatusDto>("/v1/local/sync/now", { method: "POST" }),
     connectWs(onFrame, onConnChange, onAuthExpired) {

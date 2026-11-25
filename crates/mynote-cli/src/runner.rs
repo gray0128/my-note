@@ -11,16 +11,24 @@ use crate::help::render_topic;
 use crate::output::{emit_error, emit_json, emit_jsonl, CliMeta, OutputMode};
 use crate::sync_client::{render_terminal_qr, RelayClient};
 use crate::uds::{try_send_uds, ApplyMeta, ApplyRequest, UdsRequest, UdsResponse};
+use base64::Engine;
 use clap::Parser;
+use mynote_core::crypto::{decrypt_mnb1, encrypt_mnb1, RecoveryKeypair, VaultHeaderV1};
 use mynote_core::error::{CoreError, ErrorCode};
-use mynote_core::ids::DeviceId;
+use mynote_core::ids::{BlockId, DeviceId, KeyId, OpId, Ulid, VkekKid};
 use mynote_core::model::KeyMaterialKind;
 use mynote_core::sync::StoreMutation;
+use mynote_core::vault::{
+    change_vault_passphrase, create_vault_header, detect_secret_pattern, unlock_vault_with_passphrase,
+    unseal_vault_with_recovery, UnlockedVaultKeys,
+};
 use mynote_store::store::{DeleteReceipt, LocalStore, WriteReceipt};
+use mynote_store::Tier2OpInput;
 use std::collections::BTreeSet;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 fn run_async<F, T>(fut: F) -> Result<T, CoreError>
 where
@@ -199,6 +207,27 @@ fn read_text_arg_or_stdin(arg: Option<String>) -> Result<(String, bool), CoreErr
     Ok((buf, true))
 }
 
+fn rand_bytes_cli<const N: usize>() -> Result<[u8; N], CoreError> {
+    let mut b = [0u8; N];
+    getrandom::fill(&mut b).map_err(|e| {
+        CoreError::new(
+            ErrorCode::IntegrityError,
+            format!("OS CSPRNG error: {e}"),
+            "Check system entropy",
+        )
+    })?;
+    Ok(b)
+}
+
+fn now_ms_cli() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1)
+        .max(1)
+}
+
+#[cfg(not(unix))]
 fn read_tty_line(prompt: &str) -> Result<String, CoreError> {
     let mut stderr = io::stderr().lock();
     let _ = write!(stderr, "{prompt}");
@@ -212,6 +241,118 @@ fn read_tty_line(prompt: &str) -> Result<String, CoreError> {
         )
     })?;
     Ok(line.trim().to_string())
+}
+
+/// Read a secret passphrase interactively from `/dev/tty` (falling back to TTY stdin inside
+/// isolated PTY harnesses) with terminal echo suppressed and guaranteed restoration on drop.
+/// Fails closed if `stty -echo` cannot disable terminal echo (H15).
+fn read_tty_secret(prompt: &str) -> Result<Zeroizing<String>, CoreError> {
+    #[cfg(unix)]
+    {
+        struct EchoRestore(Option<std::fs::File>);
+        impl Drop for EchoRestore {
+            fn drop(&mut self) {
+                if let Some(f) = self.0.as_ref().and_then(|f| f.try_clone().ok()) {
+                    let _ = std::process::Command::new("stty")
+                        .arg("echo")
+                        .stdin(std::process::Stdio::from(f))
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                } else {
+                    let _ = std::process::Command::new("stty")
+                        .arg("echo")
+                        .stdin(std::process::Stdio::inherit())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
+        }
+
+        let disable_echo = |stdin_cfg: std::process::Stdio| -> Result<(), CoreError> {
+            let status = std::process::Command::new("stty")
+                .arg("-echo")
+                .stdin(stdin_cfg)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map_err(|e| {
+                    CoreError::new(
+                        ErrorCode::InteractionRequired,
+                        format!("failed to invoke stty -echo: {e}"),
+                        "Run inside a real POSIX terminal where terminal echo can be disabled",
+                    )
+                })?;
+            if !status.success() {
+                return Err(CoreError::new(
+                    ErrorCode::InteractionRequired,
+                    "refusing to read secret because terminal echo could not be suppressed",
+                    "Run inside a real interactive TTY",
+                ));
+            }
+            Ok(())
+        };
+
+        if let Ok(tty) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+        {
+            let clone_for_stty = tty.try_clone().map_err(|e| {
+                CoreError::new(
+                    ErrorCode::InteractionRequired,
+                    format!("tty clone: {e}"),
+                    "Retry in TTY",
+                )
+            })?;
+            let restore_handle = tty.try_clone().ok();
+            disable_echo(std::process::Stdio::from(clone_for_stty))?;
+            let _guard = EchoRestore(restore_handle);
+            let mut writer = tty.try_clone().map_err(|e| {
+                CoreError::new(
+                    ErrorCode::InteractionRequired,
+                    format!("tty clone: {e}"),
+                    "Retry in TTY",
+                )
+            })?;
+            let _ = write!(writer, "{prompt}");
+            let _ = writer.flush();
+            let mut reader = io::BufReader::new(tty);
+            let mut line = Zeroizing::new(String::new());
+            reader.read_line(&mut line).map_err(|e| {
+                CoreError::new(
+                    ErrorCode::InteractionRequired,
+                    format!("failed reading secret from /dev/tty: {e}"),
+                    "Retry in an interactive terminal",
+                )
+            })?;
+            let _ = writeln!(writer);
+            let trimmed = line.trim_end_matches(&['\r', '\n'][..]).to_string();
+            return Ok(Zeroizing::new(trimmed));
+        }
+        // Fallback when running under an isolated PTY without controlling `/dev/tty`
+        disable_echo(std::process::Stdio::inherit())?;
+        let _guard = EchoRestore(None);
+        let mut stderr = io::stderr().lock();
+        let _ = write!(stderr, "{prompt}");
+        let _ = stderr.flush();
+        let mut line = Zeroizing::new(String::new());
+        io::stdin().read_line(&mut line).map_err(|e| {
+            CoreError::new(
+                ErrorCode::InteractionRequired,
+                format!("failed reading interactive secret: {e}"),
+                "Retry in an interactive terminal",
+            )
+        })?;
+        let _ = writeln!(stderr);
+        let trimmed = line.trim_end_matches(&['\r', '\n'][..]).to_string();
+        Ok(Zeroizing::new(trimmed))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Zeroizing::new(read_tty_line(prompt)?))
+    }
 }
 
 fn execute(cli: Cli, mode: OutputMode, started: Instant) -> i32 {
@@ -257,7 +398,7 @@ fn execute(cli: Cli, mode: OutputMode, started: Instant) -> i32 {
             return handle_restore(args, non_interactive, mode, started, quiet);
         }
         Commands::Vault { action } => {
-            return handle_vault(action, non_interactive, mode, started, quiet);
+            return handle_vault(&data_dir, action, &actor, non_interactive, mode, started, quiet);
         }
         Commands::Daemon(args) => {
             return handle_daemon(args, data_dir, mode, started, quiet);
@@ -403,8 +544,8 @@ fn handle_device_bootstrap(
         return emit_error(&err, mode, empty_meta(started), quiet);
     }
     let token = match std::env::var("MYNOTE_BOOTSTRAP_TOKEN") {
-        Ok(v) if !v.trim().is_empty() => v,
-        _ => match read_tty_line("Enter Cloudflare BOOTSTRAP_TOKEN: ") {
+        Ok(v) if !v.trim().is_empty() => Zeroizing::new(v),
+        _ => match read_tty_secret("Enter Cloudflare BOOTSTRAP_TOKEN: ") {
             Ok(t) => t,
             Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
         },
@@ -569,7 +710,7 @@ fn handle_device_claim(
     if let Err(err) = require_tty(non_interactive, "device claim") {
         return emit_error(&err, mode, empty_meta(started), quiet);
     }
-    let code = match read_tty_line("Paste pairing/refresh code (mynote-pair:v1:...): ") {
+    let code = match read_tty_secret("Paste pairing/refresh code (mynote-pair:v1:...): ") {
         Ok(c) => c,
         Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
     };
@@ -673,6 +814,15 @@ fn handle_add(
                 CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode daemon receipt")
             })?;
             emit_write_receipt(&receipt, store, mode, started);
+            if !quiet && mode == OutputMode::Human {
+                if let Some(kind) = detect_secret_pattern(&final_text) {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "note: detected possible secret ({kind}); run 'mynote vault lock {}' to protect it in Tier 2 Vault",
+                        receipt.block_id
+                    );
+                }
+            }
             return Ok(0);
         }
     }
@@ -687,6 +837,15 @@ fn handle_add(
     )?;
 
     emit_write_receipt(&receipt, store, mode, started);
+    if !quiet && mode == OutputMode::Human {
+        if let Some(kind) = detect_secret_pattern(&final_text) {
+            let _ = writeln!(
+                io::stderr(),
+                "note: detected possible secret ({kind}); run 'mynote vault lock {}' to protect it in Tier 2 Vault",
+                receipt.block_id
+            );
+        }
+    }
     Ok(0)
 }
 
@@ -772,18 +931,98 @@ fn handle_block(
         } => {
             if decrypt {
                 // `docs/interface-contracts.md` §2.6 #9: --decrypt in non-TTY returns BLOCK_LOCKED (exit 5)
-                if !is_interactive_tty(non_interactive) {
+                if non_interactive || !io::stdin().is_terminal() {
                     return Err(CoreError::new(
                         ErrorCode::BlockLocked,
                         "cannot decrypt a locked block in non-TTY mode",
                         "Unlock interactively in a real terminal or desktop UI",
                     ));
                 }
-                return Err(CoreError::new(
-                    ErrorCode::BlockLocked,
-                    "Tier 2 Vault interactive decryption lands in Milestone M2",
-                    "Use the desktop UI once Tier 2 Vault is enabled",
-                ));
+                let mut detail = store.get_block_for_daemon(&id)?;
+                if detail.is_locked {
+                    let vault = unlock_local_vault_interactive(store)?;
+                    let blk_id = BlockId::parse(&detail.id)?;
+                    let b64 = base64::engine::general_purpose::STANDARD;
+                    let mut display_pt: Option<String> = None;
+                    for ver in &mut detail.versions {
+                        if ver.is_locked {
+                            let (Some(kid_s), Some(mnb1_b64), Some(mnw1_b64)) = (
+                                ver.key_id.as_deref(),
+                                ver.mnb1_b64.as_deref(),
+                                ver.mnw1_b64.as_deref(),
+                            ) else {
+                                continue;
+                            };
+                            let kid = KeyId::parse(kid_s)?;
+                            let oid = OpId::parse(&ver.op_id)?;
+                            let mnb1 = b64.decode(mnb1_b64).map_err(|e| {
+                                CoreError::new(
+                                    ErrorCode::IntegrityError,
+                                    format!("bad mnb1: {e}"),
+                                    "Check store",
+                                )
+                            })?;
+                            let mnw1 = b64.decode(mnw1_b64).map_err(|e| {
+                                CoreError::new(
+                                    ErrorCode::IntegrityError,
+                                    format!("bad mnw1: {e}"),
+                                    "Check store",
+                                )
+                            })?;
+                            let bdek = vault.unwrap_bdek(kid, blk_id, &mnw1)?;
+                            let pt = decrypt_mnb1(blk_id.as_bytes(), oid, kid, &bdek, &mnb1)?;
+                            if ver.is_display {
+                                display_pt = Some(pt.clone());
+                            }
+                            ver.content = Some(pt);
+                            ver.mnb1_b64 = None;
+                            ver.mnw1_b64 = None;
+                        }
+                    }
+                    drop(vault);
+                    detail.redacted = false;
+                    detail.content =
+                        display_pt.or_else(|| detail.versions.first().and_then(|v| v.content.clone()));
+                    if detail.content.is_none() {
+                        return Err(CoreError::new(
+                            ErrorCode::KeyMissing,
+                            format!(
+                                "unable to decrypt locked block '{id}'; key material missing or shredded"
+                            ),
+                            "Run 'mynote sync pull' or check key status",
+                        ));
+                    }
+                }
+                if raw {
+                    let content = detail.content.as_deref().ok_or_else(|| {
+                        CoreError::new(
+                            ErrorCode::KeyMissing,
+                            format!("block '{id}' has no readable plaintext content"),
+                            "Run 'mynote sync pull' or unlock Vault",
+                        )
+                    })?;
+                    let out_str = apply_max_chars(content, max_chars);
+                    let mut stdout = io::stdout().lock();
+                    let _ = stdout.write_all(out_str.as_bytes());
+                    let _ = stdout.flush();
+                    return Ok(0);
+                }
+                if let Some(limit) = max_chars {
+                    if let Some(c) = &detail.content {
+                        detail.content = Some(apply_max_chars(c, Some(limit)));
+                    }
+                }
+                match mode {
+                    OutputMode::Json | OutputMode::Jsonl => {
+                        emit_json(&detail, store_meta(store, started, None));
+                    }
+                    OutputMode::Human => {
+                        if let Some(c) = &detail.content {
+                            println!("{c}");
+                        }
+                    }
+                }
+                return Ok(0);
             }
 
             let mut detail = store.get_block(&id)?;
@@ -1197,7 +1436,7 @@ fn handle_block(
                     "head_op_ids": detail.head_op_ids,
                     "in_trash": true,
                     "shred_not_before_ms": serde_json::Value::Null,
-                    "shred_state": "unscheduled",
+                    "shred_state": "pending_sync",
                 });
                 match mode {
                     OutputMode::Json | OutputMode::Jsonl => {
@@ -1733,8 +1972,44 @@ fn handle_sync(
     }
 }
 
+fn load_local_vault_header(store: &LocalStore) -> Result<(i64, VaultHeaderV1), CoreError> {
+    let dto = store.get_vault_header()?.ok_or_else(|| {
+        CoreError::new(
+            ErrorCode::NotFound,
+            "Tier 2 Vault is not initialized yet",
+            "Run 'mynote vault init' in an interactive terminal or initialize Vault in the desktop UI",
+        )
+    })?;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&dto.blob_b64)
+        .map_err(|e| {
+            CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("corrupt vault_header: {e}"),
+                "Check store",
+            )
+        })?;
+    let hdr: VaultHeaderV1 = rmp_serde::from_slice(&raw).map_err(|e| {
+        CoreError::new(
+            ErrorCode::IntegrityError,
+            format!("invalid VaultHeaderV1 MessagePack: {e}"),
+            "Check store",
+        )
+    })?;
+    Ok((dto.gen, hdr))
+}
+
+fn unlock_local_vault_interactive(store: &LocalStore) -> Result<UnlockedVaultKeys, CoreError> {
+    let (_gen, hdr) = load_local_vault_header(store)?;
+    let pass = read_tty_secret("Enter Vault passphrase: ")?;
+    unlock_vault_with_passphrase(pass.as_bytes(), &hdr)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_vault(
-    _action: &VaultCommand,
+    data_dir: &Path,
+    action: &VaultCommand,
+    actor: &str,
     non_interactive: bool,
     mode: OutputMode,
     started: Instant,
@@ -1743,12 +2018,368 @@ fn handle_vault(
     if let Err(err) = require_tty(non_interactive, "vault") {
         return emit_error(&err, mode, empty_meta(started), quiet);
     }
-    let err = CoreError::new(
-        ErrorCode::InvalidArgument,
-        "Tier 2 Vault commands ship in Milestone M2",
-        "M1 provides full Tier 1 E2EE sync & unified 24-word recovery",
-    );
-    emit_error(&err, mode, empty_meta(started), quiet)
+    let mut store = match LocalStore::open(data_dir) {
+        Ok(s) => s,
+        Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+    };
+    if let Some(words) = &store.initial_recovery_words {
+        if !quiet && mode == OutputMode::Human {
+            let mut err_out = io::stderr().lock();
+            let _ = writeln!(
+                err_out,
+                "Initialized new vault at {}. Record your 24-word recovery bundle safely:\n  {words}",
+                data_dir.display()
+            );
+        }
+    }
+    let res = handle_vault_inner(&mut store, action, actor, mode, started, quiet);
+    match res {
+        Ok(code) => code,
+        Err(err) => emit_error(&err, mode, store_meta(&store, started, None), quiet),
+    }
+}
+
+fn handle_vault_inner(
+    store: &mut LocalStore,
+    action: &VaultCommand,
+    actor: &str,
+    mode: OutputMode,
+    started: Instant,
+    quiet: bool,
+) -> Result<i32, CoreError> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    match action {
+        VaultCommand::Init => {
+            if store.get_vault_header()?.is_some() {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    "Tier 2 Vault is already initialized",
+                    "Use 'mynote vault passwd' to change your Vault passphrase",
+                ));
+            }
+            let p1 = read_tty_secret("Set new Vault passphrase: ")?;
+            if p1.is_empty() {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    "Vault passphrase cannot be empty",
+                    "Choose a strong non-empty passphrase",
+                ));
+            }
+            let p2 = read_tty_secret("Confirm Vault passphrase: ")?;
+            if p1.as_str() != p2.as_str() {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    "passphrases do not match",
+                    "Re-run 'mynote vault init'",
+                ));
+            }
+            let recovery_pk = store.recovery_pk()?;
+            let now = now_ms_cli();
+            let vkek_kid = VkekKid::from_ulid(Ulid::from_parts(now, rand_bytes_cli::<10>()?));
+            let vkek = Zeroizing::new(rand_bytes_cli::<32>()?);
+            let hdr = create_vault_header(
+                p1.as_bytes(),
+                &recovery_pk,
+                vkek_kid,
+                &vkek,
+                rand_bytes_cli::<16>()?,
+                rand_bytes_cli::<24>()?,
+                rand_bytes_cli::<32>()?,
+                rand_bytes_cli::<24>()?,
+                now as i64,
+            )?;
+            drop(vkek);
+            let blob = rmp_serde::to_vec_named(&hdr).map_err(|e| {
+                CoreError::new(
+                    ErrorCode::IntegrityError,
+                    format!("encode VaultHeaderV1: {e}"),
+                    "Retry",
+                )
+            })?;
+            let blob_b64 = b64.encode(&blob);
+            // Align vault_header gen with WASM (`hdr.updated_at_ms`) so CLI and Web UI stay monotonic.
+            let header_gen = hdr.updated_at_ms;
+            let dto = if let Some(resp) = try_daemon_apply(
+                store.data_dir(),
+                ApplyMeta {
+                    actor: actor.to_string(),
+                    idempotency_key: None,
+                    allow_empty: true,
+                    force: false,
+                },
+                ApplyRequest::PutVaultHeader {
+                    gen: header_gen,
+                    blob_b64: blob_b64.clone(),
+                },
+                quiet,
+            )? {
+                serde_json::from_value(resp.data.unwrap_or_default()).map_err(|e| {
+                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode vault header")
+                })?
+            } else {
+                store.put_vault_header(header_gen, &blob)?
+            };
+            match mode {
+                OutputMode::Json | OutputMode::Jsonl => emit_json(&dto, store_meta(store, started, None)),
+                OutputMode::Human => println!(
+                    "Tier 2 Vault initialized (gen={}, vkek_kid={}; recoverable via your existing 24-word recovery bundle).",
+                    dto.gen, hdr.vkek_kid
+                ),
+            }
+            Ok(0)
+        }
+        VaultCommand::Passwd { recover } => {
+            let (cur_gen, cur_hdr) = load_local_vault_header(store)?;
+            let unlocked = if *recover {
+                let words = read_tty_secret("Enter 24-word recovery bundle: ")?;
+                let kp = RecoveryKeypair::from_mnemonic_words(&words)?;
+                unseal_vault_with_recovery(&kp, &cur_hdr)?
+            } else {
+                let old_pass = read_tty_secret("Enter current Vault passphrase: ")?;
+                unlock_vault_with_passphrase(old_pass.as_bytes(), &cur_hdr)?
+            };
+            let new1 = read_tty_secret("Enter new Vault passphrase: ")?;
+            if new1.is_empty() {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    "new Vault passphrase cannot be empty",
+                    "Choose a strong non-empty passphrase",
+                ));
+            }
+            let new2 = read_tty_secret("Confirm new Vault passphrase: ")?;
+            if new1.as_str() != new2.as_str() {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    "new passphrases do not match",
+                    "Re-run 'mynote vault passwd'",
+                ));
+            }
+            let mut prev_nonces = Vec::with_capacity(cur_hdr.retired.len());
+            for _ in 0..cur_hdr.retired.len() {
+                prev_nonces.push(rand_bytes_cli::<24>()?);
+            }
+            let new_hdr = change_vault_passphrase(
+                &cur_hdr,
+                &unlocked,
+                new1.as_bytes(),
+                rand_bytes_cli::<16>()?,
+                rand_bytes_cli::<24>()?,
+                &prev_nonces,
+                now_ms_cli() as i64,
+            )?;
+            drop(unlocked);
+            let blob = rmp_serde::to_vec_named(&new_hdr).map_err(|e| {
+                CoreError::new(
+                    ErrorCode::IntegrityError,
+                    format!("encode VaultHeaderV1: {e}"),
+                    "Retry",
+                )
+            })?;
+            let next_gen = new_hdr.updated_at_ms.max(cur_gen + 1);
+            let dto = if let Some(resp) = try_daemon_apply(
+                store.data_dir(),
+                ApplyMeta {
+                    actor: actor.to_string(),
+                    idempotency_key: None,
+                    allow_empty: true,
+                    force: false,
+                },
+                ApplyRequest::PutVaultHeader {
+                    gen: next_gen,
+                    blob_b64: b64.encode(&blob),
+                },
+                quiet,
+            )? {
+                serde_json::from_value(resp.data.unwrap_or_default()).map_err(|e| {
+                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode vault header")
+                })?
+            } else {
+                store.put_vault_header(next_gen, &blob)?
+            };
+            match mode {
+                OutputMode::Json | OutputMode::Jsonl => emit_json(&dto, store_meta(store, started, None)),
+                OutputMode::Human => println!("Vault passphrase updated (gen={}).", dto.gen),
+            }
+            Ok(0)
+        }
+        VaultCommand::Lock {
+            id,
+            hint,
+            expected_heads,
+        } => {
+            let detail = store.get_block(id)?;
+            if detail.is_locked {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("block '{id}' is already locked"),
+                    "No action needed",
+                ));
+            }
+            if detail.has_conflict {
+                return Err(CoreError::new(
+                    ErrorCode::ConflictPresent,
+                    format!("block '{id}' has concurrent conflicting versions"),
+                    "Resolve the conflict first (e.g. 'mynote block resolve') before locking",
+                ));
+            }
+            let plaintext = detail.content.ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::KeyMissing,
+                    format!("block '{id}' is unreadable; refusing to encrypt empty placeholder (C5)"),
+                    "Sync missing keys or inspect block integrity before locking",
+                )
+            })?;
+            let heads = if expected_heads.is_empty() {
+                detail.head_op_ids.clone()
+            } else {
+                expected_heads.clone()
+            };
+            let vault = unlock_local_vault_interactive(store)?;
+            let blk_id = BlockId::parse(&detail.id)?;
+            let now = now_ms_cli();
+            let op_id = OpId::from_ulid(Ulid::from_parts(now, rand_bytes_cli::<10>()?));
+            let key_id = KeyId::from_ulid(Ulid::from_parts(now, rand_bytes_cli::<10>()?));
+            let bdek = Zeroizing::new(rand_bytes_cli::<32>()?);
+            let mnb1 = encrypt_mnb1(
+                blk_id.as_bytes(),
+                op_id,
+                key_id,
+                &bdek,
+                &plaintext,
+                rand_bytes_cli::<24>()?,
+            )?;
+            let mnw1 = vault.wrap_bdek(key_id, blk_id, &bdek, rand_bytes_cli::<24>()?)?;
+            drop(vault);
+
+            let receipt = if let Some(resp) = try_daemon_apply(
+                store.data_dir(),
+                ApplyMeta {
+                    actor: actor.to_string(),
+                    idempotency_key: None,
+                    allow_empty: true,
+                    force: false,
+                },
+                ApplyRequest::LockBlockTier2 {
+                    id: detail.id.clone(),
+                    op_id: op_id.to_string(),
+                    key_id: key_id.to_string(),
+                    mnb1_b64: b64.encode(&mnb1),
+                    mnw1_b64: b64.encode(&mnw1),
+                    expected_heads: heads.clone(),
+                    public_hint: hint.clone(),
+                },
+                quiet,
+            )? {
+                serde_json::from_value(resp.data.unwrap_or_default()).map_err(|e| {
+                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode lock receipt")
+                })?
+            } else {
+                store.lock_block_tier2(
+                    &detail.id,
+                    Tier2OpInput {
+                        op_id: &op_id.to_string(),
+                        key_id: &key_id.to_string(),
+                        mnb1: &mnb1,
+                        mnw1: Some(&mnw1),
+                    },
+                    &heads,
+                    None,
+                    hint.as_deref(),
+                    mynote_core::vault::T_GRACE_DEFAULT_MS,
+                    actor,
+                )?
+            };
+            emit_write_receipt(&receipt, store, mode, started);
+            Ok(0)
+        }
+        VaultCommand::Unlock {
+            id,
+            shred_old_key,
+            expected_heads,
+        } => {
+            let detail = store.get_block_for_daemon(id)?;
+            if !detail.is_locked {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("block '{id}' is already unlocked (Tier 1)"),
+                    "No action needed",
+                ));
+            }
+            if detail.has_conflict {
+                return Err(CoreError::new(
+                    ErrorCode::ConflictPresent,
+                    format!("block '{id}' has concurrent conflicting versions"),
+                    "Resolve the conflict in desktop UI before unlocking so concurrent branches are preserved",
+                ));
+            }
+            let heads = if expected_heads.is_empty() {
+                detail.head_op_ids.clone()
+            } else {
+                expected_heads.clone()
+            };
+            let display_ver = detail
+                .versions
+                .iter()
+                .find(|v| v.is_display && v.is_locked)
+                .or_else(|| detail.versions.iter().find(|v| v.is_locked))
+                .ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::KeyMissing,
+                        "no locked ciphertext leaf found to decrypt",
+                        "Inspect block versions",
+                    )
+                })?;
+            let (Some(kid_s), Some(mnb1_b64), Some(mnw1_b64)) = (
+                display_ver.key_id.as_deref(),
+                display_ver.mnb1_b64.as_deref(),
+                display_ver.mnw1_b64.as_deref(),
+            ) else {
+                return Err(CoreError::new(
+                    ErrorCode::KeyMissing,
+                    "locked leaf missing key material",
+                    "Sync keys first",
+                ));
+            };
+            let vault = unlock_local_vault_interactive(store)?;
+            let blk_id = BlockId::parse(&detail.id)?;
+            let kid = KeyId::parse(kid_s)?;
+            let oid = OpId::parse(&display_ver.op_id)?;
+            let mnb1 = b64.decode(mnb1_b64).map_err(|e| {
+                CoreError::new(ErrorCode::IntegrityError, format!("bad mnb1: {e}"), "Check store")
+            })?;
+            let mnw1 = b64.decode(mnw1_b64).map_err(|e| {
+                CoreError::new(ErrorCode::IntegrityError, format!("bad mnw1: {e}"), "Check store")
+            })?;
+            let bdek = vault.unwrap_bdek(kid, blk_id, &mnw1)?;
+            let plaintext = decrypt_mnb1(blk_id.as_bytes(), oid, kid, &bdek, &mnb1)?;
+            drop(vault);
+
+            let receipt = if let Some(resp) = try_daemon_apply(
+                store.data_dir(),
+                ApplyMeta {
+                    actor: actor.to_string(),
+                    idempotency_key: None,
+                    allow_empty: true,
+                    force: false,
+                },
+                ApplyRequest::UnlockBlockTier1 {
+                    id: detail.id.clone(),
+                    plaintext_content: plaintext.clone(),
+                    expected_heads: heads.clone(),
+                    shred_old_key: *shred_old_key,
+                },
+                quiet,
+            )? {
+                serde_json::from_value(resp.data.unwrap_or_default()).map_err(|e| {
+                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode unlock receipt")
+                })?
+            } else {
+                store.unlock_block_tier1(&detail.id, &heads, &plaintext, None, *shred_old_key, actor)?
+            };
+            emit_write_receipt(&receipt, store, mode, started);
+            Ok(0)
+        }
+    }
 }
 
 fn handle_device(
@@ -1927,7 +2558,7 @@ fn handle_keyring(
         }
         KeyringCommand::Unlock => {
             require_tty(non_interactive, "keyring unlock")?;
-            let words = read_tty_line("Enter 24-word recovery bundle: ")?;
+            let words = read_tty_secret("Enter 24-word recovery bundle: ")?;
             // Pull latest remote keyring before unsealing so rotated generations are included immediately.
             let maybe_creds = store.load_credentials().ok().flatten();
             if let Some(creds) = &maybe_creds {
@@ -1999,7 +2630,7 @@ fn handle_recovery(
         }
         RecoveryCommand::Drill => {
             require_tty(non_interactive, "recovery drill")?;
-            let words = read_tty_line("Enter 24-word recovery bundle for offline drill: ")?;
+            let words = read_tty_secret("Enter 24-word recovery bundle for offline drill: ")?;
             let res = store.recovery_drill(&words)?;
             match mode {
                 OutputMode::Json | OutputMode::Jsonl => emit_json(&res, store_meta(store, started, None)),
@@ -2023,7 +2654,7 @@ fn handle_restore(
     if let Err(err) = require_tty(non_interactive, "restore --from-archive") {
         return emit_error(&err, mode, empty_meta(started), quiet);
     }
-    let words = match read_tty_line("Enter 24-word recovery bundle: ") {
+    let words = match read_tty_secret("Enter 24-word recovery bundle: ") {
         Ok(w) => w,
         Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
     };

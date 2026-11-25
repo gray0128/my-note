@@ -768,22 +768,77 @@ async fn mock_push(
             envelope: b64.decode(o["envelope_b64"].as_str().unwrap()).unwrap(),
         })
         .collect();
+    let cancel_key_ids: Vec<KeyId> = body["cancel_key_ids"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|v| v.as_str().and_then(|s| KeyId::parse(s).ok()))
+        .collect();
+    let shred_marks: Vec<mynote_core::model::ShredMarkRow> = body["shred_marks"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| {
+            Some(mynote_core::model::ShredMarkRow {
+                mark_id: mynote_core::ids::MarkId::parse(m["mark_id"].as_str()?).ok()?,
+                key_id: KeyId::parse(m["key_id"].as_str()?).ok()?,
+                seen_seq,
+                requested_by: dev_id.clone(),
+                requested_at_ms: 1_795_521_600_000,
+                grace_ms: m["grace_ms"]
+                    .as_i64()
+                    .unwrap_or(mynote_core::vault::T_GRACE_DEFAULT_MS),
+                not_before_ms: None,
+                state: mynote_core::model::ShredMarkState::PendingConfirm,
+                confirmed_at_ms: None,
+                cancelled_by: None,
+                executed_at_ms: None,
+            })
+        })
+        .collect();
     let req = PushRequestDto {
         expected_epoch,
         seen_seq,
         key_records,
+        cancel_key_ids,
         ops,
+        shred_marks,
     };
     match g.relay.handle_push(&dev_id, &req, 1_795_521_600_000) {
-        Ok((epoch, acked, head_seq)) => {
-            let acked_json: Vec<Value> = acked
+        Ok(ok) => {
+            let acked_json: Vec<Value> = ok
+                .acked
                 .into_iter()
                 .map(|a| json!({ "op_id": a.op_id.to_string(), "seq": a.seq }))
                 .collect();
-            Json(json!({ "ok": true, "epoch": epoch.to_string(), "acked": acked_json, "head_seq": head_seq }))
-                .into_response()
+            let shred_json: Vec<Value> = ok
+                .shred_results
+                .into_iter()
+                .map(|r| {
+                    json!({
+                        "key_id": r.key_id.to_string(),
+                        "state": match r.state {
+                            mynote_core::model::ShredMarkState::PendingConfirm => "pending_confirm",
+                            mynote_core::model::ShredMarkState::Scheduled => "scheduled",
+                            mynote_core::model::ShredMarkState::Cancelled => "cancelled",
+                            mynote_core::model::ShredMarkState::Executed => "executed",
+                        },
+                        "not_before_ms": r.not_before_ms,
+                    })
+                })
+                .collect();
+            Json(json!({
+                "ok": true,
+                "epoch": ok.epoch.to_string(),
+                "acked": acked_json,
+                "shred_results": shred_json,
+                "head_seq": ok.head_seq,
+            }))
+            .into_response()
         }
-        Err(ErrorCode::CasMismatch) => (
+        Err(err) if err.code == ErrorCode::CasMismatch => (
             StatusCode::CONFLICT,
             Json(json!({
                 "ok": false,
@@ -795,9 +850,9 @@ async fn mock_push(
             })),
         )
             .into_response(),
-        Err(code) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "ok": false, "error": { "code": code.as_str(), "message": "push error" } })),
+        Err(err) => (
+            StatusCode::from_u16(err.code.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
+            Json(json!({ "ok": false, "error": { "code": err.code.as_str(), "message": "push error" } })),
         )
             .into_response(),
     }
@@ -823,6 +878,32 @@ async fn mock_keys_get(State(st): State<Arc<Mutex<MockRelayState>>>, headers: He
             })
         })
         .collect();
+    let marks: Vec<Value> = g
+        .relay
+        .keys
+        .marks
+        .values()
+        .map(|m| {
+            json!({
+                "mark_id": m.mark_id.to_string(),
+                "key_id": m.key_id.to_string(),
+                "seen_seq": m.seen_seq,
+                "requested_by": m.requested_by.as_str(),
+                "requested_at_ms": m.requested_at_ms,
+                "grace_ms": m.grace_ms,
+                "not_before_ms": m.not_before_ms,
+                "state": match m.state {
+                    mynote_core::model::ShredMarkState::PendingConfirm => "pending_confirm",
+                    mynote_core::model::ShredMarkState::Scheduled => "scheduled",
+                    mynote_core::model::ShredMarkState::Cancelled => "cancelled",
+                    mynote_core::model::ShredMarkState::Executed => "executed",
+                },
+                "confirmed_at_ms": m.confirmed_at_ms,
+                "cancelled_by": m.cancelled_by.as_ref().map(|d| d.as_str()),
+                "executed_at_ms": m.executed_at_ms,
+            })
+        })
+        .collect();
     let mut km = serde_json::Map::new();
     if let Some((gen, blob)) = &g.relay.keys.keyring_material {
         km.insert(
@@ -830,10 +911,17 @@ async fn mock_keys_get(State(st): State<Arc<Mutex<MockRelayState>>>, headers: He
             json!({ "gen": gen, "blob_b64": b64.encode(blob) }),
         );
     }
+    if let Some((gen, blob)) = &g.relay.keys.vault_header_material {
+        km.insert(
+            "vault_header".into(),
+            json!({ "gen": gen, "blob_b64": b64.encode(blob) }),
+        );
+    }
     Json(json!({
         "ok": true,
         "keys_digest": g.relay.keys.digest(),
         "key_records": recs,
+        "shred_marks": marks,
         "key_material": km,
     }))
     .into_response()
@@ -1462,6 +1550,328 @@ async fn regression_recovery_bootstrap_key_table_diff_large_batch_and_daemon_smk
     daemon.shutdown();
     server.abort();
     for d in [&dir_a, &dir_rec, &dir_peer, &dir_daemon] {
+        let _ = Path::new(d).exists().then(|| std::fs::remove_dir_all(d));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr38_cli_daemon_regressions_c1_c8_h16_h17() {
+    use axum::body::Bytes;
+    use axum::routing::put;
+    use mynote_core::crypto::encrypt_mnb1;
+    use mynote_core::ids::{BlockId, KeyId, OpId, Ulid, VkekKid};
+    use mynote_core::vault::{create_vault_header, unlock_vault_with_passphrase};
+    use zeroize::Zeroizing;
+
+    // === 1. C1: RelayClient::put_state_snapshot & get_state_snapshot MUST use X-Journal-Epoch / X-Covers-Seq / X-Snapshot-Id ===
+    type SnapEntry = (String, i64, String, Vec<u8>);
+    let snap_store: Arc<Mutex<Option<SnapEntry>>> = Arc::new(Mutex::new(None));
+    let state = Arc::new(Mutex::new(MockRelayState {
+        bootstrap_token: "c1-boot".into(),
+        relay: SimRelay::new(JournalEpoch::from_random_bytes([0xC1; 16])),
+        devices: BTreeMap::new(),
+        pairings: BTreeMap::new(),
+    }));
+    let snap_put_store = snap_store.clone();
+    let snap_get_store = snap_store.clone();
+    let app = Router::new()
+        .route("/v1/devices/bootstrap", post(mock_bootstrap))
+        .route("/v1/sync/pull", get(mock_pull))
+        .route("/v1/sync/push", post(mock_push))
+        .route("/v1/keys", get(mock_keys_get).post(mock_keys_post))
+        .route(
+            "/v1/snapshots/state",
+            put(move |headers: HeaderMap, body: Bytes| {
+                let s = snap_put_store.clone();
+                async move {
+                    let ep = headers.get("x-journal-epoch").and_then(|v| v.to_str().ok()).map(str::to_string);
+                    let seq = headers.get("x-covers-seq").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<i64>().ok());
+                    let sid = headers.get("x-snapshot-id").and_then(|v| v.to_str().ok()).map(str::to_string);
+                    match (ep, seq, sid) {
+                        (Some(e), Some(q), Some(id)) => {
+                            *s.lock().unwrap() = Some((e, q, id, body.to_vec()));
+                            Json(json!({ "ok": true })).into_response()
+                        }
+                        _ => (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({ "ok": false, "error": { "code": "INVALID_ARGUMENT", "message": "missing C1 headers" } })),
+                        )
+                            .into_response(),
+                    }
+                }
+            })
+            .get(move || {
+                let s = snap_get_store.clone();
+                async move {
+                    let guard = s.lock().unwrap();
+                    if let Some((ep, seq, sid, bytes)) = guard.as_ref() {
+                        (
+                            StatusCode::OK,
+                            [
+                                ("content-type", "application/octet-stream".to_string()),
+                                ("x-journal-epoch", ep.clone()),
+                                ("x-covers-seq", seq.to_string()),
+                                ("x-snapshot-id", sid.clone()),
+                            ],
+                            bytes.clone(),
+                        )
+                            .into_response()
+                    } else {
+                        StatusCode::NOT_FOUND.into_response()
+                    }
+                }
+            }),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let dir_c1 = temp_dir("pr38_c1_snap");
+    let mut store_c1 = LocalStore::open(&dir_c1).unwrap();
+    RelayClient::bootstrap_device(&relay_url, "c1-boot", &store_c1, "c1-mac", false)
+        .await
+        .unwrap();
+    store_c1
+        .add_block("scratch", "snapshot canary", Some("text"), None, "human", None)
+        .unwrap();
+    let creds = store_c1.load_credentials().unwrap().unwrap();
+    let relay_client = RelayClient::from_credentials(&creds).unwrap();
+    relay_client.run_sync_round(&mut store_c1, false).await.unwrap();
+    let (hdr, raw) = store_c1.build_state_snapshot().unwrap();
+    relay_client
+        .put_state_snapshot(
+            &hdr.journal_epoch.to_string(),
+            hdr.covers_seq,
+            &hdr.snapshot_id.to_string(),
+            &raw,
+        )
+        .await
+        .expect("C1: put_state_snapshot must succeed with X-Journal-Epoch/X-Covers-Seq/X-Snapshot-Id");
+    let fetched = relay_client
+        .get_state_snapshot()
+        .await
+        .unwrap()
+        .expect("C1: get_state_snapshot must return uploaded snapshot");
+    assert_eq!(fetched.0, hdr.journal_epoch.to_string());
+    assert_eq!(fetched.1, hdr.covers_seq);
+    assert_eq!(fetched.2, hdr.snapshot_id.to_string());
+    assert_eq!(fetched.3, raw);
+    server.abort();
+
+    // === 2. C8 / H16 / H17: Daemon trash action guards + session-bound confirm_nonce + Tier 1 leaf endpoint ===
+    let dir_d = temp_dir("pr38_daemon_guards");
+    let daemon = start_daemon(DaemonConfig {
+        data_dir: dir_d.clone(),
+        port: 0,
+        enable_cloud_sync: false,
+    })
+    .await
+    .unwrap();
+    let port = daemon.port;
+    let base_ip = format!("http://127.0.0.1:{port}");
+    let base_localhost = format!("http://localhost:{port}");
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    // Issue TWO independent sessions (Session A & Session B)
+    let mut sessions = Vec::new();
+    for _ in 0..2 {
+        let dd = dir_d.clone();
+        let t = tokio::task::spawn_blocking(move || {
+            try_send_uds(&dd, &UdsRequest::OpenTicket, Duration::from_secs(3))
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let path = t.url.unwrap().strip_prefix(&base_localhost).unwrap().to_string();
+        let res = http
+            .get(format!("{base_ip}{path}"))
+            .header(HOST, format!("localhost:{port}"))
+            .send()
+            .await
+            .unwrap();
+        let cookie = res
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        sessions.push(cookie);
+    }
+    let cookie_a = &sessions[0];
+    let cookie_b = &sessions[1];
+
+    // Create 2 blocks and trash block 1
+    let (b1_id, b2_id) = {
+        let mut g = daemon.state.store.lock().unwrap();
+        let r1 = g
+            .add_block("scratch", "blk1", Some("text"), None, "human", None)
+            .unwrap();
+        let r2 = g
+            .add_block("scratch", "blk2", Some("text"), None, "human", None)
+            .unwrap();
+        let _ = g
+            .delete_block(&r1.block_id, Some(&r1.head_op_ids), "human")
+            .unwrap();
+        (r1.block_id, r2.block_id)
+    };
+
+    // H16: multi-block purge_history MUST be rejected with 400 INVALID_ARGUMENT!
+    let multi_purge = http
+        .post(format!("{base_ip}/v1/local/trash/actions/prepare"))
+        .header(HOST, format!("localhost:{port}"))
+        .header(ORIGIN, &base_localhost)
+        .header(COOKIE, cookie_a)
+        .json(&json!({ "action": "purge_history", "block_ids": [&b1_id, &b2_id] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(multi_purge.status(), StatusCode::BAD_REQUEST);
+
+    // H16: confirm_nonce prepared by Session A MUST be rejected when submitted by Session B!
+    let prep_res = http
+        .post(format!("{base_ip}/v1/local/trash/actions/prepare"))
+        .header(HOST, format!("localhost:{port}"))
+        .header(ORIGIN, &base_localhost)
+        .header(COOKIE, cookie_a)
+        .json(&json!({ "action": "expedite", "block_ids": [&b1_id] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(prep_res.status(), StatusCode::OK);
+    let prep_json: Value = prep_res.json().await.unwrap();
+    let nonce = prep_json["data"]["confirm_nonce"].as_str().unwrap().to_string();
+
+    let hijack = http
+        .post(format!("{base_ip}/v1/local/trash/actions/commit"))
+        .header(HOST, format!("localhost:{port}"))
+        .header(ORIGIN, &base_localhost)
+        .header(COOKIE, cookie_b)
+        .json(&json!({ "confirm_nonce": nonce }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hijack.status(), StatusCode::PRECONDITION_REQUIRED);
+    let hijack_json: Value = hijack.json().await.unwrap();
+    assert_eq!(hijack_json["error"]["code"], "UI_CONFIRMATION_REQUIRED");
+
+    // H17: Locked block with concurrent Tier 1 leaf -> GET /v1/local/blocks redacts Tier 1 leaf,
+    // while GET /v1/local/blocks/{id}/tier1-leaf/{op_id} returns its plaintext on demand!
+    let (h17_blk_id, t1_op_id) = {
+        use mynote_core::hlc::Hlc;
+        use mynote_core::ids::DeviceId;
+        use mynote_core::model::OpType;
+        use mynote_store::store::RemoteBlockOpParams;
+
+        let mut g = daemon.state.store.lock().unwrap();
+        let rpk = g.recovery_pk().unwrap();
+        let vkid = VkekKid::from_ulid(Ulid::from_parts(1_720_000_000_000, [1; 10]));
+        let vh = create_vault_header(
+            b"h17-pass",
+            &rpk,
+            vkid,
+            &[0x42; 32],
+            [2; 16],
+            [3; 24],
+            [4; 32],
+            [5; 24],
+            1_720_000_000_000,
+        )
+        .unwrap();
+        let unlocked = unlock_vault_with_passphrase(b"h17-pass", &vh).unwrap();
+        g.put_vault_header(vh.updated_at_ms, &rmp_serde::to_vec_named(&vh).unwrap())
+            .unwrap();
+
+        let created = g
+            .add_block("scratch", "H17_BASE", Some("text"), None, "human", None)
+            .unwrap();
+        let t1_edit = g
+            .update_block(
+                &created.block_id,
+                "H17_TIER1_CONCURRENT",
+                &created.head_op_ids,
+                false,
+                "human",
+            )
+            .unwrap();
+        // Concurrent Tier 2 LOCK branching off `created.head_op_ids` from a remote device (sibling to `t1_edit`)!
+        let blk_id = BlockId::parse(&created.block_id).unwrap();
+        let parent_op = OpId::parse(&created.head_op_ids[0]).unwrap();
+        let remote_dev = DeviceId::from_random_bytes([0xAB; 10]);
+        let t2_op = OpId::from_ulid(Ulid::from_parts(1_720_000_005_000, [9; 10]));
+        let t2_kid = KeyId::from_ulid(Ulid::from_parts(1_720_000_005_001, [10; 10]));
+        let t2_bdek = Zeroizing::new([0x55; 32]);
+        let mnb1 = encrypt_mnb1(
+            blk_id.as_bytes(),
+            t2_op,
+            t2_kid,
+            &t2_bdek,
+            "H17_TIER2_SEALED",
+            [11; 24],
+        )
+        .unwrap();
+        let mnw1 = unlocked.wrap_bdek(t2_kid, blk_id, &t2_bdek, [12; 24]).unwrap();
+        g.apply_remote_block_op_for_sync(RemoteBlockOpParams {
+            remote_device: remote_dev.clone(),
+            block_id: blk_id,
+            op_id: t2_op,
+            parents: vec![parent_op],
+            op_type: OpType::Lock,
+            hlc: Hlc::new(1_720_000_005_000, 0, remote_dev),
+            tier: 2,
+            key_id: t2_kid,
+            new_key_record: Some((1, mnw1)),
+            mnb1,
+            public_hint: Some("h17 hint".to_string()),
+        })
+        .unwrap();
+        (created.block_id, t1_edit.op_id)
+    };
+
+    let list_res = http
+        .get(format!("{base_ip}/v1/local/blocks?buffer_id=scratch"))
+        .header(HOST, format!("localhost:{port}"))
+        .header(COOKIE, cookie_a)
+        .send()
+        .await
+        .unwrap();
+    let list_json: Value = list_res.json().await.unwrap();
+    let h17_dto = list_json["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["id"] == h17_blk_id)
+        .unwrap();
+    assert_eq!(h17_dto["is_locked"], true);
+    assert_eq!(h17_dto["has_unlocked_concurrent_version"], true);
+    assert!(!h17_dto.to_string().contains("H17_TIER1_CONCURRENT"));
+
+    let leaf_res = http
+        .get(format!(
+            "{base_ip}/v1/local/blocks/{h17_blk_id}/tier1-leaf/{t1_op_id}"
+        ))
+        .header(HOST, format!("localhost:{port}"))
+        .header(COOKIE, cookie_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(leaf_res.status(), StatusCode::OK);
+    let leaf_json: Value = leaf_res.json().await.unwrap();
+    assert_eq!(leaf_json["data"]["content"], "H17_TIER1_CONCURRENT");
+
+    daemon.shutdown();
+    for d in [&dir_c1, &dir_d] {
         let _ = Path::new(d).exists().then(|| std::fs::remove_dir_all(d));
     }
 }

@@ -17,9 +17,11 @@ pub struct KeyTableState {
 }
 
 impl KeyTableState {
-    pub fn insert_record(&mut self, row: KeyRecordRow) {
+    pub fn insert_record(&mut self, mut row: KeyRecordRow) {
         if row.key_record.is_none() {
             self.executed_tombstones.insert(row.key_id);
+        } else if self.executed_tombstones.contains(&row.key_id) {
+            row.key_record = None;
         }
         self.records
             .entry(row.key_id)
@@ -95,6 +97,40 @@ impl KeyTableState {
     /// Available key set `K \ ExecutedShreds` (`docs/data-structures.md` §3.4.4 #4).
     pub fn is_key_available(&self, key_id: &KeyId) -> bool {
         !self.is_shredded(key_id) && self.records.get(key_id).is_some_and(|r| r.key_record.is_some())
+    }
+
+    /// Returns true if `key_id` currently has any `PendingConfirm` or `Scheduled` shred mark.
+    pub fn has_pending_or_scheduled_mark(&self, key_id: &KeyId) -> bool {
+        self.marks.values().any(|m| {
+            &m.key_id == key_id
+                && matches!(
+                    m.state,
+                    ShredMarkState::PendingConfirm | ShredMarkState::Scheduled
+                )
+        })
+    }
+
+    /// Returns all active (`PendingConfirm` or `Scheduled`) shred marks for `key_id`.
+    pub fn active_marks_for_key(&self, key_id: &KeyId) -> Vec<&ShredMarkRow> {
+        self.marks
+            .values()
+            .filter(|m| {
+                &m.key_id == key_id
+                    && matches!(
+                        m.state,
+                        ShredMarkState::PendingConfirm | ShredMarkState::Scheduled
+                    )
+            })
+            .collect()
+    }
+
+    /// Earliest `not_before_ms` among `Scheduled` marks for any key in `key_ids`.
+    pub fn earliest_scheduled_not_before(&self, key_ids: &[KeyId]) -> Option<i64> {
+        self.marks
+            .values()
+            .filter(|m| m.state == ShredMarkState::Scheduled && key_ids.contains(&m.key_id))
+            .filter_map(|m| m.not_before_ms)
+            .min()
     }
 
     /// Deterministic BLAKE3 digest over `block_keys`, `shred_marks`, and `key_material`
@@ -176,11 +212,6 @@ fn merge_mark(a: &ShredMarkRow, b: &ShredMarkRow) -> ShredMarkRow {
     } else {
         a.state
     };
-    let opt_max_i64 = |x: Option<i64>, y: Option<i64>| match (x, y) {
-        (Some(u), Some(v)) => Some(u.max(v)),
-        (Some(u), None) | (None, Some(u)) => Some(u),
-        (None, None) => None,
-    };
     let opt_min_i64 = |x: Option<i64>, y: Option<i64>| match (x, y) {
         (Some(u), Some(v)) => Some(u.min(v)),
         (Some(u), None) | (None, Some(u)) => Some(u),
@@ -202,7 +233,9 @@ fn merge_mark(a: &ShredMarkRow, b: &ShredMarkRow) -> ShredMarkRow {
         },
         requested_at_ms: a.requested_at_ms.min(b.requested_at_ms),
         grace_ms: a.grace_ms.max(b.grace_ms),
-        not_before_ms: opt_max_i64(a.not_before_ms, b.not_before_ms),
+        // Per docs/data-structures.md §3.4.4 #2 & sync-protocol.md §5.2:
+        // Scheduled marks converge by `min` over non-null `not_before_ms` (expedite moves deadline earlier).
+        not_before_ms: opt_min_i64(a.not_before_ms, b.not_before_ms),
         state,
         confirmed_at_ms: opt_min_i64(a.confirmed_at_ms, b.confirmed_at_ms),
         cancelled_by,
@@ -211,33 +244,54 @@ fn merge_mark(a: &ShredMarkRow, b: &ShredMarkRow) -> ShredMarkRow {
 }
 
 /// Daily INV-KEY-LIVENESS self-check (`docs/sync-protocol.md` §5.6 #8).
-/// Returns `(ok, missing_key_ids)` where any missing key for an Active block triggers `KEY_MISSING`
-/// and halts shred issuance on this device.
+/// Returns `(ok, missing_key_ids)` where any missing or retiring key for an Active block
+/// triggers `KEY_MISSING` and halts shred issuance on this device.
 pub fn self_check_key_liveness(blocks: &[MaterializedBlock], keys: &KeyTableState) -> (bool, Vec<KeyId>) {
     let mut missing = BTreeSet::new();
+    let mut has_decrypt_failed = false;
     for block in blocks {
         if block.state != BlockState::Active {
             continue;
         }
+        let has_readable_live_leaf = block.leaves.iter().any(|leaf| {
+            leaf.is_live()
+                && match &leaf.body {
+                    LeafBody::Plaintext(_) => true,
+                    LeafBody::Sealed { key_id, .. } => {
+                        keys.is_key_available(key_id) && !keys.has_pending_or_scheduled_mark(key_id)
+                    }
+                    _ => false,
+                }
+        });
         for leaf in &block.leaves {
             if !leaf.is_live() {
                 continue;
             }
             match &leaf.body {
-                LeafBody::KeyUnavailable {
-                    key_id,
-                    shredded: false,
-                } => {
+                LeafBody::KeyUnavailable { key_id, shredded } => {
+                    // Only exempt a shredded concurrent branch when the active block retains
+                    // at least one other readable live leaf; an active block with ZERO readable
+                    // leaves is always an INV-KEY-LIVENESS violation.
+                    if !*shredded || !has_readable_live_leaf {
+                        missing.insert(*key_id);
+                    }
+                }
+                LeafBody::Sealed { key_id, .. }
+                    if !keys.is_key_available(key_id) || keys.has_pending_or_scheduled_mark(key_id) =>
+                {
                     missing.insert(*key_id);
                 }
-                LeafBody::Sealed { key_id, .. } if !keys.is_key_available(key_id) => {
-                    missing.insert(*key_id);
+                LeafBody::DecryptFailed { .. } => {
+                    has_decrypt_failed = true;
                 }
                 _ => {}
             }
         }
     }
-    (missing.is_empty(), missing.into_iter().collect())
+    (
+        missing.is_empty() && !has_decrypt_failed,
+        missing.into_iter().collect(),
+    )
 }
 
 #[cfg(test)]
@@ -332,5 +386,79 @@ mod tests {
                 prop_assert!(ab_c.is_shredded(&k1));
             }
         }
+    }
+
+    #[test]
+    fn shred_mark_merge_converges_not_before_by_min_and_monotonic_state() {
+        let mut gen = MonotonicUlidGen::new();
+        let k1 = KeyId::from_ulid(gen.next(100, [1; 10]));
+        let m1 = MarkId::from_ulid(gen.next(100, [2; 10]));
+
+        // PendingConfirm (None) + Scheduled (7d) -> Scheduled (7d)
+        let mut s_pending = KeyTableState::default();
+        s_pending.insert_mark(make_mark(m1, k1, ShredMarkState::PendingConfirm, None));
+        let mut s_7d = KeyTableState::default();
+        s_7d.insert_mark(make_mark(m1, k1, ShredMarkState::Scheduled, Some(700_000)));
+        // Expedited Scheduled (24h) -> min(700_000, 200_000) == 200_000
+        let mut s_24h = KeyTableState::default();
+        s_24h.insert_mark(make_mark(m1, k1, ShredMarkState::Scheduled, Some(200_000)));
+
+        let mut merged = s_pending.clone();
+        merged.merge_from(&s_7d);
+        assert_eq!(merged.marks[&m1].state, ShredMarkState::Scheduled);
+        assert_eq!(merged.marks[&m1].not_before_ms, Some(700_000));
+
+        merged.merge_from(&s_24h);
+        assert_eq!(merged.marks[&m1].state, ShredMarkState::Scheduled);
+        assert_eq!(merged.marks[&m1].not_before_ms, Some(200_000));
+
+        // Reverse order gives identical result
+        let mut rev = s_24h.clone();
+        rev.merge_from(&s_7d);
+        rev.merge_from(&s_pending);
+        assert_eq!(rev.marks[&m1].not_before_ms, Some(200_000));
+        assert_eq!(merged.digest(), rev.digest());
+
+        // Executed permanently marks key as shredded regardless of order
+        let mut s_exec = KeyTableState::default();
+        s_exec.insert_mark(make_mark(m1, k1, ShredMarkState::Executed, Some(200_000)));
+        merged.merge_from(&s_exec);
+        assert_eq!(merged.marks[&m1].state, ShredMarkState::Executed);
+        assert!(merged.is_shredded(&k1));
+    }
+
+    #[test]
+    fn cross_language_keys_digest_vector_matches_wire_ts() {
+        let mut st = KeyTableState::default();
+        let k1 = KeyId::parse("01JDF9M20000000000000000K1").unwrap();
+        let m1 = MarkId::parse("01JDF9M20000000000000000M1").unwrap();
+        st.insert_record(KeyRecordRow {
+            key_id: k1,
+            wrap_gen: 1,
+            key_record: Some(b"mnr1_vec".to_vec()),
+            created_at_ms: 1_795_521_600_000,
+        });
+        st.insert_mark(ShredMarkRow {
+            mark_id: m1,
+            key_id: k1,
+            seen_seq: 1,
+            requested_by: DeviceId::parse("dev_mac00001").unwrap(),
+            requested_at_ms: 1_795_521_600_000,
+            grace_ms: 604_800_000,
+            not_before_ms: Some(1_796_126_400_000),
+            state: ShredMarkState::Scheduled,
+            confirmed_at_ms: None,
+            cancelled_by: None,
+            executed_at_ms: None,
+        });
+        st.update_keyring_material(1, b"kr_vec".to_vec());
+        st.update_vault_header_material(1_795_521_600_000, b"vh_vec".to_vec());
+        let d = st.digest();
+        assert!(d.starts_with("blake3:"));
+        // Deterministic vector verified identically by cloud-cf/test/contract.test.ts!
+        assert_eq!(
+            d,
+            "blake3:38ec33ece0a92a473a0c05a51973dcd64784a8aaffabc71aa87f71046443aae0"
+        );
     }
 }

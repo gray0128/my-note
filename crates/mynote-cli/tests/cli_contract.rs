@@ -323,7 +323,7 @@ fn g07_g08_offline_sync_and_trash_delete_boundary_with_ui_confirmation_required(
     assert_eq!(st_j["data"]["key_self_check"]["ok"], true);
     assert_eq!(st_j["data"]["trash"]["count"], 0);
 
-    // G08: block delete moves to trash only (shred_state = "unscheduled", shred_not_before_ms = null)
+    // G08: block delete moves to trash only (M2 offline: shred_state = "pending_sync", shred_not_before_ms = null)
     let del_out = run_cli(
         &dir,
         &["block", "delete", &blk_id, "--expected-head", &head, "--json"],
@@ -332,7 +332,7 @@ fn g07_g08_offline_sync_and_trash_delete_boundary_with_ui_confirmation_required(
     assert_eq!(del_out.status.code(), Some(0));
     let del_j = parse_single_json_stdout(&del_out);
     assert_eq!(del_j["data"]["in_trash"], true);
-    assert_eq!(del_j["data"]["shred_state"], "unscheduled");
+    assert_eq!(del_j["data"]["shred_state"], "pending_sync");
     assert!(del_j["data"]["shred_not_before_ms"].is_null());
 
     // Hidden from ls, returns IN_TRASH (exit 3) on block get, present in trash ls

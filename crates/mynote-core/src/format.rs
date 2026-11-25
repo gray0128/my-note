@@ -340,7 +340,7 @@ fn query_to_json(input: &str) -> Result<String, CoreError> {
         trimmed
     };
     let mut map: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-    for (k, v) in url::form_urlencoded::parse(qs.as_bytes()) {
+    for (k, v) in form_urlencoded::parse(qs.as_bytes()) {
         let key = k.into_owned();
         let val = serde_json::Value::String(v.into_owned());
         map.entry(key)
@@ -358,7 +358,7 @@ fn json_to_query(input: &str) -> Result<String, CoreError> {
     let obj = val
         .as_object()
         .ok_or_else(|| syntax_err("json-to-query requires a top-level JSON object"))?;
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
     for (k, v) in obj {
         match v {
             serde_json::Value::String(s) => {

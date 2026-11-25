@@ -24,6 +24,7 @@ mynote-core = { path = "../mynote-core" }
 mynote-store = { path = "../mynote-store" }
 qrcode.workspace = true
 reqwest.workspace = true
+rmp-serde.workspace = true
 rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true

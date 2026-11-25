@@ -4,4 +4,4 @@ pub mod schema;
 pub mod store;
 
 pub use credentials::DeviceCredentials;
-pub use store::LocalStore;
+pub use store::{BlockDetailDto, LocalStore, Tier2OpInput, VaultHeaderDto, WriteReceipt};

@@ -4,6 +4,7 @@ import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { loadLangExtension, loadVimExtension, SUPPORTED_LANGS } from "./langs";
 import type { BlockDto } from "./types";
+import { detectSecretPatternFast } from "./wasm/desktop";
 
 const REMOTE_SYNC_ANN = Annotation.define<boolean>();
 const INITIAL_MOUNT_WINDOW = 20;
@@ -29,6 +30,12 @@ export interface BlockEditorCallbacks {
   onDeleteBlock(block: BlockDto): Promise<void>;
   onKeepVersion(block: BlockDto, opId: string): Promise<void>;
   onActiveChange(blockId: string | null): void;
+  onUnlockVaultRequest?(): void;
+  onLockBlock?(block: BlockDto): Promise<void>;
+  onUnlockBlockToTier1?(block: BlockDto): Promise<void>;
+  onPurgeHistory?(block: BlockDto): Promise<void>;
+  onSecretPasted?(block: BlockDto, secretType: string): void;
+  onVaultActivity?(): void;
 }
 
 interface MountedEditor {
@@ -51,6 +58,7 @@ interface DirtyDraft {
  * - Preserves original `baseHeads` per dirty draft so concurrent remote edits trigger `HEAD_MISMATCH`
  *   instead of silently overwriting sibling writes (`AGENTS.md` §3.1).
  * - Serializes per-block in-flight saves so keystrokes typed during PATCH are never clobbered.
+ * - Holds decrypted Tier 2 plaintext strictly in RAM (`unlockedPlaintext`) and scrubs DOM/editors on lock (`SEC-03`).
  */
 export class BlockStreamController {
   private blocks: BlockDto[] = [];
@@ -58,8 +66,12 @@ export class BlockStreamController {
   private cards = new Map<string, HTMLElement>();
   private dirty = new Map<string, DirtyDraft>();
   private saving = new Set<string>();
+  private savingPromises = new Map<string, Promise<void>>();
   private pendingResave = new Map<string, { fastSync: boolean; isMerge: boolean; keepalive?: boolean }>();
   private saveTimers = new Map<string, number>();
+  private unlockedPlaintext = new Map<string, string>();
+  private unlockedLeafPlaintext = new Map<string, Map<string, string>>();
+  private vaultLockEpoch = 0;
   private activeBlockId: string | null = null;
   private bufferAllSelected = false;
   private vimMode = false;
@@ -94,7 +106,72 @@ export class BlockStreamController {
   }
 
   private isEditable(block: BlockDto): boolean {
-    return !block.is_locked && block.content !== null;
+    if (block.is_locked) {
+      return this.unlockedPlaintext.has(block.id);
+    }
+    return block.content !== null;
+  }
+
+  isBlockEditable(id: string): boolean {
+    const blk = this.blocks.find((b) => b.id === id);
+    return blk ? this.isEditable(blk) : false;
+  }
+
+  private getEffectiveContent(block: BlockDto): string | null {
+    if (block.is_locked) {
+      return this.unlockedPlaintext.get(block.id) ?? null;
+    }
+    return block.content;
+  }
+
+  getVaultLockEpoch(): number {
+    return this.vaultLockEpoch;
+  }
+
+  setUnlockedPlaintext(blockId: string, content: string, leafMap?: Map<string, string>): void {
+    this.unlockedPlaintext.set(blockId, content);
+    if (leafMap) {
+      this.unlockedLeafPlaintext.set(blockId, leafMap);
+    }
+    this.syncDomAndEditors();
+  }
+
+  setUnlockedLeafPlaintext(blockId: string, opId: string, content: string): void {
+    let map = this.unlockedLeafPlaintext.get(blockId);
+    if (!map) {
+      map = new Map<string, string>();
+      this.unlockedLeafPlaintext.set(blockId, map);
+    }
+    map.set(opId, content);
+    const blk = this.blocks.find((b) => b.id === blockId);
+    const card = this.cards.get(blockId);
+    if (blk && card) {
+      this.renderConflictSection(card, blk);
+    }
+  }
+
+  /** Immediately wipe all transient Tier 2 plaintext from RAM, destroy Tier 2 CM6 views, and restore locked cards (`SEC-03`). */
+  clearUnlockedVaultPlaintext(): void {
+    this.vaultLockEpoch++;
+    const lockedIds = new Set(this.blocks.filter((b) => b.is_locked).map((b) => b.id));
+    for (const id of [...this.unlockedPlaintext.keys(), ...lockedIds]) {
+      this.clearTimer(id);
+      this.dirty.delete(id);
+      this.pendingResave.delete(id);
+      const m = this.mounted.get(id);
+      if (m) {
+        m.view.destroy();
+        this.mounted.delete(id);
+      }
+      const card = this.cards.get(id);
+      if (card) {
+        const host = card.querySelector<HTMLElement>(".block-editor-host");
+        if (host) host.textContent = "";
+      }
+    }
+    this.unlockedPlaintext.clear();
+    this.unlockedLeafPlaintext.clear();
+    this.syncDomAndEditors();
   }
 
   getBlocks(): BlockDto[] {
@@ -120,6 +197,7 @@ export class BlockStreamController {
     if (m) return m.view.state.doc.toString();
     const d = this.dirty.get(id);
     if (d) return d.text;
+    if (this.unlockedPlaintext.has(id)) return this.unlockedPlaintext.get(id) ?? "";
     return this.blocks.find((b) => b.id === id)?.content ?? "";
   }
 
@@ -131,8 +209,18 @@ export class BlockStreamController {
     this.renderMismatchNotice(id, false);
   }
 
+  getUnlockedLeafContent(blockId: string, opId: string): string | null {
+    return this.unlockedLeafPlaintext.get(blockId)?.get(opId) ?? null;
+  }
+
   /** Apply an authoritative server block (e.g. after format or conflict keep) replacing any local draft. */
-  applyAuthoritativeBlock(updated: BlockDto, currentBufferId: string | null): void {
+  applyAuthoritativeBlock(updated: BlockDto, currentBufferId: string | null, decryptedContent?: string): void {
+    if (updated.is_locked && decryptedContent !== undefined) {
+      this.unlockedPlaintext.set(updated.id, decryptedContent);
+    } else if (!updated.is_locked) {
+      this.unlockedPlaintext.delete(updated.id);
+      this.unlockedLeafPlaintext.delete(updated.id);
+    }
     this.clearDirty(updated.id);
     this.upsertBlocks([updated], [], currentBufferId);
   }
@@ -247,6 +335,13 @@ export class BlockStreamController {
     );
   }
 
+  async waitForSaveIdle(id: string): Promise<void> {
+    this.clearTimer(id);
+    while (this.savingPromises.has(id)) {
+      await this.savingPromises.get(id);
+    }
+  }
+
   async flushDirtyBlock(id: string, opts: { fastSync: boolean; isMerge?: boolean; keepalive?: boolean }): Promise<void> {
     this.clearTimer(id);
     const blk = this.blocks.find((b) => b.id === id);
@@ -268,57 +363,85 @@ export class BlockStreamController {
     }
 
     const draft = this.getBlockDraftContent(id);
+    const lockEpochAtStart = this.vaultLockEpoch;
     // Use ORIGINAL baseHeads captured when editing began (so concurrent remote updates trigger HEAD_MISMATCH
     // rather than silently overwriting!). Explicit merge intentionally passes all current remote head_op_ids.
     const expectedHeads = isMerge ? [...blk.head_op_ids] : [...(entry?.baseHeads ?? blk.head_op_ids)];
 
     this.saving.add(id);
-    try {
-      const res = await this.cb.onSaveContent(blk, draft, expectedHeads, {
-        fastSync: opts.fastSync,
-        isMerge,
-        keepalive: opts.keepalive,
-      });
-      if (res.status === "ok") {
-        const currentDraft = this.getBlockDraftContent(id);
-        if (currentDraft === draft) {
-          this.dirty.delete(id);
-          this.updateDirtyBadge(id, false);
-          this.renderMismatchNotice(id, false);
-        } else {
-          // User continued typing while PATCH was in flight: advance baseHeads to the saved head and re-queue save!
-          this.dirty.set(id, { text: currentDraft, baseHeads: [...res.updated.head_op_ids], mismatch: false });
-          this.updateDirtyBadge(id, true);
-          this.renderMismatchNotice(id, false);
-          const prev = this.pendingResave.get(id);
-          this.pendingResave.set(id, {
-            fastSync: opts.fastSync || (prev?.fastSync ?? false),
-            isMerge: false,
-            keepalive: opts.keepalive || prev?.keepalive,
-          });
-        }
-        this.upsertBlocks([res.updated], [], res.updated.buffer_id);
-      } else if (res.status === "head_mismatch") {
-        // Keep the user's draft intact in the editor, halt auto-save, and offer explicit Merge or Reload!
-        this.clearTimer(id);
-        this.dirty.set(id, {
-          text: this.getBlockDraftContent(id),
-          baseHeads: expectedHeads,
-          mismatch: true,
+    const run = (async () => {
+      try {
+        const res = await this.cb.onSaveContent(blk, draft, expectedHeads, {
+          fastSync: opts.fastSync,
+          isMerge,
+          keepalive: opts.keepalive,
         });
-        this.updateDirtyBadge(id, true, "● conflict (unsaved draft)");
-        this.renderMismatchNotice(id, true);
-      } else {
-        this.updateDirtyBadge(id, true, "● save failed");
+        const lockedDuringSave =
+          blk.is_locked && (lockEpochAtStart !== this.vaultLockEpoch || !this.unlockedPlaintext.has(id));
+        if (res.status === "ok") {
+          if (lockedDuringSave) {
+            // C4: Vault was locked & CM6 view destroyed while PATCH was in flight; NEVER read getBlockDraftContent() -> ""!
+            this.dirty.delete(id);
+            this.pendingResave.delete(id);
+            this.upsertBlocks([res.updated], [], res.updated.buffer_id);
+            return;
+          }
+          const currentDraft = this.getBlockDraftContent(id);
+          if (currentDraft === draft) {
+            this.dirty.delete(id);
+            this.updateDirtyBadge(id, false);
+            this.renderMismatchNotice(id, false);
+          } else {
+            // User continued typing while PATCH was in flight: advance baseHeads to the saved head and re-queue save!
+            this.dirty.set(id, { text: currentDraft, baseHeads: [...res.updated.head_op_ids], mismatch: false });
+            this.updateDirtyBadge(id, true);
+            this.renderMismatchNotice(id, false);
+            const prev = this.pendingResave.get(id);
+            this.pendingResave.set(id, {
+              fastSync: opts.fastSync || (prev?.fastSync ?? false),
+              isMerge: false,
+              keepalive: opts.keepalive || prev?.keepalive,
+            });
+          }
+          this.upsertBlocks([res.updated], [], res.updated.buffer_id);
+        } else if (res.status === "head_mismatch") {
+          this.clearTimer(id);
+          if (lockedDuringSave) {
+            this.dirty.delete(id);
+            this.pendingResave.delete(id);
+            return;
+          }
+          // Keep the user's draft intact in the editor, halt auto-save, and offer explicit Merge or Reload!
+          this.dirty.set(id, {
+            text: this.getBlockDraftContent(id),
+            baseHeads: expectedHeads,
+            mismatch: true,
+          });
+          this.updateDirtyBadge(id, true, "● conflict (unsaved draft)");
+          this.renderMismatchNotice(id, true);
+        } else {
+          if (lockedDuringSave) {
+            this.dirty.delete(id);
+            this.pendingResave.delete(id);
+          } else {
+            this.updateDirtyBadge(id, true, "● save failed");
+          }
+        }
+      } finally {
+        this.saving.delete(id);
+        this.savingPromises.delete(id);
+        const next = this.pendingResave.get(id);
+        if (next) {
+          this.pendingResave.delete(id);
+          const cur = this.blocks.find((x) => x.id === id);
+          if (cur && this.isEditable(cur) && (!cur.is_locked || lockEpochAtStart === this.vaultLockEpoch)) {
+            void this.flushDirtyBlock(id, next);
+          }
+        }
       }
-    } finally {
-      this.saving.delete(id);
-      const next = this.pendingResave.get(id);
-      if (next) {
-        this.pendingResave.delete(id);
-        void this.flushDirtyBlock(id, next);
-      }
-    }
+    })();
+    this.savingPromises.set(id, run);
+    await run;
   }
 
   findAcrossBlocks(query: string): { blockId: string; from: number; to: number }[] {
@@ -340,25 +463,30 @@ export class BlockStreamController {
   async replaceAllAcrossBlocks(query: string, replacement: string): Promise<number> {
     if (!query) return 0;
     let total = 0;
-    for (const b of this.blocks) {
-      if (!this.isEditable(b) || b.has_conflict) continue;
-      const text = this.getBlockDraftContent(b.id);
+    const lockEpochAtStart = this.vaultLockEpoch;
+    for (const b of [...this.blocks]) {
+      const cur = this.blocks.find((x) => x.id === b.id);
+      if (!cur || !this.isEditable(cur) || cur.has_conflict) continue;
+      if (cur.is_locked && lockEpochAtStart !== this.vaultLockEpoch) continue;
+      const text = this.getBlockDraftContent(cur.id);
       const parts = text.split(query);
       if (parts.length <= 1) continue;
       total += parts.length - 1;
       const next = parts.join(replacement);
-      const expectedHeads = this.getExpectedHeadsForBlock(b.id);
-      this.clearTimer(b.id);
-      const m = this.mounted.get(b.id);
+      const expectedHeads = this.getExpectedHeadsForBlock(cur.id);
+      this.clearTimer(cur.id);
+      const m = this.mounted.get(cur.id);
       if (m) {
         m.view.dispatch({
           changes: { from: 0, to: m.view.state.doc.length, insert: next },
           annotations: REMOTE_SYNC_ANN.of(true),
         });
       }
-      const res = await this.cb.onSaveContent(b, next, expectedHeads, { fastSync: true, isMerge: false });
+      const res = await this.cb.onSaveContent(cur, next, expectedHeads, { fastSync: true, isMerge: false });
       if (res.status === "ok") {
-        this.applyAuthoritativeBlock(res.updated, b.buffer_id);
+        // H18: Never re-insert plaintext into RAM if Vault was locked while PATCH was awaiting!
+        const keepUnlocked = cur.is_locked && lockEpochAtStart === this.vaultLockEpoch && this.unlockedPlaintext.has(cur.id);
+        this.applyAuthoritativeBlock(res.updated, cur.buffer_id, keepUnlocked ? next : undefined);
       }
     }
     return total;
@@ -562,12 +690,13 @@ export class BlockStreamController {
       if (sel && sel.value !== b.lang) sel.value = b.lang;
 
       const m = this.mounted.get(b.id);
+      const effContent = this.getEffectiveContent(b);
       if (m) {
-        if (!this.dirty.has(b.id) && !this.saving.has(b.id) && b.content !== null) {
+        if (!this.dirty.has(b.id) && !this.saving.has(b.id) && effContent !== null) {
           const curDoc = m.view.state.doc.toString();
-          if (curDoc !== b.content) {
+          if (curDoc !== effContent) {
             m.view.dispatch({
-              changes: { from: 0, to: curDoc.length, insert: b.content },
+              changes: { from: 0, to: curDoc.length, insert: effContent },
               annotations: REMOTE_SYNC_ANN.of(true),
             });
           }
@@ -583,7 +712,7 @@ export class BlockStreamController {
         }
       } else if (desiredEditable) {
         const pre = card!.querySelector<HTMLElement>(".block-placeholder");
-        if (pre && !this.dirty.has(b.id) && b.content !== null) pre.textContent = b.content;
+        if (pre && !this.dirty.has(b.id) && effContent !== null) pre.textContent = effContent;
       }
 
       this.renderConflictSection(card!, b);
@@ -595,8 +724,9 @@ export class BlockStreamController {
 
   private buildCard(block: BlockDto): HTMLElement {
     const editable = this.isEditable(block);
+    const effContent = this.getEffectiveContent(block);
     const card = document.createElement("section");
-    card.className = `block-card${block.has_conflict ? " has-conflict" : ""}${block.id === this.activeBlockId ? " focused" : ""}`;
+    card.className = `block-card${block.has_conflict ? " has-conflict" : ""}${block.id === this.activeBlockId ? " focused" : ""}${block.is_locked ? " is-vault-block" : ""}`;
     card.dataset.blockId = block.id;
     card.dataset.lang = block.lang;
     card.dataset.locked = String(block.is_locked);
@@ -627,6 +757,13 @@ export class BlockStreamController {
     });
     left.appendChild(select);
 
+    if (block.is_locked) {
+      const vBadge = document.createElement("span");
+      vBadge.className = `vault-badge${editable ? " unlocked" : ""}`;
+      vBadge.textContent = editable ? "🔓 Vault (RAM)" : "🔒 Tier 2";
+      left.appendChild(vBadge);
+    }
+
     const displayLeaf = block.versions.find((v) => v.is_display);
     if (displayLeaf && displayLeaf.actor && displayLeaf.actor !== "human") {
       const actorBadge = document.createElement("span");
@@ -650,13 +787,14 @@ export class BlockStreamController {
       btn.className = `btn btn-icon ${cls}`.trim();
       btn.textContent = label;
       btn.title = title;
+      btn.addEventListener("mousedown", (ev) => ev.preventDefault());
       btn.addEventListener("click", onClick);
       return btn;
     };
 
     if (editable) {
       right.appendChild(
-        mkBtn("Format", "Format block (Cmd/Ctrl+Shift+F)", "", () => {
+        mkBtn("Format", block.is_locked ? "Format in browser WASM only (zero network)" : "Format block (Cmd/Ctrl+Shift+F)", "", () => {
           const cur = this.blocks.find((x) => x.id === block.id);
           if (cur) void this.cb.onFormatBlock(cur);
         }),
@@ -667,6 +805,29 @@ export class BlockStreamController {
           if (cur) void this.cb.onCopyBlock(cur, this.getBlockDraftContent(block.id));
         }),
       );
+      if (!block.is_locked && this.cb.onLockBlock) {
+        right.appendChild(
+          mkBtn("🔒 Lock", "Encrypt block into Tier 2 Vault", "", () => {
+            const cur = this.blocks.find((x) => x.id === block.id);
+            if (cur) void this.cb.onLockBlock?.(cur);
+          }),
+        );
+      } else if (block.is_locked && this.cb.onUnlockBlockToTier1) {
+        right.appendChild(
+          mkBtn("To Tier 1", "Downgrade block back to Tier 1", "", () => {
+            const cur = this.blocks.find((x) => x.id === block.id);
+            if (cur) void this.cb.onUnlockBlockToTier1?.(cur);
+          }),
+        );
+      }
+      if (this.cb.onPurgeHistory) {
+        right.appendChild(
+          mkBtn("Purge Hist", "Schedule old historical keys for cryptographic shred (24h min grace)", "", () => {
+            const cur = this.blocks.find((x) => x.id === block.id);
+            if (cur) void this.cb.onPurgeHistory?.(cur);
+          }),
+        );
+      }
     }
     right.appendChild(
       mkBtn("↑", "Move block up", "", () => {
@@ -695,14 +856,24 @@ export class BlockStreamController {
     header.append(left, right);
     card.appendChild(header);
 
-    if (block.is_locked) {
+    if (block.is_locked && !editable) {
       const locked = document.createElement("div");
       locked.className = "locked-card";
-      locked.textContent = `🔒 Locked Tier 2 Block${block.public_hint ? ` (${block.public_hint})` : ""}${
-        block.has_unlocked_concurrent_version ? " — has unlocked concurrent version" : ""
+      const label = document.createElement("span");
+      label.textContent = `🔒 Locked Tier 2 Block${block.public_hint ? ` (${block.public_hint})` : ""}${
+        block.has_unlocked_concurrent_version ? " — ⚠ has unlocked concurrent version" : ""
       }`;
+      locked.appendChild(label);
+      if (this.cb.onUnlockVaultRequest) {
+        const unlockBtn = document.createElement("button");
+        unlockBtn.type = "button";
+        unlockBtn.className = "btn btn-primary btn-icon";
+        unlockBtn.textContent = "Unlock Vault";
+        unlockBtn.addEventListener("click", () => this.cb.onUnlockVaultRequest?.());
+        locked.appendChild(unlockBtn);
+      }
       card.appendChild(locked);
-    } else if (block.content === null) {
+    } else if (effContent === null) {
       // Anti-wipe UI guard: NEVER mount an editable empty editor over KEY_UNAVAILABLE / DECRYPT_FAILED!
       const unreadable = document.createElement("div");
       unreadable.className = "unreadable-card";
@@ -714,7 +885,7 @@ export class BlockStreamController {
       host.className = "block-editor-host";
       const pre = document.createElement("pre");
       pre.className = "block-placeholder";
-      pre.textContent = this.dirty.get(block.id)?.text ?? block.content;
+      pre.textContent = this.dirty.get(block.id)?.text ?? effContent;
       pre.addEventListener("click", () => {
         const cur = this.blocks.find((x) => x.id === block.id);
         if (cur && this.isEditable(cur)) {
@@ -741,7 +912,8 @@ export class BlockStreamController {
     const slot = card.querySelector<HTMLElement>(".conflict-slot");
     if (!slot) return;
     slot.innerHTML = "";
-    if (block.versions.length <= 1 || block.is_locked) return;
+    if (block.versions.length <= 1) return;
+    if (block.is_locked && !this.isEditable(block)) return;
 
     const panel = document.createElement("div");
     panel.className = "conflict-panel";
@@ -774,7 +946,8 @@ export class BlockStreamController {
       keepBtn.type = "button";
       keepBtn.className = "btn btn-amber btn-icon";
       keepBtn.textContent = "Keep this version";
-      if (v.content === null) {
+      const leafText = v.content ?? this.unlockedLeafPlaintext.get(block.id)?.get(v.op_id) ?? null;
+      if (leafText === null) {
         keepBtn.disabled = true;
         keepBtn.title = "Cannot keep an unreadable or sealed version";
       } else {
@@ -786,7 +959,7 @@ export class BlockStreamController {
       meta.append(label, keepBtn);
       const body = document.createElement("pre");
       body.className = "leaf-body";
-      body.textContent = v.content ?? (v.is_locked ? "<sealed>" : "<unavailable — missing key or decrypt failed>");
+      body.textContent = leafText ?? (v.is_locked ? "<sealed>" : "<unavailable — missing key or decrypt failed>");
       leafCard.append(meta, body);
       leavesGrid.appendChild(leafCard);
     }
@@ -805,7 +978,7 @@ export class BlockStreamController {
     host.innerHTML = "";
     const pre = document.createElement("pre");
     pre.className = "block-placeholder";
-    pre.textContent = block.content ?? "";
+    pre.textContent = this.getEffectiveContent(block) ?? "";
     pre.addEventListener("click", () => {
       const cur = this.blocks.find((x) => x.id === block.id);
       if (cur && this.isEditable(cur)) {
@@ -894,6 +1067,8 @@ export class BlockStreamController {
       EditorView.updateListener.of((u) => {
         if (u.focusChanged && u.view.hasFocus) {
           this.setActive(block.id);
+          const cur = this.blocks.find((x) => x.id === block.id);
+          if (cur?.is_locked) this.cb.onVaultActivity?.();
         }
         if (u.docChanged) {
           const isRemote = u.transactions.every((tr) => tr.annotation(REMOTE_SYNC_ANN) === true);
@@ -902,14 +1077,25 @@ export class BlockStreamController {
           this.container.classList.remove("buffer-all-selected");
           const text = u.state.doc.toString();
           const cur = this.blocks.find((x) => x.id === block.id);
+          if (cur?.is_locked) this.cb.onVaultActivity?.();
           const prevDirty = this.dirty.get(block.id);
           const baseHeads = prevDirty ? prevDirty.baseHeads : [...(cur?.head_op_ids ?? block.head_op_ids)];
           const mismatch = prevDirty?.mismatch ?? false;
           this.dirty.set(block.id, { text, baseHeads, mismatch });
           this.updateDirtyBadge(block.id, true, mismatch ? "● conflict (unsaved draft)" : "● unsaved");
+          const isPaste = u.transactions.some((tr) => tr.isUserEvent("input.paste"));
+          if (isPaste && cur && !cur.is_locked && this.cb.onSecretPasted) {
+            let pasted = "";
+            for (const tr of u.transactions) {
+              tr.changes.iterChanges((_fa, _ta, _fb, _tb, ins) => {
+                pasted += ins.toString();
+              });
+            }
+            const secretHit = detectSecretPatternFast(pasted || text);
+            if (secretHit) this.cb.onSecretPasted(cur, secretHit);
+          }
           // Conflicted or mismatched blocks require explicit merge confirmation so edits never silently discard sibling leaves
           if (!cur || cur.has_conflict || mismatch) return;
-          const isPaste = u.transactions.some((tr) => tr.isUserEvent("input.paste"));
           const delayMs = isPaste ? 50 : text.length > LARGE_BLOCK_BYTES ? 3500 : 450;
           this.clearTimer(block.id);
           this.saveTimers.set(
@@ -922,7 +1108,7 @@ export class BlockStreamController {
       }),
     ];
 
-    const initialDoc = this.dirty.get(block.id)?.text ?? block.content ?? "";
+    const initialDoc = this.dirty.get(block.id)?.text ?? this.getEffectiveContent(block) ?? "";
     const view = new EditorView({
       state: EditorState.create({ doc: initialDoc, extensions: exts }),
       parent: host,

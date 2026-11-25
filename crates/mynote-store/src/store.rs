@@ -23,7 +23,7 @@ use mynote_core::keys::KeyTableState;
 use mynote_core::materialize::{materialize_block, materialize_buffer, DecodedOp};
 use mynote_core::model::{
     BlockState, EntityType, InnerOpV1, KeyMaterialKind, KeyRecordRow, LeafBody, MaterializedBlock,
-    MaterializedBuffer, OpBodyV1, OpType,
+    MaterializedBuffer, OpBodyV1, OpType, ShredMarkState,
 };
 use mynote_core::sim::offline_restore_from_r2;
 use mynote_core::sync::{EngineSnapshot, LocalOpRecord, StoreMutation};
@@ -134,6 +134,10 @@ pub struct BlockSummaryDto {
     pub updated_at_ms: i64,
 }
 
+#[path = "m2_vault_shred.rs"]
+mod m2_vault_shred;
+pub use m2_vault_shred::{BlockedTier2OpDto, Tier2OpInput, VaultHeaderDto};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockVersionDto {
     pub op_id: String,
@@ -142,7 +146,13 @@ pub struct BlockVersionDto {
     pub actor: String,
     pub is_display: bool,
     pub is_locked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mnb1_b64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mnw1_b64: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -751,7 +761,7 @@ impl LocalStore {
         let pending_confirm_count: usize = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM shred_marks WHERE state = 'pending_confirm'",
+                "SELECT COUNT(*) FROM shred_marks WHERE state = 'pending_confirm' AND server_acked = 1",
                 [],
                 |r| r.get::<_, i64>(0),
             )
@@ -850,6 +860,9 @@ impl LocalStore {
                 created_at_ms,
             });
         }
+        for mark in self.load_shred_marks(true)? {
+            kt.insert_mark(mark);
+        }
         if let Ok(mut mstmt) = self.conn.prepare("SELECT kind, gen, blob FROM key_material") {
             if let Ok(mrows) = mstmt.query_map([], |r| {
                 Ok((
@@ -870,7 +883,7 @@ impl LocalStore {
         Ok(kt)
     }
 
-    fn unwrap_bdek(&self, key_id: KeyId) -> Result<(u8, Vec<u8>), CoreError> {
+    pub(super) fn unwrap_key_record_full(&self, key_id: KeyId) -> Result<KeyRecordV1, CoreError> {
         let row: Option<(i64, Option<Vec<u8>>)> = self
             .conn
             .query_row(
@@ -902,7 +915,11 @@ impl LocalStore {
                 "Run 'mynote keyring unlock'",
             )
         })?;
-        let rec = decrypt_mnr1(smk_kid, smk, key_id, wrap_gen as u32, &mnr1)?;
+        decrypt_mnr1(smk_kid, smk, key_id, wrap_gen as u32, &mnr1)
+    }
+
+    fn unwrap_bdek(&self, key_id: KeyId) -> Result<(u8, Vec<u8>), CoreError> {
+        let rec = self.unwrap_key_record_full(key_id)?;
         Ok((rec.tier, rec.bdek))
     }
 
@@ -980,8 +997,16 @@ impl LocalStore {
     }
 
     fn rematerialize_block(&self, block_id: BlockId) -> Result<MaterializedBlock, CoreError> {
-        let decoded = self.load_entity_decoded_ops(EntityType::Block, &block_id.to_string())?;
         let kt = self.load_key_table()?;
+        self.rematerialize_block_with_kt(block_id, &kt)
+    }
+
+    fn rematerialize_block_with_kt(
+        &self,
+        block_id: BlockId,
+        kt: &KeyTableState,
+    ) -> Result<MaterializedBlock, CoreError> {
+        let decoded = self.load_entity_decoded_ops(EntityType::Block, &block_id.to_string())?;
         let has_unshredded_key: bool = decoded
             .iter()
             .filter_map(|d| d.inner.key_id())
@@ -998,33 +1023,49 @@ impl LocalStore {
                         shredded: true,
                     };
                 }
-                if tier == 2 {
-                    return LeafBody::Sealed {
-                        key_id: kid,
-                        mnb1: mnb1.to_vec(),
-                    };
-                }
-                match self.unwrap_bdek(kid) {
-                    Ok((1, bdek_vec)) if bdek_vec.len() == 32 => {
-                        let mut bdek = Zeroizing::new([0u8; 32]);
-                        bdek.copy_from_slice(&bdek_vec);
-                        match decrypt_mnb1(block_id.as_bytes(), op_id, kid, &bdek, mnb1) {
-                            Ok(pt) => LeafBody::Plaintext(pt),
-                            Err(e) => LeafBody::DecryptFailed {
-                                error_code: e.code().as_str().to_string(),
-                            },
+                match tier {
+                    2 => match self.unwrap_key_record_full(kid) {
+                        Ok(rec) if rec.tier == 2 && rec.bdek.len() == 93 => LeafBody::Sealed {
+                            key_id: kid,
+                            mnb1: mnb1.to_vec(),
+                        },
+                        Ok(_) => LeafBody::DecryptFailed {
+                            error_code: ErrorCode::IntegrityError.as_str().to_string(),
+                        },
+                        Err(e) if e.code() == ErrorCode::KeyShredded => LeafBody::KeyUnavailable {
+                            key_id: kid,
+                            shredded: true,
+                        },
+                        Err(_) => LeafBody::KeyUnavailable {
+                            key_id: kid,
+                            shredded: false,
+                        },
+                    },
+                    1 => match self.unwrap_bdek(kid) {
+                        Ok((1, bdek_vec)) if bdek_vec.len() == 32 => {
+                            let mut bdek = Zeroizing::new([0u8; 32]);
+                            bdek.copy_from_slice(&bdek_vec);
+                            match decrypt_mnb1(block_id.as_bytes(), op_id, kid, &bdek, mnb1) {
+                                Ok(pt) => LeafBody::Plaintext(pt),
+                                Err(e) => LeafBody::DecryptFailed {
+                                    error_code: e.code().as_str().to_string(),
+                                },
+                            }
                         }
-                    }
-                    Ok(_) => LeafBody::DecryptFailed {
+                        Ok(_) => LeafBody::DecryptFailed {
+                            error_code: ErrorCode::IntegrityError.as_str().to_string(),
+                        },
+                        Err(e) if e.code() == ErrorCode::KeyShredded => LeafBody::KeyUnavailable {
+                            key_id: kid,
+                            shredded: true,
+                        },
+                        Err(_) => LeafBody::KeyUnavailable {
+                            key_id: kid,
+                            shredded: false,
+                        },
+                    },
+                    _ => LeafBody::DecryptFailed {
                         error_code: ErrorCode::IntegrityError.as_str().to_string(),
-                    },
-                    Err(e) if e.code() == ErrorCode::KeyShredded => LeafBody::KeyUnavailable {
-                        key_id: kid,
-                        shredded: true,
-                    },
-                    Err(_) => LeafBody::KeyUnavailable {
-                        key_id: kid,
-                        shredded: false,
                     },
                 }
             },
@@ -1203,8 +1244,16 @@ impl LocalStore {
     }
 
     fn rematerialize_buffer(&self, buffer_id: BufferId) -> Result<MaterializedBuffer, CoreError> {
-        let decoded = self.load_entity_decoded_ops(EntityType::Buffer, &buffer_id.to_string())?;
         let kt = self.load_key_table()?;
+        self.rematerialize_buffer_with_kt(buffer_id, &kt)
+    }
+
+    fn rematerialize_buffer_with_kt(
+        &self,
+        buffer_id: BufferId,
+        kt: &KeyTableState,
+    ) -> Result<MaterializedBuffer, CoreError> {
+        let decoded = self.load_entity_decoded_ops(EntityType::Buffer, &buffer_id.to_string())?;
         let has_unshredded_key = decoded
             .iter()
             .filter_map(|d| d.inner.key_id())
@@ -1654,6 +1703,11 @@ impl LocalStore {
             now as i64,
         )?;
         let mat = self.rematerialize_buffer(buf_id)?;
+        if self.key_self_check()?.0 {
+            let buf_keys = self.collect_entity_unshredded_key_ids(EntityType::Buffer, &buf_id.to_string())?;
+            let _ =
+                self.queue_local_shred_marks(&buf_keys, mynote_core::vault::T_GRACE_DEFAULT_MS, now as i64);
+        }
         self.refresh_mirror()?;
         Ok(BufferDto {
             id: mat.id.to_string(),
@@ -2175,6 +2229,7 @@ impl LocalStore {
             })?;
 
         if row.state == "TRASHED" {
+            let (_, nb_ms) = self.block_trash_shred_status(&blk_id.to_string());
             return Err(CoreError::new(
                 ErrorCode::InTrash,
                 format!(
@@ -2185,7 +2240,7 @@ impl LocalStore {
             )
             .with_details(serde_json::json!({
                 "deleted_at_ms": row.deleted_at_ms,
-                "shred_not_before_ms": serde_json::Value::Null,
+                "shred_not_before_ms": nb_ms,
             })));
         }
         if row.state == "SHREDDED" {
@@ -2242,7 +2297,10 @@ impl LocalStore {
                 actor: leaf.actor,
                 is_display,
                 is_locked: leaf.tier == Some(2),
+                key_id: None,
                 content: exposed_content,
+                mnb1_b64: None,
+                mnw1_b64: None,
             });
         }
 
@@ -2566,6 +2624,17 @@ impl LocalStore {
             now as i64,
         )?;
         let mat = self.rematerialize_block(blk_id)?;
+        let (shred_state, shred_not_before_ms) = if self.key_self_check()?.0 {
+            let keys = self.collect_entity_unshredded_key_ids(EntityType::Block, &blk_id.to_string())?;
+            if keys.is_empty() {
+                ("unscheduled".to_string(), None)
+            } else {
+                self.queue_local_shred_marks(&keys, mynote_core::vault::T_GRACE_DEFAULT_MS, now as i64)?;
+                ("pending_sync".to_string(), None)
+            }
+        } else {
+            ("withheld_self_check".to_string(), None)
+        };
         self.refresh_mirror()?;
 
         Ok(DeleteReceipt {
@@ -2574,8 +2643,8 @@ impl LocalStore {
             head_op_ids: mat.head_op_ids().into_iter().map(|o| o.to_string()).collect(),
             buffer_id: mat.buffer_id.to_string(),
             in_trash: true,
-            shred_not_before_ms: None,
-            shred_state: "unscheduled".to_string(), // M1 pure soft-delete recycle bin
+            shred_not_before_ms,
+            shred_state,
         })
     }
 
@@ -2607,19 +2676,68 @@ impl LocalStore {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .unwrap_or_else(|_| (self.device_id.to_string(), "human".to_string()));
+            // Trashed blocks have no live leaves so blocks.is_locked is 0; inspect latest content op tier.
+            let is_locked = if is_locked_i != 0 {
+                true
+            } else {
+                self.conn
+                    .query_row(
+                        "SELECT op_id, device_id, key_id, smk_kid, envelope
+                         FROM sync_ops
+                         WHERE entity_type = 'block' AND entity_id = ?1 AND key_id IS NOT NULL
+                         ORDER BY hlc DESC LIMIT 1",
+                        [&id],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, Option<String>>(2)?,
+                                r.get::<_, String>(3)?,
+                                r.get::<_, Vec<u8>>(4)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .and_then(|(oid_s, dev_s, kid_s, smk_s, env)| {
+                        let oid = OpId::parse(&oid_s).ok()?;
+                        let d = DeviceId::parse(dev_s).ok()?;
+                        let kid = kid_s.as_deref().and_then(|s| KeyId::parse(s).ok());
+                        let skid = SmkKid::parse(&smk_s).ok()?;
+                        let smk = self.smks.get(&skid)?;
+                        let inner = decrypt_mns1(skid, smk, oid, &d, kid, &env).ok()?;
+                        match inner.body {
+                            OpBodyV1::BlockContent { tier, .. } => Some(tier == 2),
+                            _ => None,
+                        }
+                    })
+                    .unwrap_or(false)
+            };
+            let (shred_state, shred_not_before_ms) = self.block_trash_shred_status(&id);
             out.push(TrashItemDto {
                 id,
                 buffer_id,
                 buffer_name,
-                is_locked: is_locked_i != 0,
+                is_locked,
                 preview: None,
                 deleted_at_ms,
                 deleted_by_device: dev,
                 actor,
-                shred_not_before_ms: None,
-                shred_state: "unscheduled".to_string(),
+                shred_not_before_ms,
+                shred_state,
             });
         }
+        // `docs/interface-contracts.md` §2.6 #5: sort by `shred_not_before_ms` ASC NULLS LAST
+        out.sort_by(|a, b| match (a.shred_not_before_ms, b.shred_not_before_ms) {
+            (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.id.cmp(&b.id)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => b
+                .deleted_at_ms
+                .cmp(&a.deleted_at_ms)
+                .then_with(|| a.id.cmp(&b.id)),
+        });
         Ok(out)
     }
 
@@ -2689,67 +2807,81 @@ impl LocalStore {
                 ));
             }
         };
+        if self.is_key_executed(&key_id) {
+            return Err(CoreError::new(
+                ErrorCode::KeyShredded,
+                format!("key {key_id} has already been shredded"),
+                "Cannot restore a shredded block",
+            ));
+        }
         let bdek = self.unwrap_tier1_bdek(key_id)?;
         let restored_pt = decrypt_mnb1(blk_id.as_bytes(), last_content_op.op_id, key_id, &bdek, mnb1)?;
 
-        let parents = self.current_entity_leaves(EntityType::Block, &blk_id.to_string())?;
-        let now = now_ms();
-        let op_id = OpId::from_ulid(self.ulid_gen.next(now, rand_bytes::<10>()?));
-        let hlc = self.hlc_clock.tick(now);
-        let smk_kid = self.current_smk_kid;
-        let smk = self.current_smk()?.clone();
+        let receipt = self.with_savepoint("restore_trash", |this| {
+            // Cancel active shred marks ONLY for the restored content key_id (M3: never cancel
+            // intentionally retired keys from earlier LOCK / purge_block_history!).
+            this.cancel_local_shred_marks_for_keys(&[key_id])?;
 
-        let new_mnb1 = encrypt_mnb1(
-            blk_id.as_bytes(),
-            op_id,
-            key_id,
-            &bdek,
-            &restored_pt,
-            rand_bytes::<24>()?,
-        )?;
-        let inner = InnerOpV1 {
-            v: 1,
-            entity_type: EntityType::Block,
-            entity_id: blk_id.to_string(),
-            op_type: OpType::Update,
-            parent_op_ids: parents.clone(),
-            hlc: hlc.clone(),
-            actor: actor.to_string(),
-            body: OpBodyV1::BlockContent {
-                buffer_id: None,
-                position: None,
-                lang: None,
-                public_hint: None,
-                tier: 1,
+            let parents = this.current_entity_leaves(EntityType::Block, &blk_id.to_string())?;
+            let now = now_ms();
+            let op_id = OpId::from_ulid(this.ulid_gen.next(now, rand_bytes::<10>()?));
+            let hlc = this.hlc_clock.tick(now);
+            let smk_kid = this.current_smk_kid;
+            let smk = this.current_smk()?.clone();
+
+            let new_mnb1 = encrypt_mnb1(
+                blk_id.as_bytes(),
+                op_id,
                 key_id,
-                mnb1: new_mnb1,
-            },
-        };
-        let mns1 = encrypt_mns1(smk_kid, &smk, op_id, &self.device_id, &inner, rand_bytes::<24>()?)?;
-        self.insert_sync_op(
-            op_id,
-            None,
-            EntityType::Block,
-            &blk_id.to_string(),
-            &parents,
-            OpType::Update,
-            &hlc,
-            actor,
-            Some(key_id),
-            smk_kid,
-            &mns1,
-            now as i64,
-        )?;
-        let mat = self.rematerialize_block(blk_id)?;
+                &bdek,
+                &restored_pt,
+                rand_bytes::<24>()?,
+            )?;
+            let inner = InnerOpV1 {
+                v: 1,
+                entity_type: EntityType::Block,
+                entity_id: blk_id.to_string(),
+                op_type: OpType::Update,
+                parent_op_ids: parents.clone(),
+                hlc: hlc.clone(),
+                actor: actor.to_string(),
+                body: OpBodyV1::BlockContent {
+                    buffer_id: None,
+                    position: None,
+                    lang: None,
+                    public_hint: None,
+                    tier: 1,
+                    key_id,
+                    mnb1: new_mnb1,
+                },
+            };
+            let mns1 = encrypt_mns1(smk_kid, &smk, op_id, &this.device_id, &inner, rand_bytes::<24>()?)?;
+            this.insert_sync_op(
+                op_id,
+                None,
+                EntityType::Block,
+                &blk_id.to_string(),
+                &parents,
+                OpType::Update,
+                &hlc,
+                actor,
+                Some(key_id),
+                smk_kid,
+                &mns1,
+                now as i64,
+            )?;
+            let mat = this.rematerialize_block(blk_id)?;
+            Ok(WriteReceipt {
+                block_id: mat.id.to_string(),
+                op_id: op_id.to_string(),
+                head_op_ids: mat.head_op_ids().into_iter().map(|o| o.to_string()).collect(),
+                buffer_id: mat.buffer_id.to_string(),
+                idempotent_replay: None,
+            })
+        })?;
         self.refresh_mirror()?;
 
-        Ok(WriteReceipt {
-            block_id: mat.id.to_string(),
-            op_id: op_id.to_string(),
-            head_op_ids: mat.head_op_ids().into_iter().map(|o| o.to_string()).collect(),
-            buffer_id: mat.buffer_id.to_string(),
-            idempotent_replay: None,
-        })
+        Ok(receipt)
     }
 
     pub fn block_history(&self, block_id_str: &str, limit: usize) -> Result<Vec<HistoryEntryDto>, CoreError> {
@@ -3044,16 +3176,28 @@ impl LocalStore {
                 "Verify recovery bundle matches this vault",
             ));
         }
-        let has_vault: bool = self
+        let vh_blob: Option<Vec<u8>> = self
             .conn
             .query_row(
-                "SELECT 1 FROM key_material WHERE kind = 'vault_header'",
+                "SELECT blob FROM key_material WHERE kind = 'vault_header'",
                 [],
-                |_| Ok(true),
+                |r| r.get(0),
             )
             .optional()
-            .unwrap_or(None)
-            .unwrap_or(false);
+            .unwrap_or(None);
+        let has_vault = if let Some(blob) = vh_blob {
+            let vh: mynote_core::crypto::VaultHeaderV1 = rmp_serde::from_slice(&blob).map_err(|e| {
+                CoreError::new(
+                    ErrorCode::IntegrityError,
+                    format!("corrupt VaultHeaderV1 during recovery drill: {e}"),
+                    "Sync the latest VaultHeaderV1",
+                )
+            })?;
+            let _ = mynote_core::vault::unseal_vault_with_recovery(&kp, &vh)?;
+            true
+        } else {
+            false
+        };
         let drilled_at_ms = now_ms() as i64;
         let _ = self.set_local_meta("recovery_drill_due", "0");
         let _ = self.set_local_meta("last_recovery_drill_ms", &drilled_at_ms.to_string());
@@ -3065,23 +3209,69 @@ impl LocalStore {
         })
     }
 
-    /// Run daily `VACUUM INTO` automatic backup (`0600`).
+    /// Run daily `VACUUM INTO` automatic backup (`0600`), updating `last_local_backup_ms` and pruning
+    /// `auto-*.db` files older than `T_snap` (30 days, `docs/threat-model.md` §2.3, H9).
     pub fn create_auto_backup(&self, label: &str) -> Result<PathBuf, CoreError> {
-        let dest = self.data_dir.join("backups").join(format!("auto-{label}.db"));
+        if label.is_empty()
+            || label.len() > 64
+            || label.contains("..")
+            || !label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err(CoreError::new(
+                ErrorCode::InvalidArgument,
+                format!("invalid backup label '{label}'"),
+                "Backup label must match [A-Za-z0-9._-]{1,64} without '..'",
+            ));
+        }
+        let backups_dir = self.data_dir.join("backups");
+        let dest = backups_dir.join(format!("auto-{label}.db"));
         vacuum_into(&self.conn, &dest)?;
+        let now = now_ms() as i64;
+        self.set_local_meta("last_local_backup_ms", &now.to_string())?;
+        // Prune auto-*.db backups older than T_snap (30 days) so shredded data does not linger.
+        const T_SNAP_SECS: u64 = 30 * 86_400;
+        let now_sys = std::time::SystemTime::now();
+        if let Ok(rd) = std::fs::read_dir(&backups_dir) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p == dest {
+                    continue;
+                }
+                if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                    if name.starts_with("auto-") && name.ends_with(".db") {
+                        if let Ok(meta) = ent.metadata() {
+                            if let Ok(mtime) = meta.modified() {
+                                if let Ok(age) = now_sys.duration_since(mtime) {
+                                    if age.as_secs() > T_SNAP_SECS {
+                                        let _ = std::fs::remove_file(&p);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Ok(dest)
     }
 
-    /// Run read-only key liveness self-check (`INV-KEY-LIVENESS`) with ZERO SQLite writes.
+    /// Run read-only key liveness self-check (`INV-KEY-LIVENESS`, H9) with ZERO SQLite writes.
+    /// Checks all ACTIVE blocks' live leaves AND ACTIVE buffers:
+    /// - Fails if any live key is missing, shredded, pending/scheduled for shred, or fails local MNR1 unwrap;
+    /// - Fails if any active leaf is in `DECRYPT_FAILED`;
+    /// - Does NOT false-positive on a concurrent leaf whose key was already legitimately shredded on an
+    ///   otherwise readable active block (`KEY_UNAVAILABLE` with `kt.is_shredded(&kid)`).
     pub fn key_self_check(&self) -> Result<(bool, Vec<KeyId>), CoreError> {
         let kt = self.load_key_table()?;
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT DISTINCT bl.key_id, bl.body_state
+                "SELECT bl.block_id, bl.key_id, bl.body_state
                  FROM block_leaves bl
                  JOIN blocks b ON b.id = bl.block_id
-                 WHERE b.state = 'ACTIVE' AND bl.key_id IS NOT NULL",
+                 WHERE b.state = 'ACTIVE' AND bl.body_state != 'TOMBSTONE'",
             )
             .map_err(|e| {
                 CoreError::new(
@@ -3091,7 +3281,13 @@ impl LocalStore {
                 )
             })?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
             .map_err(|e| {
                 CoreError::new(
                     ErrorCode::IntegrityError,
@@ -3099,23 +3295,90 @@ impl LocalStore {
                     "map active block leaf keys",
                 )
             })?;
-        let mut missing: BTreeSet<KeyId> = BTreeSet::new();
+        let mut by_block: BTreeMap<String, Vec<(Option<String>, String)>> = BTreeMap::new();
         for row in rows {
-            let (kid_s, body_state) = row.map_err(|e| {
+            let (bid, kid_opt, body_state) = row.map_err(|e| {
                 CoreError::new(
                     ErrorCode::IntegrityError,
                     e.to_string(),
                     "read active block leaf key",
                 )
             })?;
+            by_block.entry(bid).or_default().push((kid_opt, body_state));
+        }
+        let mut missing: BTreeSet<KeyId> = BTreeSet::new();
+        let mut has_decrypt_failed = false;
+        for leaves in by_block.values() {
+            let has_readable_live_leaf = leaves.iter().any(|(kid_opt, body_state)| {
+                if body_state != "PLAINTEXT" && body_state != "SEALED" {
+                    return false;
+                }
+                match kid_opt.as_deref().and_then(|s| KeyId::parse(s).ok()) {
+                    Some(kid) => {
+                        kt.is_key_available(&kid)
+                            && !kt.has_pending_or_scheduled_mark(&kid)
+                            && self.unwrap_bdek(kid).is_ok()
+                    }
+                    None => false,
+                }
+            });
+            for (kid_opt, body_state) in leaves {
+                if body_state == "DECRYPT_FAILED" {
+                    has_decrypt_failed = true;
+                    if let Some(ref ks) = kid_opt {
+                        if let Ok(kid) = KeyId::parse(ks) {
+                            missing.insert(kid);
+                        }
+                    }
+                    continue;
+                }
+                if let Some(kid_s) = kid_opt {
+                    if let Ok(kid) = KeyId::parse(kid_s) {
+                        if body_state == "KEY_UNAVAILABLE" && kt.is_shredded(&kid) && has_readable_live_leaf {
+                            // Legitimately shredded concurrent branch on an otherwise readable active
+                            // block; do not permanently wedge shredding on future trashed items.
+                            continue;
+                        }
+                        if body_state == "KEY_UNAVAILABLE"
+                            || !kt.is_key_available(&kid)
+                            || kt.has_pending_or_scheduled_mark(&kid)
+                            || self.unwrap_bdek(kid).is_err()
+                        {
+                            missing.insert(kid);
+                        }
+                    }
+                }
+            }
+        }
+        // Also check ACTIVE buffers' keys!
+        let mut bstmt = self
+            .conn
+            .prepare("SELECT DISTINCT key_id FROM buffers WHERE state = 'ACTIVE'")
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::IntegrityError,
+                    e.to_string(),
+                    "scan active buffer keys",
+                )
+            })?;
+        let brows = bstmt.query_map([], |r| r.get::<_, String>(0)).map_err(|e| {
+            CoreError::new(ErrorCode::IntegrityError, e.to_string(), "map active buffer keys")
+        })?;
+        for row in brows {
+            let kid_s = row.map_err(|e| {
+                CoreError::new(ErrorCode::IntegrityError, e.to_string(), "read active buffer key")
+            })?;
             if let Ok(kid) = KeyId::parse(&kid_s) {
-                if !kt.is_key_available(&kid) || body_state == "KEY_UNAVAILABLE" {
+                if !kt.is_key_available(&kid)
+                    || kt.has_pending_or_scheduled_mark(&kid)
+                    || self.unwrap_bdek(kid).is_err()
+                {
                     missing.insert(kid);
                 }
             }
         }
         let missing_vec: Vec<KeyId> = missing.into_iter().collect();
-        Ok((missing_vec.is_empty(), missing_vec))
+        Ok((missing_vec.is_empty() && !has_decrypt_failed, missing_vec))
     }
 
     /// Inject a remote concurrent op (e.g. from another device) and re-materialize cleanly.
@@ -3281,12 +3544,18 @@ impl LocalStore {
                 "INSERT INTO local_meta (key, value) VALUES ('device_id', ?1)",
                 [dev.as_str()],
             )
-            .ok();
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "insert device_id"))?;
             conn.execute(
                 "INSERT INTO local_meta (key, value) VALUES ('bootstrap_completed', '1')",
                 [],
             )
-            .ok();
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::IntegrityError,
+                    e.to_string(),
+                    "insert bootstrap_completed",
+                )
+            })?;
             let kr_blob = rmp_serde::to_vec_named(&mnks_body.keyring)
                 .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "encode keyring"))?;
             conn.execute(
@@ -3297,7 +3566,21 @@ impl LocalStore {
                     mnks_hdr.created_at_ms
                 ],
             )
-            .ok();
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "insert keyring"))?;
+
+            // H6: Restore VaultHeaderV1 so Tier 2 Vault blocks can be unlocked offline after restore!
+            if let Some(ref vh) = mnks_body.vault_header {
+                let vh_blob = rmp_serde::to_vec_named(vh).map_err(|e| {
+                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "encode vault_header")
+                })?;
+                conn.execute(
+                    "INSERT INTO key_material (kind, gen, blob, updated_at_ms) VALUES ('vault_header', ?1, ?2, ?3)",
+                    params![vh.updated_at_ms, vh_blob, vh.updated_at_ms],
+                )
+                .map_err(|e| {
+                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "insert vault_header")
+                })?;
+            }
 
             for rec in &mnks_body.records {
                 let (blk_id_s, tier) = if let Some(mnr1) = &rec.key_record {
@@ -3326,7 +3609,48 @@ impl LocalStore {
                         rec.created_at_ms,
                     ],
                 )
-                .ok();
+                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "insert block_key"))?;
+            }
+
+            // H6: Restore all shred_marks (creating NULL block_keys tombstones if absent for FK safety)
+            for mark in &mnks_body.marks {
+                conn.execute(
+                    "INSERT OR IGNORE INTO block_keys
+                     (key_id, block_id, tier, wrap_gen, key_record, created_hlc, created_at_ms, server_acked)
+                     VALUES (?1, ?2, 1, 1, NULL, '', ?3, 1)",
+                    params![
+                        mark.key_id.to_string(),
+                        Ulid::ZERO.to_string(),
+                        mark.requested_at_ms,
+                    ],
+                )
+                .map_err(|e| {
+                    CoreError::new(
+                        ErrorCode::IntegrityError,
+                        e.to_string(),
+                        "ensure block_key for mark",
+                    )
+                })?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO shred_marks
+                     (mark_id, key_id, requested_by, requested_at_ms, seen_seq, grace_ms, not_before_ms,
+                      state, confirmed_at_ms, cancelled_by, executed_at_ms, server_acked)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)",
+                    params![
+                        mark.mark_id.to_string(),
+                        mark.key_id.to_string(),
+                        mark.requested_by.as_str(),
+                        mark.requested_at_ms,
+                        mark.seen_seq,
+                        mark.grace_ms,
+                        mark.not_before_ms,
+                        m2_vault_shred::shred_state_to_str(mark.state),
+                        mark.confirmed_at_ms,
+                        mark.cancelled_by.as_ref().map(|d| d.as_str()),
+                        mark.executed_at_ms,
+                    ],
+                )
+                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "insert shred_mark"))?;
             }
 
             for op in restored_snap.ops.values() {
@@ -3364,7 +3688,7 @@ impl LocalStore {
                         op.created_at_ms,
                     ],
                 )
-                .ok();
+                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "insert sync_op"))?;
             }
 
             Self::save_local_smks(
@@ -3376,11 +3700,12 @@ impl LocalStore {
 
             // Re-open restored store and rematerialize every buffer & block + mirror
             let restored_store = Self::open(target_dir)?;
+            let kt = restored_store.load_key_table()?;
             for b in &all_bufs {
-                let _ = restored_store.rematerialize_buffer(b.id);
+                let _ = restored_store.rematerialize_buffer_with_kt(b.id, &kt);
             }
             for blk in &all_blks {
-                let _ = restored_store.rematerialize_block(blk.id);
+                let _ = restored_store.rematerialize_block_with_kt(blk.id, &kt);
             }
             restored_store.refresh_mirror()?;
         }
@@ -3752,6 +4077,8 @@ impl LocalStore {
             snap.hlc = h;
         }
         snap.keys = self.load_key_table()?;
+        snap.pending_shred_marks = self.load_shred_marks(false)?;
+        snap.pending_cancel_key_ids = self.load_pending_cancel_keys();
         snap.smks = self.smks.clone();
 
         let mut stmt = self
@@ -3956,7 +4283,9 @@ impl LocalStore {
     ) -> Result<SyncApplySummary, CoreError> {
         let mut touched_buffers: BTreeSet<BufferId> = BTreeSet::new();
         let mut touched_blocks: BTreeSet<BlockId> = BTreeSet::new();
-        let mut keys_changed = false;
+        let mut changed_keys: BTreeSet<KeyId> = BTreeSet::new();
+        let mut marks_changed = false;
+        let mut shred_keys_to_execute: BTreeMap<KeyId, Option<(u32, i64)>> = BTreeMap::new();
         let mut summary = SyncApplySummary::default();
 
         self.conn
@@ -4030,7 +4359,7 @@ impl LocalStore {
                         for a in acked {
                             self.conn
                                 .execute(
-                                    "UPDATE sync_ops SET server_seq = ?1 WHERE op_id = ?2",
+                                    "UPDATE sync_ops SET server_seq = ?1, sync_blocked_reason = NULL WHERE op_id = ?2",
                                     params![a.seq, a.op_id.to_string()],
                                 )
                                 .map_err(|e| {
@@ -4038,8 +4367,61 @@ impl LocalStore {
                                 })?;
                         }
                         self.conn
-                            .execute("UPDATE block_keys SET server_acked = 1", [])
+                            .execute(
+                                "UPDATE block_keys SET server_acked = 1
+                                 WHERE key_id IN (
+                                     SELECT key_id FROM sync_ops
+                                     WHERE server_seq IS NOT NULL AND key_id IS NOT NULL
+                                 )",
+                                [],
+                            )
                             .ok();
+                    }
+                    StoreMutation::MarkOpBlocked { op_id, reason } => {
+                        self.conn
+                            .execute(
+                                "UPDATE sync_ops SET sync_blocked_reason = ?1 WHERE op_id = ?2",
+                                params![reason, op_id.to_string()],
+                            )
+                            .map_err(|e| {
+                                CoreError::new(ErrorCode::IntegrityError, e.to_string(), "mark op blocked")
+                            })?;
+                        if reason == "NEEDS_VAULT_REKEY" {
+                            // H8: Back up wrapped mnw1 BEFORE any subsequent shred wipes block_keys.key_record!
+                            if let Ok(Some(kid_s)) = self.conn.query_row(
+                                "SELECT key_id FROM sync_ops WHERE op_id = ?1",
+                                [op_id.to_string()],
+                                |r| r.get::<_, Option<String>>(0),
+                            ) {
+                                if let Ok(kid) = KeyId::parse(&kid_s) {
+                                    if let Ok((2, mnw1)) = self.unwrap_bdek(kid) {
+                                        use base64::Engine as _;
+                                        let slot_key = format!("blocked_t2_mnw1:{op_id}");
+                                        self.set_local_meta(
+                                            &slot_key,
+                                            &base64::engine::general_purpose::STANDARD.encode(mnw1),
+                                        )?;
+                                    }
+                                }
+                            }
+                            summary.needs_vault_rekey.push(op_id.to_string());
+                        }
+                    }
+                    StoreMutation::MarkShredMarksAcked {
+                        results,
+                        cancelled_keys,
+                    } => {
+                        self.apply_shred_results_acked(results, cancelled_keys)?;
+                        summary.trash_changed = true;
+                        for r in results {
+                            if r.state == ShredMarkState::PendingConfirm {
+                                summary.pending_confirm_count += 1;
+                            }
+                            // C3 Path C: execute local physical shred when push-ack reports Executed!
+                            if r.state == ShredMarkState::Executed {
+                                shred_keys_to_execute.entry(r.key_id).or_insert(None);
+                            }
+                        }
                     }
                     StoreMutation::ClearServerSeqsForReconcile { new_epoch } => {
                         // NEVER delete sync_ops or blocks — only clear server_seq for Set-Union reconciliation!
@@ -4052,6 +4434,34 @@ impl LocalStore {
                         self.set_local_meta("last_seq", "0")?;
                     }
                     StoreMutation::UpsertBlockKey(rec) => {
+                        if rec.key_record.is_none() {
+                            // C2 FIX: If this shredded key has NEVER been seen locally, insert a NULL
+                            // tombstone row in `block_keys` immediately so subsequent `UpsertShredMark`
+                            // satisfies `FOREIGN KEY(key_id) REFERENCES block_keys(key_id)`!
+                            // If a non-NULL row already exists, keep it intact until AFTER rematerialize,
+                            // outbox reconciliation, and INV-KEY-LIVENESS check.
+                            self.conn
+                                .execute(
+                                    "INSERT OR IGNORE INTO block_keys
+                                     (key_id, block_id, tier, wrap_gen, key_record, created_hlc, created_at_ms, server_acked)
+                                     VALUES (?1, ?2, 1, ?3, NULL, '', ?4, 1)",
+                                    params![
+                                        rec.key_id.to_string(),
+                                        Ulid::ZERO.to_string(),
+                                        rec.wrap_gen as i64,
+                                        rec.created_at_ms,
+                                    ],
+                                )
+                                .map_err(|e| {
+                                    CoreError::new(
+                                        ErrorCode::IntegrityError,
+                                        e.to_string(),
+                                        "insert unseen shredded block_key tombstone",
+                                    )
+                                })?;
+                            shred_keys_to_execute.insert(rec.key_id, Some((rec.wrap_gen, rec.created_at_ms)));
+                            continue;
+                        }
                         let zero_id = Ulid::ZERO.to_string();
                         let existing: Option<(String, i64, Option<Vec<u8>>)> = self
                             .conn
@@ -4065,11 +4475,7 @@ impl LocalStore {
                         let should_write = match existing {
                             None => true,
                             Some((_, _, None)) => false, // Executed shred is terminal
-                            Some((ref bid, g, Some(_))) => {
-                                rec.key_record.is_none()
-                                    || (rec.wrap_gen as i64) > g
-                                    || (bid == &zero_id && rec.key_record.is_some())
-                            }
+                            Some((ref bid, g, Some(_))) => (rec.wrap_gen as i64) > g || bid == &zero_id,
                         };
                         if should_write {
                             let (blk_id_s, tier) = if let Some(mnr1) = &rec.key_record {
@@ -4113,11 +4519,41 @@ impl LocalStore {
                                 .map_err(|e| {
                                     CoreError::new(ErrorCode::IntegrityError, e.to_string(), "upsert block_key")
                                 })?;
-                            keys_changed = true;
+                            changed_keys.insert(rec.key_id);
                         }
                     }
-                    StoreMutation::UpsertShredMark(_) | StoreMutation::ExecuteShred { .. } => {
-                        // M1 does not execute physical key shredding (M2 feature).
+                    StoreMutation::UpsertShredMark(mark) => {
+                        // C2 defense-in-depth: ensure parent block_keys row exists before shred_marks FK insert
+                        self.conn
+                            .execute(
+                                "INSERT OR IGNORE INTO block_keys
+                                 (key_id, block_id, tier, wrap_gen, key_record, created_hlc, created_at_ms, server_acked)
+                                 VALUES (?1, ?2, 1, 1, NULL, '', ?3, 1)",
+                                params![
+                                    mark.key_id.to_string(),
+                                    Ulid::ZERO.to_string(),
+                                    mark.requested_at_ms,
+                                ],
+                            )
+                            .map_err(|e| {
+                                CoreError::new(
+                                    ErrorCode::IntegrityError,
+                                    e.to_string(),
+                                    "ensure parent block_key for shred_mark",
+                                )
+                            })?;
+                        self.upsert_shred_mark_row(mark, true)?;
+                        marks_changed = true;
+                        summary.trash_changed = true;
+                        if mark.state == ShredMarkState::PendingConfirm {
+                            summary.pending_confirm_count += 1;
+                        }
+                        if mark.state == ShredMarkState::Executed {
+                            shred_keys_to_execute.entry(mark.key_id).or_insert(None);
+                        }
+                    }
+                    StoreMutation::ExecuteShred { key_id } => {
+                        shred_keys_to_execute.entry(*key_id).or_insert(None);
                     }
                     StoreMutation::UpsertKeyMaterial {
                         kind,
@@ -4125,6 +4561,56 @@ impl LocalStore {
                         blob,
                         updated_at_ms,
                     } => {
+                        // Validate remote key_material blob & monotonic SMK retention before persisting!
+                        match kind {
+                            KeyMaterialKind::Keyring => {
+                                let new_kr: RecoveryKeyringV1 = rmp_serde::from_slice(blob).map_err(|e| {
+                                    CoreError::new(
+                                        ErrorCode::IntegrityError,
+                                        format!("invalid remote RecoveryKeyringV1 payload: {e}"),
+                                        "Refusing to persist malformed remote keyring",
+                                    )
+                                })?;
+                                if let Ok(existing_kr) = self.current_keyring() {
+                                    if new_kr.recovery_pk != existing_kr.recovery_pk {
+                                        return Err(CoreError::new(
+                                            ErrorCode::IntegrityError,
+                                            "remote keyring recovery_pk mismatch",
+                                            "Recovery public key cannot change silently across keyring generations",
+                                        ));
+                                    }
+                                    for old_ent in &existing_kr.smk_entries {
+                                        if !new_kr.smk_entries.iter().any(|e| e == old_ent) {
+                                            return Err(CoreError::new(
+                                                ErrorCode::IntegrityError,
+                                                format!(
+                                                    "remote keyring gen {} truncated existing SMK generation",
+                                                    new_kr.keyring_gen
+                                                ),
+                                                "Old SMK generations must be preserved permanently",
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            KeyMaterialKind::VaultHeader => {
+                                let vh: mynote_core::crypto::VaultHeaderV1 = rmp_serde::from_slice(blob)
+                                    .map_err(|e| {
+                                        CoreError::new(
+                                            ErrorCode::IntegrityError,
+                                            format!("invalid remote VaultHeaderV1 payload: {e}"),
+                                            "Refusing to persist malformed remote vault header",
+                                        )
+                                    })?;
+                                if vh.v != 1 {
+                                    return Err(CoreError::new(
+                                        ErrorCode::IntegrityError,
+                                        format!("unsupported remote VaultHeaderV1 version {}", vh.v),
+                                        "Upgrade mynote to handle newer vault header format",
+                                    ));
+                                }
+                            }
+                        }
                         let kind_s = match kind {
                             KeyMaterialKind::Keyring => "keyring",
                             KeyMaterialKind::VaultHeader => "vault_header",
@@ -4150,6 +4636,9 @@ impl LocalStore {
                                         "upsert key_material",
                                     )
                                 })?;
+                            if *kind == KeyMaterialKind::VaultHeader {
+                                summary.vault_header_changed = true;
+                            }
                         }
                     }
                     StoreMutation::SetSyncMeta {
@@ -4186,57 +4675,101 @@ impl LocalStore {
                 }
             }
 
-            if keys_changed {
-                // Rematerialize buffers first (FK safety), then blocks inside the same transaction.
-                let mut buf_ids: Vec<BufferId> = Vec::new();
-                let mut blk_ids: Vec<BlockId> = Vec::new();
-                {
-                    let mut stmt = self
-                        .conn
-                        .prepare("SELECT DISTINCT entity_type, entity_id FROM sync_ops")
-                        .map_err(|e| {
-                            CoreError::new(ErrorCode::IntegrityError, e.to_string(), "scan entities")
-                        })?;
-                    let rows = stmt
-                        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-                        .map_err(|e| {
-                            CoreError::new(ErrorCode::IntegrityError, e.to_string(), "map entities")
-                        })?;
-                    for r in rows.flatten() {
-                        if r.0 == "buffer" {
-                            if let Ok(id) = BufferId::parse(&r.1) {
-                                buf_ids.push(id);
+            // Helper: collect all buffers & blocks referencing any key in `keys` so we only
+            // rematerialize affected entities (`O(touched)` instead of `O(blocks * keys)`).
+            let collect_entities_for_keys =
+                |conn: &Connection,
+                 keys: &BTreeSet<KeyId>,
+                 bufs: &mut BTreeSet<BufferId>,
+                 blks: &mut BTreeSet<BlockId>| {
+                    for kid in keys {
+                        let ks = kid.to_string();
+                        if let Ok(mut stmt) = conn
+                            .prepare("SELECT DISTINCT entity_type, entity_id FROM sync_ops WHERE key_id = ?1")
+                        {
+                            if let Ok(rows) = stmt
+                                .query_map([&ks], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                            {
+                                for (et, eid) in rows.flatten() {
+                                    if et == "buffer" {
+                                        if let Ok(id) = BufferId::parse(&eid) {
+                                            bufs.insert(id);
+                                        }
+                                    } else if let Ok(id) = BlockId::parse(&eid) {
+                                        blks.insert(id);
+                                    }
+                                }
                             }
-                        } else if let Ok(id) = BlockId::parse(&r.1) {
-                            blk_ids.push(id);
+                        }
+                        if let Ok(mut stmt) =
+                            conn.prepare("SELECT DISTINCT block_id FROM block_leaves WHERE key_id = ?1")
+                        {
+                            if let Ok(rows) = stmt.query_map([&ks], |r| r.get::<_, String>(0)) {
+                                for bid in rows.flatten() {
+                                    if let Ok(id) = BlockId::parse(&bid) {
+                                        blks.insert(id);
+                                    }
+                                }
+                            }
+                        }
+                        if let Ok(mut stmt) =
+                            conn.prepare("SELECT DISTINCT id FROM buffers WHERE key_id = ?1")
+                        {
+                            if let Ok(rows) = stmt.query_map([&ks], |r| r.get::<_, String>(0)) {
+                                for bid in rows.flatten() {
+                                    if let Ok(id) = BufferId::parse(&bid) {
+                                        bufs.insert(id);
+                                    }
+                                }
+                            }
+                        }
+                        if let Ok(mut stmt) =
+                            conn.prepare("SELECT DISTINCT block_id FROM block_keys WHERE key_id = ?1")
+                        {
+                            if let Ok(rows) = stmt.query_map([&ks], |r| r.get::<_, String>(0)) {
+                                for eid in rows.flatten() {
+                                    if let Ok(id) = BlockId::parse(&eid) {
+                                        blks.insert(id);
+                                    }
+                                    if let Ok(id) = BufferId::parse(&eid) {
+                                        bufs.insert(id);
+                                    }
+                                }
+                            }
                         }
                     }
-                }
-                for id in buf_ids {
-                    let _ = self.rematerialize_buffer(id);
-                }
-                for id in blk_ids {
-                    let _ = self.rematerialize_block(id);
-                }
-                for b in self.list_buffers()? {
-                    summary.upserted_buffer_ids.push(b.id);
-                }
-                for blk in self.list_blocks(None, 10_000)? {
-                    summary.upserted_block_ids.push(blk.id);
-                }
-                need_mirror_refresh = true;
-            } else {
+                };
+
+            let mut upserted_bufs: BTreeSet<String> = BTreeSet::new();
+            let mut deleted_bufs: BTreeSet<String> = BTreeSet::new();
+            let mut upserted_blks: BTreeSet<String> = BTreeSet::new();
+            let mut deleted_blks: BTreeSet<String> = BTreeSet::new();
+
+            // Step A & B: Rematerialize touched ops + newly synced keys FIRST so `block_leaves` and
+            // `blocks.state` reflect newly pulled DELETE/LOCK/UPDATE before outbox reconciliation,
+            // unacked-mark pruning (C7), and physical shred execution (C3 Path A)!
+            if !changed_keys.is_empty() {
+                collect_entities_for_keys(
+                    &self.conn,
+                    &changed_keys,
+                    &mut touched_buffers,
+                    &mut touched_blocks,
+                );
+            }
+            if !touched_buffers.is_empty() || !touched_blocks.is_empty() {
+                let kt = self.load_key_table()?;
                 let had_buffers = !touched_buffers.is_empty();
-                for buf_id in touched_buffers {
-                    if let Ok(m) = self.rematerialize_buffer(buf_id) {
+                for buf_id in &touched_buffers {
+                    if let Ok(m) = self.rematerialize_buffer_with_kt(*buf_id, &kt) {
                         if m.state == BlockState::Active {
-                            summary.upserted_buffer_ids.push(buf_id.to_string());
+                            upserted_bufs.insert(buf_id.to_string());
+                            deleted_bufs.remove(&buf_id.to_string());
                         } else {
-                            summary.deleted_buffer_ids.push(buf_id.to_string());
+                            deleted_bufs.insert(buf_id.to_string());
+                            upserted_bufs.remove(&buf_id.to_string());
                         }
                     }
                 }
-                // Retry any previously out-of-order block ops whose parent buffer just materialized.
                 if had_buffers {
                     if let Ok(mut stmt) = self.conn.prepare(
                         "SELECT DISTINCT entity_id FROM sync_ops
@@ -4251,21 +4784,92 @@ impl LocalStore {
                         }
                     }
                 }
-                for blk_id in touched_blocks {
-                    if let Ok(m) = self.rematerialize_block(blk_id) {
+                for blk_id in &touched_blocks {
+                    if let Ok(m) = self.rematerialize_block_with_kt(*blk_id, &kt) {
                         if m.state == BlockState::Active {
-                            summary.upserted_block_ids.push(blk_id.to_string());
+                            upserted_blks.insert(blk_id.to_string());
+                            deleted_blks.remove(&blk_id.to_string());
                         } else {
-                            summary.deleted_block_ids.push(blk_id.to_string());
+                            deleted_blks.insert(blk_id.to_string());
+                            upserted_blks.remove(&blk_id.to_string());
                             summary.trash_changed = true;
                         }
                     }
                 }
-                need_mirror_refresh = !summary.upserted_block_ids.is_empty()
-                    || !summary.deleted_block_ids.is_empty()
-                    || !summary.upserted_buffer_ids.is_empty()
-                    || !summary.deleted_buffer_ids.is_empty();
             }
+
+            // Step C (C7): Prune any local unacked (`server_acked = 0`) shred marks targeting keys
+            // now live on ACTIVE blocks/buffers (e.g. offline DELETE revived by remote Update-Wins)!
+            let cancelled_unacked = self.cancel_active_unacked_shred_marks_in_tx()?;
+            if cancelled_unacked > 0 {
+                summary.trash_changed = true;
+            }
+
+            // Step D: Reconcile local outbox against newly received shred marks & imminent shreds BEFORE
+            // nullifying key_record so offline Tier 1 edits rekey & Tier 2 edits save mnw1!
+            if marks_changed || !shred_keys_to_execute.is_empty() {
+                let imminent: BTreeSet<KeyId> = shred_keys_to_execute.keys().copied().collect();
+                let (rekey_ops, rekeyed_t1) = self.reconcile_outbox_with_imminent_shreds(&imminent)?;
+                if !rekey_ops.is_empty() {
+                    summary.needs_vault_rekey.extend(rekey_ops);
+                }
+                summary.rekeyed_tier1_ops += rekeyed_t1;
+            }
+
+            // Step E (C3): Execute server-confirmed key shreds with INV-KEY-LIVENESS guard, AND sweep
+            // any previously deferred `shred_marks.state = 'executed'` rows whose key is now eligible!
+            let mut shredded_now: BTreeSet<KeyId> = BTreeSet::new();
+            for (kid, meta) in shred_keys_to_execute {
+                if self.execute_shred_in_tx(kid, meta)? {
+                    shredded_now.insert(kid);
+                }
+            }
+            for kid in self.sweep_unexecuted_shreds_in_tx()? {
+                shredded_now.insert(kid);
+            }
+            if !shredded_now.is_empty() {
+                summary.trash_changed = true;
+                for kid in &shredded_now {
+                    summary.executed_shreds.push(kid.to_string());
+                }
+                // Step F: Rematerialize entities referencing freshly shredded keys (O(affected))
+                let mut post_bufs = BTreeSet::new();
+                let mut post_blks = BTreeSet::new();
+                collect_entities_for_keys(&self.conn, &shredded_now, &mut post_bufs, &mut post_blks);
+                let kt = self.load_key_table()?;
+                for buf_id in post_bufs {
+                    if let Ok(m) = self.rematerialize_buffer_with_kt(buf_id, &kt) {
+                        if m.state == BlockState::Active {
+                            upserted_bufs.insert(buf_id.to_string());
+                            deleted_bufs.remove(&buf_id.to_string());
+                        } else {
+                            deleted_bufs.insert(buf_id.to_string());
+                            upserted_bufs.remove(&buf_id.to_string());
+                        }
+                    }
+                }
+                for blk_id in post_blks {
+                    if let Ok(m) = self.rematerialize_block_with_kt(blk_id, &kt) {
+                        if m.state == BlockState::Active {
+                            upserted_blks.insert(blk_id.to_string());
+                            deleted_blks.remove(&blk_id.to_string());
+                        } else {
+                            deleted_blks.insert(blk_id.to_string());
+                            upserted_blks.remove(&blk_id.to_string());
+                        }
+                    }
+                }
+            }
+
+            summary.upserted_buffer_ids = upserted_bufs.into_iter().collect();
+            summary.deleted_buffer_ids = deleted_bufs.into_iter().collect();
+            summary.upserted_block_ids = upserted_blks.into_iter().collect();
+            summary.deleted_block_ids = deleted_blks.into_iter().collect();
+            need_mirror_refresh = !summary.upserted_block_ids.is_empty()
+                || !summary.deleted_block_ids.is_empty()
+                || !summary.upserted_buffer_ids.is_empty()
+                || !summary.deleted_buffer_ids.is_empty()
+                || !summary.executed_shreds.is_empty();
             Ok(())
         })();
 
@@ -4281,7 +4885,10 @@ impl LocalStore {
             }
         }
 
-        if need_mirror_refresh {
+        if !summary.executed_shreds.is_empty() {
+            // SEC-01 / INV-SHRED-BOUND: scrub FTS5 segments, VACUUM under secure_delete=ON, truncate WAL, refresh mirror!
+            self.full_forensic_shred_scrub()?;
+        } else if need_mirror_refresh {
             self.refresh_mirror()?;
         }
         Ok(summary)
@@ -4302,6 +4909,11 @@ pub struct SyncApplySummary {
     pub trash_changed: bool,
     pub clock_skew_ms: Option<i64>,
     pub integrity_alerts: Vec<(String, String)>,
+    pub executed_shreds: Vec<String>,
+    pub needs_vault_rekey: Vec<String>,
+    pub pending_confirm_count: usize,
+    pub vault_header_changed: bool,
+    pub rekeyed_tier1_ops: usize,
 }
 
 fn collect_mna1_files(dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Result<(), CoreError> {
@@ -4431,7 +5043,7 @@ mod tests {
             .delete_block(&r1.block_id, Some(&r2.head_op_ids), "human")
             .unwrap();
         assert!(del.in_trash);
-        assert_eq!(del.shred_state, "unscheduled");
+        assert_eq!(del.shred_state, "pending_sync");
         assert!(store.search_blocks("canary", None, 20).unwrap().is_empty());
         let mirror_after_del = std::fs::read_to_string(dir.join("mirror/scratch.md")).unwrap();
         assert!(!mirror_after_del.contains("canary"));
@@ -5082,5 +5694,497 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir_src);
         let _ = std::fs::remove_dir_all(&dir_dst);
+    }
+
+    #[test]
+    fn sec_01_and_inv_shred_bound_zero_plaintext_in_db_wal_fts_mirror_and_backup() {
+        let dir = temp_dir("sec01_shred");
+        let mut store = LocalStore::open(&dir).unwrap();
+        let canary = "CANARY_SECRET_TOKEN_987654321_XYZ_FORENSIC";
+        let blk = store
+            .add_block("scratch", canary, Some("text"), None, "human", None)
+            .unwrap();
+        assert_eq!(store.search_blocks("CANARY_SECRET", None, 10).unwrap().len(), 1);
+        let mirror_before = std::fs::read_to_string(dir.join("mirror/scratch.md")).unwrap();
+        assert!(mirror_before.contains(canary));
+
+        // 1. Delete block -> enters trash & queues local pending shred mark; mirror & FTS immediately scrubbed
+        let del = store.delete_block(&blk.block_id, None, "human").unwrap();
+        assert!(del.in_trash);
+        assert_eq!(del.shred_state, "pending_sync");
+        assert!(store.search_blocks("CANARY_SECRET", None, 10).unwrap().is_empty());
+
+        let snap = store.export_engine_snapshot().unwrap();
+        assert_eq!(snap.pending_shred_marks.len(), 1);
+        let key_id = snap.pending_shred_marks[0].key_id;
+
+        // 2. Simulate server executing shred after grace period expires
+        let mut executed_mark = snap.pending_shred_marks[0].clone();
+        executed_mark.state = ShredMarkState::Executed;
+        executed_mark.executed_at_ms = Some(now_ms() as i64);
+        let summary = store
+            .apply_store_mutations(&[
+                StoreMutation::UpsertShredMark(executed_mark),
+                StoreMutation::ExecuteShred { key_id },
+            ])
+            .unwrap();
+        assert_eq!(summary.executed_shreds, vec![key_id.to_string()]);
+        assert_eq!(
+            store.get_block(&blk.block_id).unwrap_err().code(),
+            ErrorCode::KeyShredded
+        );
+        assert!(store.list_trash().unwrap().is_empty());
+
+        // 3. Create fresh backup AFTER shred & drop store so WAL/SHM flush cleanly
+        let post_shred_backup = store.create_auto_backup("post-shred").unwrap();
+        drop(store);
+
+        // 4. Forensic raw-byte scan across mynote.db, .db-wal, .db-shm, mirror, and post-shred backup!
+        let needle = canary.as_bytes();
+        let mut scan_paths = vec![
+            dir.join("mynote.db"),
+            dir.join("mynote.db-wal"),
+            dir.join("mynote.db-shm"),
+            dir.join("mirror/scratch.md"),
+            post_shred_backup,
+        ];
+        for path in scan_paths.drain(..) {
+            if path.exists() {
+                let bytes = std::fs::read(&path).unwrap();
+                assert!(
+                    !bytes.windows(needle.len()).any(|w| w == needle),
+                    "SEC-01 / INV-SHRED-BOUND VIOLATION: canary found in {}",
+                    path.display()
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vault_tier2_roundtrip_rekey_blocked_op_and_recovery_drill_includes_vkek() {
+        use mynote_core::ids::VkekKid;
+        use mynote_core::vault::{create_vault_header, unlock_vault_with_passphrase};
+
+        let dir = temp_dir("vault_t2_store");
+        let mut store = LocalStore::open(&dir).unwrap();
+        let words = store
+            .initial_recovery_words
+            .clone()
+            .expect("24 words on first init");
+        let rpk = store.recovery_pk().unwrap();
+
+        // 1. Create VaultHeaderV1 + persist in key_material
+        let vkek_kid = VkekKid::from_ulid(Ulid::from_parts(1_700_000_000_000, [0x10; 10]));
+        let hdr = create_vault_header(
+            b"correct-horse-battery",
+            &rpk,
+            vkek_kid,
+            &[0x22; 32],
+            [0x11; 16],
+            [0x33; 24],
+            [0x44; 32],
+            [0x55; 24],
+            1_700_000_000_000,
+        )
+        .unwrap();
+        let hdr_bytes = rmp_serde::to_vec_named(&hdr).unwrap();
+        store.put_vault_header(1, &hdr_bytes).unwrap();
+        let fetched_hdr = store.get_vault_header().unwrap().unwrap();
+        assert_eq!(fetched_hdr.gen, 1);
+
+        // 2. Recovery drill MUST verify BOTH SMK keyring AND Vault VKEK!
+        let drill = store.recovery_drill(&words).unwrap();
+        assert!(drill.ok);
+        assert!(drill.includes_vkek);
+
+        // 3. Encrypt Tier 2 block in-memory (simulating WasmVaultSession) -> Daemon/Store NEVER sees plaintext or VKEK
+        let unlocked = unlock_vault_with_passphrase(b"correct-horse-battery", &hdr).unwrap();
+        let secret_body = "VAULT_SECRET_NEVER_ON_DISK_4242";
+        let blk_id = BlockId::from_ulid(Ulid::from_parts(1_700_000_001_000, [0xA1; 10]));
+        let op_id = OpId::from_ulid(Ulid::from_parts(1_700_000_001_001, [0xA2; 10]));
+        let key_id = KeyId::from_ulid(Ulid::from_parts(1_700_000_001_002, [0xA3; 10]));
+        let bdek = Zeroizing::new([0x77; 32]);
+        let mnb1 = encrypt_mnb1(blk_id.as_bytes(), op_id, key_id, &bdek, secret_body, [0x88; 24]).unwrap();
+        let mnw1 = unlocked.wrap_bdek(key_id, blk_id, &bdek, [0x99; 24]).unwrap();
+
+        let receipt = store
+            .add_tier2_block(
+                &blk_id.to_string(),
+                Tier2OpInput {
+                    op_id: &op_id.to_string(),
+                    key_id: &key_id.to_string(),
+                    mnb1: &mnb1,
+                    mnw1: Some(&mnw1),
+                },
+                "scratch",
+                "text",
+                None,
+                Some("prod api key"),
+                "human",
+            )
+            .unwrap();
+        assert_eq!(receipt.op_id, op_id.to_string()); // F-01: Daemon reused exact caller op_id!
+
+        // Daemon view returns ciphertext only, zero plaintext!
+        let daemon_blk = store.get_block_for_daemon(&blk_id.to_string()).unwrap();
+        assert!(daemon_blk.is_locked);
+        assert!(daemon_blk.content.is_none());
+        assert_eq!(daemon_blk.public_hint.as_deref(), Some("prod api key"));
+        assert!(daemon_blk.versions[0].mnb1_b64.is_some());
+        assert!(daemon_blk.versions[0].mnw1_b64.is_some());
+
+        // 4. Simulate remote shred execution while local Tier 2 op is still unpushed -> NEEDS_VAULT_REKEY!
+        let exec_mark = mynote_core::model::ShredMarkRow {
+            mark_id: mynote_core::ids::MarkId::from_ulid(Ulid::from_parts(1_700_000_002_000, [0xB1; 10])),
+            key_id,
+            seen_seq: 1,
+            requested_by: DeviceId::from_random_bytes([0xCC; 10]),
+            requested_at_ms: 1_700_000_002_000,
+            grace_ms: mynote_core::vault::T_GRACE_DEFAULT_MS,
+            not_before_ms: Some(1_700_000_002_000),
+            state: ShredMarkState::Executed,
+            confirmed_at_ms: None,
+            cancelled_by: None,
+            executed_at_ms: Some(1_700_000_002_000),
+        };
+        let sum = store
+            .apply_store_mutations(&[
+                StoreMutation::UpsertShredMark(exec_mark),
+                StoreMutation::ExecuteShred { key_id },
+            ])
+            .unwrap();
+        assert_eq!(sum.needs_vault_rekey, vec![op_id.to_string()]);
+        let blocked = store.list_blocked_tier2_ops().unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].op_id, op_id.to_string());
+        assert!(blocked[0].mnw1_b64.is_some()); // Saved mnw1 before shred so UI can rescue it!
+
+        // 5. Rekey blocked Tier 2 op on fresh key -> unblocks and becomes active again!
+        let new_op = OpId::from_ulid(Ulid::from_parts(1_700_000_003_000, [0xD1; 10]));
+        let new_key = KeyId::from_ulid(Ulid::from_parts(1_700_000_003_001, [0xD2; 10]));
+        let new_bdek = Zeroizing::new([0x66; 32]);
+        let new_mnb1 = encrypt_mnb1(
+            blk_id.as_bytes(),
+            new_op,
+            new_key,
+            &new_bdek,
+            secret_body,
+            [0x55; 24],
+        )
+        .unwrap();
+        let new_mnw1 = unlocked
+            .wrap_bdek(new_key, blk_id, &new_bdek, [0x44; 24])
+            .unwrap();
+        store
+            .rekey_blocked_tier2_op(
+                &op_id.to_string(),
+                Tier2OpInput {
+                    op_id: &new_op.to_string(),
+                    key_id: &new_key.to_string(),
+                    mnb1: &new_mnb1,
+                    mnw1: Some(&new_mnw1),
+                },
+                "human",
+            )
+            .unwrap();
+        assert!(store.list_blocked_tier2_ops().unwrap().is_empty());
+
+        // 6. Verify ZERO plaintext on disk in SQLite or mirror!
+        drop(store);
+        let needle = secret_body.as_bytes();
+        for rel in ["mynote.db", "mynote.db-wal", "mirror/scratch.md"] {
+            let p = dir.join(rel);
+            if p.exists() {
+                let bytes = std::fs::read(&p).unwrap();
+                assert!(!bytes.windows(needle.len()).any(|w| w == needle));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pr38_store_regressions_c2_c3_c5_c7_c8_h6_h8_h9() {
+        use mynote_core::crypto::{
+            encode_mna1, encode_mnks, ArchiveOpsHeaderV1, ArchivedOpRow, KeySnapshotBodyV1,
+            KeySnapshotHeaderV1,
+        };
+        use mynote_core::ids::{MarkId, VkekKid};
+        use mynote_core::model::{KeyRecordRow, ShredMarkRow};
+        use mynote_core::sync::{ShredResultDto, StoreMutation};
+        use mynote_core::vault::{create_vault_header, T_GRACE_DEFAULT_MS};
+
+        let dir = temp_dir("pr38_store_regs");
+        let mut store = LocalStore::open(&dir).unwrap();
+        let words = store.initial_recovery_words.clone().unwrap();
+        let rpk = store.recovery_pk().unwrap();
+
+        // --- C2: New device receiving unseen shredded key (key_record: None) + UpsertShredMark must NOT fail FK! ---
+        let unseen_kid = KeyId::from_ulid(Ulid::from_parts(1_710_000_000_001, [0xE1; 10]));
+        let unseen_mid = MarkId::from_ulid(Ulid::from_parts(1_710_000_000_002, [0xE2; 10]));
+        store
+            .apply_store_mutations(&[
+                StoreMutation::UpsertBlockKey(KeyRecordRow {
+                    key_id: unseen_kid,
+                    wrap_gen: 1,
+                    key_record: None,
+                    created_at_ms: 1_710_000_000_000,
+                }),
+                StoreMutation::UpsertShredMark(ShredMarkRow {
+                    mark_id: unseen_mid,
+                    key_id: unseen_kid,
+                    seen_seq: 1,
+                    requested_by: DeviceId::from_random_bytes([0xEE; 10]),
+                    requested_at_ms: 1_710_000_000_000,
+                    grace_ms: T_GRACE_DEFAULT_MS,
+                    not_before_ms: Some(1_710_000_000_000),
+                    state: ShredMarkState::Executed,
+                    confirmed_at_ms: None,
+                    cancelled_by: None,
+                    executed_at_ms: Some(1_710_000_000_000),
+                }),
+            ])
+            .expect("C2: unseen shredded key + shred_mark must succeed without FK error");
+
+        // --- C8: collect_trash_action_keys("expedite") MUST ignore ACTIVE blocks and pending_confirm trashed blocks ---
+        let active_blk = store
+            .add_block("scratch", "still active!", Some("text"), None, "human", None)
+            .unwrap();
+        let (exp_ids, exp_keys, _) = store
+            .collect_trash_action_keys("expedite", Some(std::slice::from_ref(&active_blk.block_id)))
+            .unwrap();
+        assert!(
+            exp_ids.is_empty() && exp_keys.is_empty(),
+            "C8: active block must never be expedited"
+        );
+
+        // Delete a block and mark its key pending_confirm (server_acked=1) -> expedite MUST exclude it, confirm_pending includes it
+        let trash_blk = store
+            .add_block("scratch", "pending trash", Some("text"), None, "human", None)
+            .unwrap();
+        let trash_kid = store
+            .collect_entity_unshredded_key_ids(EntityType::Block, &trash_blk.block_id)
+            .unwrap()[0];
+        let _ = store
+            .delete_block(&trash_blk.block_id, Some(&trash_blk.head_op_ids), "human")
+            .unwrap();
+        store
+            .apply_store_mutations(&[StoreMutation::UpsertShredMark(ShredMarkRow {
+                mark_id: MarkId::from_ulid(Ulid::from_parts(1_710_000_010_000, [0xA1; 10])),
+                key_id: trash_kid,
+                seen_seq: 1,
+                requested_by: store.device_id().clone(),
+                requested_at_ms: 1_710_000_010_000,
+                grace_ms: T_GRACE_DEFAULT_MS,
+                not_before_ms: None,
+                state: ShredMarkState::PendingConfirm,
+                confirmed_at_ms: None,
+                cancelled_by: None,
+                executed_at_ms: None,
+            })])
+            .unwrap();
+        let (_, exp_k2, _) = store
+            .collect_trash_action_keys("expedite", Some(std::slice::from_ref(&trash_blk.block_id)))
+            .unwrap();
+        assert!(
+            exp_k2.is_empty(),
+            "C8: pending_confirm block must not be expedited"
+        );
+        let (_, conf_k, _) = store
+            .collect_trash_action_keys("confirm_pending", Some(std::slice::from_ref(&trash_blk.block_id)))
+            .unwrap();
+        assert_eq!(conf_k, vec![trash_kid]);
+
+        // --- C3 Path C: MarkShredMarksAcked(Executed) MUST physically nullify block_keys.key_record on disk! ---
+        store
+            .apply_store_mutations(&[StoreMutation::MarkShredMarksAcked {
+                results: vec![ShredResultDto {
+                    key_id: trash_kid,
+                    state: ShredMarkState::Executed,
+                    not_before_ms: None,
+                }],
+                cancelled_keys: vec![],
+            }])
+            .unwrap();
+        let raw_krec: Option<Vec<u8>> = store
+            .conn
+            .query_row(
+                "SELECT key_record FROM block_keys WHERE key_id = ?1",
+                [trash_kid.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            raw_krec.is_none(),
+            "C3 Path C: MarkShredMarksAcked(Executed) must physically wipe key_record"
+        );
+
+        // --- C5: purge_block_history MUST reject unreadable blocks (KeyMissing) instead of overwriting with "" ---
+        let unread_blk = store
+            .add_block("scratch", "about to lose key", Some("text"), None, "human", None)
+            .unwrap();
+        let unread_kid = store
+            .collect_entity_unshredded_key_ids(EntityType::Block, &unread_blk.block_id)
+            .unwrap()[0];
+        // Remove key row locally to simulate missing/unarrived key on an ACTIVE block (shredded=false)
+        store
+            .conn
+            .execute(
+                "DELETE FROM block_keys WHERE key_id = ?1",
+                [unread_kid.to_string()],
+            )
+            .unwrap();
+        store
+            .rematerialize_block(BlockId::parse(&unread_blk.block_id).unwrap())
+            .unwrap();
+        // H9: key_self_check MUST now report ok == false with unread_kid!
+        let (self_ok, self_missing) = store.key_self_check().unwrap();
+        assert!(
+            !self_ok && self_missing.contains(&unread_kid),
+            "H9: key_self_check must fail on unreadable active block (ok={self_ok}, missing={self_missing:?})"
+        );
+        let purge_err = store
+            .purge_block_history(
+                &unread_blk.block_id,
+                Some(&unread_blk.head_op_ids),
+                None,
+                T_GRACE_DEFAULT_MS,
+                "human",
+            )
+            .unwrap_err();
+        assert_eq!(
+            purge_err.code(),
+            ErrorCode::KeyMissing,
+            "C5: purge_block_history must refuse unreadable block"
+        );
+
+        // --- H9: create_auto_backup updates last_local_backup_ms ---
+        let backup_path = store.create_auto_backup("h9-test").unwrap();
+        assert!(backup_path.exists());
+        assert!(store.sync_status().unwrap().last_local_backup_ms.is_some());
+
+        // --- H8: Multi-op offline retiring chain (Create -> Update) collapses into single rekeyed Create preserving metadata ---
+        let chain_blk = store
+            .add_block("scratch", "chain v1", Some("json"), None, "human", None)
+            .unwrap();
+        let chain_upd = store
+            .update_block(
+                &chain_blk.block_id,
+                "chain v2 final",
+                &chain_blk.head_op_ids,
+                false,
+                "human",
+            )
+            .unwrap();
+        let old_chain_kid = store
+            .collect_entity_unshredded_key_ids(EntityType::Block, &chain_blk.block_id)
+            .unwrap()[0];
+        let (_, rekeyed_cnt) = store
+            .apply_store_mutations(&[StoreMutation::UpsertShredMark(ShredMarkRow {
+                mark_id: MarkId::from_ulid(Ulid::from_parts(1_710_000_020_000, [0xC1; 10])),
+                key_id: old_chain_kid,
+                seen_seq: 1,
+                requested_by: DeviceId::from_random_bytes([0xDD; 10]),
+                requested_at_ms: 1_710_000_020_000,
+                grace_ms: T_GRACE_DEFAULT_MS,
+                not_before_ms: Some(1_710_000_020_000 + T_GRACE_DEFAULT_MS),
+                state: ShredMarkState::Scheduled,
+                confirmed_at_ms: None,
+                cancelled_by: None,
+                executed_at_ms: None,
+            })])
+            .map(|s| (s.needs_vault_rekey, s.rekeyed_tier1_ops))
+            .unwrap();
+        assert_eq!(
+            rekeyed_cnt, 1,
+            "H8: multi-op offline chain must collapse into 1 rekeyed Create"
+        );
+        let after_chain = store.get_block(&chain_blk.block_id).unwrap();
+        assert_eq!(after_chain.content.as_deref(), Some("chain v2 final"));
+        assert_eq!(after_chain.lang, "json");
+        assert_ne!(after_chain.head_op_ids, chain_upd.head_op_ids);
+
+        // --- H6: restore_from_archive_dir restores VaultHeaderV1 and shred_marks ---
+        let vkek_kid = VkekKid::from_ulid(Ulid::from_parts(1_710_000_030_000, [0xF1; 10]));
+        let vh = create_vault_header(
+            b"archive-vault-pass",
+            &rpk,
+            vkek_kid,
+            &[0x33; 32],
+            [0x12; 16],
+            [0x13; 24],
+            [0x14; 32],
+            [0x15; 24],
+            1_710_000_030_000,
+        )
+        .unwrap();
+        let vh_bytes = rmp_serde::to_vec_named(&vh).unwrap();
+        store.put_vault_header(vh.updated_at_ms, &vh_bytes).unwrap();
+
+        let archive_dir = temp_dir("pr38_archive_h6");
+        std::fs::create_dir_all(archive_dir.join("ops/ep1")).unwrap();
+        std::fs::create_dir_all(archive_dir.join("keys")).unwrap();
+        let snap = store.export_engine_snapshot().unwrap();
+        let rows: Vec<ArchivedOpRow> = snap
+            .ops
+            .values()
+            .enumerate()
+            .map(|(i, o)| ArchivedOpRow {
+                seq: (i + 1) as i64,
+                op_id: o.op_id,
+                key_id: o.key_id,
+                device_id: o.device_id.clone(),
+                created_at: o.created_at_ms,
+                envelope: o.envelope.clone(),
+            })
+            .collect();
+        let mna1 = encode_mna1(
+            &ArchiveOpsHeaderV1 {
+                journal_epoch: JournalEpoch::from_random_bytes([0xAB; 16]),
+                from_seq: 1,
+                to_seq: rows.len() as i64,
+                row_count: rows.len() as u32,
+                created_at_ms: 1_710_000_030_000,
+            },
+            &rows,
+        )
+        .unwrap();
+        std::fs::write(archive_dir.join("ops/ep1/000000000001-000000000010.mna1"), mna1).unwrap();
+        let kr = store.current_keyring().unwrap();
+        let recs: Vec<KeyRecordRow> = snap.keys.records.values().cloned().collect();
+        let marks: Vec<ShredMarkRow> = snap.keys.marks.values().cloned().collect();
+        let mnks = encode_mnks(
+            &KeySnapshotHeaderV1 {
+                created_at_ms: 1_710_000_030_000,
+                keyring_gen: kr.keyring_gen,
+                record_count: recs.len() as u32,
+            },
+            &KeySnapshotBodyV1 {
+                keyring: kr,
+                vault_header: Some(vh),
+                records: recs,
+                marks,
+            },
+        )
+        .unwrap();
+        std::fs::write(archive_dir.join("keys/latest.mnks"), mnks).unwrap();
+
+        let restore_dir = temp_dir("pr38_restore_h6");
+        let _summary =
+            LocalStore::restore_from_archive_dir(&archive_dir, &words, &restore_dir, false).unwrap();
+        let restored = LocalStore::open(&restore_dir).unwrap();
+        assert!(
+            restored.get_vault_header().unwrap().is_some(),
+            "H6: restored store must contain VaultHeaderV1 from latest.mnks"
+        );
+        let restored_marks = restored.load_shred_marks(true).unwrap();
+        assert!(
+            restored_marks.iter().any(|m| m.mark_id == unseen_mid),
+            "H6: restored store must contain shred_marks from latest.mnks"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&archive_dir);
+        let _ = std::fs::remove_dir_all(&restore_dir);
     }
 }

@@ -147,7 +147,10 @@ where
     let (lang_hlc, _, lang_val) = lang?;
     let (hint_hlc, hint_val) = match public_hint {
         Some((h, _, v)) => (h, v),
-        None => (buf_hlc.clone(), None),
+        None => (
+            Hlc::new(0, 0, DeviceId::parse("dev_00000000").expect("valid zero dev id")),
+            None,
+        ),
     };
 
     // 4. Live leaves, Update-Wins state, locked rendering (no Lock-Wins special case), display_op_id

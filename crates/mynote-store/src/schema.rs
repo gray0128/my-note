@@ -230,6 +230,7 @@ pub fn init_connection(conn: &Connection, backups_dir: Option<&Path>) -> Result<
                 })?;
                 let snap = dir.join(format!("mynote-pre-schema-v{existing_ver}.db"));
                 vacuum_into(conn, &snap)?;
+                prune_pre_schema_backups(dir, 2);
             }
         }
     }
@@ -310,4 +311,32 @@ pub fn vacuum_into(conn: &Connection, dest: &Path) -> Result<(), CoreError> {
         })?;
     }
     Ok(())
+}
+
+/// Keep at most `keep_latest` `mynote-pre-schema-v*.db` files in `dir` so shredded data does not
+/// linger indefinitely in ancient schema-migration backups (`docs/threat-model.md` §2.3, H9).
+fn prune_pre_schema_backups(dir: &Path, keep_latest: usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<(u64, std::path::PathBuf)> = Vec::new();
+    for ent in rd.flatten() {
+        let p = ent.path();
+        if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+            if let Some(rest) = name.strip_prefix("mynote-pre-schema-v") {
+                if let Some(ver_s) = rest.strip_suffix(".db") {
+                    if let Ok(ver) = ver_s.parse::<u64>() {
+                        entries.push((ver, p));
+                    }
+                }
+            }
+        }
+    }
+    if entries.len() <= keep_latest {
+        return;
+    }
+    entries.sort_by_key(|a| std::cmp::Reverse(a.0));
+    for (_, old_path) in entries.into_iter().skip(keep_latest) {
+        let _ = std::fs::remove_file(old_path);
+    }
 }

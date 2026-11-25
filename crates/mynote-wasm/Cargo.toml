@@ -7,5 +7,19 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["desktop", "pwa"]
+desktop = ["mynote-core/layer1-format"]
+pwa = []
+
 [dependencies]
-mynote-core = { path = "../mynote-core" }
+base64.workspace = true
+mynote-core = { path = "../mynote-core", default-features = false }
+rmp-serde.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen = "0.2.130"
+zeroize.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom.workspace = true

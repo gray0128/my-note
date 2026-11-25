@@ -443,22 +443,29 @@ pub enum SyncCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum VaultCommand {
-    /// Initialize Tier 2 Vault VKEK (TTY required; M2)
+    /// Initialize Tier 2 Vault VKEK with Argon2id passphrase and 24-word recovery backup (TTY required)
     Init,
-    /// Lock a block into Tier 2 Vault (TTY required; M2)
+    /// Lock an active block into Tier 2 Vault (TTY required)
     Lock {
         id: String,
         #[arg(long)]
         hint: Option<String>,
+        #[arg(long = "expected-head", value_name = "OP_ID")]
+        expected_heads: Vec<String>,
     },
-    /// Unlock a Tier 2 Vault block back to Tier 1 (TTY required; M2)
+    /// Unlock a Tier 2 Vault block back to Tier 1 (TTY required)
     Unlock {
         id: String,
         #[arg(long)]
         shred_old_key: bool,
+        #[arg(long = "expected-head", value_name = "OP_ID")]
+        expected_heads: Vec<String>,
     },
-    /// Change Vault passphrase (TTY required; M2)
-    Passwd,
+    /// Change Vault passphrase (use --recover to reset via 24-word recovery bundle; TTY required)
+    Passwd {
+        #[arg(long)]
+        recover: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

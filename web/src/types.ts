@@ -74,12 +74,45 @@ export interface SyncStatusDto {
   last_local_backup_ms: number | null;
 }
 
+export interface VaultHeaderDto {
+  gen: number;
+  blob_b64: string;
+  updated_at_ms: number;
+}
+
+export interface BlockedTier2OpDto {
+  op_id: string;
+  block_id: string;
+  buffer_id: string;
+  lang: string;
+  public_hint: string | null;
+  old_key_id: string;
+  reason: string;
+  mnb1_b64: string;
+  mnw1_b64: string | null;
+  head_op_ids: string[];
+}
+
+export interface TrashActionPrepareResponse {
+  confirm_nonce: string;
+  expires_in_ms: number;
+  summary: {
+    action: "expedite" | "confirm_pending" | "purge_history";
+    block_count: number;
+    key_count: number;
+    grace_ms: number;
+    earliest_not_before_ms: number | null;
+  };
+}
+
 export interface BootstrapResponse {
   buffers: BufferDto[];
   initial_buffer_id: string | null;
   blocks: BlockDto[];
   sync_status: SyncStatusDto;
-  vault_header: unknown | null;
+  vault_header: VaultHeaderDto | null;
+  recovery_pk_b64?: string | null;
+  blocked_tier2_ops?: BlockedTier2OpDto[];
   trash_count: number;
   device_id: string;
   last_hlc: string | null;
@@ -111,4 +144,6 @@ export type LocalWsFrame =
   | { type: "buffers_changed"; upserted: BufferDto[]; deleted_ids: string[] }
   | { type: "trash_changed"; count: number; pending_confirm_count: number; next_shred_ms: number | null }
   | { type: "sync_status"; state: SyncStateLabel; last_seq: number; pending_ops?: number }
+  | { type: "vault_header_changed"; vault_header: VaultHeaderDto }
   | AlertFrame;
+
