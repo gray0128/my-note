@@ -1,3 +1,4 @@
 fn main() {
-    println!("mynote CLI skeleton");
+    let code = mynote_cli::run();
+    std::process::exit(code);
 }

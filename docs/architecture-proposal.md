@@ -741,14 +741,14 @@ flowchart LR
 - **产出**：4 份一页报告位于 `docs/spikes/s0-*.md`；§8 中已获完整实测证据的 ADR 已升级为 `Accepted`。
 
 ### M1：替换 Heynote + iCloud
-- [ ] **core**：块、全量载荷 op、在完整因果图 `G(b)` 上求叶子、多叶子并列 + 手动合并、字段 LWW、Update-Wins（[`sync-protocol.md`](./sync-protocol.md)）。
-- [ ] **每块数据密钥 BDEK + 信封带 `key_id` + 独立密钥表 `block_keys` / `key_material`（D2′ 不可逆线格式，必须在 M1 定型，服务端仅校验 `KEY_UNKNOWN`）**；删除走纯软删回收站（写 `DELETE` 墓碑 op，`shred_state = "unscheduled"`，随时可 `trash restore`，M1 4 周观察期内物理零删钥路径）。
-- [ ] SQLite 存储；CLI：`add` / `ls` / `block` / `buf` / `trash` / `search` / `format`（Layer 1）/ `sync` / `device` / `keyring` / `recovery` / `restore`；最小可用 UI；Heynote 导入。
+- [x] **core**：块、全量载荷 op、在完整因果图 `G(b)` 上求叶子、多叶子并列 + 手动合并、字段 LWW、Update-Wins（`crates/mynote-core`，见 [`sync-protocol.md`](./sync-protocol.md)）。
+- [x] **每块数据密钥 BDEK + 信封带 `key_id` + 独立密钥表 `block_keys` / `key_material`（D2′ 不可逆线格式，已在 M1 Day-1 定型，服务端仅校验 `KEY_UNKNOWN`）**；删除走纯软删回收站（写 `DELETE` 墓碑 op，`shred_state = "unscheduled"`，随时可 `trash restore`，M1 4 周观察期内物理零删钥路径）。
+- [ ] SQLite 存储；CLI：`add` / `ls` / `block` / `buf` / `trash` / `search` / `format`（Layer 1）/ `sync` / `device` / `keyring` / `recovery` / `restore`；最小可用 UI；Heynote 导入。（*进度：SQLite 存储 `mynote-store`、完整 `mynote` CLI + `skill/SKILL.md`、Layer 1/2 格式化与 Heynote 导入已完成并绿灯；待本地 Daemon 与最小可用桌面 UI*）
 - [ ] **macOS Tauri 壳 + 全局热键；Omarchy 用 Hyprland 键绑定唤出 / 聚焦 Chromium webapp**；两端加载同一份前端资源。
-- [ ] Tier 1 E2EE 同步到 CF DO：push / pull / `/v1/keys` / `BOOTSTRAP_TOKEN` 首台引导 / 一次性配对与刷新 / epoch / WebSocket 唤醒（只发通知），**无手机快照、无 GC、云端代码 < 500 行 [目标]**。
-- [ ] R2 每日 op 密文归档（永久、只追加）+ 密钥表快照（每日覆写、不挂过期删除的 `latest.mnks` + 30 天生命周期的 `history/<yyyy-mm-dd>.mnks`）+ 纯离线 `mynote restore --from-archive <local-dir>`；本地 `VACUUM INTO` 自动备份（按 `T_snap` 轮换）+ 只读 Markdown 镜像（默认开启）。
-- [ ] 统一恢复包 + 恢复密钥环（公钥封装追加、旧 SMK 代际永久保留）+ `mynote recovery drill` + INV-RECOVERY + INV-KEY-LIVENESS + 密钥每日自检。
-- [ ] 质量门禁（[`eval-framework.md`](./eval-framework.md)）：属性测试、同步核心 DST、针对真实 Worker 的契约测试、CLI 黄金测试、macOS + Linux 双平台 CI；部署时配置 Spend Management 支出告警。
+- [ ] Tier 1 E2EE 同步到 CF DO：push / pull / `/v1/keys` / `BOOTSTRAP_TOKEN` 首台引导 / 一次性配对与刷新 / epoch / WebSocket 唤醒（只发通知），**无手机快照、无 GC、云端代码 < 500 行 [目标]**。（*进度：S0-4 `workerd` 原型已验证 `297 LOC` [已测]；待正式 `cloud-cf/` 落地*）
+- [ ] R2 每日 op 密文归档（永久、只追加）+ 密钥表快照（每日覆写、不挂过期删除的 `latest.mnks` + 30 天生命周期的 `history/<yyyy-mm-dd>.mnks`）+ 纯离线 `mynote restore --from-archive <local-dir>`；本地 `VACUUM INTO` 自动备份（按 `T_snap` 轮换）+ 只读 Markdown 镜像（默认开启）。（*进度：本地离线 `restore --from-archive`、`VACUUM INTO` 备份与只读 Markdown 镜像已完成；待云端 `cloud-cf/` 每日归档任务部署*）
+- [x] 统一恢复包 + 恢复密钥环（公钥封装追加、旧 SMK 代际永久保留）+ `mynote recovery drill` + INV-RECOVERY + INV-KEY-LIVENESS + 密钥每日自检。
+- [ ] 质量门禁（[`eval-framework.md`](./eval-framework.md)）：属性测试、同步核心 DST、针对真实 Worker 的契约测试、CLI 黄金测试、macOS + Linux 双平台 CI；部署时配置 Spend Management 支出告警。（*进度：属性测试、200 种子 DST + 回归种子集、`INV-RECOVERY`、CLI `G01–G11` 合约测试与双平台 CI `.github/workflows/ci.yml` 已就绪；待正式 `cloud-cf/` Worker 契约测试、独立 `[eval-only]` 黄金快照与 Spend Management 配置*）
 - **准出条件**：上述门禁全部通过；热键唤出实测 < 100 ms；Mac 与 Omarchy 日常使用 4 周零丢数；Heynote 卸载。
 
 ### M2：手机只读 + Vault + 碎纸
@@ -787,16 +787,16 @@ flowchart LR
 
 | # | 决策项 | 结论 | 依据 | 状态（证据链接） |
 | --- | --- | --- | --- | --- |
-| ADR-01 | **核心状态机与存储** | Rust Sans-I/O `mynote-core`（WASM 侧采用纯 Rust `ruzstd` + 关闭 `x25519` 预计算表）；桌面 `rusqlite`（SQLite 单写入方）；手机 IndexedDB 仅作只读缓存 | §6.1、D1 | **Accepted**（[`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md)：手机 `71.5 KiB` / 桌面全功能 `260.4 KiB` gzip [已测]） |
+| ADR-01 | **核心状态机与存储** | Rust Sans-I/O `mynote-core`（WASM 侧采用纯 Rust `ruzstd` + 关闭 `x25519` 预计算表）；桌面 `rusqlite`（SQLite 单写入方）；手机 IndexedDB 仅作只读缓存 | §6.1、D1 | **Accepted**（[`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md)：手机 `71.5 KiB` / 桌面全功能 `260.4 KiB` gzip [已测]；`mynote-core` + `mynote-store` 绿灯） |
 | ADR-02 | **云端基础设施** | Cloudflare **Workers Paid**（约 \$5/月 [估算]）：单 Worker + SQLite DO + R2 + Static Assets；服务端极薄（幂等追加、分配 seq、按 seq 分页、epoch、令牌范围、WebSocket 唤醒、密钥表 / `key_material` / 碎纸标记存储 + 宽限期 / 批量阈值校验 + alarm 置空、每日归档，不暴露云端归档 HTTP 路由）；配置支出告警 | D4、F-12 | Proposed（[`s0-4-cloudflare-relay.md`](./spikes/s0-4-cloudflare-relay.md)：`workerd` 3/3 绿灯、`297 LOC` [已测]；待真实 CF 账号补测 Spend Management） |
-| ADR-03 | **同步协议（路径 γ）** | 全量载荷 op；在完整因果图 `G(b)` 上求叶子，冲突 = 同块多存活叶子，并列展示 + 手动合并；HLC 只决定展示顺序；字段 LWW；Update-Wins；无 `SPAN_PATCH` / Lock-Wins / GC / 快照 CAS | D3 | Proposed（M1：DST + 属性测试 + 4 周实测） |
-| ADR-04 | **加密与密钥** | 每块 BDEK，信封只带 `key_id`；独立密钥表 `block_keys` + `key_material` + `shred_marks`（2P-Set）；统一恢复包 → Root Seed → X25519 恢复密钥对（设备只存公钥，SMK 代际 / VKEK 封装追加，旧 SMK 代际永久保留）；AAD 只在 `data-structures.md` 定义 | D2′、F-01、F-05 | Proposed（[`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md) 已验 `ruzstd`↔`zstd` 帧兼容；待 M1 INV-RECOVERY / INV-KEY-LIVENESS） |
+| ADR-03 | **同步协议（路径 γ）** | 全量载荷 op；在完整因果图 `G(b)` 上求叶子，冲突 = 同块多存活叶子，并列展示 + 手动合并；HLC 只决定展示顺序；字段 LWW；Update-Wins；无 `SPAN_PATCH` / Lock-Wins / GC / 快照 CAS | D3 | Proposed（`mynote-core` 200 种子 DST + 回归种子集 + 属性测试绿灯 [已测]；待 M1 4 周真机实测） |
+| ADR-04 | **加密与密钥** | 每块 BDEK，信封只带 `key_id`；独立密钥表 `block_keys` + `key_material` + `shred_marks`（2P-Set）；统一恢复包 → Root Seed → X25519 恢复密钥对（设备只存公钥，SMK 代际 / VKEK 封装追加，旧 SMK 代际永久保留）；AAD 只在 `data-structures.md` 定义 | D2′、F-01、F-05 | Proposed（[`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md) + `INV-RECOVERY` / `INV-KEY-LIVENESS` / `SEC-04` 绿灯 [已测]；待真机联调闭环） |
 | ADR-05 | **删除语义** | 删除优先、有界时延：M1 软删回收站，M2 启用服务端强制宽限期（`T_grace` = 7 天）+ 加密碎纸（仅服务端 `executed` 触发本地删钥）；彻底不可恢复上界约 37 天；op 密文永久保留 | D2′、Q7–Q9 | Proposed（[`s0-4-cloudflare-relay.md`](./spikes/s0-4-cloudflare-relay.md)：DO alarm 置空 `workerd` [已测]；待真账号 R2 生命周期 & M2 INV-SHRED-BOUND / INV-GRACE） |
 | ADR-06 | **平台形态** | macOS：Tauri 壳 + 全局热键（M1 必备）；Omarchy：Hyprland 绑定 Chromium webapp；手机：只读 PWA + Vault 解锁；本地 UI 统一 `http://localhost:<port>` | D1、D5、D7、F-15 | Proposed（待真机补测：[`s0-2-macos-tauri-shell.md`](./spikes/s0-2-macos-tauri-shell.md) 热键/Keychain、[`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md) iPhone Argon2id） |
 | ADR-07 | **编辑器与渲染** | CodeMirror 6 **候选 A：视口虚拟化 + 按源码块独立挂载 `EditorView`** + Markdown 双模 + `Pele` 纯 SVG | F-11 | **Accepted**（[`s0-1-editor-architecture.md`](./spikes/s0-1-editor-architecture.md)：200 块虚拟化挂载 `31.7 ms`、打字 P50 `7.30 ms`、`266 LOC`，Vim `dG` 物理隔离 [已测]） |
-| ADR-08 | **Agent 集成** | 纯 CLI（Daemon 运行时 UDS `apply` / 未起时直写 WAL）+ 极轻 `SKILL.md`（L0–L3a，`--help-json` 推迟）；不做本地与云端 MCP；CLI 只能把块删进回收站 | §5.5、D2′ | Proposed（M1：CLI 黄金测试） |
-| ADR-09 | **分发与升级** | Homebrew tap / AUR / `cargo install`，二进制装在用户不可写位置；不做自升级；Schema 迁移前 `VACUUM INTO` 备份 | F-14、F-07 | Proposed |
-| ADR-10 | **质量保障** | 只保留 Plane A 确定性门禁（属性测试、DST、真实 Worker 契约测试、INV-RECOVERY、SEC 取证、格式化幂等、CLI 黄金测试、双平台 CI） | D6 | Proposed（M1） |
+| ADR-08 | **Agent 集成** | 纯 CLI（Daemon 运行时 UDS `apply` / 未起时直写 WAL）+ 极轻 `SKILL.md`（L0–L3a，`--help-json` 推迟）；不做本地与云端 MCP；CLI 只能把块删进回收站 | §5.5、D2′ | Proposed（`mynote-cli` + `skill/SKILL.md` + `G01–G11` 合约测试绿灯 [已测]；待 UDS Daemon 联调与独立黄金快照） |
+| ADR-09 | **分发与升级** | Homebrew tap / AUR / `cargo install`，二进制装在用户不可写位置；不做自升级；Schema 迁移前 `VACUUM INTO` 备份 | F-14、F-07 | Proposed（`VACUUM INTO` 备份与 `SCHEMA_TOO_NEW` 守卫已测；待打包发布） |
+| ADR-10 | **质量保障** | 只保留 Plane A 确定性门禁（属性测试、DST、真实 Worker 契约测试、INV-RECOVERY、SEC 取证、格式化幂等、CLI 黄金测试、双平台 CI） | D6 | Proposed（双平台 CI + DST + 属性测试 + CLI 合约测试已上线；待 `cloud-cf/` 契约测试与夜间长浸泡） |
 
 ---
 

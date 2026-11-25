@@ -6,7 +6,7 @@
 
 ## 状态
 
-**设计阶段**。架构决策（ADR）均为 **Proposed**，待 **S0 技术 spike** 产出证据后逐条转为 Accepted；尚无实现代码。路线图：S0 spike → M1 替换 Heynote + iCloud → M2 手机只读 + Vault + 碎纸 → M3 渲染与打磨（详见 [`docs/architecture-proposal.md`](./docs/architecture-proposal.md) 与 [review §9.11](./review/2026-11-24-first-principles-review.md)）。
+**S0 技术 Spike（软件可测项已闭环，真机/真账号待回填）与 M1 纯领域核 / 本地存储 / Agent CLI 已落地**。`ADR-01`（Rust Sans-I/O 核 + `ruzstd` WASM）与 `ADR-07`（CodeMirror 6 候选 A 按块虚拟化）已获实测证据转为 **Accepted**，其余硬件/账号相关 ADR 诚实保持 **Proposed**（详见 [`docs/spikes/`](./docs/spikes/)）。Rust Workspace（`mynote-core`、`mynote-wasm`、`mynote-store`、`mynote-cli`）、`skill/SKILL.md`、200 种子 DST、CLI 合约测试与双平台 CI 均已就绪；开发与 Agent 协作红线见 [`AGENTS.md`](./AGENTS.md)。路线图：S0 spike → M1 替换 Heynote + iCloud → M2 手机只读 + Vault + 碎纸 → M3 渲染与打磨（详见 [`docs/architecture-proposal.md`](./docs/architecture-proposal.md) 与 [review §9.11](./review/2026-11-24-first-principles-review.md)）。
 
 ## 背景
 
