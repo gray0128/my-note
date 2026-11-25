@@ -1,20 +1,67 @@
 //! CLI command execution engine implementing `docs/interface-contracts.md` §1 & §2.
 
 use crate::cli::{
-    build_cli, AddArgs, BlockCommand, BufCommand, Cli, Commands, DeviceCommand, FormatArgs, ImportCommand,
-    KeyringCommand, LsArgs, RecoveryCommand, RestoreArgs, SearchArgs, SyncCommand, TrashCommand,
-    VaultCommand,
+    build_cli, AddArgs, BlockCommand, BufCommand, Cli, Commands, DaemonArgs, DeviceCommand, FormatArgs,
+    ImportCommand, KeyringCommand, LsArgs, RecoveryCommand, RestoreArgs, SearchArgs, SyncCommand,
+    TrashCommand, VaultCommand,
 };
+use crate::daemon::{run_daemon_foreground, DaemonConfig};
 use crate::formatters::format_content;
 use crate::help::render_topic;
 use crate::output::{emit_error, emit_json, emit_jsonl, CliMeta, OutputMode};
+use crate::sync_client::{render_terminal_qr, RelayClient};
+use crate::uds::{try_send_uds, ApplyMeta, ApplyRequest, UdsRequest, UdsResponse};
 use clap::Parser;
 use mynote_core::error::{CoreError, ErrorCode};
+use mynote_core::ids::DeviceId;
+use mynote_core::model::KeyMaterialKind;
+use mynote_core::sync::StoreMutation;
 use mynote_store::store::{DeleteReceipt, LocalStore, WriteReceipt};
 use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::PathBuf;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+fn run_async<F, T>(fut: F) -> Result<T, CoreError>
+where
+    F: std::future::Future<Output = Result<T, CoreError>>,
+{
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| CoreError::new(ErrorCode::IntegrityError, format!("tokio runtime: {e}"), "Retry"))?;
+    rt.block_on(fut)
+}
+
+fn try_daemon_apply(
+    data_dir: &Path,
+    meta: ApplyMeta,
+    request: ApplyRequest,
+    quiet: bool,
+) -> Result<Option<UdsResponse>, CoreError> {
+    let resp = try_send_uds(
+        data_dir,
+        &UdsRequest::Apply { meta, request },
+        Duration::from_secs(10),
+    )?;
+    let Some(r) = resp else {
+        return Ok(None);
+    };
+    if !quiet {
+        if let Some(ver) = &r.version {
+            if ver != env!("CARGO_PKG_VERSION") {
+                eprintln!(
+                    "warning: running mynote daemon version ({ver}) differs from CLI ({}); restart daemon",
+                    env!("CARGO_PKG_VERSION")
+                );
+            }
+        }
+    }
+    if !r.ok {
+        return Err(r.into_core_error());
+    }
+    Ok(Some(r))
+}
 
 /// Entrypoint accepting arbitrary argv (makes in-process testing ergonomic).
 pub fn run_from<I, T>(args: I) -> i32
@@ -212,18 +259,29 @@ fn execute(cli: Cli, mode: OutputMode, started: Instant) -> i32 {
         Commands::Vault { action } => {
             return handle_vault(action, non_interactive, mode, started, quiet);
         }
+        Commands::Daemon(args) => {
+            return handle_daemon(args, data_dir, mode, started, quiet);
+        }
         Commands::Open => {
-            let msg = serde_json::json!({
-                "status": "daemon_not_running",
-                "hint": "Start the local mynote daemon to open http://localhost:<port> in your browser"
-            });
-            match mode {
-                OutputMode::Json | OutputMode::Jsonl => emit_json(msg, empty_meta(started)),
-                OutputMode::Human => {
-                    println!("Desktop UI daemon is not running yet (M1-7/M1-8).");
-                }
-            }
-            return 0;
+            return handle_open(&data_dir, mode, started, quiet);
+        }
+        Commands::Device {
+            action: DeviceCommand::Claim,
+        } => {
+            return handle_device_claim(&data_dir, non_interactive, mode, started, quiet);
+        }
+        Commands::Device {
+            action: DeviceCommand::Bootstrap { url, revoke_existing },
+        } => {
+            return handle_device_bootstrap(
+                &data_dir,
+                url,
+                *revoke_existing,
+                non_interactive,
+                mode,
+                started,
+                quiet,
+            );
         }
         _ => {}
     }
@@ -245,21 +303,25 @@ fn execute(cli: Cli, mode: OutputMode, started: Instant) -> i32 {
     }
 
     let res = match cli.command {
-        Commands::Add(args) => handle_add(&mut store, args, &actor, mode, started),
+        Commands::Add(args) => handle_add(&mut store, args, &actor, mode, started, quiet),
         Commands::Ls(args) => handle_ls(&store, args, mode, started),
         Commands::Search(args) => handle_search(&store, args, mode, started),
         Commands::Block { action } => {
             handle_block(&mut store, action, &actor, non_interactive, mode, started, quiet)
         }
-        Commands::Buf { action } => handle_buf(&mut store, action, &actor, mode, started),
-        Commands::Trash { action } => handle_trash(&mut store, action, &actor, mode, started),
-        Commands::Format(args) => handle_format_block(&mut store, args, &actor, mode, started),
-        Commands::Import { source } => handle_import(&mut store, source, &actor, mode, started),
-        Commands::Sync { action } => handle_sync(&store, action, mode, started),
-        Commands::Device { action } => handle_device(action, non_interactive),
+        Commands::Buf { action } => handle_buf(&mut store, action, &actor, mode, started, quiet),
+        Commands::Trash { action } => handle_trash(&mut store, action, &actor, mode, started, quiet),
+        Commands::Format(args) => handle_format_block(&mut store, args, &actor, mode, started, quiet),
+        Commands::Import { source } => handle_import(&mut store, source, &actor, mode, started, quiet),
+        Commands::Sync { action } => handle_sync(&mut store, action, mode, started),
+        Commands::Device { action } => handle_device(&mut store, action, non_interactive, mode, started),
         Commands::Keyring { action } => handle_keyring(&mut store, action, non_interactive, mode, started),
         Commands::Recovery { action } => handle_recovery(&store, action, non_interactive, mode, started),
-        Commands::Help { .. } | Commands::Restore(_) | Commands::Vault { .. } | Commands::Open => {
+        Commands::Help { .. }
+        | Commands::Restore(_)
+        | Commands::Vault { .. }
+        | Commands::Daemon(_)
+        | Commands::Open => {
             unreachable!("handled prior to opening store")
         }
     };
@@ -268,6 +330,275 @@ fn execute(cli: Cli, mode: OutputMode, started: Instant) -> i32 {
         Ok(code) => code,
         Err(err) => emit_error(&err, mode, store_meta(&store, started, None), quiet),
     }
+}
+
+fn handle_daemon(
+    args: &DaemonArgs,
+    data_dir: PathBuf,
+    mode: OutputMode,
+    started: Instant,
+    quiet: bool,
+) -> i32 {
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(r) => r,
+        Err(e) => {
+            let err = CoreError::new(ErrorCode::IntegrityError, format!("tokio runtime: {e}"), "Retry");
+            return emit_error(&err, mode, empty_meta(started), quiet);
+        }
+    };
+    let cfg = DaemonConfig {
+        data_dir,
+        port: args.port,
+        enable_cloud_sync: !args.no_cloud_sync,
+    };
+    match rt.block_on(run_daemon_foreground(cfg)) {
+        Ok(()) => 0,
+        Err(err) => emit_error(&err, mode, empty_meta(started), quiet),
+    }
+}
+
+fn handle_open(data_dir: &Path, mode: OutputMode, started: Instant, quiet: bool) -> i32 {
+    match try_send_uds(data_dir, &UdsRequest::OpenTicket, Duration::from_secs(3)) {
+        Ok(Some(resp)) if resp.ok => {
+            let url = resp.url.unwrap_or_default();
+            let port = resp.port.unwrap_or(19876);
+            if mode == OutputMode::Human && std::env::var("MYNOTE_NO_BROWSER").is_err() {
+                #[cfg(target_os = "macos")]
+                let _ = std::process::Command::new("open").arg(&url).spawn();
+                #[cfg(target_os = "linux")]
+                let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+            }
+            match mode {
+                OutputMode::Json | OutputMode::Jsonl => emit_json(
+                    serde_json::json!({ "status": "opened", "url": url, "port": port }),
+                    empty_meta(started),
+                ),
+                OutputMode::Human => println!("{url}"),
+            }
+            0
+        }
+        Ok(Some(resp)) => emit_error(&resp.into_core_error(), mode, empty_meta(started), quiet),
+        Ok(None) => {
+            let err = CoreError::new(
+                ErrorCode::SyncOffline,
+                "mynote daemon is not running",
+                "Start the local daemon via 'mynote daemon' before running 'mynote open'",
+            );
+            emit_error(&err, mode, empty_meta(started), quiet)
+        }
+        Err(err) => emit_error(&err, mode, empty_meta(started), quiet),
+    }
+}
+
+fn handle_device_bootstrap(
+    data_dir: &Path,
+    url: &str,
+    revoke_existing: bool,
+    non_interactive: bool,
+    mode: OutputMode,
+    started: Instant,
+    quiet: bool,
+) -> i32 {
+    if let Err(err) = require_tty(non_interactive, "device bootstrap") {
+        return emit_error(&err, mode, empty_meta(started), quiet);
+    }
+    let token = match std::env::var("MYNOTE_BOOTSTRAP_TOKEN") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => match read_tty_line("Enter Cloudflare BOOTSTRAP_TOKEN: ") {
+            Ok(t) => t,
+            Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+        },
+    };
+    if token.trim().is_empty() {
+        let err = CoreError::new(
+            ErrorCode::InvalidArgument,
+            "BOOTSTRAP_TOKEN cannot be empty",
+            "Provide the secret set via 'wrangler secret put BOOTSTRAP_TOKEN'",
+        );
+        return emit_error(&err, mode, empty_meta(started), quiet);
+    }
+    let dev_name = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "desktop".to_string());
+
+    let db_exists = data_dir.join("mynote.db").exists();
+    if db_exists {
+        let mut store = match LocalStore::open(data_dir) {
+            Ok(s) => s,
+            Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+        };
+        let receipt = match run_async(RelayClient::bootstrap_device(
+            url,
+            &token,
+            &store,
+            &dev_name,
+            revoke_existing,
+        )) {
+            Ok(r) => r,
+            Err(err) => return emit_error(&err, mode, store_meta(&store, started, None), quiet),
+        };
+        if let Ok(Some(creds)) = store.load_credentials() {
+            if let Ok(client) = RelayClient::from_credentials(&creds) {
+                let _ = run_async(client.run_sync_round(&mut store, false));
+            }
+        }
+        let _ = try_send_uds(
+            store.data_dir(),
+            &UdsRequest::Poke { fast_flush: true },
+            Duration::from_secs(2),
+        );
+        match mode {
+            OutputMode::Json | OutputMode::Jsonl => {
+                emit_json(&receipt, store_meta(&store, started, None));
+            }
+            OutputMode::Human => println!(
+                "bootstrapped device {} (scope={}, epoch={}) -> {}",
+                receipt.device_id, receipt.scope, receipt.epoch, receipt.sync_url
+            ),
+        }
+        return 0;
+    }
+
+    // Empty data_dir: register with relay and probe GET /v1/keys BEFORE creating LocalStore
+    // so Disaster Recovery Path #1 detects an existing remote keyring instead of minting a conflicting gen=1 keyring!
+    let mut rnd = [0u8; 10];
+    if let Err(e) = getrandom::fill(&mut rnd) {
+        let err = CoreError::new(
+            ErrorCode::IntegrityError,
+            format!("OS CSPRNG error: {e}"),
+            "Check system entropy",
+        );
+        return emit_error(&err, mode, empty_meta(started), quiet);
+    }
+    let preset_device_id = DeviceId::from_random_bytes(rnd);
+    let (receipt, creds) = match run_async(RelayClient::bootstrap_register(
+        url,
+        &token,
+        &preset_device_id,
+        &dev_name,
+        revoke_existing,
+    )) {
+        Ok(v) => v,
+        Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+    };
+    let client = match RelayClient::from_credentials(&creds) {
+        Ok(c) => c,
+        Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+    };
+    let (_records, _marks, remote_keyring, _vh) = match run_async(client.fetch_remote_keys()) {
+        Ok(k) => k,
+        Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+    };
+
+    let (store, recovery_required) = if let Some((kr_gen, kr_blob)) = remote_keyring {
+        let s = match LocalStore::open_for_recovery_bootstrap(
+            data_dir,
+            preset_device_id,
+            &creds.sync_url,
+            &creds.device_token,
+            &creds.scope,
+            kr_gen,
+            &kr_blob,
+        ) {
+            Ok(s) => s,
+            Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+        };
+        (s, true)
+    } else {
+        let mut s = match LocalStore::open_with_device_id(data_dir, Some(preset_device_id)) {
+            Ok(s) => s,
+            Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+        };
+        if let Some(words) = &s.initial_recovery_words {
+            if !quiet && mode == OutputMode::Human {
+                let mut err_out = io::stderr().lock();
+                let _ = writeln!(
+                    err_out,
+                    "Initialized new vault at {}. Record your 24-word recovery bundle safely:\n  {words}",
+                    data_dir.display()
+                );
+            }
+        }
+        if let Err(err) = s.save_credentials(&creds) {
+            return emit_error(&err, mode, store_meta(&s, started, None), quiet);
+        }
+        let _ = run_async(client.run_sync_round(&mut s, false));
+        (s, false)
+    };
+
+    let _ = try_send_uds(
+        store.data_dir(),
+        &UdsRequest::Poke { fast_flush: true },
+        Duration::from_secs(2),
+    );
+    match mode {
+        OutputMode::Json | OutputMode::Jsonl => {
+            emit_json(
+                serde_json::json!({
+                    "device_id": receipt.device_id,
+                    "scope": receipt.scope,
+                    "epoch": receipt.epoch,
+                    "sync_url": receipt.sync_url,
+                    "recovery_required": recovery_required,
+                }),
+                store_meta(&store, started, None),
+            );
+        }
+        OutputMode::Human => {
+            println!(
+                "bootstrapped device {} (scope={}, epoch={}) -> {}",
+                receipt.device_id, receipt.scope, receipt.epoch, receipt.sync_url
+            );
+            if recovery_required {
+                println!(
+                    "Existing cloud vault detected. Run 'mynote keyring unlock' with your 24-word recovery bundle to unseal SMKs and restore your notes."
+                );
+            }
+        }
+    }
+    0
+}
+
+fn handle_device_claim(
+    data_dir: &Path,
+    non_interactive: bool,
+    mode: OutputMode,
+    started: Instant,
+    quiet: bool,
+) -> i32 {
+    if let Err(err) = require_tty(non_interactive, "device claim") {
+        return emit_error(&err, mode, empty_meta(started), quiet);
+    }
+    let code = match read_tty_line("Paste pairing/refresh code (mynote-pair:v1:...): ") {
+        Ok(c) => c,
+        Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+    };
+    let receipt = match run_async(RelayClient::claim_pairing_code(&code, data_dir)) {
+        Ok(r) => r,
+        Err(err) => return emit_error(&err, mode, empty_meta(started), quiet),
+    };
+    // Perform an immediate pull so synced notes/keys hydrate cleanly right after claim
+    if let Ok(mut store) = LocalStore::open(data_dir) {
+        if let Ok(Some(creds)) = store.load_credentials() {
+            if let Ok(client) = RelayClient::from_credentials(&creds) {
+                let _ = run_async(client.run_sync_round(&mut store, creds.scope == "read"));
+            }
+        }
+    }
+    // Notify any already-running local daemon to hot-reload SMKs, credentials, and WS loop
+    let _ = try_send_uds(
+        data_dir,
+        &UdsRequest::Poke { fast_flush: true },
+        Duration::from_secs(2),
+    );
+    match mode {
+        OutputMode::Json | OutputMode::Jsonl => emit_json(&receipt, empty_meta(started)),
+        OutputMode::Human => println!(
+            "claimed {} for device {} (scope={}, smk_generations={})",
+            receipt.kind, receipt.device_id, receipt.scope, receipt.smk_generations
+        ),
+    }
+    0
 }
 
 fn handle_help(topic: Option<&str>, mode: OutputMode, started: Instant, quiet: bool) -> i32 {
@@ -308,6 +639,7 @@ fn handle_add(
     actor: &str,
     mode: OutputMode,
     started: Instant,
+    quiet: bool,
 ) -> Result<i32, CoreError> {
     let (raw_text, _) = read_text_arg_or_stdin(args.text)?;
     let effective_lang = args
@@ -319,6 +651,31 @@ fn handle_add(
     } else {
         raw_text
     };
+
+    if let Some(resp) = try_daemon_apply(
+        store.data_dir(),
+        ApplyMeta {
+            actor: actor.to_string(),
+            idempotency_key: args.idempotency_key.clone(),
+            allow_empty: true,
+            force: false,
+        },
+        ApplyRequest::AddBlock {
+            buffer: args.buf.clone(),
+            content: final_text.clone(),
+            lang: Some(effective_lang.clone()),
+            after_id: args.after.clone(),
+        },
+        quiet,
+    )? {
+        if let Some(data) = resp.data {
+            let receipt: WriteReceipt = serde_json::from_value(data).map_err(|e| {
+                CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode daemon receipt")
+            })?;
+            emit_write_receipt(&receipt, store, mode, started);
+            return Ok(0);
+        }
+    }
 
     let receipt = store.add_block(
         &args.buf,
@@ -528,6 +885,29 @@ fn handle_block(
             }
             let (content, from_stdin) = read_text_arg_or_stdin(text)?;
             check_empty_stdin_fuse(store, &id, &content, from_stdin, allow_empty, non_interactive)?;
+            if let Some(resp) = try_daemon_apply(
+                store.data_dir(),
+                ApplyMeta {
+                    actor: actor.to_string(),
+                    idempotency_key: None,
+                    allow_empty,
+                    force,
+                },
+                ApplyRequest::UpdateBlock {
+                    id: id.clone(),
+                    content: content.clone(),
+                    expected_heads: expected_heads.clone(),
+                },
+                quiet,
+            )? {
+                if let Some(data) = resp.data {
+                    let receipt: WriteReceipt = serde_json::from_value(data).map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode daemon receipt")
+                    })?;
+                    emit_write_receipt(&receipt, store, mode, started);
+                    return Ok(0);
+                }
+            }
             let receipt = store.update_block(&id, &content, &expected_heads, force, actor)?;
             emit_write_receipt(&receipt, store, mode, started);
             Ok(0)
@@ -539,6 +919,29 @@ fn handle_block(
             expected_heads,
         } => {
             let (suffix, _) = read_text_arg_or_stdin(text)?;
+            if let Some(resp) = try_daemon_apply(
+                store.data_dir(),
+                ApplyMeta {
+                    actor: actor.to_string(),
+                    idempotency_key: None,
+                    allow_empty: true,
+                    force: false,
+                },
+                ApplyRequest::AppendBlock {
+                    id: id.clone(),
+                    text: suffix.clone(),
+                    expected_heads: expected_heads.clone(),
+                },
+                quiet,
+            )? {
+                if let Some(data) = resp.data {
+                    let receipt: WriteReceipt = serde_json::from_value(data).map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode daemon receipt")
+                    })?;
+                    emit_write_receipt(&receipt, store, mode, started);
+                    return Ok(0);
+                }
+            }
             let exp_opt = if expected_heads.is_empty() {
                 None
             } else {
@@ -562,6 +965,31 @@ fn handle_block(
                     "specify at least one of --to-buf, --after, --before, or --lang",
                     "Run 'mynote block move --help' for examples",
                 ));
+            }
+            if let Some(resp) = try_daemon_apply(
+                store.data_dir(),
+                ApplyMeta {
+                    actor: actor.to_string(),
+                    idempotency_key: None,
+                    allow_empty: true,
+                    force: false,
+                },
+                ApplyRequest::MoveBlock {
+                    id: id.clone(),
+                    to_buf: to_buf.clone(),
+                    after_id: after.clone(),
+                    before_id: before.clone(),
+                    lang: lang.clone(),
+                },
+                quiet,
+            )? {
+                if let Some(data) = resp.data {
+                    let receipt: WriteReceipt = serde_json::from_value(data).map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode daemon receipt")
+                    })?;
+                    emit_write_receipt(&receipt, store, mode, started);
+                    return Ok(0);
+                }
             }
             let receipt = store.move_block(
                 &id,
@@ -593,7 +1021,7 @@ fn handle_block(
                 ));
             }
 
-            let content = if let Some(keep_op) = keep {
+            let content = if let Some(ref keep_op) = keep {
                 let detail = store.get_block(&id)?;
                 if detail.is_locked {
                     return Err(CoreError::new(
@@ -605,7 +1033,7 @@ fn handle_block(
                 let ver = detail
                     .versions
                     .iter()
-                    .find(|v| v.op_id == keep_op)
+                    .find(|v| v.op_id == *keep_op)
                     .ok_or_else(|| {
                         CoreError::new(
                             ErrorCode::NotFound,
@@ -625,6 +1053,35 @@ fn handle_block(
                 check_empty_stdin_fuse(store, &id, &c, from_stdin, allow_empty, non_interactive)?;
                 c
             };
+
+            if let Some(resp) = try_daemon_apply(
+                store.data_dir(),
+                ApplyMeta {
+                    actor: actor.to_string(),
+                    idempotency_key: None,
+                    allow_empty,
+                    force,
+                },
+                ApplyRequest::ResolveBlock {
+                    id: id.clone(),
+                    expected_heads: expected_heads.clone(),
+                    content: if keep.is_some() {
+                        None
+                    } else {
+                        Some(content.clone())
+                    },
+                    keep_op_id: keep.clone(),
+                },
+                quiet,
+            )? {
+                if let Some(data) = resp.data {
+                    let receipt: WriteReceipt = serde_json::from_value(data).map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode daemon receipt")
+                    })?;
+                    emit_write_receipt(&receipt, store, mode, started);
+                    return Ok(0);
+                }
+            }
 
             let receipt = store.update_block(&id, &content, &expected_heads, force, actor)?;
             emit_write_receipt(&receipt, store, mode, started);
@@ -653,6 +1110,36 @@ fn handle_block(
             to_op,
             undo_actor,
         } => {
+            if to_op.is_none() && undo_actor.is_none() {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    "specify either --to-op <op_id> or --undo-actor <actor>",
+                    format!("Run 'mynote block history {id} --json' to list historical ops"),
+                ));
+            }
+            if let Some(resp) = try_daemon_apply(
+                store.data_dir(),
+                ApplyMeta {
+                    actor: actor.to_string(),
+                    idempotency_key: None,
+                    allow_empty: true,
+                    force: false,
+                },
+                ApplyRequest::RevertBlock {
+                    id: id.clone(),
+                    to_op: to_op.clone(),
+                    undo_actor: undo_actor.clone(),
+                },
+                quiet,
+            )? {
+                if let Some(data) = resp.data {
+                    let receipt: WriteReceipt = serde_json::from_value(data).map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode daemon receipt")
+                    })?;
+                    emit_write_receipt(&receipt, store, mode, started);
+                    return Ok(0);
+                }
+            }
             let target_op = match (to_op, undo_actor) {
                 (Some(op), _) => op,
                 (None, Some(bad_actor)) => {
@@ -669,13 +1156,7 @@ fn handle_block(
                             )
                         })?
                 }
-                (None, None) => {
-                    return Err(CoreError::new(
-                        ErrorCode::InvalidArgument,
-                        "specify either --to-op <op_id> or --undo-actor <actor>",
-                        format!("Run 'mynote block history {id} --json' to list historical ops"),
-                    ));
-                }
+                (None, None) => unreachable!("checked above"),
             };
             let receipt = store.revert_block(&id, &target_op, actor)?;
             emit_write_receipt(&receipt, store, mode, started);
@@ -727,6 +1208,30 @@ fn handle_block(
                     }
                 }
                 return Ok(0);
+            }
+
+            if let Some(resp) = try_daemon_apply(
+                store.data_dir(),
+                ApplyMeta {
+                    actor: actor.to_string(),
+                    idempotency_key: None,
+                    allow_empty: true,
+                    force: false,
+                },
+                ApplyRequest::DeleteBlock {
+                    id: id.clone(),
+                    expected_heads: expected_heads.clone(),
+                    dry_run: false,
+                },
+                quiet,
+            )? {
+                if let Some(data) = resp.data {
+                    let receipt: DeleteReceipt = serde_json::from_value(data).map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode delete receipt")
+                    })?;
+                    emit_delete_receipt(&receipt, store, mode, started);
+                    return Ok(0);
+                }
             }
 
             let receipt = store.delete_block(&id, exp_opt, actor)?;
@@ -784,6 +1289,7 @@ fn handle_buf(
     actor: &str,
     mode: OutputMode,
     started: Instant,
+    quiet: bool,
 ) -> Result<i32, CoreError> {
     match action {
         BufCommand::Ls => {
@@ -799,14 +1305,52 @@ fn handle_buf(
             }
         }
         BufCommand::Create { name, after } => {
-            let buf = store.create_buffer(&name, after.as_deref(), actor)?;
+            let buf: mynote_store::store::BufferDto = if let Some(resp) = try_daemon_apply(
+                store.data_dir(),
+                ApplyMeta {
+                    actor: actor.to_string(),
+                    idempotency_key: None,
+                    allow_empty: true,
+                    force: false,
+                },
+                ApplyRequest::CreateBuffer {
+                    name: name.clone(),
+                    after: after.clone(),
+                },
+                quiet,
+            )? {
+                serde_json::from_value(resp.data.unwrap_or_default()).map_err(|e| {
+                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode buffer dto")
+                })?
+            } else {
+                store.create_buffer(&name, after.as_deref(), actor)?
+            };
             match mode {
                 OutputMode::Json | OutputMode::Jsonl => emit_json(&buf, store_meta(store, started, None)),
                 OutputMode::Human => println!("created buffer {} ({})", buf.name, buf.id),
             }
         }
         BufCommand::Rename { buf, new_name } => {
-            let updated = store.rename_buffer(&buf, &new_name, actor)?;
+            let updated: mynote_store::store::BufferDto = if let Some(resp) = try_daemon_apply(
+                store.data_dir(),
+                ApplyMeta {
+                    actor: actor.to_string(),
+                    idempotency_key: None,
+                    allow_empty: true,
+                    force: false,
+                },
+                ApplyRequest::RenameBuffer {
+                    buf: buf.clone(),
+                    new_name: new_name.clone(),
+                },
+                quiet,
+            )? {
+                serde_json::from_value(resp.data.unwrap_or_default()).map_err(|e| {
+                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode buffer dto")
+                })?
+            } else {
+                store.rename_buffer(&buf, &new_name, actor)?
+            };
             match mode {
                 OutputMode::Json | OutputMode::Jsonl => {
                     emit_json(&updated, store_meta(store, started, None));
@@ -815,7 +1359,23 @@ fn handle_buf(
             }
         }
         BufCommand::Delete { buf } => {
-            let deleted = store.delete_buffer(&buf, actor)?;
+            let deleted: mynote_store::store::BufferDto = if let Some(resp) = try_daemon_apply(
+                store.data_dir(),
+                ApplyMeta {
+                    actor: actor.to_string(),
+                    idempotency_key: None,
+                    allow_empty: true,
+                    force: false,
+                },
+                ApplyRequest::DeleteBuffer { buf: buf.clone() },
+                quiet,
+            )? {
+                serde_json::from_value(resp.data.unwrap_or_default()).map_err(|e| {
+                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode buffer dto")
+                })?
+            } else {
+                store.delete_buffer(&buf, actor)?
+            };
             match mode {
                 OutputMode::Json | OutputMode::Jsonl => {
                     emit_json(&deleted, store_meta(store, started, None));
@@ -835,6 +1395,7 @@ fn handle_trash(
     actor: &str,
     mode: OutputMode,
     started: Instant,
+    quiet: bool,
 ) -> Result<i32, CoreError> {
     match action {
         TrashCommand::Ls => {
@@ -890,6 +1451,25 @@ fn handle_trash(
                 }
                 return Ok(0);
             }
+            if let Some(resp) = try_daemon_apply(
+                store.data_dir(),
+                ApplyMeta {
+                    actor: actor.to_string(),
+                    idempotency_key: None,
+                    allow_empty: true,
+                    force: false,
+                },
+                ApplyRequest::RestoreTrash { id: id.clone() },
+                quiet,
+            )? {
+                if let Some(data) = resp.data {
+                    let receipt: WriteReceipt = serde_json::from_value(data).map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode restore receipt")
+                    })?;
+                    emit_write_receipt(&receipt, store, mode, started);
+                    return Ok(0);
+                }
+            }
             let receipt = store.restore_trash(&id, actor)?;
             emit_write_receipt(&receipt, store, mode, started);
         }
@@ -938,6 +1518,7 @@ fn handle_format_block(
     actor: &str,
     mode: OutputMode,
     started: Instant,
+    quiet: bool,
 ) -> Result<i32, CoreError> {
     let id = args.id.expect("id checked by caller");
     if args.expected_heads.is_empty() {
@@ -978,9 +1559,38 @@ fn handle_format_block(
         })));
     }
 
-    let current = detail.content.unwrap_or_default();
+    let current = detail.content.ok_or_else(|| {
+        CoreError::new(
+            ErrorCode::KeyMissing,
+            format!("block '{id}' content is unreadable; refusing to format unavailable body"),
+            "Sync missing keys or unlock keyring before formatting this block",
+        )
+    })?;
     let lang = args.lang.as_deref().unwrap_or(&detail.lang);
     let formatted = format_content(&current, lang, args.action.as_deref())?;
+    if let Some(resp) = try_daemon_apply(
+        store.data_dir(),
+        ApplyMeta {
+            actor: actor.to_string(),
+            idempotency_key: None,
+            allow_empty: true,
+            force: false,
+        },
+        ApplyRequest::UpdateBlock {
+            id: id.clone(),
+            content: formatted.clone(),
+            expected_heads: args.expected_heads.clone(),
+        },
+        quiet,
+    )? {
+        if let Some(data) = resp.data {
+            let receipt: WriteReceipt = serde_json::from_value(data).map_err(|e| {
+                CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode daemon receipt")
+            })?;
+            emit_write_receipt(&receipt, store, mode, started);
+            return Ok(0);
+        }
+    }
     let receipt = store.update_block(&id, &formatted, &args.expected_heads, false, actor)?;
     emit_write_receipt(&receipt, store, mode, started);
     Ok(0)
@@ -992,10 +1602,35 @@ fn handle_import(
     actor: &str,
     mode: OutputMode,
     started: Instant,
+    quiet: bool,
 ) -> Result<i32, CoreError> {
     match source {
         ImportCommand::Heynote { path, buf, dry_run } => {
-            let summary = store.import_heynote(&path, buf.as_deref(), dry_run, actor)?;
+            let summary: mynote_store::store::ImportSummaryDto = if !dry_run {
+                if let Some(resp) = try_daemon_apply(
+                    store.data_dir(),
+                    ApplyMeta {
+                        actor: actor.to_string(),
+                        idempotency_key: None,
+                        allow_empty: true,
+                        force: false,
+                    },
+                    ApplyRequest::ImportHeynote {
+                        path: path.to_string_lossy().to_string(),
+                        buf: buf.clone(),
+                        dry_run,
+                    },
+                    quiet,
+                )? {
+                    serde_json::from_value(resp.data.unwrap_or_default()).map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "decode import summary")
+                    })?
+                } else {
+                    store.import_heynote(&path, buf.as_deref(), dry_run, actor)?
+                }
+            } else {
+                store.import_heynote(&path, buf.as_deref(), dry_run, actor)?
+            };
             match mode {
                 OutputMode::Json | OutputMode::Jsonl => {
                     emit_json(&summary, store_meta(store, started, None));
@@ -1021,7 +1656,7 @@ fn handle_import(
 }
 
 fn handle_sync(
-    store: &LocalStore,
+    store: &mut LocalStore,
     action: SyncCommand,
     mode: OutputMode,
     started: Instant,
@@ -1046,11 +1681,55 @@ fn handle_sync(
             }
             Ok(0)
         }
-        SyncCommand::Push | SyncCommand::Pull => Err(CoreError::new(
-            ErrorCode::SyncOffline,
-            "sync relay is offline or not configured on this device",
-            "Local writes are safely persisted; configure Cloudflare relay via 'mynote device bootstrap' or retry once online",
-        )),
+        SyncCommand::Push | SyncCommand::Pull => {
+            // If Daemon is running, trigger Single-Flight sync through Daemon so SQLite keeps one writer.
+            if let Some(resp) = try_send_uds(
+                store.data_dir(),
+                &UdsRequest::SyncNow { wait: true },
+                Duration::from_secs(30),
+            )? {
+                if !resp.ok {
+                    return Err(resp.into_core_error());
+                }
+                let data = serde_json::json!({
+                    "head_seq": resp.head_seq.unwrap_or(0),
+                    "sync_state": resp.sync_state.unwrap_or_else(|| "idle".to_string()),
+                    "pending_ops": resp.pending_ops.unwrap_or(0),
+                });
+                match mode {
+                    OutputMode::Json | OutputMode::Jsonl => {
+                        emit_json(data, store_meta(store, started, None));
+                    }
+                    OutputMode::Human => println!(
+                        "sync ok (via daemon): head_seq={}  pending_ops={}",
+                        resp.head_seq.unwrap_or(0),
+                        resp.pending_ops.unwrap_or(0)
+                    ),
+                }
+                return Ok(0);
+            }
+
+            let Some(creds) = store.load_credentials()? else {
+                return Err(CoreError::new(
+                    ErrorCode::SyncOffline,
+                    "sync relay is offline or not configured on this device",
+                    "Local writes are safely persisted; configure Cloudflare relay via 'mynote device bootstrap' or retry once online",
+                ));
+            };
+            let client = RelayClient::from_credentials(&creds)?;
+            let read_only = creds.scope == "read" || matches!(action, SyncCommand::Pull);
+            let report = run_async(client.run_sync_round(store, read_only))?;
+            match mode {
+                OutputMode::Json | OutputMode::Jsonl => {
+                    emit_json(&report, store_meta(store, started, None));
+                }
+                OutputMode::Human => println!(
+                    "sync ok: head_seq={}  pulled={}  pushed={}  keys_synced={}",
+                    report.head_seq, report.pulled_ops, report.pushed_ops, report.keys_synced
+                ),
+            }
+            Ok(0)
+        }
     }
 }
 
@@ -1072,24 +1751,130 @@ fn handle_vault(
     emit_error(&err, mode, empty_meta(started), quiet)
 }
 
-fn handle_device(action: DeviceCommand, non_interactive: bool) -> Result<i32, CoreError> {
+fn handle_device(
+    store: &mut LocalStore,
+    action: DeviceCommand,
+    non_interactive: bool,
+    mode: OutputMode,
+    started: Instant,
+) -> Result<i32, CoreError> {
     match action {
-        DeviceCommand::Bootstrap { .. }
-        | DeviceCommand::Add { .. }
-        | DeviceCommand::Refresh { .. }
-        | DeviceCommand::Claim => {
-            require_tty(non_interactive, "device pairing/bootstrap")?;
-            Err(CoreError::new(
-                ErrorCode::SyncOffline,
-                "cannot reach Cloudflare sync relay while offline",
-                "Check network connectivity and Cloudflare Worker URL, then retry",
-            ))
+        DeviceCommand::Bootstrap { .. } => unreachable!("handled prior to opening store"),
+        DeviceCommand::Add { name, scope } => {
+            require_tty(non_interactive, "device add")?;
+            if mode != OutputMode::Human {
+                return Err(CoreError::new(
+                    ErrorCode::InteractionRequired,
+                    "pairing codes contain K_pair and are never emitted into --json/--jsonl output",
+                    "Run 'mynote device add' in an interactive terminal without --json",
+                ));
+            }
+            let Some(creds) = store.load_credentials()? else {
+                return Err(CoreError::new(
+                    ErrorCode::SyncOffline,
+                    "sync relay is not configured on this device",
+                    "Run 'mynote device bootstrap --url <https://...>' first",
+                ));
+            };
+            let client = RelayClient::from_credentials(&creds)?;
+            let smks = store.current_smks_for_pairing();
+            let ticket = run_async(client.create_pairing_ticket(&name, &scope, smks))?;
+            println!(
+                "One-time pairing ticket created for device {} (scope={}, valid 10 min):",
+                ticket.device_id, ticket.scope
+            );
+            println!("\n{}\n", render_terminal_qr(&ticket.pairing_code));
+            println!("Pairing code:\n  {}\n", ticket.pairing_code);
+            println!("Run 'mynote device claim' on the target device and paste the code above.");
+            Ok(0)
         }
-        DeviceCommand::Ls | DeviceCommand::Revoke { .. } => Err(CoreError::new(
-            ErrorCode::SyncOffline,
-            "sync relay is offline or not configured",
-            "Run 'mynote device bootstrap --url <https://...>' once Cloudflare relay is deployed",
-        )),
+        DeviceCommand::Refresh { device_id } => {
+            require_tty(non_interactive, "device refresh")?;
+            if mode != OutputMode::Human {
+                return Err(CoreError::new(
+                    ErrorCode::InteractionRequired,
+                    "refresh pairing codes contain K_pair and are never emitted into --json/--jsonl output",
+                    "Run 'mynote device refresh <device_id>' in an interactive terminal without --json",
+                ));
+            }
+            let Some(creds) = store.load_credentials()? else {
+                return Err(CoreError::new(
+                    ErrorCode::SyncOffline,
+                    "sync relay is not configured on this device",
+                    "Run 'mynote device bootstrap --url <https://...>' first",
+                ));
+            };
+            let client = RelayClient::from_credentials(&creds)?;
+            let smks = store.current_smks_for_pairing();
+            let ticket = run_async(client.create_refresh_ticket(&device_id, smks))?;
+            println!(
+                "One-time SMK refresh ticket created for device {} (valid 10 min):",
+                ticket.device_id
+            );
+            println!("\n{}\n", render_terminal_qr(&ticket.pairing_code));
+            println!("Refresh code:\n  {}\n", ticket.pairing_code);
+            println!(
+                "Run 'mynote device claim' on device {} and paste the code above.",
+                ticket.device_id
+            );
+            Ok(0)
+        }
+        DeviceCommand::Claim => unreachable!("handled prior to opening store"),
+        DeviceCommand::Ls => {
+            let Some(creds) = store.load_credentials()? else {
+                return Err(CoreError::new(
+                    ErrorCode::SyncOffline,
+                    "sync relay is offline or not configured",
+                    "Run 'mynote device bootstrap --url <https://...>' once Cloudflare relay is deployed",
+                ));
+            };
+            let client = RelayClient::from_credentials(&creds)?;
+            let devices = run_async(client.list_devices())?;
+            match mode {
+                OutputMode::Json => emit_json(&devices, store_meta(store, started, None)),
+                OutputMode::Jsonl => emit_jsonl(&devices),
+                OutputMode::Human => {
+                    for d in &devices {
+                        let st = if d.revoked_at_ms.is_some() {
+                            "REVOKED"
+                        } else {
+                            "active"
+                        };
+                        println!(
+                            "{}  {:14} {:10} {:7} last_seq={}",
+                            d.device_id, d.device_name, d.scope, st, d.last_pulled_seq
+                        );
+                    }
+                }
+            }
+            Ok(0)
+        }
+        DeviceCommand::Revoke { device_id } => {
+            let Some(creds) = store.load_credentials()? else {
+                return Err(CoreError::new(
+                    ErrorCode::SyncOffline,
+                    "sync relay is offline or not configured",
+                    "Run 'mynote device bootstrap --url <https://...>' first",
+                ));
+            };
+            let client = RelayClient::from_credentials(&creds)?;
+            let revoked_at_ms = run_async(client.revoke_device(&device_id))?;
+            let data = serde_json::json!({
+                "device_id": device_id,
+                "revoked_at_ms": revoked_at_ms,
+                "hint": "Run 'mynote keyring rotate' to prevent the revoked device from decrypting future notes",
+            });
+            match mode {
+                OutputMode::Json | OutputMode::Jsonl => {
+                    emit_json(data, store_meta(store, started, None));
+                }
+                OutputMode::Human => {
+                    println!("revoked device {device_id} at {revoked_at_ms}");
+                    println!("hint: run 'mynote keyring rotate' to rotate SMK for future notes");
+                }
+            }
+            Ok(0)
+        }
     }
 }
 
@@ -1103,16 +1888,76 @@ fn handle_keyring(
     match action {
         KeyringCommand::Rotate => {
             require_tty(non_interactive, "keyring rotate")?;
-            Err(CoreError::new(
-                ErrorCode::SyncOffline,
-                "keyring rotate requires cloud sync connectivity to publish the new SMK generation",
-                "Reconnect to the Cloudflare sync relay and re-run 'mynote keyring rotate'",
-            ))
+            let Some(creds) = store.load_credentials()? else {
+                return Err(CoreError::new(
+                    ErrorCode::SyncOffline,
+                    "keyring rotate requires cloud sync connectivity to publish the new SMK generation",
+                    "Configure cloud sync via 'mynote device bootstrap' and re-run 'mynote keyring rotate'",
+                ));
+            };
+            let client = RelayClient::from_credentials(&creds)?;
+            // Pre-flight relay reachability BEFORE mutating local keys or SMK generations.
+            let _ = run_async(client.fetch_remote_keys())?;
+            let (new_gen, new_kid) = store.rotate_smk()?;
+            // Push updated block_keys + RecoveryKeyringV1 immediately to the relay
+            let report = run_async(client.run_sync_round(store, false))?;
+            let _ = try_send_uds(
+                store.data_dir(),
+                &UdsRequest::Poke { fast_flush: true },
+                Duration::from_secs(2),
+            );
+            let data = serde_json::json!({
+                "ok": true,
+                "active_smk_kid": new_kid.to_string(),
+                "keyring_gen": new_gen,
+                "keys_synced": report.keys_synced,
+                "hint": "Run 'mynote recovery drill' to verify your 24-word recovery bundle unseals the new SMK generation",
+            });
+            match mode {
+                OutputMode::Json | OutputMode::Jsonl => emit_json(data, store_meta(store, started, None)),
+                OutputMode::Human => {
+                    println!(
+                        "rotated SMK to {new_kid} (keyring_gen={new_gen}, keys_synced={})",
+                        report.keys_synced
+                    );
+                    println!("hint: run 'mynote recovery drill' to verify offline recovery; run 'mynote device refresh <id>' or 'mynote keyring unlock' on other trusted devices");
+                }
+            }
+            Ok(0)
         }
         KeyringCommand::Unlock => {
             require_tty(non_interactive, "keyring unlock")?;
             let words = read_tty_line("Enter 24-word recovery bundle: ")?;
+            // Pull latest remote keyring before unsealing so rotated generations are included immediately.
+            let maybe_creds = store.load_credentials().ok().flatten();
+            if let Some(creds) = &maybe_creds {
+                if let Ok(client) = RelayClient::from_credentials(creds) {
+                    if let Ok((_recs, _marks, Some((gen, blob)), _vh)) = run_async(client.fetch_remote_keys())
+                    {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(1);
+                        let _ = store.apply_store_mutations(&[StoreMutation::UpsertKeyMaterial {
+                            kind: KeyMaterialKind::Keyring,
+                            gen: gen as i64,
+                            blob,
+                            updated_at_ms: now_ms,
+                        }]);
+                    }
+                }
+            }
             let gens = store.unlock_keyring_with_words(&words)?;
+            if let Some(creds) = &maybe_creds {
+                if let Ok(client) = RelayClient::from_credentials(creds) {
+                    let _ = run_async(client.run_sync_round(store, creds.scope == "read"));
+                }
+            }
+            let _ = try_send_uds(
+                store.data_dir(),
+                &UdsRequest::Poke { fast_flush: true },
+                Duration::from_secs(2),
+            );
             let data = serde_json::json!({ "ok": true, "unsealed_generations": gens });
             match mode {
                 OutputMode::Json | OutputMode::Jsonl => emit_json(data, store_meta(store, started, None)),

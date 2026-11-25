@@ -1,0 +1,29 @@
+name: Nightly DST Soak
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Number of deterministic simulation seeds to execute"
+        required: false
+        default: "100000"
+
+permissions:
+  contents: read
+
+jobs:
+  dst-soak:
+    name: Deterministic Sync Simulation Soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run nightly DST soak
+        env:
+          MYNOTE_DST_SEEDS: ${{ inputs.seeds || '100000' }}
+        run: |
+          cargo test --release -p mynote-core sim::tests:: -- --nocapture

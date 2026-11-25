@@ -1,0 +1,157 @@
+{
+  "name": "m1_relay_contract",
+  "description": "Shared M1 blind-relay protocol scenario executed identically against Rust SimRelay and real Cloudflare SyncJournalDO in workerd (F-12).",
+  "devices": [
+    { "device_id": "dev_aaaaaaaaaaaa0001", "device_name": "macOS-Desktop", "scope": "read-write" },
+    { "device_id": "dev_bbbbbbbbbbbb0002", "device_name": "Omarchy-Desktop", "scope": "read-write" }
+  ],
+  "steps": [
+    {
+      "id": "push_initial_batch_with_key_and_null_key_op",
+      "action": "push",
+      "as_device": "dev_aaaaaaaaaaaa0001",
+      "use_epoch": "current",
+      "key_records": [
+        { "key_id": "01JDF8Z9X4K7M2N5P8Q1R3S6T1", "wrap_gen": 1, "key_record_b64": "TU5SMV9rZXlfMV9nZW4x" }
+      ],
+      "ops": [
+        { "op_id": "01JDF910A2B3C4D5E6F7G8H901", "key_id": "01JDF8Z9X4K7M2N5P8Q1R3S6T1", "device_id": "dev_aaaaaaaaaaaa0001", "envelope_b64": "TU5TMV9vcF8xX2VuY3J5cHRlZA==" },
+        { "op_id": "01JDF910A2B3C4D5E6F7G8H902", "key_id": null, "device_id": "dev_aaaaaaaaaaaa0001", "envelope_b64": "TU5TMV9vcF8yX3NldF9tZXRh" }
+      ],
+      "expect": { "status": 200, "acked_seqs": [1, 2], "head_seq": 2 }
+    },
+    {
+      "id": "push_idempotent_replay_plus_new_op",
+      "action": "push",
+      "as_device": "dev_aaaaaaaaaaaa0001",
+      "use_epoch": "current",
+      "key_records": [],
+      "ops": [
+        { "op_id": "01JDF910A2B3C4D5E6F7G8H901", "key_id": "01JDF8Z9X4K7M2N5P8Q1R3S6T1", "device_id": "dev_aaaaaaaaaaaa0001", "envelope_b64": "TU5TMV9vcF8xX2VuY3J5cHRlZA==" },
+        { "op_id": "01JDF910A2B3C4D5E6F7G8H903", "key_id": "01JDF8Z9X4K7M2N5P8Q1R3S6T1", "device_id": "dev_aaaaaaaaaaaa0001", "envelope_b64": "TU5TMV9vcF8zX3VwZGF0ZQ==" }
+      ],
+      "expect": { "status": 200, "acked_seqs": [1, 3], "head_seq": 3 }
+    },
+    {
+      "id": "push_unknown_key_rolls_back_entire_batch",
+      "action": "push",
+      "as_device": "dev_aaaaaaaaaaaa0001",
+      "use_epoch": "current",
+      "key_records": [],
+      "ops": [
+        { "op_id": "01JDF910A2B3C4D5E6F7G8H904", "key_id": "01JDF8Z9X4K7M2N5P8Q1R3S6T1", "device_id": "dev_aaaaaaaaaaaa0001", "envelope_b64": "TU5TMV9vcF80X3Nob3VsZF9yb2xsYmFjaw==" },
+        { "op_id": "01JDF910A2B3C4D5E6F7G8H905", "key_id": "01JDF8Z9X4K7M2N5P8Q1R3S699", "device_id": "dev_aaaaaaaaaaaa0001", "envelope_b64": "TU5TMV9vcF81X3Vua25vd25fa2V5" }
+      ],
+      "expect": { "status": 409, "error_code": "KEY_UNKNOWN" }
+    },
+    {
+      "id": "pull_page_1_verifies_rollback_and_pagination",
+      "action": "pull",
+      "as_device": "dev_bbbbbbbbbbbb0002",
+      "since": 0,
+      "limit": 2,
+      "expect": {
+        "status": 200,
+        "op_ids": ["01JDF910A2B3C4D5E6F7G8H901", "01JDF910A2B3C4D5E6F7G8H902"],
+        "seqs": [1, 2],
+        "has_more": true,
+        "head_seq": 3
+      }
+    },
+    {
+      "id": "pull_page_2_exhausts_log",
+      "action": "pull",
+      "as_device": "dev_bbbbbbbbbbbb0002",
+      "since": 2,
+      "limit": 2,
+      "expect": {
+        "status": 200,
+        "op_ids": ["01JDF910A2B3C4D5E6F7G8H903"],
+        "seqs": [3],
+        "has_more": false,
+        "head_seq": 3
+      }
+    },
+    {
+      "id": "keys_rewrap_gen2_and_keyring_gen1",
+      "action": "keys_post",
+      "as_device": "dev_aaaaaaaaaaaa0001",
+      "key_records": [
+        { "key_id": "01JDF8Z9X4K7M2N5P8Q1R3S6T1", "wrap_gen": 2, "key_record_b64": "TU5SMV9rZXlfMV9nZW4y" }
+      ],
+      "keyring": { "gen": 1, "blob_b64": "a2V5cmluZ19nZW5fMQ==" },
+      "expect": { "status": 200 }
+    },
+    {
+      "id": "keys_same_gen_different_bytes_rejected",
+      "action": "keys_post",
+      "as_device": "dev_aaaaaaaaaaaa0001",
+      "key_records": [
+        { "key_id": "01JDF8Z9X4K7M2N5P8Q1R3S6T1", "wrap_gen": 2, "key_record_b64": "VEFNUEVSRURfZ2VuMg==" }
+      ],
+      "expect": { "status": 409, "error_code": "INTEGRITY_ERROR" }
+    },
+    {
+      "id": "keys_same_gen_same_bytes_idempotent",
+      "action": "keys_post",
+      "as_device": "dev_aaaaaaaaaaaa0001",
+      "key_records": [
+        { "key_id": "01JDF8Z9X4K7M2N5P8Q1R3S6T1", "wrap_gen": 2, "key_record_b64": "TU5SMV9rZXlfMV9nZW4y" }
+      ],
+      "keyring": { "gen": 1, "blob_b64": "a2V5cmluZ19nZW5fMQ==" },
+      "expect": { "status": 200 }
+    },
+    {
+      "id": "keys_stale_keyring_gen_rejected",
+      "action": "keys_post",
+      "as_device": "dev_aaaaaaaaaaaa0001",
+      "key_records": [],
+      "keyring": { "gen": 0, "blob_b64": "c3RhbGVfa2V5cmluZw==" },
+      "expect": { "status": 409, "error_code": "CAS_MISMATCH" }
+    },
+    {
+      "id": "simulate_pitr_rollback_to_seq_1",
+      "action": "pitr_rollback",
+      "keep_seq": 1,
+      "new_epoch": "9c8b7a65-4321-4fed-8cba-9876543210ff"
+    },
+    {
+      "id": "push_with_stale_epoch_triggers_cas_mismatch",
+      "action": "push",
+      "as_device": "dev_bbbbbbbbbbbb0002",
+      "use_epoch": "previous",
+      "key_records": [],
+      "ops": [
+        { "op_id": "01JDF910A2B3C4D5E6F7G8H903", "key_id": "01JDF8Z9X4K7M2N5P8Q1R3S6T1", "device_id": "dev_aaaaaaaaaaaa0001", "envelope_b64": "TU5TMV9vcF8zX3VwZGF0ZQ==" }
+      ],
+      "expect": { "status": 409, "error_code": "CAS_MISMATCH", "head_seq": 1 }
+    },
+    {
+      "id": "peer_device_rescues_ops_after_pitr_preserving_author_device_id",
+      "action": "push",
+      "as_device": "dev_bbbbbbbbbbbb0002",
+      "use_epoch": "current",
+      "key_records": [],
+      "ops": [
+        { "op_id": "01JDF910A2B3C4D5E6F7G8H902", "key_id": null, "device_id": "dev_aaaaaaaaaaaa0001", "envelope_b64": "TU5TMV9vcF8yX3NldF9tZXRh" },
+        { "op_id": "01JDF910A2B3C4D5E6F7G8H903", "key_id": "01JDF8Z9X4K7M2N5P8Q1R3S6T1", "device_id": "dev_aaaaaaaaaaaa0001", "envelope_b64": "TU5TMV9vcF8zX3VwZGF0ZQ==" }
+      ],
+      "expect": { "status": 200, "acked_seqs": [2, 3], "head_seq": 3 }
+    },
+    {
+      "id": "pull_after_pitr_rescue_confirms_author_device_id_preserved",
+      "action": "pull",
+      "as_device": "dev_aaaaaaaaaaaa0001",
+      "since": 0,
+      "limit": 10,
+      "expect": {
+        "status": 200,
+        "op_ids": ["01JDF910A2B3C4D5E6F7G8H901", "01JDF910A2B3C4D5E6F7G8H902", "01JDF910A2B3C4D5E6F7G8H903"],
+        "device_ids": ["dev_aaaaaaaaaaaa0001", "dev_aaaaaaaaaaaa0001", "dev_aaaaaaaaaaaa0001"],
+        "seqs": [1, 2, 3],
+        "has_more": false,
+        "head_seq": 3
+      }
+    }
+  ]
+}

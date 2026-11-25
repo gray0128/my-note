@@ -500,6 +500,8 @@ fn g09_g10_multi_leaf_merge_and_locked_block_non_tty_zero_plaintext() {
                 public_hint: Some("api key".into()),
             })
             .unwrap();
+        // G09 simulates an already-bootstrapped desktop receiving a concurrent remote edit.
+        store.set_local_meta("bootstrap_completed", "1").unwrap();
 
         (c1.block_id, l1.block_id)
     };

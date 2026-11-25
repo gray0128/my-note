@@ -117,6 +117,9 @@ pub enum Commands {
     /// Pure offline disaster recovery from local R2 archive directory (--from-archive)
     Restore(RestoreArgs),
 
+    /// Run the local desktop HTTP/WS/UDS daemon with embedded Web UI and background sync
+    Daemon(DaemonArgs),
+
     /// Open the local desktop UI
     Open,
 
@@ -125,6 +128,17 @@ pub enum Commands {
         /// Topic name (agent, formatting, conflict, locking, upgrade) or subcommand name
         topic: Option<String>,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonArgs {
+    /// Loopback port for http://localhost:<port> (default: 19876)
+    #[arg(long, default_value_t = 19876)]
+    pub port: u16,
+
+    /// Disable background cloud sync loop (local-only mode)
+    #[arg(long)]
+    pub no_cloud_sync: bool,
 }
 
 #[derive(Debug, Args)]

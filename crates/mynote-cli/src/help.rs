@@ -23,6 +23,7 @@ TRANSFORM & OPS:
   keyring     Rotate SMK generation or unlock synced keyring with 24 words
   recovery    Show recovery bundle on init or run offline recovery drill
   restore     Rebuild offline from local R2 archive directory (--from-archive)
+  daemon      Run local desktop HTTP/WS/UDS daemon with embedded Web UI
   open        Open the local desktop UI
   help        Deep topics: agent, formatting, conflict, locking, upgrade
 

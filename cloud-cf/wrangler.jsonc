@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mynote-sync-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-01-15",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SYNC_DO",
+        "class_name": "SyncJournalDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["SyncJournalDO"]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ARCHIVE_BUCKET",
+      "bucket_name": "mynote-archive"
+    }
+  ],
+  "vars": {
+    "DAILY_ARCHIVE_INTERVAL_MS": "86400000",
+    "PAIRING_TTL_MS": "600000"
+  }
+}

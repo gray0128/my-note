@@ -101,7 +101,7 @@ pub struct SimRelay {
 }
 
 impl SimRelay {
-    fn new(epoch: JournalEpoch) -> Self {
+    pub fn new(epoch: JournalEpoch) -> Self {
         Self {
             epoch,
             ops: Vec::new(),
@@ -113,11 +113,11 @@ impl SimRelay {
         }
     }
 
-    fn head_seq(&self) -> i64 {
+    pub fn head_seq(&self) -> i64 {
         self.ops.last().map_or(0, |o| o.seq)
     }
 
-    fn handle_push(
+    pub fn handle_push(
         &mut self,
         _pusher_device_id: &DeviceId,
         req: &PushRequestDto,
@@ -163,7 +163,7 @@ impl SimRelay {
         Ok((self.epoch, acked, self.head_seq()))
     }
 
-    fn handle_pull(
+    pub fn handle_pull(
         &self,
         since_seq: i64,
         limit: usize,
@@ -180,8 +180,52 @@ impl SimRelay {
         (self.epoch, page, self.keys.digest(), self.head_seq(), has_more)
     }
 
+    pub fn handle_keys_post(
+        &mut self,
+        records: &[KeyRecordRow],
+        keyring: Option<(u32, Vec<u8>)>,
+        vault_header: Option<(i64, Vec<u8>)>,
+    ) -> Result<(), ErrorCode> {
+        let mut staged = self.keys.clone();
+        for rec in records {
+            if let Some(cur) = staged.records.get(&rec.key_id) {
+                if cur.key_record.is_none() {
+                    return Err(ErrorCode::KeyShredded);
+                }
+                if rec.wrap_gen == cur.wrap_gen && rec.key_record != cur.key_record {
+                    return Err(ErrorCode::IntegrityError);
+                }
+            }
+            staged.insert_record(rec.clone());
+        }
+        if let Some((gen, blob)) = keyring {
+            if let Some((cur_gen, cur_blob)) = &staged.keyring_material {
+                if gen < *cur_gen {
+                    return Err(ErrorCode::CasMismatch);
+                }
+                if gen == *cur_gen && &blob != cur_blob {
+                    return Err(ErrorCode::IntegrityError);
+                }
+            }
+            staged.update_keyring_material(gen, blob);
+        }
+        if let Some((gen, blob)) = vault_header {
+            if let Some((cur_gen, cur_blob)) = &staged.vault_header_material {
+                if gen < *cur_gen {
+                    return Err(ErrorCode::CasMismatch);
+                }
+                if gen == *cur_gen && &blob != cur_blob {
+                    return Err(ErrorCode::IntegrityError);
+                }
+            }
+            staged.update_vault_header_material(gen, blob);
+        }
+        self.keys = staged;
+        Ok(())
+    }
+
     /// Simulate DO PITR rollback to `keep_ops` prefix with a brand new `journal_epoch`.
-    fn inject_pitr_rollback(&mut self, keep_ops: usize, new_epoch: JournalEpoch) {
+    pub fn inject_pitr_rollback(&mut self, keep_ops: usize, new_epoch: JournalEpoch) {
         self.ops.truncate(keep_ops);
         self.op_index = self.ops.iter().map(|o| (o.op_id, o.seq)).collect();
         self.epoch = new_epoch;
@@ -1102,6 +1146,158 @@ mod tests {
             let report = cluster.run_and_verify(60);
             assert!(report.total_ops_committed >= 2);
             assert!(report.tamper_rejections >= 1);
+        }
+    }
+
+    #[test]
+    fn execute_shared_m1_relay_contract_scenario_on_sim_relay() {
+        use base64::Engine;
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = Path::new(manifest_dir).join("../../tests/scenarios/m1_relay_contract.json");
+        let raw = std::fs::read_to_string(&path).expect("shared scenario json readable");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid scenario json");
+
+        let mut current_epoch = JournalEpoch::from_random_bytes([0x42; 16]);
+        let mut previous_epoch = current_epoch;
+        let mut relay = SimRelay::new(current_epoch);
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        for step in doc["steps"].as_array().expect("steps array") {
+            let step_id = step["id"].as_str().unwrap();
+            match step["action"].as_str().unwrap() {
+                "pitr_rollback" => {
+                    previous_epoch = current_epoch;
+                    let keep = step["keep_seq"].as_u64().unwrap() as usize;
+                    let next = JournalEpoch::parse(step["new_epoch"].as_str().unwrap()).unwrap();
+                    relay.inject_pitr_rollback(keep, next);
+                    current_epoch = next;
+                }
+                "push" => {
+                    let dev = DeviceId::parse(step["as_device"].as_str().unwrap()).unwrap();
+                    let expected_epoch = if step["use_epoch"].as_str() == Some("previous") {
+                        previous_epoch
+                    } else {
+                        current_epoch
+                    };
+                    let key_records: Vec<KeyRecordRow> = step["key_records"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|k| KeyRecordRow {
+                            key_id: KeyId::parse(k["key_id"].as_str().unwrap()).unwrap(),
+                            wrap_gen: k["wrap_gen"].as_u64().unwrap() as u32,
+                            key_record: Some(b64.decode(k["key_record_b64"].as_str().unwrap()).unwrap()),
+                            created_at_ms: 1_795_521_600_000,
+                        })
+                        .collect();
+                    let ops: Vec<crate::sync::PushOpDto> = step["ops"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|o| crate::sync::PushOpDto {
+                            op_id: OpId::parse(o["op_id"].as_str().unwrap()).unwrap(),
+                            device_id: DeviceId::parse(o["device_id"].as_str().unwrap()).unwrap(),
+                            key_id: o["key_id"].as_str().map(|s| KeyId::parse(s).unwrap()),
+                            envelope: b64.decode(o["envelope_b64"].as_str().unwrap()).unwrap(),
+                        })
+                        .collect();
+                    let req = PushRequestDto {
+                        expected_epoch,
+                        seen_seq: 0,
+                        key_records,
+                        ops,
+                    };
+                    let exp = &step["expect"];
+                    match relay.handle_push(&dev, &req, 1_795_521_600_000) {
+                        Ok((_, acked, head_seq)) => {
+                            assert_eq!(exp["status"].as_u64().unwrap(), 200, "step={step_id}");
+                            let got_seqs: Vec<i64> = acked.iter().map(|a| a.seq).collect();
+                            let want_seqs: Vec<i64> = exp["acked_seqs"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|v| v.as_i64().unwrap())
+                                .collect();
+                            assert_eq!(got_seqs, want_seqs, "step={step_id}");
+                            assert_eq!(head_seq, exp["head_seq"].as_i64().unwrap(), "step={step_id}");
+                        }
+                        Err(code) => {
+                            assert_ne!(exp["status"].as_u64().unwrap(), 200, "step={step_id}");
+                            assert_eq!(
+                                code.as_str(),
+                                exp["error_code"].as_str().unwrap(),
+                                "step={step_id}"
+                            );
+                            if let Some(h) = exp["head_seq"].as_i64() {
+                                assert_eq!(relay.head_seq(), h, "step={step_id}");
+                            }
+                        }
+                    }
+                }
+                "pull" => {
+                    let since = step["since"].as_i64().unwrap();
+                    let limit = step["limit"].as_u64().unwrap() as usize;
+                    let (_, ops, digest, head_seq, has_more) = relay.handle_pull(since, limit);
+                    let exp = &step["expect"];
+                    let got_ids: Vec<String> = ops.iter().map(|o| o.op_id.to_string()).collect();
+                    let want_ids: Vec<String> = exp["op_ids"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap().to_string())
+                        .collect();
+                    assert_eq!(got_ids, want_ids, "step={step_id}");
+                    let got_seqs: Vec<i64> = ops.iter().map(|o| o.seq).collect();
+                    let want_seqs: Vec<i64> = exp["seqs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_i64().unwrap())
+                        .collect();
+                    assert_eq!(got_seqs, want_seqs, "step={step_id}");
+                    if let Some(dev_ids) = exp["device_ids"].as_array() {
+                        let got_devs: Vec<String> = ops.iter().map(|o| o.device_id.to_string()).collect();
+                        let want_devs: Vec<String> =
+                            dev_ids.iter().map(|v| v.as_str().unwrap().to_string()).collect();
+                        assert_eq!(got_devs, want_devs, "step={step_id}");
+                    }
+                    assert_eq!(has_more, exp["has_more"].as_bool().unwrap(), "step={step_id}");
+                    assert_eq!(head_seq, exp["head_seq"].as_i64().unwrap(), "step={step_id}");
+                    assert!(digest.starts_with("blake3:"), "step={step_id}");
+                }
+                "keys_post" => {
+                    let records: Vec<KeyRecordRow> = step["key_records"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|k| KeyRecordRow {
+                            key_id: KeyId::parse(k["key_id"].as_str().unwrap()).unwrap(),
+                            wrap_gen: k["wrap_gen"].as_u64().unwrap() as u32,
+                            key_record: Some(b64.decode(k["key_record_b64"].as_str().unwrap()).unwrap()),
+                            created_at_ms: 1_795_521_600_000,
+                        })
+                        .collect();
+                    let keyring = step.get("keyring").and_then(|kr| {
+                        Some((
+                            kr["gen"].as_u64()? as u32,
+                            b64.decode(kr["blob_b64"].as_str()?).ok()?,
+                        ))
+                    });
+                    let exp = &step["expect"];
+                    match relay.handle_keys_post(&records, keyring, None) {
+                        Ok(()) => assert_eq!(exp["status"].as_u64().unwrap(), 200, "step={step_id}"),
+                        Err(code) => {
+                            assert_ne!(exp["status"].as_u64().unwrap(), 200, "step={step_id}");
+                            assert_eq!(
+                                code.as_str(),
+                                exp["error_code"].as_str().unwrap(),
+                                "step={step_id}"
+                            );
+                        }
+                    }
+                }
+                other => panic!("unexpected scenario action: {other}"),
+            }
         }
     }
 }

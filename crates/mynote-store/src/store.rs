@@ -2,23 +2,31 @@
 //! multi-leaf materialization, FTS5 indexing, default read-only Markdown mirror (`F-19`),
 //! `VACUUM INTO` backups, Heynote import (`M1-5`), SMK rotation, and offline restore (`INV-RECOVERY`).
 
+use crate::credentials::{
+    exclude_from_os_backups, load_device_credentials, save_device_credentials, write_atomic_0600,
+    DeviceCredentials,
+};
 use crate::heynote::{load_heynote_path, ParsedHeynoteBuffer};
 use crate::schema::{init_connection, vacuum_into};
 use mynote_core::crypto::{
     decrypt_mnb1, decrypt_mnr1, decrypt_mns1, encrypt_mnb1, encrypt_mnr1, encrypt_mns1, peek_envelope_kid,
-    seal_mnrs, KeyRecordV1, RecoveryKeypair, RecoveryKeyringV1, MAGIC_MNR1, MNRS_KIND_SMK,
+    seal_mnrs, KeyRecordV1, RecoveryKeypair, RecoveryKeyringV1, SmkGenerationBytes, MAGIC_MNR1, MAGIC_MNS1,
+    MNRS_KIND_SMK,
 };
 use mynote_core::error::{CoreError, ErrorCode};
 use mynote_core::fractional_index;
 use mynote_core::hlc::{Hlc, HlcClock};
-use mynote_core::ids::{BlockId, BufferId, DeviceId, KeyId, MonotonicUlidGen, OpId, SmkKid, Ulid};
-use mynote_core::keys::{self_check_key_liveness, KeyTableState};
+use mynote_core::ids::{
+    BlockId, BufferId, DeviceId, JournalEpoch, KeyId, MonotonicUlidGen, OpId, SmkKid, Ulid,
+};
+use mynote_core::keys::KeyTableState;
 use mynote_core::materialize::{materialize_block, materialize_buffer, DecodedOp};
 use mynote_core::model::{
-    BlockState, EntityType, InnerOpV1, KeyRecordRow, LeafBody, MaterializedBlock, MaterializedBuffer,
-    OpBodyV1, OpType,
+    BlockState, EntityType, InnerOpV1, KeyMaterialKind, KeyRecordRow, LeafBody, MaterializedBlock,
+    MaterializedBuffer, OpBodyV1, OpType,
 };
 use mynote_core::sim::offline_restore_from_r2;
+use mynote_core::sync::{EngineSnapshot, LocalOpRecord, StoreMutation};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -332,25 +340,43 @@ fn sanitize_mirror_name(name: &str) -> String {
     }
 }
 
+fn ensure_private_dir(path: &Path) -> Result<(), CoreError> {
+    std::fs::create_dir_all(path).map_err(|e| {
+        CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!("cannot create dir '{}': {e}", path.display()),
+            "Check directory permissions",
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            CoreError::new(
+                ErrorCode::InvalidArgument,
+                format!("cannot set 0700 on '{}': {e}", path.display()),
+                "Check directory ownership and permissions",
+            )
+        })?;
+    }
+    Ok(())
+}
+
 impl LocalStore {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, CoreError> {
+        Self::open_with_device_id(data_dir, None)
+    }
+
+    pub fn open_with_device_id(
+        data_dir: impl AsRef<Path>,
+        preset_device_id: Option<DeviceId>,
+    ) -> Result<Self, CoreError> {
         let data_dir = data_dir.as_ref().to_path_buf();
         let backups_dir = data_dir.join("backups");
         let mirror_dir = data_dir.join("mirror");
-        std::fs::create_dir_all(&backups_dir).map_err(|e| {
-            CoreError::new(
-                ErrorCode::InvalidArgument,
-                format!("cannot create data dir '{}': {e}", data_dir.display()),
-                "Check directory permissions",
-            )
-        })?;
-        std::fs::create_dir_all(&mirror_dir).map_err(|e| {
-            CoreError::new(
-                ErrorCode::InvalidArgument,
-                format!("cannot create mirror dir: {e}"),
-                "Check directory permissions",
-            )
-        })?;
+        ensure_private_dir(&data_dir)?;
+        ensure_private_dir(&backups_dir)?;
+        ensure_private_dir(&mirror_dir)?;
 
         let db_path = data_dir.join("mynote.db");
         let conn = Connection::open(&db_path).map_err(|e| {
@@ -380,7 +406,10 @@ impl LocalStore {
             let (cur_kid, map) = Self::load_local_smks(&smk_file_path)?;
             (dev, cur_kid, map, None, false)
         } else {
-            let dev = DeviceId::from_random_bytes(rand_bytes::<10>()?);
+            let dev = match preset_device_id {
+                Some(d) => d,
+                None => DeviceId::from_random_bytes(rand_bytes::<10>()?),
+            };
             let now = now_ms();
             let entropy = Zeroizing::new(rand_bytes::<32>()?);
             let (kp, words) = RecoveryKeypair::from_entropy(&entropy)?;
@@ -449,7 +478,11 @@ impl LocalStore {
         };
 
         if is_fresh {
+            exclude_from_os_backups(&store.data_dir);
             store.create_buffer("scratch", None, "human")?;
+        } else if !store.smks.is_empty() {
+            // Read-only fast-path if no placeholder Ulid::ZERO block_keys exist.
+            let _ = store.backfill_unknown_block_keys();
         }
         Ok(store)
     }
@@ -469,17 +502,7 @@ impl LocalStore {
         };
         let bytes = serde_json::to_vec_pretty(&file)
             .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "serialize SMK store"))?;
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, bytes)
-            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "write SMK store"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&tmp, path)
-            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "rename SMK store"))?;
-        Ok(())
+        write_atomic_0600(path, &bytes)
     }
 
     fn load_local_smks(path: &Path) -> Result<(SmkKid, SmkMap), CoreError> {
@@ -498,6 +521,126 @@ impl LocalStore {
             map.insert(SmkKid::parse(&k)?, decode_hex_32(&v)?);
         }
         Ok((cur, map))
+    }
+
+    /// Reload SMK generations from disk (e.g. after CLI `keyring rotate` / `keyring unlock` / `device claim`
+    /// while the daemon is already running) and backfill any placeholder `Ulid::ZERO` `block_keys`.
+    pub fn reload_smks_from_disk(&mut self) -> Result<bool, CoreError> {
+        let path = self.data_dir.join("smk_keyring.local.json");
+        let (cur, map) = Self::load_local_smks(&path)?;
+        let changed = cur != self.current_smk_kid
+            || map.len() != self.smks.len()
+            || map
+                .iter()
+                .any(|(k, v)| self.smks.get(k).is_none_or(|old| old.as_ref() != v.as_ref()));
+        if changed {
+            self.current_smk_kid = cur;
+            self.smks = map;
+            let _ = self.backfill_unknown_block_keys()?;
+        }
+        Ok(changed)
+    }
+
+    /// Backfill `block_id` and `tier` on any `block_keys` rows that were synced before their SMK
+    /// became available locally (stored temporarily with `block_id = Ulid::ZERO`).
+    /// Performs ZERO SQLite writes when no placeholder rows exist.
+    pub fn backfill_unknown_block_keys(&self) -> Result<usize, CoreError> {
+        let zero = Ulid::ZERO.to_string();
+        let pending: Vec<(String, i64, Vec<u8>)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT key_id, wrap_gen, key_record FROM block_keys WHERE block_id = ?1 AND key_record IS NOT NULL")
+                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "scan unknown block_keys"))?;
+            let rows: Vec<(String, i64, Vec<u8>)> = stmt
+                .query_map([&zero], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(|e| {
+                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "map unknown block_keys")
+                })?
+                .filter_map(Result::ok)
+                .collect();
+            rows
+        };
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let mut updated = 0usize;
+        for (kid_s, wrap_gen, mnr1) in pending {
+            let Ok(kid) = KeyId::parse(&kid_s) else {
+                continue;
+            };
+            let Some(smk_kid) = peek_envelope_kid(MAGIC_MNR1, &mnr1).ok().map(SmkKid::from_bytes) else {
+                continue;
+            };
+            let Some(smk) = self.smks.get(&smk_kid) else {
+                continue;
+            };
+            if let Ok(kr) = decrypt_mnr1(smk_kid, smk, kid, wrap_gen as u32, &mnr1) {
+                self.conn
+                    .execute(
+                        "UPDATE block_keys SET block_id = ?1, tier = ?2 WHERE key_id = ?3",
+                        params![kr.block_id.to_string(), kr.tier as i64, kid_s],
+                    )
+                    .map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "backfill block_key")
+                    })?;
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
+    /// Enforce Bootstrap Gate (`AGENTS.md` §3.1, `docs/sync-protocol.md` §3 #1, `INV-SYNC-3`):
+    /// Before `bootstrap_completed == 1`, refuse non-CREATE mutations against remote-existing entities.
+    fn check_bootstrap_gate(
+        &self,
+        entity_type: EntityType,
+        entity_id: &str,
+        op_type: OpType,
+    ) -> Result<(), CoreError> {
+        if op_type == OpType::Create || self.get_local_meta("bootstrap_completed").as_deref() == Some("1") {
+            return Ok(());
+        }
+        let has_sync_configured = self.get_local_meta("sync_url").is_some();
+        let et_s = match entity_type {
+            EntityType::Buffer => "buffer",
+            EntityType::Block => "block",
+        };
+        let remote_seq_count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_ops WHERE entity_type = ?1 AND entity_id = ?2 AND server_seq IS NOT NULL",
+                params![et_s, entity_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "bootstrap gate check"))?;
+        let foreign_dev_count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_ops WHERE entity_type = ?1 AND entity_id = ?2 AND device_id != ?3",
+                params![et_s, entity_id, self.device_id.as_str()],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "bootstrap gate check"))?;
+        let local_create_count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_ops WHERE entity_type = ?1 AND entity_id = ?2 AND op_type = 'CREATE' AND device_id = ?3",
+                params![et_s, entity_id, self.device_id.as_str()],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "bootstrap gate check"))?;
+
+        if remote_seq_count > 0 || local_create_count == 0 || (has_sync_configured && foreign_dev_count > 0) {
+            return Err(CoreError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "Bootstrap Gate blocked {:?} on remote {et_s} '{entity_id}' before initial sync bootstrap completed",
+                    op_type
+                ),
+                "Wait for initial sync bootstrap ('mynote sync pull') before modifying existing remote entities",
+            ));
+        }
+        Ok(())
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -665,6 +808,9 @@ impl LocalStore {
             self.current_smk_kid,
             &self.smks,
         )?;
+        self.backfill_unknown_block_keys()?;
+        self.set_local_meta("last_seq", "0")?;
+        self.rematerialize_all()?;
         Ok(unsealed.len())
     }
 
@@ -704,6 +850,23 @@ impl LocalStore {
                 created_at_ms,
             });
         }
+        if let Ok(mut mstmt) = self.conn.prepare("SELECT kind, gen, blob FROM key_material") {
+            if let Ok(mrows) = mstmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            }) {
+                for mrow in mrows.flatten() {
+                    match mrow.0.as_str() {
+                        "keyring" => kt.update_keyring_material(mrow.1 as u32, mrow.2),
+                        "vault_header" => kt.update_vault_header_material(mrow.1, mrow.2),
+                        _ => {}
+                    }
+                }
+            }
+        }
         Ok(kt)
     }
 
@@ -741,6 +904,28 @@ impl LocalStore {
         })?;
         let rec = decrypt_mnr1(smk_kid, smk, key_id, wrap_gen as u32, &mnr1)?;
         Ok((rec.tier, rec.bdek))
+    }
+
+    /// Unwrap a Tier 1 32-byte BDEK, rejecting Tier 2 Vault keys (`BlockLocked`) and malformed lengths (`IntegrityError`).
+    fn unwrap_tier1_bdek(&self, key_id: KeyId) -> Result<Zeroizing<[u8; 32]>, CoreError> {
+        let (tier, bdek_vec) = self.unwrap_bdek(key_id)?;
+        if tier != 1 {
+            return Err(CoreError::new(
+                ErrorCode::BlockLocked,
+                format!("key {key_id} belongs to Tier {tier} Vault and cannot be unwrapped on Tier 1 path"),
+                "Unlock Vault in the desktop UI before editing locked blocks",
+            ));
+        }
+        if bdek_vec.len() != 32 {
+            return Err(CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("invalid Tier 1 BDEK length {} for key {key_id}", bdek_vec.len()),
+                "Verify key integrity or restore from backup",
+            ));
+        }
+        let mut bdek = Zeroizing::new([0u8; 32]);
+        bdek.copy_from_slice(&bdek_vec);
+        Ok(bdek)
     }
 
     fn load_entity_decoded_ops(
@@ -858,139 +1043,163 @@ impl LocalStore {
             BlockState::Shredded => "SHREDDED",
         };
 
-        // Remove old FTS entries for this block's leaves BEFORE replacing block_leaves
         self.conn
-            .execute(
-                "DELETE FROM blocks_fts WHERE rowid IN (SELECT rowid FROM block_leaves WHERE block_id = ?1)",
-                [block_id.to_string()],
-            )
-            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "cleanup fts"))?;
+            .execute_batch("SAVEPOINT mynote_remat_block;")
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "savepoint remat_block"))?;
 
-        self.conn
-            .execute(
-                "INSERT INTO blocks (
-                    id, buffer_id, position, lang, public_hint,
-                    buffer_id_hlc, position_hlc, lang_hlc, public_hint_hlc,
-                    state, is_locked, display_op_id, leaf_count, updated_at_ms, deleted_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-                 ON CONFLICT(id) DO UPDATE SET
-                    buffer_id=excluded.buffer_id, position=excluded.position, lang=excluded.lang,
-                    public_hint=excluded.public_hint, buffer_id_hlc=excluded.buffer_id_hlc,
-                    position_hlc=excluded.position_hlc, lang_hlc=excluded.lang_hlc,
-                    public_hint_hlc=excluded.public_hint_hlc, state=excluded.state,
-                    is_locked=excluded.is_locked, display_op_id=excluded.display_op_id,
-                    leaf_count=excluded.leaf_count, updated_at_ms=excluded.updated_at_ms,
-                    deleted_at_ms=excluded.deleted_at_ms",
-                params![
-                    mat.id.to_string(),
-                    mat.buffer_id.to_string(),
-                    mat.position,
-                    mat.lang,
-                    mat.public_hint,
-                    mat.field_hlc.buffer_id.canonical_string(),
-                    mat.field_hlc.position.canonical_string(),
-                    mat.field_hlc.lang.canonical_string(),
-                    mat.field_hlc.public_hint.canonical_string(),
-                    state_str,
-                    if mat.is_locked { 1i64 } else { 0i64 },
-                    mat.display_op_id.map(|o| o.to_string()),
-                    mat.leaves.len() as i64,
-                    mat.updated_at_ms,
-                    mat.deleted_at_ms,
-                ],
-            )
-            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "upsert blocks"))?;
-
-        self.conn
-            .execute(
-                "DELETE FROM block_leaves WHERE block_id = ?1",
-                [block_id.to_string()],
-            )
-            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "clear block_leaves"))?;
-
-        for leaf in &mat.leaves {
-            let row = match &leaf.body {
-                LeafBody::Plaintext(s) => {
-                    let kid = decoded
-                        .iter()
-                        .find(|d| d.op_id == leaf.op_id)
-                        .and_then(|d| d.inner.key_id())
-                        .map(|k| k.to_string());
-                    LeafInsertRow {
-                        body_state: "PLAINTEXT",
-                        tier: Some(1),
-                        key_id: kid,
-                        content: Some(s.as_str()),
-                        ciphertext: None,
-                    }
-                }
-                LeafBody::Sealed { key_id, mnb1 } => LeafInsertRow {
-                    body_state: "SEALED",
-                    tier: Some(2),
-                    key_id: Some(key_id.to_string()),
-                    content: None,
-                    ciphertext: Some(mnb1.as_slice()),
-                },
-                LeafBody::Tombstone { .. } => LeafInsertRow {
-                    body_state: "TOMBSTONE",
-                    tier: None,
-                    key_id: None,
-                    content: None,
-                    ciphertext: None,
-                },
-                LeafBody::KeyUnavailable { key_id, .. } => LeafInsertRow {
-                    body_state: "KEY_UNAVAILABLE",
-                    tier: leaf.tier.map(i64::from),
-                    key_id: Some(key_id.to_string()),
-                    content: None,
-                    ciphertext: None,
-                },
-                LeafBody::DecryptFailed { .. } => LeafInsertRow {
-                    body_state: "DECRYPT_FAILED",
-                    tier: leaf.tier.map(i64::from),
-                    key_id: None,
-                    content: None,
-                    ciphertext: None,
-                },
-            };
+        let write_res: Result<(), CoreError> = (|| {
+            // Remove old FTS entries for this block's leaves BEFORE replacing block_leaves
+            self.conn
+                .execute(
+                    "DELETE FROM blocks_fts WHERE rowid IN (SELECT rowid FROM block_leaves WHERE block_id = ?1)",
+                    [block_id.to_string()],
+                )
+                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "cleanup fts"))?;
 
             self.conn
                 .execute(
-                    "INSERT INTO block_leaves
-                     (block_id, op_id, hlc, device_id, actor, body_state, tier, key_id, content, ciphertext)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    "INSERT INTO blocks (
+                        id, buffer_id, position, lang, public_hint,
+                        buffer_id_hlc, position_hlc, lang_hlc, public_hint_hlc,
+                        state, is_locked, display_op_id, leaf_count, updated_at_ms, deleted_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                     ON CONFLICT(id) DO UPDATE SET
+                        buffer_id=excluded.buffer_id, position=excluded.position, lang=excluded.lang,
+                        public_hint=excluded.public_hint, buffer_id_hlc=excluded.buffer_id_hlc,
+                        position_hlc=excluded.position_hlc, lang_hlc=excluded.lang_hlc,
+                        public_hint_hlc=excluded.public_hint_hlc, state=excluded.state,
+                        is_locked=excluded.is_locked, display_op_id=excluded.display_op_id,
+                        leaf_count=excluded.leaf_count, updated_at_ms=excluded.updated_at_ms,
+                        deleted_at_ms=excluded.deleted_at_ms",
                     params![
                         mat.id.to_string(),
-                        leaf.op_id.to_string(),
-                        leaf.hlc.canonical_string(),
-                        leaf.device_id.as_str(),
-                        leaf.actor,
-                        row.body_state,
-                        row.tier,
-                        row.key_id,
-                        row.content,
-                        row.ciphertext,
+                        mat.buffer_id.to_string(),
+                        mat.position,
+                        mat.lang,
+                        mat.public_hint,
+                        mat.field_hlc.buffer_id.canonical_string(),
+                        mat.field_hlc.position.canonical_string(),
+                        mat.field_hlc.lang.canonical_string(),
+                        mat.field_hlc.public_hint.canonical_string(),
+                        state_str,
+                        if mat.is_locked { 1i64 } else { 0i64 },
+                        mat.display_op_id.map(|o| o.to_string()),
+                        mat.leaves.len() as i64,
+                        mat.updated_at_ms,
+                        mat.deleted_at_ms,
                     ],
                 )
-                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "insert block_leaf"))?;
+                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "upsert blocks"))?;
 
-            // FTS5 INVARIANT: ONLY index ACTIVE unlocked PLAINTEXT leaves!
-            if mat.state == BlockState::Active && !mat.is_locked {
-                if let LeafBody::Plaintext(pt) = &leaf.body {
-                    let rowid = self.conn.last_insert_rowid();
-                    self.conn
-                        .execute(
-                            "INSERT INTO blocks_fts (rowid, content, public_hint) VALUES (?1, ?2, ?3)",
-                            params![rowid, pt, mat.public_hint.as_deref().unwrap_or("")],
-                        )
-                        .map_err(|e| {
-                            CoreError::new(ErrorCode::IntegrityError, e.to_string(), "insert fts")
-                        })?;
+            self.conn
+                .execute(
+                    "DELETE FROM block_leaves WHERE block_id = ?1",
+                    [block_id.to_string()],
+                )
+                .map_err(|e| {
+                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "clear block_leaves")
+                })?;
+
+            for leaf in &mat.leaves {
+                let row = match &leaf.body {
+                    LeafBody::Plaintext(s) => {
+                        let kid = decoded
+                            .iter()
+                            .find(|d| d.op_id == leaf.op_id)
+                            .and_then(|d| d.inner.key_id())
+                            .map(|k| k.to_string());
+                        LeafInsertRow {
+                            body_state: "PLAINTEXT",
+                            tier: Some(1),
+                            key_id: kid,
+                            content: Some(s.as_str()),
+                            ciphertext: None,
+                        }
+                    }
+                    LeafBody::Sealed { key_id, mnb1 } => LeafInsertRow {
+                        body_state: "SEALED",
+                        tier: Some(2),
+                        key_id: Some(key_id.to_string()),
+                        content: None,
+                        ciphertext: Some(mnb1.as_slice()),
+                    },
+                    LeafBody::Tombstone { .. } => LeafInsertRow {
+                        body_state: "TOMBSTONE",
+                        tier: None,
+                        key_id: None,
+                        content: None,
+                        ciphertext: None,
+                    },
+                    LeafBody::KeyUnavailable { key_id, .. } => LeafInsertRow {
+                        body_state: "KEY_UNAVAILABLE",
+                        tier: leaf.tier.map(i64::from),
+                        key_id: Some(key_id.to_string()),
+                        content: None,
+                        ciphertext: None,
+                    },
+                    LeafBody::DecryptFailed { .. } => LeafInsertRow {
+                        body_state: "DECRYPT_FAILED",
+                        tier: leaf.tier.map(i64::from),
+                        key_id: None,
+                        content: None,
+                        ciphertext: None,
+                    },
+                };
+
+                self.conn
+                    .execute(
+                        "INSERT INTO block_leaves
+                         (block_id, op_id, hlc, device_id, actor, body_state, tier, key_id, content, ciphertext)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        params![
+                            mat.id.to_string(),
+                            leaf.op_id.to_string(),
+                            leaf.hlc.canonical_string(),
+                            leaf.device_id.as_str(),
+                            leaf.actor,
+                            row.body_state,
+                            row.tier,
+                            row.key_id,
+                            row.content,
+                            row.ciphertext,
+                        ],
+                    )
+                    .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "insert block_leaf"))?;
+
+                // FTS5 INVARIANT: ONLY index ACTIVE unlocked PLAINTEXT leaves!
+                if mat.state == BlockState::Active && !mat.is_locked {
+                    if let LeafBody::Plaintext(pt) = &leaf.body {
+                        let rowid = self.conn.last_insert_rowid();
+                        self.conn
+                            .execute(
+                                "INSERT INTO blocks_fts (rowid, content, public_hint) VALUES (?1, ?2, ?3)",
+                                params![rowid, pt, mat.public_hint.as_deref().unwrap_or("")],
+                            )
+                            .map_err(|e| {
+                                CoreError::new(ErrorCode::IntegrityError, e.to_string(), "insert fts")
+                            })?;
+                    }
                 }
             }
-        }
+            Ok(())
+        })();
 
-        Ok(mat)
+        match write_res {
+            Ok(()) => {
+                self.conn
+                    .execute_batch("RELEASE SAVEPOINT mynote_remat_block;")
+                    .map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "release savepoint")
+                    })?;
+                Ok(mat)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT mynote_remat_block; RELEASE SAVEPOINT mynote_remat_block;",
+                );
+                Err(e)
+            }
+        }
     }
 
     fn rematerialize_buffer(&self, buffer_id: BufferId) -> Result<MaterializedBuffer, CoreError> {
@@ -1323,6 +1532,7 @@ impl LocalStore {
         actor: &str,
     ) -> Result<BufferDto, CoreError> {
         let buf_id = self.resolve_buffer_id(selector)?;
+        self.check_bootstrap_gate(EntityType::Buffer, &buf_id.to_string(), OpType::Update)?;
         let key_str: String = self
             .conn
             .query_row(
@@ -1332,9 +1542,7 @@ impl LocalStore {
             )
             .map_err(|e| CoreError::new(ErrorCode::NotFound, e.to_string(), "Buffer not found"))?;
         let key_id = KeyId::parse(&key_str)?;
-        let (_, bdek_vec) = self.unwrap_bdek(key_id)?;
-        let mut bdek = Zeroizing::new([0u8; 32]);
-        bdek.copy_from_slice(&bdek_vec);
+        let bdek = self.unwrap_tier1_bdek(key_id)?;
 
         let now = now_ms();
         let op_id = OpId::from_ulid(self.ulid_gen.next(now, rand_bytes::<10>()?));
@@ -1392,6 +1600,7 @@ impl LocalStore {
 
     pub fn delete_buffer(&mut self, selector: &str, actor: &str) -> Result<BufferDto, CoreError> {
         let buf_id = self.resolve_buffer_id(selector)?;
+        self.check_bootstrap_gate(EntityType::Buffer, &buf_id.to_string(), OpType::Delete)?;
         // Also soft-delete all active blocks inside the buffer (`docs/sync-protocol.md` §2.2)
         let child_ids: Vec<String> = {
             let mut stmt = self
@@ -2073,11 +2282,21 @@ impl LocalStore {
         actor: &str,
     ) -> Result<WriteReceipt, CoreError> {
         let detail = self.get_block(block_id_str)?;
+        self.check_bootstrap_gate(EntityType::Block, &detail.id, OpType::Update)?;
         if detail.is_locked {
             return Err(CoreError::new(
                 ErrorCode::BlockLocked,
                 format!("block '{block_id_str}' is locked (Tier 2 Vault)"),
                 "Unlock the block interactively in desktop UI or TTY before editing",
+            ));
+        }
+        if !force && detail.versions.iter().any(|v| v.content.is_none()) {
+            return Err(CoreError::new(
+                ErrorCode::KeyMissing,
+                format!(
+                    "block '{block_id_str}' has unreadable leaves (KEY_UNAVAILABLE or DECRYPT_FAILED); refusing plaintext overwrite"
+                ),
+                "Sync missing keys or unlock keyring before editing this block",
             ));
         }
         let actual_set: BTreeSet<String> = detail.head_op_ids.iter().cloned().collect();
@@ -2101,9 +2320,7 @@ impl LocalStore {
 
         let blk_id = BlockId::parse(block_id_str)?;
         let key_id = self.find_active_block_key(blk_id)?;
-        let (_, bdek_vec) = self.unwrap_bdek(key_id)?;
-        let mut bdek = Zeroizing::new([0u8; 32]);
-        bdek.copy_from_slice(&bdek_vec);
+        let bdek = self.unwrap_tier1_bdek(key_id)?;
 
         let parents: Vec<OpId> = detail
             .head_op_ids
@@ -2177,6 +2394,7 @@ impl LocalStore {
         actor: &str,
     ) -> Result<WriteReceipt, CoreError> {
         let detail = self.get_block(block_id_str)?;
+        self.check_bootstrap_gate(EntityType::Block, &detail.id, OpType::Update)?;
         if detail.is_locked {
             return Err(CoreError::new(
                 ErrorCode::BlockLocked,
@@ -2197,7 +2415,15 @@ impl LocalStore {
             Some(h) if !h.is_empty() => h.to_vec(),
             _ => detail.head_op_ids.clone(),
         };
-        let mut combined = detail.content.unwrap_or_default();
+        let mut combined = detail.content.ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::KeyMissing,
+                format!(
+                    "block '{block_id_str}' content is unreadable; refusing to append over unavailable body"
+                ),
+                "Sync missing keys or unlock keyring before modifying this block",
+            )
+        })?;
         if !combined.is_empty() && !combined.ends_with('\n') && !suffix.starts_with('\n') {
             combined.push('\n');
         }
@@ -2215,6 +2441,7 @@ impl LocalStore {
         actor: &str,
     ) -> Result<WriteReceipt, CoreError> {
         let detail = self.get_block(block_id_str)?;
+        self.check_bootstrap_gate(EntityType::Block, &detail.id, OpType::SetMeta)?;
         let blk_id = BlockId::parse(block_id_str)?;
         let target_buf = match to_buf {
             Some(s) => self.resolve_buffer_id(s)?,
@@ -2281,6 +2508,7 @@ impl LocalStore {
         actor: &str,
     ) -> Result<DeleteReceipt, CoreError> {
         let detail = self.get_block(block_id_str)?;
+        self.check_bootstrap_gate(EntityType::Block, &detail.id, OpType::Delete)?;
         if let Some(exp) = expected_heads {
             if !exp.is_empty() {
                 let exp_set: BTreeSet<String> = exp.iter().cloned().collect();
@@ -2397,6 +2625,7 @@ impl LocalStore {
 
     pub fn restore_trash(&mut self, block_id_str: &str, actor: &str) -> Result<WriteReceipt, CoreError> {
         let blk_id = BlockId::parse(block_id_str)?;
+        self.check_bootstrap_gate(EntityType::Block, &blk_id.to_string(), OpType::Update)?;
         let state: Option<String> = self
             .conn
             .query_row(
@@ -2452,11 +2681,15 @@ impl LocalStore {
                     "Unlock Vault in desktop UI before restoring this block",
                 ));
             }
-            _ => unreachable!(),
+            _ => {
+                return Err(CoreError::new(
+                    ErrorCode::IntegrityError,
+                    "unsupported or corrupted block content tier in op history",
+                    "Inspect block history or restore from backup",
+                ));
+            }
         };
-        let (_, bdek_vec) = self.unwrap_bdek(key_id)?;
-        let mut bdek = Zeroizing::new([0u8; 32]);
-        bdek.copy_from_slice(&bdek_vec);
+        let bdek = self.unwrap_tier1_bdek(key_id)?;
         let restored_pt = decrypt_mnb1(blk_id.as_bytes(), last_content_op.op_id, key_id, &bdek, mnb1)?;
 
         let parents = self.current_entity_leaves(EntityType::Block, &blk_id.to_string())?;
@@ -2558,6 +2791,7 @@ impl LocalStore {
         actor: &str,
     ) -> Result<WriteReceipt, CoreError> {
         let detail = self.get_block(block_id_str)?;
+        self.check_bootstrap_gate(EntityType::Block, &detail.id, OpType::Update)?;
         if detail.has_conflict {
             return Err(CoreError::new(
                 ErrorCode::ConflictPresent,
@@ -2597,9 +2831,7 @@ impl LocalStore {
                 ));
             }
         };
-        let (_, bdek_vec) = self.unwrap_bdek(key_id)?;
-        let mut bdek = Zeroizing::new([0u8; 32]);
-        bdek.copy_from_slice(&bdek_vec);
+        let bdek = self.unwrap_tier1_bdek(key_id)?;
         let pt = decrypt_mnb1(blk_id.as_bytes(), target_op_id, key_id, &bdek, mnb1)?;
         self.update_block(block_id_str, &pt, &detail.head_op_ids, false, actor)
     }
@@ -2608,7 +2840,7 @@ impl LocalStore {
         let key_str: Option<String> = self
             .conn
             .query_row(
-                "SELECT key_id FROM block_keys WHERE block_id = ?1 AND key_record IS NOT NULL ORDER BY created_at_ms DESC LIMIT 1",
+                "SELECT key_id FROM block_keys WHERE block_id = ?1 AND tier = 1 AND key_record IS NOT NULL ORDER BY created_at_ms DESC LIMIT 1",
                 [blk_id.to_string()],
                 |r| r.get(0),
             )
@@ -2618,7 +2850,7 @@ impl LocalStore {
             Some(s) => KeyId::parse(&s),
             None => Err(CoreError::new(
                 ErrorCode::KeyMissing,
-                format!("no active BDEK found for block {blk_id}"),
+                format!("no active Tier 1 BDEK found for block {blk_id}"),
                 "Run 'mynote sync pull'",
             )),
         }
@@ -2683,6 +2915,8 @@ impl LocalStore {
 
     /// Rotate SMK generation by sealing a new SMK via device-stored `recovery_pk` (NO 24 words required!),
     /// re-wrapping all active `block_keys` with `wrap_gen + 1`, and PERMANENTLY retaining old SMK generations (`F-05`).
+    /// Fully atomic: decrypts/re-wraps all keys in memory first, persists the new SMK alongside old SMKs
+    /// on disk (`0600` + `fsync`), then commits all SQLite updates inside a single `BEGIN IMMEDIATE` transaction.
     pub fn rotate_smk(&mut self) -> Result<(u32, SmkKid), CoreError> {
         let now = now_ms();
         let mut kr = self.current_keyring()?;
@@ -2701,7 +2935,7 @@ impl LocalStore {
         kr.current_smk_kid = new_smk_kid;
         kr.smk_entries.push(sealed);
 
-        // Re-wrap every active MNR1 key record under new SMK and new wrap_gen
+        // Phase 1: Decrypt & re-wrap ALL active keys in memory before mutating disk or SQLite.
         let active_keys: Vec<(String, i64, Vec<u8>)> = {
             let mut stmt = self
                 .conn
@@ -2717,6 +2951,7 @@ impl LocalStore {
             rows
         };
 
+        let mut rewrapped_rows: Vec<(String, Vec<u8>)> = Vec::with_capacity(active_keys.len());
         for (kid_s, old_gen, mnr1) in active_keys {
             let kid = KeyId::parse(&kid_s)?;
             let old_smk_kid = SmkKid::from_bytes(peek_envelope_kid(MAGIC_MNR1, &mnr1)?);
@@ -2724,40 +2959,80 @@ impl LocalStore {
                 CoreError::new(
                     ErrorCode::KeyMissing,
                     format!("missing old SMK {old_smk_kid}"),
-                    "Unlock keyring",
+                    "Unlock keyring before rotating SMK",
                 )
             })?;
             let rec = decrypt_mnr1(old_smk_kid, old_smk, kid, old_gen as u32, &mnr1)?;
             let rewrapped = encrypt_mnr1(new_smk_kid, &new_smk, kr.keyring_gen, &rec, rand_bytes::<24>()?)?;
-            self.conn
-                .execute(
-                    "UPDATE block_keys SET wrap_gen = ?1, key_record = ?2, server_acked = 0 WHERE key_id = ?3",
-                    params![kr.keyring_gen as i64, rewrapped, kid_s],
-                )
-                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "rewrap block_key"))?;
+            rewrapped_rows.push((kid_s, rewrapped));
         }
 
         let kr_blob = rmp_serde::to_vec_named(&kr)
             .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "encode keyring"))?;
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO key_material (kind, gen, blob, updated_at_ms) VALUES ('keyring', ?1, ?2, ?3)",
-                params![kr.keyring_gen as i64, kr_blob, now as i64],
-            )
-            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "save rotated keyring"))?;
 
-        // Permanently retain old SMK generations alongside the new generation
-        self.smks.insert(new_smk_kid, new_smk);
+        // Phase 2: Persist new SMK generation (retaining all old generations) BEFORE SQLite commit.
+        let smk_path = self.data_dir.join("smk_keyring.local.json");
+        let mut next_smks = self.smks.clone();
+        next_smks.insert(new_smk_kid, new_smk);
+        Self::save_local_smks(&smk_path, new_smk_kid, &next_smks)?;
+
+        // Phase 3: Commit all re-wrapped keys, keyring blob, and drill flag atomically in SQLite.
+        let tx_res: Result<(), CoreError> = (|| {
+            self.conn
+                .execute_batch("BEGIN IMMEDIATE;")
+                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "begin rotate_smk"))?;
+            let body: Result<(), CoreError> = (|| {
+                for (kid_s, rewrapped) in &rewrapped_rows {
+                    self.conn
+                        .execute(
+                            "UPDATE block_keys SET wrap_gen = ?1, key_record = ?2, server_acked = 0 WHERE key_id = ?3",
+                            params![kr.keyring_gen as i64, rewrapped, kid_s],
+                        )
+                        .map_err(|e| {
+                            CoreError::new(ErrorCode::IntegrityError, e.to_string(), "rewrap block_key")
+                        })?;
+                }
+                self.conn
+                    .execute(
+                        "INSERT OR REPLACE INTO key_material (kind, gen, blob, updated_at_ms) VALUES ('keyring', ?1, ?2, ?3)",
+                        params![kr.keyring_gen as i64, kr_blob, now as i64],
+                    )
+                    .map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "save rotated keyring")
+                    })?;
+                self.conn
+                    .execute(
+                        "INSERT OR REPLACE INTO local_meta (key, value) VALUES ('recovery_drill_due', '1')",
+                        [],
+                    )
+                    .map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "set recovery_drill_due")
+                    })?;
+                Ok(())
+            })();
+            match body {
+                Ok(()) => self.conn.execute_batch("COMMIT;").map_err(|e| {
+                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "commit rotate_smk")
+                }),
+                Err(e) => {
+                    let _ = self.conn.execute_batch("ROLLBACK;");
+                    Err(e)
+                }
+            }
+        })();
+
+        if let Err(e) = tx_res {
+            // Roll back current_smk_kid pointer on disk while retaining old SMKs intact.
+            let _ = Self::save_local_smks(&smk_path, self.current_smk_kid, &self.smks);
+            return Err(e);
+        }
+
+        self.smks = next_smks;
         self.current_smk_kid = new_smk_kid;
-        Self::save_local_smks(
-            &self.data_dir.join("smk_keyring.local.json"),
-            new_smk_kid,
-            &self.smks,
-        )?;
         Ok((kr.keyring_gen, new_smk_kid))
     }
 
-    /// Offline sandbox recovery drill (`mynote recovery drill`, read-only, zero DB writes).
+    /// Offline sandbox recovery drill (`mynote recovery drill`, read-only on user notes, updates drill timestamp).
     pub fn recovery_drill(&self, words: &str) -> Result<RecoveryDrillDto, CoreError> {
         let kp = RecoveryKeypair::from_mnemonic_words(words)?;
         let kr = self.current_keyring()?;
@@ -2779,11 +3054,14 @@ impl LocalStore {
             .optional()
             .unwrap_or(None)
             .unwrap_or(false);
+        let drilled_at_ms = now_ms() as i64;
+        let _ = self.set_local_meta("recovery_drill_due", "0");
+        let _ = self.set_local_meta("last_recovery_drill_ms", &drilled_at_ms.to_string());
         Ok(RecoveryDrillDto {
             ok: true,
             keyring_generations: unsealed.len(),
             includes_vkek: has_vault,
-            drilled_at_ms: now_ms() as i64,
+            drilled_at_ms,
         })
     }
 
@@ -2794,32 +3072,50 @@ impl LocalStore {
         Ok(dest)
     }
 
-    /// Run daily key liveness self-check (`INV-KEY-LIVENESS`).
+    /// Run read-only key liveness self-check (`INV-KEY-LIVENESS`) with ZERO SQLite writes.
     pub fn key_self_check(&self) -> Result<(bool, Vec<KeyId>), CoreError> {
         let kt = self.load_key_table()?;
-        let ids: Vec<String> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id FROM blocks WHERE state = 'ACTIVE'")
-                .map_err(|e| {
-                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "scan active blocks")
-                })?;
-            let rows: Vec<String> = stmt
-                .query_map([], |r| r.get(0))
-                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "map active blocks"))?
-                .filter_map(Result::ok)
-                .collect();
-            rows
-        };
-        let mut blocks = Vec::new();
-        for id_s in ids {
-            if let Ok(bid) = BlockId::parse(&id_s) {
-                if let Ok(m) = self.rematerialize_block(bid) {
-                    blocks.push(m);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT bl.key_id, bl.body_state
+                 FROM block_leaves bl
+                 JOIN blocks b ON b.id = bl.block_id
+                 WHERE b.state = 'ACTIVE' AND bl.key_id IS NOT NULL",
+            )
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::IntegrityError,
+                    e.to_string(),
+                    "scan active block leaf keys",
+                )
+            })?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::IntegrityError,
+                    e.to_string(),
+                    "map active block leaf keys",
+                )
+            })?;
+        let mut missing: BTreeSet<KeyId> = BTreeSet::new();
+        for row in rows {
+            let (kid_s, body_state) = row.map_err(|e| {
+                CoreError::new(
+                    ErrorCode::IntegrityError,
+                    e.to_string(),
+                    "read active block leaf key",
+                )
+            })?;
+            if let Ok(kid) = KeyId::parse(&kid_s) {
+                if !kt.is_key_available(&kid) || body_state == "KEY_UNAVAILABLE" {
+                    missing.insert(kid);
                 }
             }
         }
-        Ok(self_check_key_liveness(&blocks, &kt))
+        let missing_vec: Vec<KeyId> = missing.into_iter().collect();
+        Ok((missing_vec.is_empty(), missing_vec))
     }
 
     /// Inject a remote concurrent op (e.g. from another device) and re-materialize cleanly.
@@ -3098,6 +3394,914 @@ impl LocalStore {
             data_dir: target_dir.to_string_lossy().into_owned(),
         })
     }
+
+    /// Initialize an empty data directory when joining an existing cloud account via `mynote device claim`
+    /// (`kind = "add"`). Installs the claimed `device_id`, SMKs, and sync credentials without creating a
+    /// redundant local `"scratch"` buffer or random recovery bundle.
+    pub fn open_for_claim(
+        data_dir: impl AsRef<Path>,
+        device_id: DeviceId,
+        smks_in: &[SmkGenerationBytes],
+        sync_url: &str,
+        device_token: &str,
+        scope: &str,
+    ) -> Result<Self, CoreError> {
+        if smks_in.is_empty() {
+            return Err(CoreError::new(
+                ErrorCode::IntegrityError,
+                "pairing payload contains zero SMK generations",
+                "Re-generate the pairing code on the existing desktop",
+            ));
+        }
+        let data_dir = data_dir.as_ref().to_path_buf();
+        if data_dir.join("mynote.db").exists() || data_dir.join("smk_keyring.local.json").exists() {
+            return Err(CoreError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "target data directory '{}' is already initialized; refusing to overwrite existing local data",
+                    data_dir.display()
+                ),
+                "Use an empty --data-dir for claiming a new device, or use 'mynote device refresh' for an existing device",
+            ));
+        }
+        let backups_dir = data_dir.join("backups");
+        let mirror_dir = data_dir.join("mirror");
+        ensure_private_dir(&data_dir)?;
+        ensure_private_dir(&backups_dir)?;
+        ensure_private_dir(&mirror_dir)?;
+        exclude_from_os_backups(&data_dir);
+
+        let conn = Connection::open(data_dir.join("mynote.db")).map_err(|e| {
+            CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("cannot open SQLite: {e}"),
+                "Check directory permissions",
+            )
+        })?;
+        init_connection(&conn, Some(&backups_dir))?;
+
+        let mut map = BTreeMap::new();
+        let mut latest_kid = smks_in[0].smk_kid;
+        for entry in smks_in {
+            map.insert(entry.smk_kid, Zeroizing::new(entry.key));
+            if entry.smk_kid > latest_kid {
+                latest_kid = entry.smk_kid;
+            }
+        }
+
+        conn.execute(
+            "INSERT OR REPLACE INTO local_meta (key, value) VALUES ('device_id', ?1)",
+            [device_id.as_str()],
+        )
+        .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "save device_id"))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO local_meta (key, value) VALUES ('bootstrap_completed', '0')",
+            [],
+        )
+        .ok();
+        conn.execute(
+            "INSERT OR REPLACE INTO local_meta (key, value) VALUES ('last_seq', '0')",
+            [],
+        )
+        .ok();
+        conn.execute(
+            "INSERT OR REPLACE INTO local_meta (key, value) VALUES ('sync_url', ?1)",
+            [sync_url],
+        )
+        .ok();
+        conn.execute(
+            "INSERT OR REPLACE INTO local_meta (key, value) VALUES ('device_scope', ?1)",
+            [scope],
+        )
+        .ok();
+
+        Self::save_local_smks(&data_dir.join("smk_keyring.local.json"), latest_kid, &map)?;
+        save_device_credentials(
+            &data_dir,
+            &DeviceCredentials {
+                sync_url: sync_url.to_string(),
+                device_token: device_token.to_string(),
+                scope: scope.to_string(),
+            },
+        )?;
+        drop(conn);
+        Self::open(&data_dir)
+    }
+
+    /// Initialize an empty data directory when recovering an existing cloud account via
+    /// `mynote device bootstrap --revoke-existing` (Disaster Recovery Path #1, `docs/sync-protocol.md` §5.3).
+    /// Installs the registered `device_id`, remote `keyring` (`gen`, `blob`), sync credentials, and an
+    /// empty local SMK store (awaiting `mynote keyring unlock` with the user's 24-word recovery bundle),
+    /// WITHOUT generating a conflicting gen=1 keyring or dummy `"scratch"` buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_for_recovery_bootstrap(
+        data_dir: impl AsRef<Path>,
+        device_id: DeviceId,
+        sync_url: &str,
+        device_token: &str,
+        scope: &str,
+        keyring_gen: u32,
+        keyring_blob: &[u8],
+    ) -> Result<Self, CoreError> {
+        let data_dir = data_dir.as_ref().to_path_buf();
+        if data_dir.join("mynote.db").exists() || data_dir.join("smk_keyring.local.json").exists() {
+            return Err(CoreError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "target data directory '{}' is already initialized; refusing recovery bootstrap overwrite",
+                    data_dir.display()
+                ),
+                "Use an empty --data-dir for disaster recovery bootstrap",
+            ));
+        }
+        let backups_dir = data_dir.join("backups");
+        let mirror_dir = data_dir.join("mirror");
+        ensure_private_dir(&data_dir)?;
+        ensure_private_dir(&backups_dir)?;
+        ensure_private_dir(&mirror_dir)?;
+        exclude_from_os_backups(&data_dir);
+
+        let conn = Connection::open(data_dir.join("mynote.db")).map_err(|e| {
+            CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("cannot open SQLite: {e}"),
+                "Check directory permissions",
+            )
+        })?;
+        init_connection(&conn, Some(&backups_dir))?;
+
+        let now = now_ms() as i64;
+        conn.execute(
+            "INSERT OR REPLACE INTO local_meta (key, value) VALUES ('device_id', ?1)",
+            [device_id.as_str()],
+        )
+        .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "save device_id"))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO local_meta (key, value) VALUES ('bootstrap_completed', '0')",
+            [],
+        )
+        .ok();
+        conn.execute(
+            "INSERT OR REPLACE INTO local_meta (key, value) VALUES ('last_seq', '0')",
+            [],
+        )
+        .ok();
+        conn.execute(
+            "INSERT OR REPLACE INTO local_meta (key, value) VALUES ('sync_url', ?1)",
+            [sync_url],
+        )
+        .ok();
+        conn.execute(
+            "INSERT OR REPLACE INTO local_meta (key, value) VALUES ('device_scope', ?1)",
+            [scope],
+        )
+        .ok();
+        conn.execute(
+            "INSERT OR REPLACE INTO key_material (kind, gen, blob, updated_at_ms) VALUES ('keyring', ?1, ?2, ?3)",
+            params![keyring_gen as i64, keyring_blob, now],
+        )
+        .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "save remote keyring"))?;
+
+        let empty_smks: SmkMap = BTreeMap::new();
+        Self::save_local_smks(
+            &data_dir.join("smk_keyring.local.json"),
+            SmkKid::from_ulid(Ulid::ZERO),
+            &empty_smks,
+        )?;
+        save_device_credentials(
+            &data_dir,
+            &DeviceCredentials {
+                sync_url: sync_url.to_string(),
+                device_token: device_token.to_string(),
+                scope: scope.to_string(),
+            },
+        )?;
+        drop(conn);
+        Self::open(&data_dir)
+    }
+
+    pub fn get_local_meta(&self, key: &str) -> Option<String> {
+        self.conn
+            .query_row("SELECT value FROM local_meta WHERE key = ?1", [key], |r| r.get(0))
+            .optional()
+            .unwrap_or(None)
+    }
+
+    pub fn set_local_meta(&self, key: &str, value: &str) -> Result<(), CoreError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO local_meta (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "set local_meta"))?;
+        Ok(())
+    }
+
+    pub fn load_credentials(&self) -> Result<Option<DeviceCredentials>, CoreError> {
+        load_device_credentials(&self.data_dir)
+    }
+
+    pub fn save_credentials(&self, creds: &DeviceCredentials) -> Result<(), CoreError> {
+        save_device_credentials(&self.data_dir, creds)?;
+        self.set_local_meta("sync_url", &creds.sync_url)?;
+        self.set_local_meta("device_scope", &creds.scope)?;
+        Ok(())
+    }
+
+    pub fn current_smks_for_pairing(&self) -> Vec<SmkGenerationBytes> {
+        self.smks
+            .iter()
+            .map(|(kid, k)| SmkGenerationBytes {
+                smk_kid: *kid,
+                key: **k,
+            })
+            .collect()
+    }
+
+    /// Install refreshed SMK generations received via `mynote device claim` (`kind = "refresh"`).
+    /// Permanently retains all prior generations and resets `last_seq` to 0 so any ops previously
+    /// skipped under the newer SMK are re-pulled idempotently.
+    pub fn install_refreshed_smks(&mut self, smks_in: &[SmkGenerationBytes]) -> Result<usize, CoreError> {
+        let mut added = 0usize;
+        for entry in smks_in {
+            if !self.smks.contains_key(&entry.smk_kid) {
+                added += 1;
+            }
+            self.smks.insert(entry.smk_kid, Zeroizing::new(entry.key));
+            if entry.smk_kid > self.current_smk_kid {
+                self.current_smk_kid = entry.smk_kid;
+            }
+        }
+        Self::save_local_smks(
+            &self.data_dir.join("smk_keyring.local.json"),
+            self.current_smk_kid,
+            &self.smks,
+        )?;
+        self.backfill_unknown_block_keys()?;
+        self.set_local_meta("last_seq", "0")?;
+        self.rematerialize_all()?;
+        Ok(added)
+    }
+
+    pub fn last_hlc_string(&self) -> Option<String> {
+        self.conn
+            .query_row("SELECT MAX(hlc) FROM sync_ops", [], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Full `BlockDetailDto` list for a buffer (used by `GET /v1/local/blocks?buffer_id=...`).
+    pub fn list_blocks_detailed(&self, buffer_selector: &str) -> Result<Vec<BlockDetailDto>, CoreError> {
+        let buf_id = self.resolve_buffer_id(buffer_selector)?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id FROM blocks WHERE state = 'ACTIVE' AND buffer_id = ?1
+                 ORDER BY position COLLATE BINARY ASC, id ASC",
+            )
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "query buffer blocks"))?;
+        let ids: Vec<String> = stmt
+            .query_map([buf_id.to_string()], |r| r.get(0))
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "map block ids"))?
+            .filter_map(Result::ok)
+            .collect();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(self.get_block(&id)?);
+        }
+        Ok(out)
+    }
+
+    /// Resolve a multi-leaf block by keeping the exact plaintext of `keep_op_id`.
+    pub fn resolve_block_keep(
+        &mut self,
+        block_id_str: &str,
+        expected_heads: &[String],
+        keep_op_id: &str,
+        actor: &str,
+    ) -> Result<WriteReceipt, CoreError> {
+        let detail = self.get_block(block_id_str)?;
+        self.check_bootstrap_gate(EntityType::Block, &detail.id, OpType::Resolve)?;
+        if detail.is_locked {
+            return Err(CoreError::new(
+                ErrorCode::BlockLocked,
+                format!(
+                    "block '{block_id_str}' is locked; resolve locked blocks in UI after unlocking Vault"
+                ),
+                "Unlock Vault in the desktop UI before resolving locked conflicts",
+            ));
+        }
+        let chosen = detail
+            .versions
+            .iter()
+            .find(|v| v.op_id == keep_op_id)
+            .ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::NotFound,
+                    format!("leaf op '{keep_op_id}' not found on block '{block_id_str}'"),
+                    "Inspect current leaves via 'mynote block get <id> --json'",
+                )
+            })?;
+        let content = chosen.content.as_deref().ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::KeyMissing,
+                format!(
+                    "leaf op '{keep_op_id}' on block '{block_id_str}' is unreadable; refusing empty overwrite"
+                ),
+                "Sync missing keys or choose a readable version to keep",
+            )
+        })?;
+        // Verify expected_heads against current heads before resolving (force=true allows resolving
+        // a conflict where another sibling leaf is KEY_UNAVAILABLE while the user explicitly keeps a readable leaf).
+        let expected_set: BTreeSet<String> = expected_heads.iter().cloned().collect();
+        let actual_set: BTreeSet<String> = detail.head_op_ids.iter().cloned().collect();
+        if expected_set != actual_set {
+            return Err(CoreError::new(
+                ErrorCode::HeadMismatch,
+                format!("block {block_id_str} heads changed concurrently"),
+                format!("Run 'mynote block get {block_id_str} --json' and retry with latest heads"),
+            )
+            .with_details(serde_json::json!({
+                "expected_heads": expected_heads,
+                "actual_heads": detail.head_op_ids,
+            })));
+        }
+        self.update_block(block_id_str, content, expected_heads, true, actor)
+    }
+
+    pub fn key_table_state(&self) -> Result<KeyTableState, CoreError> {
+        self.load_key_table()
+    }
+
+    /// Export complete Sans-I/O `EngineSnapshot` for driving `mynote_core::sync::step()`.
+    pub fn export_engine_snapshot(&self) -> Result<EngineSnapshot, CoreError> {
+        let mut snap = EngineSnapshot::new(self.device_id.clone(), now_ms());
+        snap.bootstrap_completed = self.get_local_meta("bootstrap_completed").as_deref() == Some("1");
+        snap.journal_epoch = self
+            .get_local_meta("journal_epoch")
+            .and_then(|s| JournalEpoch::parse(&s).ok());
+        snap.reconciling_epoch = self
+            .get_local_meta("reconciling_epoch")
+            .and_then(|s| JournalEpoch::parse(&s).ok());
+        snap.last_seq = self
+            .get_local_meta("last_seq")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        if let Some(h) = self.last_hlc_string().and_then(|s| Hlc::parse(&s).ok()) {
+            snap.hlc = h;
+        }
+        snap.keys = self.load_key_table()?;
+        snap.smks = self.smks.clone();
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT op_id, server_seq, sync_blocked_reason, device_id, entity_type, entity_id,
+                        parent_op_ids, op_type, hlc, actor, key_id, smk_kid, envelope, created_at_ms
+                 FROM sync_ops ORDER BY created_at_ms ASC, op_id ASC",
+            )
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "export sync_ops"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
+                    r.get::<_, String>(9)?,
+                    r.get::<_, Option<String>>(10)?,
+                    r.get::<_, String>(11)?,
+                    r.get::<_, Vec<u8>>(12)?,
+                    r.get::<_, i64>(13)?,
+                ))
+            })
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "map sync_ops"))?;
+
+        for row in rows {
+            let (
+                op_id_s,
+                server_seq,
+                sync_blocked_reason,
+                dev_s,
+                et_s,
+                entity_id,
+                parents_s,
+                ot_s,
+                hlc_s,
+                actor,
+                key_s,
+                smk_s,
+                envelope,
+                created_at_ms,
+            ) = row.map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "read sync_op"))?;
+            let op_id = OpId::parse(&op_id_s)?;
+            let device_id = DeviceId::parse(dev_s)?;
+            let entity_type = match et_s.as_str() {
+                "buffer" => EntityType::Buffer,
+                _ => EntityType::Block,
+            };
+            let op_type = match ot_s.as_str() {
+                "CREATE" => OpType::Create,
+                "UPDATE" => OpType::Update,
+                "SET_META" => OpType::SetMeta,
+                "LOCK" => OpType::Lock,
+                "UNLOCK" => OpType::Unlock,
+                "RESOLVE" => OpType::Resolve,
+                "DELETE" => OpType::Delete,
+                _ => OpType::Update,
+            };
+            let parent_op_ids: Vec<OpId> = serde_json::from_str(&parents_s).unwrap_or_default();
+            let hlc = Hlc::parse(&hlc_s)?;
+            let key_id = key_s.as_deref().map(KeyId::parse).transpose()?;
+            let smk_kid = SmkKid::parse(&smk_s)?;
+            snap.ops.insert(
+                op_id,
+                LocalOpRecord {
+                    op_id,
+                    server_seq,
+                    sync_blocked_reason,
+                    device_id,
+                    entity_type,
+                    entity_id,
+                    parent_op_ids,
+                    op_type,
+                    hlc,
+                    actor,
+                    key_id,
+                    smk_kid,
+                    envelope,
+                    created_at_ms,
+                },
+            );
+        }
+        Ok(snap)
+    }
+
+    /// Re-materialize every buffer (first, for FK safety) and every block from `sync_ops` + `block_keys`.
+    pub fn rematerialize_all(&self) -> Result<(), CoreError> {
+        let mut buf_ids: Vec<BufferId> = Vec::new();
+        let mut blk_ids: Vec<BlockId> = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT DISTINCT entity_type, entity_id FROM sync_ops")
+                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "scan entities"))?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "map entities"))?;
+            for r in rows.flatten() {
+                if r.0 == "buffer" {
+                    if let Ok(id) = BufferId::parse(&r.1) {
+                        buf_ids.push(id);
+                    }
+                } else if let Ok(id) = BlockId::parse(&r.1) {
+                    blk_ids.push(id);
+                }
+            }
+        }
+        for id in buf_ids {
+            let _ = self.rematerialize_buffer(id);
+        }
+        for id in blk_ids {
+            let _ = self.rematerialize_block(id);
+        }
+        self.refresh_mirror()?;
+        Ok(())
+    }
+
+    /// Re-materialize ONLY entities that are currently missing from projection tables or have
+    /// `KEY_UNAVAILABLE` / `DECRYPT_FAILED` leaves (e.g. after hot-reloading newly unlocked SMKs).
+    /// Returns `(buffers_updated, updated_block_ids)` and avoids rewriting unchanged blocks/mirrors.
+    pub fn rematerialize_unavailable(&self) -> Result<(bool, Vec<String>), CoreError> {
+        let mut buf_ids: Vec<BufferId> = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT DISTINCT entity_id FROM sync_ops
+                     WHERE entity_type = 'buffer'
+                       AND entity_id NOT IN (SELECT id FROM buffers)",
+                )
+                .map_err(|e| {
+                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "scan missing buffers")
+                })?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(|e| {
+                CoreError::new(ErrorCode::IntegrityError, e.to_string(), "map missing buffers")
+            })?;
+            for r in rows.flatten() {
+                if let Ok(id) = BufferId::parse(&r) {
+                    buf_ids.push(id);
+                }
+            }
+        }
+        let mut blk_ids: BTreeSet<BlockId> = BTreeSet::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT DISTINCT entity_id FROM sync_ops
+                     WHERE entity_type = 'block'
+                       AND entity_id NOT IN (SELECT id FROM blocks)
+                     UNION
+                     SELECT DISTINCT block_id FROM block_leaves
+                     WHERE body_state IN ('KEY_UNAVAILABLE', 'DECRYPT_FAILED')",
+                )
+                .map_err(|e| {
+                    CoreError::new(
+                        ErrorCode::IntegrityError,
+                        e.to_string(),
+                        "scan unavailable blocks",
+                    )
+                })?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(|e| {
+                CoreError::new(ErrorCode::IntegrityError, e.to_string(), "map unavailable blocks")
+            })?;
+            for r in rows.flatten() {
+                if let Ok(id) = BlockId::parse(&r) {
+                    blk_ids.insert(id);
+                }
+            }
+        }
+        if buf_ids.is_empty() && blk_ids.is_empty() {
+            return Ok((false, Vec::new()));
+        }
+        let mut buffers_updated = false;
+        for id in buf_ids {
+            if self.rematerialize_buffer(id).is_ok() {
+                buffers_updated = true;
+            }
+        }
+        let mut updated_blocks = Vec::new();
+        for id in blk_ids {
+            if self.rematerialize_block(id).is_ok() {
+                updated_blocks.push(id.to_string());
+            }
+        }
+        if buffers_updated || !updated_blocks.is_empty() {
+            self.refresh_mirror()?;
+        }
+        Ok((buffers_updated, updated_blocks))
+    }
+
+    /// Apply Sans-I/O `StoreMutation`s atomically to SQLite and re-materialize affected entities.
+    pub fn apply_store_mutations(
+        &mut self,
+        mutations: &[StoreMutation],
+    ) -> Result<SyncApplySummary, CoreError> {
+        let mut touched_buffers: BTreeSet<BufferId> = BTreeSet::new();
+        let mut touched_blocks: BTreeSet<BlockId> = BTreeSet::new();
+        let mut keys_changed = false;
+        let mut summary = SyncApplySummary::default();
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "begin apply_mutations"))?;
+
+        let mut need_mirror_refresh = false;
+        let tx_body: Result<(), CoreError> = (|| {
+            for m in mutations {
+                match m {
+                    StoreMutation::AppendOp(op) => {
+                        let et = match op.entity_type {
+                            EntityType::Buffer => "buffer",
+                            EntityType::Block => "block",
+                        };
+                        let ot = match op.op_type {
+                            OpType::Create => "CREATE",
+                            OpType::Update => "UPDATE",
+                            OpType::SetMeta => "SET_META",
+                            OpType::Lock => "LOCK",
+                            OpType::Unlock => "UNLOCK",
+                            OpType::Resolve => "RESOLVE",
+                            OpType::Delete => "DELETE",
+                        };
+                        let parents_json =
+                            serde_json::to_string(&op.parent_op_ids).unwrap_or_else(|_| "[]".into());
+                        self.conn
+                            .execute(
+                                "INSERT INTO sync_ops
+                                 (op_id, server_seq, sync_blocked_reason, device_id, entity_type, entity_id,
+                                  parent_op_ids, op_type, hlc, actor, key_id, smk_kid, envelope, created_at_ms)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                                 ON CONFLICT(op_id) DO UPDATE SET
+                                   server_seq = COALESCE(excluded.server_seq, sync_ops.server_seq)",
+                                params![
+                                    op.op_id.to_string(),
+                                    op.server_seq,
+                                    op.sync_blocked_reason,
+                                    op.device_id.as_str(),
+                                    et,
+                                    op.entity_id,
+                                    parents_json,
+                                    ot,
+                                    op.hlc.canonical_string(),
+                                    op.actor,
+                                    op.key_id.map(|k| k.to_string()),
+                                    op.smk_kid.to_string(),
+                                    op.envelope,
+                                    op.created_at_ms,
+                                ],
+                            )
+                            .map_err(|e| {
+                                CoreError::new(ErrorCode::IntegrityError, e.to_string(), "append sync_op")
+                            })?;
+                        match op.entity_type {
+                            EntityType::Buffer => {
+                                if let Ok(id) = BufferId::parse(&op.entity_id) {
+                                    touched_buffers.insert(id);
+                                }
+                            }
+                            EntityType::Block => {
+                                if let Ok(id) = BlockId::parse(&op.entity_id) {
+                                    touched_blocks.insert(id);
+                                }
+                            }
+                        }
+                        let _ = self.hlc_clock.receive(now_ms(), &op.hlc);
+                    }
+                    StoreMutation::MarkOpsSynced { epoch, acked } => {
+                        self.set_local_meta("journal_epoch", &epoch.to_string())?;
+                        for a in acked {
+                            self.conn
+                                .execute(
+                                    "UPDATE sync_ops SET server_seq = ?1 WHERE op_id = ?2",
+                                    params![a.seq, a.op_id.to_string()],
+                                )
+                                .map_err(|e| {
+                                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "mark op synced")
+                                })?;
+                        }
+                        self.conn
+                            .execute("UPDATE block_keys SET server_acked = 1", [])
+                            .ok();
+                    }
+                    StoreMutation::ClearServerSeqsForReconcile { new_epoch } => {
+                        // NEVER delete sync_ops or blocks — only clear server_seq for Set-Union reconciliation!
+                        self.conn
+                            .execute("UPDATE sync_ops SET server_seq = NULL", [])
+                            .map_err(|e| {
+                                CoreError::new(ErrorCode::IntegrityError, e.to_string(), "clear server_seq")
+                            })?;
+                        self.set_local_meta("reconciling_epoch", &new_epoch.to_string())?;
+                        self.set_local_meta("last_seq", "0")?;
+                    }
+                    StoreMutation::UpsertBlockKey(rec) => {
+                        let zero_id = Ulid::ZERO.to_string();
+                        let existing: Option<(String, i64, Option<Vec<u8>>)> = self
+                            .conn
+                            .query_row(
+                                "SELECT block_id, wrap_gen, key_record FROM block_keys WHERE key_id = ?1",
+                                [rec.key_id.to_string()],
+                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                            )
+                            .optional()
+                            .unwrap_or(None);
+                        let should_write = match existing {
+                            None => true,
+                            Some((_, _, None)) => false, // Executed shred is terminal
+                            Some((ref bid, g, Some(_))) => {
+                                rec.key_record.is_none()
+                                    || (rec.wrap_gen as i64) > g
+                                    || (bid == &zero_id && rec.key_record.is_some())
+                            }
+                        };
+                        if should_write {
+                            let (blk_id_s, tier) = if let Some(mnr1) = &rec.key_record {
+                                let smk_kid =
+                                    peek_envelope_kid(MAGIC_MNR1, mnr1).ok().map(SmkKid::from_bytes);
+                                if let Some(sk) =
+                                    smk_kid.and_then(|kid| self.smks.get(&kid).map(|k| (kid, k)))
+                                {
+                                    if let Ok(kr) = decrypt_mnr1(sk.0, sk.1, rec.key_id, rec.wrap_gen, mnr1) {
+                                        (kr.block_id.to_string(), kr.tier as i64)
+                                    } else {
+                                        (zero_id.clone(), 1)
+                                    }
+                                } else {
+                                    (zero_id.clone(), 1)
+                                }
+                            } else {
+                                (zero_id.clone(), 1)
+                            };
+                            self.conn
+                                .execute(
+                                    "INSERT INTO block_keys
+                                     (key_id, block_id, tier, wrap_gen, key_record, created_hlc, created_at_ms, server_acked)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, 1)
+                                     ON CONFLICT(key_id) DO UPDATE SET
+                                       block_id = CASE WHEN excluded.block_id != ?7 THEN excluded.block_id ELSE block_keys.block_id END,
+                                       tier = CASE WHEN excluded.block_id != ?7 THEN excluded.tier ELSE block_keys.tier END,
+                                       wrap_gen = excluded.wrap_gen,
+                                       key_record = excluded.key_record,
+                                       server_acked = 1",
+                                    params![
+                                        rec.key_id.to_string(),
+                                        blk_id_s,
+                                        tier,
+                                        rec.wrap_gen as i64,
+                                        rec.key_record,
+                                        rec.created_at_ms,
+                                        zero_id,
+                                    ],
+                                )
+                                .map_err(|e| {
+                                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "upsert block_key")
+                                })?;
+                            keys_changed = true;
+                        }
+                    }
+                    StoreMutation::UpsertShredMark(_) | StoreMutation::ExecuteShred { .. } => {
+                        // M1 does not execute physical key shredding (M2 feature).
+                    }
+                    StoreMutation::UpsertKeyMaterial {
+                        kind,
+                        gen,
+                        blob,
+                        updated_at_ms,
+                    } => {
+                        let kind_s = match kind {
+                            KeyMaterialKind::Keyring => "keyring",
+                            KeyMaterialKind::VaultHeader => "vault_header",
+                        };
+                        let cur_gen: Option<i64> = self
+                            .conn
+                            .query_row("SELECT gen FROM key_material WHERE kind = ?1", [kind_s], |r| {
+                                r.get(0)
+                            })
+                            .optional()
+                            .unwrap_or(None);
+                        if cur_gen.is_none_or(|g| *gen > g) {
+                            self.conn
+                                .execute(
+                                    "INSERT OR REPLACE INTO key_material (kind, gen, blob, updated_at_ms)
+                                     VALUES (?1, ?2, ?3, ?4)",
+                                    params![kind_s, gen, blob, updated_at_ms],
+                                )
+                                .map_err(|e| {
+                                    CoreError::new(
+                                        ErrorCode::IntegrityError,
+                                        e.to_string(),
+                                        "upsert key_material",
+                                    )
+                                })?;
+                        }
+                    }
+                    StoreMutation::SetSyncMeta {
+                        bootstrap_completed,
+                        journal_epoch,
+                        last_seq,
+                        reconciling_epoch,
+                        hlc,
+                    } => {
+                        self.set_local_meta(
+                            "bootstrap_completed",
+                            if *bootstrap_completed { "1" } else { "0" },
+                        )?;
+                        if let Some(ep) = journal_epoch {
+                            self.set_local_meta("journal_epoch", &ep.to_string())?;
+                        }
+                        self.set_local_meta("last_seq", &last_seq.to_string())?;
+                        if let Some(rec_ep) = reconciling_epoch {
+                            self.set_local_meta("reconciling_epoch", &rec_ep.to_string())?;
+                        } else {
+                            self.conn
+                                .execute("DELETE FROM local_meta WHERE key = 'reconciling_epoch'", [])
+                                .ok();
+                        }
+                        let _ = self.hlc_clock.receive(now_ms(), hlc);
+                    }
+                    StoreMutation::IntegrityAlert { op_id, reason } => {
+                        summary.integrity_alerts.push((op_id.to_string(), reason.clone()));
+                    }
+                    StoreMutation::ClockSkewAlert(w) => {
+                        self.set_local_meta("clock_skew_ms", &w.skew_ms.to_string())?;
+                        summary.clock_skew_ms = Some(w.skew_ms);
+                    }
+                }
+            }
+
+            if keys_changed {
+                // Rematerialize buffers first (FK safety), then blocks inside the same transaction.
+                let mut buf_ids: Vec<BufferId> = Vec::new();
+                let mut blk_ids: Vec<BlockId> = Vec::new();
+                {
+                    let mut stmt = self
+                        .conn
+                        .prepare("SELECT DISTINCT entity_type, entity_id FROM sync_ops")
+                        .map_err(|e| {
+                            CoreError::new(ErrorCode::IntegrityError, e.to_string(), "scan entities")
+                        })?;
+                    let rows = stmt
+                        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                        .map_err(|e| {
+                            CoreError::new(ErrorCode::IntegrityError, e.to_string(), "map entities")
+                        })?;
+                    for r in rows.flatten() {
+                        if r.0 == "buffer" {
+                            if let Ok(id) = BufferId::parse(&r.1) {
+                                buf_ids.push(id);
+                            }
+                        } else if let Ok(id) = BlockId::parse(&r.1) {
+                            blk_ids.push(id);
+                        }
+                    }
+                }
+                for id in buf_ids {
+                    let _ = self.rematerialize_buffer(id);
+                }
+                for id in blk_ids {
+                    let _ = self.rematerialize_block(id);
+                }
+                for b in self.list_buffers()? {
+                    summary.upserted_buffer_ids.push(b.id);
+                }
+                for blk in self.list_blocks(None, 10_000)? {
+                    summary.upserted_block_ids.push(blk.id);
+                }
+                need_mirror_refresh = true;
+            } else {
+                let had_buffers = !touched_buffers.is_empty();
+                for buf_id in touched_buffers {
+                    if let Ok(m) = self.rematerialize_buffer(buf_id) {
+                        if m.state == BlockState::Active {
+                            summary.upserted_buffer_ids.push(buf_id.to_string());
+                        } else {
+                            summary.deleted_buffer_ids.push(buf_id.to_string());
+                        }
+                    }
+                }
+                // Retry any previously out-of-order block ops whose parent buffer just materialized.
+                if had_buffers {
+                    if let Ok(mut stmt) = self.conn.prepare(
+                        "SELECT DISTINCT entity_id FROM sync_ops
+                         WHERE entity_type = 'block' AND entity_id NOT IN (SELECT id FROM blocks)",
+                    ) {
+                        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+                            for id_s in rows.flatten() {
+                                if let Ok(bid) = BlockId::parse(&id_s) {
+                                    touched_blocks.insert(bid);
+                                }
+                            }
+                        }
+                    }
+                }
+                for blk_id in touched_blocks {
+                    if let Ok(m) = self.rematerialize_block(blk_id) {
+                        if m.state == BlockState::Active {
+                            summary.upserted_block_ids.push(blk_id.to_string());
+                        } else {
+                            summary.deleted_block_ids.push(blk_id.to_string());
+                            summary.trash_changed = true;
+                        }
+                    }
+                }
+                need_mirror_refresh = !summary.upserted_block_ids.is_empty()
+                    || !summary.deleted_block_ids.is_empty()
+                    || !summary.upserted_buffer_ids.is_empty()
+                    || !summary.deleted_buffer_ids.is_empty();
+            }
+            Ok(())
+        })();
+
+        match tx_body {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;").map_err(|e| {
+                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "commit apply_mutations")
+                })?;
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                return Err(e);
+            }
+        }
+
+        if need_mirror_refresh {
+            self.refresh_mirror()?;
+        }
+        Ok(summary)
+    }
+
+    /// Re-encrypt a raw remote MNS1 check helper (ensures `MAGIC_MNS1` import stays used cleanly).
+    pub fn peek_op_smk_kid(envelope: &[u8]) -> Result<SmkKid, CoreError> {
+        Ok(SmkKid::from_bytes(peek_envelope_kid(MAGIC_MNS1, envelope)?))
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SyncApplySummary {
+    pub upserted_block_ids: Vec<String>,
+    pub deleted_block_ids: Vec<String>,
+    pub upserted_buffer_ids: Vec<String>,
+    pub deleted_buffer_ids: Vec<String>,
+    pub trash_changed: bool,
+    pub clock_skew_ms: Option<i64>,
+    pub integrity_alerts: Vec<(String, String)>,
 }
 
 fn collect_mna1_files(dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Result<(), CoreError> {
@@ -3311,6 +4515,8 @@ mod tests {
                 public_hint: None,
             })
             .unwrap();
+        // Simulate an already-bootstrapped desktop receiving a concurrent peer edit.
+        store.set_local_meta("bootstrap_completed", "1").unwrap();
 
         let detail = store.get_block(&r1.block_id).unwrap();
         assert!(detail.has_conflict);
@@ -3513,5 +4719,368 @@ mod tests {
         let _ = std::fs::remove_dir_all(&src_dir);
         let _ = std::fs::remove_dir_all(&arch_dir);
         let _ = std::fs::remove_dir_all(&dst_dir);
+    }
+
+    #[test]
+    fn regression_rotate_smk_is_atomic_and_rolls_back_on_missing_old_smk() {
+        let dir = temp_dir("atomic_rotate_rollback");
+        let mut store = LocalStore::open(&dir).unwrap();
+        let b1 = store
+            .add_block("scratch", "important note", Some("text"), None, "human", None)
+            .unwrap();
+        let orig_smk_kid = store.current_smk_kid;
+        let orig_kr_gen = store.current_keyring().unwrap().keyring_gen;
+
+        // Insert a second active block_key wrapped under an unknown SMK to force rotate_smk failure mid-scan
+        let bogus_smk_kid = SmkKid::from_ulid(store.ulid_gen.next(now_ms() + 10, [0x44; 10]));
+        let bogus_smk = [0x77u8; 32];
+        let bogus_key_id = KeyId::from_ulid(store.ulid_gen.next(now_ms() + 11, [0x55; 10]));
+        let bogus_krec = KeyRecordV1 {
+            v: 1,
+            key_id: bogus_key_id,
+            block_id: Ulid::ZERO,
+            tier: 1,
+            created_hlc: store.hlc_clock.tick(now_ms()).canonical_string(),
+            created_by: store.device_id.clone(),
+            bdek: vec![0x22; 32],
+        };
+        let bogus_mnr1 = encrypt_mnr1(bogus_smk_kid, &bogus_smk, 1, &bogus_krec, [0x33; 24]).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO block_keys (key_id, block_id, tier, wrap_gen, key_record, created_hlc, created_at_ms, server_acked)
+                 VALUES (?1, ?2, 1, 1, ?3, '', 1, 1)",
+                params![bogus_key_id.to_string(), Ulid::ZERO.to_string(), bogus_mnr1],
+            )
+            .unwrap();
+
+        let err = store
+            .rotate_smk()
+            .expect_err("rotate must fail on missing old SMK");
+        assert_eq!(err.code(), ErrorCode::KeyMissing);
+        // Existing keys, keyring_gen, and smk_keyring.local.json MUST remain completely untouched!
+        assert_eq!(store.current_smk_kid, orig_smk_kid);
+        assert_eq!(store.current_keyring().unwrap().keyring_gen, orig_kr_gen);
+        let blk_key = store
+            .find_active_block_key(BlockId::parse(&b1.block_id).unwrap())
+            .unwrap();
+        let wrap_gen: i64 = store
+            .conn
+            .query_row(
+                "SELECT wrap_gen FROM block_keys WHERE key_id = ?1",
+                [blk_key.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrap_gen, 1, "existing key wrap_gen must not be partially mutated");
+        assert_eq!(
+            store.get_block(&b1.block_id).unwrap().content.as_deref(),
+            Some("important note")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn regression_key_self_check_is_strictly_read_only() {
+        let dir = temp_dir("readonly_key_self_check");
+        let mut store = LocalStore::open(&dir).unwrap();
+        store
+            .add_block("scratch", "hello readonly", Some("text"), None, "human", None)
+            .unwrap();
+
+        // Enforce SQLite query_only=ON: ANY write inside key_self_check() would fail with SQLITE_READONLY!
+        store.conn.execute_batch("PRAGMA query_only = ON;").unwrap();
+        let (ok, missing) = store
+            .key_self_check()
+            .expect("key_self_check must perform zero DB writes");
+        assert!(ok);
+        assert!(missing.is_empty());
+        store.conn.execute_batch("PRAGMA query_only = OFF;").unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn regression_bootstrap_gate_unreadable_guard_non_empty_dirs_and_tier1_bdek_checks() {
+        let dir = temp_dir("bootstrap_and_guards");
+        let mut store = LocalStore::open(&dir).unwrap();
+        let local_blk = store
+            .add_block("scratch", "local offline note", Some("text"), None, "human", None)
+            .unwrap();
+
+        // 1. open_for_claim and open_for_recovery_bootstrap MUST refuse already-initialized directory
+        let fake_smk = SmkGenerationBytes {
+            smk_kid: store.current_smk_kid,
+            key: [1u8; 32],
+        };
+        assert_eq!(
+            LocalStore::open_for_claim(
+                &dir,
+                DeviceId::from_random_bytes([2u8; 10]),
+                &[fake_smk],
+                "https://relay.test",
+                "tok",
+                "read-write"
+            )
+            .err()
+            .unwrap()
+            .code(),
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            LocalStore::open_for_recovery_bootstrap(
+                &dir,
+                DeviceId::from_random_bytes([3u8; 10]),
+                "https://relay.test",
+                "tok",
+                "read-write",
+                1,
+                b"kr"
+            )
+            .err()
+            .unwrap()
+            .code(),
+            ErrorCode::InvalidArgument
+        );
+
+        // 2. Bootstrap Gate: while bootstrap_completed == 0, local-only block is editable,
+        //    but a remote-synced entity (server_seq IS NOT NULL) is strictly blocked!
+        store
+            .update_block(
+                &local_blk.block_id,
+                "local edit ok",
+                &local_blk.head_op_ids,
+                false,
+                "human",
+            )
+            .expect("pure local entity remains editable before bootstrap");
+
+        store
+            .conn
+            .execute(
+                "UPDATE sync_ops SET server_seq = 1 WHERE entity_id = ?1",
+                [&local_blk.block_id],
+            )
+            .unwrap();
+        let detail_after = store.get_block(&local_blk.block_id).unwrap();
+        assert_eq!(
+            store
+                .update_block(
+                    &local_blk.block_id,
+                    "blocked",
+                    &detail_after.head_op_ids,
+                    false,
+                    "human"
+                )
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            store
+                .delete_block(&local_blk.block_id, None, "human")
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            store
+                .move_block(&local_blk.block_id, None, None, None, Some("json"), "human")
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidArgument
+        );
+
+        // Once bootstrap_completed = 1, mutations succeed again
+        store.set_local_meta("bootstrap_completed", "1").unwrap();
+        let u2 = store
+            .update_block(
+                &local_blk.block_id,
+                "now bootstrapped",
+                &detail_after.head_op_ids,
+                false,
+                "human",
+            )
+            .unwrap();
+
+        // 3. Unreadable KEY_UNAVAILABLE block refuses append_block, update_block, and resolve_block_keep (zero "" overwrite!)
+        let blk_id = BlockId::parse(&local_blk.block_id).unwrap();
+        let key_id = store.find_active_block_key(blk_id).unwrap();
+        // Temporarily replace key_record with a record wrapped under an unknown SMK so rematerialize produces KEY_UNAVAILABLE
+        let missing_smk = SmkKid::from_ulid(store.ulid_gen.next(now_ms() + 20, [0x99; 10]));
+        let missing_mnr1 = encrypt_mnr1(
+            missing_smk,
+            &[0x88; 32],
+            2,
+            &KeyRecordV1 {
+                v: 1,
+                key_id,
+                block_id: blk_id.0,
+                tier: 1,
+                created_hlc: store.hlc_clock.tick(now_ms()).canonical_string(),
+                created_by: store.device_id.clone(),
+                bdek: vec![0x11; 32],
+            },
+            [0x44; 24],
+        )
+        .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE block_keys SET wrap_gen = 2, key_record = ?1 WHERE key_id = ?2",
+                params![missing_mnr1, key_id.to_string()],
+            )
+            .unwrap();
+        store.rematerialize_block(blk_id).unwrap();
+        let unreadable = store.get_block(&local_blk.block_id).unwrap();
+        assert!(!unreadable.is_locked);
+        assert!(unreadable.content.is_none());
+
+        assert_eq!(
+            store
+                .append_block(&local_blk.block_id, "extra", None, "human")
+                .unwrap_err()
+                .code(),
+            ErrorCode::KeyMissing
+        );
+        assert_eq!(
+            store
+                .update_block(&local_blk.block_id, "overwrite", &u2.head_op_ids, false, "human")
+                .unwrap_err()
+                .code(),
+            ErrorCode::KeyMissing
+        );
+        assert_eq!(
+            store
+                .resolve_block_keep(&local_blk.block_id, &u2.head_op_ids, &u2.op_id, "human")
+                .unwrap_err()
+                .code(),
+            ErrorCode::KeyMissing
+        );
+
+        // 4. unwrap_tier1_bdek rejects Tier 2 key with BlockLocked and malformed BDEK with IntegrityError (no panic!)
+        let smk = store.current_smk().unwrap().clone();
+        let bad_t2_key = KeyId::from_ulid(store.ulid_gen.next(now_ms() + 30, [0xA1; 10]));
+        let bad_t2_mnr1 = encrypt_mnr1(
+            store.current_smk_kid,
+            &smk,
+            1,
+            &KeyRecordV1 {
+                v: 1,
+                key_id: bad_t2_key,
+                block_id: blk_id.0,
+                tier: 2,
+                created_hlc: store.hlc_clock.tick(now_ms()).canonical_string(),
+                created_by: store.device_id.clone(),
+                bdek: vec![0xAA; 93],
+            },
+            [0x55; 24],
+        )
+        .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO block_keys (key_id, block_id, tier, wrap_gen, key_record, created_hlc, created_at_ms, server_acked)
+                 VALUES (?1, ?2, 2, 1, ?3, '', 1, 1)",
+                params![bad_t2_key.to_string(), blk_id.to_string(), bad_t2_mnr1],
+            )
+            .unwrap();
+        assert_eq!(
+            store.unwrap_tier1_bdek(bad_t2_key).unwrap_err().code(),
+            ErrorCode::BlockLocked
+        );
+
+        let bad_len_key = KeyId::from_ulid(store.ulid_gen.next(now_ms() + 31, [0xA2; 10]));
+        let bad_len_mnr1 = encrypt_mnr1(
+            store.current_smk_kid,
+            &smk,
+            1,
+            &KeyRecordV1 {
+                v: 1,
+                key_id: bad_len_key,
+                block_id: blk_id.0,
+                tier: 1,
+                created_hlc: store.hlc_clock.tick(now_ms()).canonical_string(),
+                created_by: store.device_id.clone(),
+                bdek: vec![0xBB; 16], // Invalid length (not 32B)
+            },
+            [0x56; 24],
+        )
+        .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO block_keys (key_id, block_id, tier, wrap_gen, key_record, created_hlc, created_at_ms, server_acked)
+                 VALUES (?1, ?2, 1, 1, ?3, '', 1, 1)",
+                params![bad_len_key.to_string(), blk_id.to_string(), bad_len_mnr1],
+            )
+            .unwrap();
+        assert_eq!(
+            store.unwrap_tier1_bdek(bad_len_key).unwrap_err().code(),
+            ErrorCode::IntegrityError
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn regression_out_of_order_block_op_materializes_when_buffer_arrives_later() {
+        let dir_src = temp_dir("ooo_src");
+        let dir_dst = temp_dir("ooo_dst");
+        let mut src = LocalStore::open(&dir_src).unwrap();
+        let buf = src.create_buffer("work", None, "human").unwrap();
+        let blk = src
+            .add_block("work", "arrived before buffer", Some("text"), None, "human", None)
+            .unwrap();
+
+        let snap = src.export_engine_snapshot().unwrap();
+        let buf_op = snap
+            .ops
+            .values()
+            .find(|o| o.entity_type == EntityType::Buffer && o.entity_id == buf.id)
+            .unwrap()
+            .clone();
+        let blk_op = snap
+            .ops
+            .values()
+            .find(|o| o.entity_type == EntityType::Block && o.entity_id == blk.block_id)
+            .unwrap()
+            .clone();
+        let buf_krec = snap.keys.records.get(&buf_op.key_id.unwrap()).unwrap().clone();
+        let blk_krec = snap.keys.records.get(&blk_op.key_id.unwrap()).unwrap().clone();
+
+        // Destination joins with same SMKs
+        let mut dst = LocalStore::open_for_claim(
+            &dir_dst,
+            DeviceId::from_random_bytes([0xC1; 10]),
+            &src.current_smks_for_pairing(),
+            "https://relay.test",
+            "tok",
+            "read-write",
+        )
+        .unwrap();
+
+        // First install keys
+        dst.apply_store_mutations(&[
+            StoreMutation::UpsertBlockKey(buf_krec),
+            StoreMutation::UpsertBlockKey(blk_krec),
+        ])
+        .unwrap();
+        // Page 1: block op arrives BEFORE its parent buffer op!
+        dst.apply_store_mutations(&[StoreMutation::AppendOp(blk_op)])
+            .unwrap();
+        assert!(dst.get_block(&blk.block_id).is_err());
+
+        // Page 2: parent buffer op arrives -> out-of-order block MUST auto-materialize!
+        dst.apply_store_mutations(&[StoreMutation::AppendOp(buf_op)])
+            .unwrap();
+        assert_eq!(
+            dst.get_block(&blk.block_id).unwrap().content.as_deref(),
+            Some("arrived before buffer")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir_src);
+        let _ = std::fs::remove_dir_all(&dir_dst);
     }
 }

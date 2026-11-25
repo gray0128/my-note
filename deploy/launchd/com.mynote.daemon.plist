@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  my-note macOS LaunchAgent (D5' unified CLI + Daemon + embedded HTML architecture)
+  Install (adjust ProgramArguments to /usr/local/bin/mynote on Intel Macs if needed):
+    mkdir -p ~/Library/Logs/mynote && chmod 700 ~/Library/Logs/mynote
+    sed "s|__HOME__|$HOME|g" deploy/launchd/com.mynote.daemon.plist > ~/Library/LaunchAgents/com.mynote.daemon.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mynote.daemon.plist
+  Open UI anytime:
+    mynote open
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mynote.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/mynote</string>
+        <string>daemon</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <!-- 0077 octal = 63 decimal: keep SQLite DB, backups, mirror, and logs owner-only -->
+    <key>Umask</key>
+    <integer>63</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/mynote/daemon.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/mynote/daemon.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
