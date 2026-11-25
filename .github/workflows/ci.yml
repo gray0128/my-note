@@ -19,20 +19,21 @@ jobs:
           fetch-depth: 0
       - name: Check evals/ modification rules
         shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-          PR_TITLE="${{ github.event.pull_request.title }}"
           CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
-          if echo "$PR_TITLE" | grep -q '^\[eval-only\]'; then
-            DISALLOWED=$(echo "$CHANGED" | grep -vE '^(evals/|docs/eval-framework\.md$)' || true)
+          if printf '%s\n' "$PR_TITLE" | grep -q '^\[eval-only\]'; then
+            DISALLOWED=$(printf '%s\n' "$CHANGED" | grep -vE '^(evals/|docs/eval-framework\.md$)' || true)
             if [ -n "$DISALLOWED" ]; then
               echo "ERROR: [eval-only] PR may only touch evals/ and docs/eval-framework.md:"
               echo "$DISALLOWED"
               exit 1
             fi
           else
-            if echo "$CHANGED" | grep -q '^evals/'; then
+            if printf '%s\n' "$CHANGED" | grep -q '^evals/'; then
               echo "ERROR: Feature/bugfix PR MUST NOT modify files inside evals/ (see evals/README.md)."
               exit 1
             fi
@@ -49,9 +50,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Pin evals/ to origin/main on non-[eval-only] PRs
+      - name: Pin evals/ to PR base commit on non-[eval-only] PRs
         if: github.event_name == 'pull_request' && !startsWith(github.event.pull_request.title, '[eval-only]')
-        run: git checkout origin/main -- evals/
+        run: git checkout "${{ github.event.pull_request.base.sha }}" -- evals/
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
