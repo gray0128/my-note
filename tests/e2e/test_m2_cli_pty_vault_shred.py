@@ -34,14 +34,17 @@ def run_cli(data_dir: Path, args: list[str], stdin_text: str | None = None, env_
     env = os.environ.copy()
     if env_extra:
         env.update(env_extra)
-    proc = subprocess.run(
-        [str(BIN), "--data-dir", str(data_dir), *args],
-        input=stdin_text,
-        text=True,
-        capture_output=True,
-        env=env,
-        timeout=30,
-    )
+    kwargs = {
+        "text": True,
+        "capture_output": True,
+        "env": env,
+        "timeout": 30,
+    }
+    if stdin_text is None:
+        kwargs["stdin"] = subprocess.DEVNULL
+    else:
+        kwargs["input"] = stdin_text
+    proc = subprocess.run([str(BIN), "--data-dir", str(data_dir), *args], **kwargs)
     return proc
 
 

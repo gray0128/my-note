@@ -22,6 +22,36 @@ export interface BlockVersionDto {
   mnw1_b64?: string | null;
 }
 
+export interface BlockHistoryEntryDto {
+  op_id: string;
+  op_type: string;
+  hlc: string;
+  device_id: string;
+  actor: string;
+  content_available: boolean;
+  has_content: boolean;
+  is_locked: boolean;
+  shredded: boolean;
+  key_id: string | null;
+  created_at_ms: number;
+}
+
+export interface BlockHistoryContentDto {
+  block_id: string;
+  op_id: string;
+  op_type: string;
+  hlc: string;
+  device_id: string;
+  actor: string;
+  created_at_ms: number;
+  is_locked: boolean;
+  key_id: string;
+  lang: string | null;
+  content: string | null;
+  mnb1_b64: string | null;
+  mnw1_b64: string | null;
+}
+
 export interface BlockDto {
   id: string;
   buffer_id: string;

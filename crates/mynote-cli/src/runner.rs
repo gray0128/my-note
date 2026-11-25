@@ -1334,8 +1334,17 @@ fn handle_block(
                 OutputMode::Jsonl => emit_jsonl(&entries),
                 OutputMode::Human => {
                     for e in &entries {
+                        let badge = if e.shredded {
+                            " [SHREDDED]"
+                        } else if e.is_locked {
+                            " [LOCKED]"
+                        } else if !e.has_content {
+                            " [META]"
+                        } else {
+                            ""
+                        };
                         println!(
-                            "{}  {}  {}  actor={}  available={}",
+                            "{}  {}  {}  actor={}  available={}{badge}",
                             e.op_id, e.op_type, e.hlc, e.actor, e.content_available
                         );
                     }
@@ -1348,6 +1357,7 @@ fn handle_block(
             id,
             to_op,
             undo_actor,
+            dry_run,
         } => {
             if to_op.is_none() && undo_actor.is_none() {
                 return Err(CoreError::new(
@@ -1355,6 +1365,38 @@ fn handle_block(
                     "specify either --to-op <op_id> or --undo-actor <actor>",
                     format!("Run 'mynote block history {id} --json' to list historical ops"),
                 ));
+            }
+            if to_op.is_some() && undo_actor.is_some() {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    "specify either --to-op or --undo-actor, not both",
+                    "Pass only one revert selector",
+                ));
+            }
+            if dry_run {
+                let preview = store.preview_revert_block(&id, to_op.as_deref(), undo_actor.as_deref())?;
+                match mode {
+                    OutputMode::Json | OutputMode::Jsonl => {
+                        emit_json(&preview, store_meta(store, started, None));
+                    }
+                    OutputMode::Human => {
+                        println!(
+                            "dry-run: would revert block {} to op {} (type={}, actor={}, hlc={}, skipped_actor_ops={})",
+                            preview.block_id,
+                            preview.target_op_id,
+                            preview.target_op_type,
+                            preview.target_actor,
+                            preview.target_hlc,
+                            preview.skipped_actor_ops
+                        );
+                        if preview.is_locked {
+                            println!("preview: <locked Tier 2 content>");
+                        } else if let Some(text) = &preview.preview {
+                            println!("---\n{text}");
+                        }
+                    }
+                }
+                return Ok(0);
             }
             if let Some(resp) = try_daemon_apply(
                 store.data_dir(),
@@ -1379,25 +1421,8 @@ fn handle_block(
                     return Ok(0);
                 }
             }
-            let target_op = match (to_op, undo_actor) {
-                (Some(op), _) => op,
-                (None, Some(bad_actor)) => {
-                    let history = store.block_history(&id, 200)?;
-                    history
-                        .into_iter()
-                        .find(|e| e.actor != bad_actor && e.content_available)
-                        .map(|e| e.op_id)
-                        .ok_or_else(|| {
-                            CoreError::new(
-                                ErrorCode::NotFound,
-                                format!("no earlier available version outside actor '{bad_actor}'"),
-                                format!("Run 'mynote block history {id} --json' to pick an op_id explicitly"),
-                            )
-                        })?
-                }
-                (None, None) => unreachable!("checked above"),
-            };
-            let receipt = store.revert_block(&id, &target_op, actor)?;
+            let resolved = store.resolve_revert_target(&id, to_op.as_deref(), undo_actor.as_deref())?;
+            let receipt = store.revert_block(&id, &resolved.target.op_id, actor)?;
             emit_write_receipt(&receipt, store, mode, started);
             Ok(0)
         }
@@ -1760,19 +1785,19 @@ fn handle_format_block(
     quiet: bool,
 ) -> Result<i32, CoreError> {
     let id = args.id.expect("id checked by caller");
-    if args.expected_heads.is_empty() {
-        return Err(CoreError::new(
-            ErrorCode::InvalidArgument,
-            "missing required --expected-head <op_id> when formatting a block in-place",
-            format!("Run 'mynote block get {id} --json' and pass --expected-head"),
-        ));
-    }
     let detail = store.get_block(&id)?;
     if detail.is_locked {
         return Err(CoreError::new(
             ErrorCode::BlockLocked,
             format!("block '{id}' is locked; unlocked Tier 2 blocks must be formatted in WASM UI"),
             "Never send locked blocks to CLI/external formatters",
+        ));
+    }
+    if args.expected_heads.is_empty() {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            "missing required --expected-head <op_id> when formatting a block in-place",
+            format!("Run 'mynote block get {id} --json' and pass --expected-head"),
         ));
     }
     if detail.has_conflict {

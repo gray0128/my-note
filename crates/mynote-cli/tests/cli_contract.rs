@@ -723,3 +723,471 @@ fn non_tty_gates_and_heynote_cli_import_match_contracts() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn layer2_all_five_fault_injection_fuses_array_cmd_and_locked_block_zero_subprocess() {
+    let dir = temp_dir("layer2_m3");
+    let marker = dir.join("locked_spy_was_executed.marker");
+    let cfg_path = dir.join("formatters.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[formatters.nonzero_partial]
+cmd = ["sh", "-c", "printf 'partial_garbage'; exit 1"]
+timeout_ms = 500
+
+[formatters.zero_byte]
+cmd = ["true"]
+timeout_ms = 500
+
+[formatters.bad_utf8]
+cmd = ["sh", "-c", "printf '\\377\\376\\375'"]
+timeout_ms = 500
+
+[formatters.timeout_kill]
+cmd = ["sleep", "2"]
+timeout_ms = 100
+
+[formatters.env_secret_probe]
+cmd = ["sh", "-c", "if [ -n \"$AWS_SECRET_ACCESS_KEY$MYNOTE_BOOTSTRAP_TOKEN$OPENAI_API_KEY\" ]; then echo LEAKED; else exit 1; fi"]
+timeout_ms = 500
+
+[formatters.env_clean_array]
+cmd = ["sh", "-c", "printf 'CLEAN:%s:%s:%s:%s' \"$AWS_SECRET_ACCESS_KEY\" \"$MYNOTE_BOOTSTRAP_TOKEN\" \"$OPENAI_API_KEY\" \"$LC_ALL\""]
+timeout_ms = 500
+
+[formatters.empty_array]
+cmd = []
+timeout_ms = 500
+
+[formatters.blank_cmd]
+cmd = "   "
+timeout_ms = 500
+
+[formatters.spyfmt]
+cmd = ["sh", "-c", "touch '{}'; cat"]
+timeout_ms = 500
+"#,
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let cfg_str = cfg_path.to_str().unwrap();
+
+    let secret_env = [
+        ("MYNOTE_FORMATTERS_CONFIG", cfg_str),
+        ("AWS_SECRET_ACCESS_KEY", "AKIA_CANARY_SECRET_999"),
+        ("MYNOTE_BOOTSTRAP_TOKEN", "BOOT_CANARY_SECRET_888"),
+        ("OPENAI_API_KEY", "SK_CANARY_SECRET_777"),
+    ];
+
+    // 1. All 5 fault-injection cases + malformed empty/blank cmd -> exit 7 FORMAT_SYNTAX_ERROR, zero DB overwrite!
+    let add_j = parse_single_json_stdout(&run_cli(
+        &dir,
+        &["add", "precious untouched source", "--lang", "text", "--json"],
+        None,
+    ));
+    let blk_id = add_j["data"]["block_id"].as_str().unwrap().to_string();
+    let head = add_j["data"]["op_id"].as_str().unwrap().to_string();
+
+    for lang in [
+        "nonzero_partial",
+        "zero_byte",
+        "bad_utf8",
+        "timeout_kill",
+        "env_secret_probe",
+        "empty_array",
+        "blank_cmd",
+    ] {
+        // Stdin mode
+        let out_stdin = run_cli_with_env(
+            &dir,
+            &["format", "--lang", lang, "--json"],
+            Some(b"non-empty source"),
+            &secret_env,
+        );
+        assert_eq!(
+            out_stdin.status.code(),
+            Some(7),
+            "Layer 2 stdin fuse '{lang}' must exit 7"
+        );
+        assert_eq!(
+            parse_single_json_stdout(&out_stdin)["error"]["code"],
+            "FORMAT_SYNTAX_ERROR"
+        );
+
+        // In-place block mode -> exit 7, original content & head untouched
+        let out_blk = run_cli_with_env(
+            &dir,
+            &[
+                "format",
+                &blk_id,
+                "--lang",
+                lang,
+                "--expected-head",
+                &head,
+                "--json",
+            ],
+            None,
+            &secret_env,
+        );
+        assert_eq!(
+            out_blk.status.code(),
+            Some(7),
+            "Layer 2 block fuse '{lang}' must exit 7"
+        );
+        assert_eq!(
+            parse_single_json_stdout(&out_blk)["error"]["code"],
+            "FORMAT_SYNTAX_ERROR"
+        );
+        let check = parse_single_json_stdout(&run_cli(&dir, &["block", "get", &blk_id, "--json"], None));
+        assert_eq!(check["data"]["head_op_ids"][0], head);
+        assert_eq!(check["data"]["content"], "precious untouched source");
+    }
+
+    // 2. Positive array-style cmd + env secret isolation verification
+    let clean_out = run_cli_with_env(
+        &dir,
+        &["format", "--lang", "env_clean_array", "--json"],
+        Some(b"hello"),
+        &secret_env,
+    );
+    assert_eq!(clean_out.status.code(), Some(0));
+    let clean_j = parse_single_json_stdout(&clean_out);
+    assert_eq!(clean_j["data"]["formatted"], "CLEAN::::C.UTF-8");
+    let raw_stdout = String::from_utf8_lossy(&clean_out.stdout);
+    assert!(!raw_stdout.contains("AKIA_CANARY_SECRET_999"));
+    assert!(!raw_stdout.contains("BOOT_CANARY_SECRET_888"));
+    assert!(!raw_stdout.contains("SK_CANARY_SECRET_777"));
+
+    // 3. Locked-block ZERO subprocess guarantee: `mynote format <locked_id>` MUST exit 5 BLOCK_LOCKED
+    //    both with and without `--expected-head`, AND spy marker MUST NOT be created!
+    let (locked_id, locked_head) = {
+        let mut store = LocalStore::open(&dir).unwrap();
+        let l1 = store
+            .add_block(
+                "scratch",
+                "LOCKED_SECRET_ZERO_SUBPROCESS",
+                Some("spyfmt"),
+                None,
+                "human",
+                None,
+            )
+            .unwrap();
+        let kr_json: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("smk_keyring.local.json")).unwrap()).unwrap();
+        let smk_kid_s = kr_json["current_smk_kid"].as_str().unwrap();
+        let smk_hex = kr_json["generations"][smk_kid_s].as_str().unwrap();
+        let mut smk = [0u8; 32];
+        for i in 0..32 {
+            smk[i] = u8::from_str_radix(&smk_hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        let smk_kid = mynote_core::ids::SmkKid::parse(smk_kid_s).unwrap();
+        let mut gen = MonotonicUlidGen::new();
+        let remote_dev = DeviceId::parse("dev_lockspy001").unwrap();
+        let l_bid = BlockId::parse(&l1.block_id).unwrap();
+        let l_op = OpId::from_ulid(gen.next(1_795_700_000_000, [1u8; 10]));
+        let l_key = KeyId::from_ulid(gen.next(1_795_700_000_001, [2u8; 10]));
+        let l_mnr1 = encrypt_mnr1(
+            smk_kid,
+            &smk,
+            1,
+            &KeyRecordV1 {
+                v: 1,
+                key_id: l_key,
+                block_id: l_bid.0,
+                tier: 2,
+                created_hlc: Hlc::new(1_795_700_000_000, 0, remote_dev.clone()).canonical_string(),
+                created_by: remote_dev.clone(),
+                bdek: vec![0x99; 93],
+            },
+            [3u8; 24],
+        )
+        .unwrap();
+        store
+            .apply_remote_block_op_for_sync(RemoteBlockOpParams {
+                remote_device: remote_dev.clone(),
+                block_id: l_bid,
+                op_id: l_op,
+                parents: vec![OpId::parse(&l1.op_id).unwrap()],
+                op_type: OpType::Lock,
+                hlc: Hlc::new(1_795_700_000_000, 0, remote_dev),
+                tier: 2,
+                key_id: l_key,
+                new_key_record: Some((1, l_mnr1)),
+                mnb1: vec![0xCC; 317],
+                public_hint: Some("spy locked".into()),
+            })
+            .unwrap();
+        (l1.block_id, l_op.to_string())
+    };
+
+    for argv in [
+        vec!["format", &locked_id, "--json"],
+        vec!["format", &locked_id, "--expected-head", &locked_head, "--json"],
+    ] {
+        let out = run_cli_with_env(&dir, &argv, None, &[("MYNOTE_FORMATTERS_CONFIG", cfg_str)]);
+        assert_eq!(out.status.code(), Some(5));
+        assert_eq!(parse_single_json_stdout(&out)["error"]["code"], "BLOCK_LOCKED");
+        assert!(
+            !marker.exists(),
+            "SEC-03 VIOLATION: external formatter subprocess MUST NEVER execute for a locked block"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn time_travel_cli_history_dry_run_undo_actor_shredded_and_conflict() {
+    use mynote_core::sync::StoreMutation;
+    use mynote_core::vault::T_GRACE_DEFAULT_MS;
+
+    let dir = temp_dir("time_travel_cli");
+
+    // 1. Interleaved human edits + agent edits + SET_META
+    let r1 = parse_single_json_stdout(&run_cli(
+        &dir,
+        &["add", "human v1", "--lang", "text", "--json"],
+        None,
+    ));
+    let blk_id = r1["data"]["block_id"].as_str().unwrap().to_string();
+    let op1 = r1["data"]["op_id"].as_str().unwrap().to_string();
+
+    let r2 = parse_single_json_stdout(&run_cli(
+        &dir,
+        &[
+            "block",
+            "update",
+            &blk_id,
+            "human v2",
+            "--expected-head",
+            &op1,
+            "--json",
+        ],
+        None,
+    ));
+    let op2 = r2["data"]["op_id"].as_str().unwrap().to_string();
+
+    let r3 = parse_single_json_stdout(&run_cli_with_env(
+        &dir,
+        &[
+            "block",
+            "update",
+            &blk_id,
+            "agent oops 1",
+            "--expected-head",
+            &op2,
+            "--json",
+        ],
+        None,
+        &[("MYNOTE_ACTOR", "agent:claude-code")],
+    ));
+    let op3 = r3["data"]["op_id"].as_str().unwrap().to_string();
+
+    let r4 = parse_single_json_stdout(&run_cli_with_env(
+        &dir,
+        &[
+            "block",
+            "update",
+            &blk_id,
+            "agent oops 2",
+            "--expected-head",
+            &op3,
+            "--json",
+        ],
+        None,
+        &[("MYNOTE_ACTOR", "agent:claude-code")],
+    ));
+    let op4 = r4["data"]["op_id"].as_str().unwrap().to_string();
+
+    // SET_META by human after agent edits
+    let meta_out = run_cli(
+        &dir,
+        &["block", "move", &blk_id, "--lang", "markdown", "--json"],
+        None,
+    );
+    assert_eq!(meta_out.status.code(), Some(0));
+
+    // Check enriched `block history --json`
+    let hist_j = parse_single_json_stdout(&run_cli(&dir, &["block", "history", &blk_id, "--json"], None));
+    let entries = hist_j["data"].as_array().unwrap();
+    assert_eq!(entries.len(), 5);
+    let set_meta_e = entries.iter().find(|e| e["op_type"] == "SET_META").unwrap();
+    assert_eq!(set_meta_e["has_content"], false);
+    assert_eq!(set_meta_e["content_available"], false);
+    assert_eq!(set_meta_e["shredded"], false);
+    assert!(set_meta_e["key_id"].is_null());
+
+    // 2. `--undo-actor agent:claude-code --dry-run` -> preview with ZERO writes!
+    let dry_out = run_cli(
+        &dir,
+        &[
+            "block",
+            "revert",
+            &blk_id,
+            "--undo-actor",
+            "agent:claude-code",
+            "--dry-run",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(dry_out.status.code(), Some(0));
+    let dry_j = parse_single_json_stdout(&dry_out);
+    assert_eq!(dry_j["data"]["dry_run"], true);
+    assert_eq!(dry_j["data"]["current_head_op_id"], op4);
+    assert_eq!(dry_j["data"]["target_op_id"], op2);
+    assert_eq!(dry_j["data"]["target_actor"], "human");
+    assert_eq!(dry_j["data"]["skipped_actor_ops"], 2);
+    assert_eq!(dry_j["data"]["is_locked"], false);
+    assert_eq!(dry_j["data"]["preview"], "human v2");
+    // DB untouched after dry-run
+    assert_eq!(
+        run_cli(&dir, &["block", "get", &blk_id, "--raw"], None).stdout,
+        b"agent oops 2"
+    );
+
+    // 3. Execute `--undo-actor agent:claude-code` -> restores "human v2"
+    let rev_out = run_cli(
+        &dir,
+        &[
+            "block",
+            "revert",
+            &blk_id,
+            "--undo-actor",
+            "agent:claude-code",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(rev_out.status.code(), Some(0));
+    assert_eq!(
+        run_cli(&dir, &["block", "get", &blk_id, "--raw"], None).stdout,
+        b"human v2"
+    );
+
+    // 4. History purge + ExecuteShred -> `block history` flags shredded=true, `revert --to-op` exits 5 KEY_SHREDDED
+    {
+        let mut store = LocalStore::open(&dir).unwrap();
+        let (_rec, old_keys) = store
+            .purge_block_history(&blk_id, None, None, T_GRACE_DEFAULT_MS, "human")
+            .unwrap();
+        let muts: Vec<StoreMutation> = old_keys
+            .into_iter()
+            .map(|key_id| StoreMutation::ExecuteShred { key_id })
+            .collect();
+        store.apply_store_mutations(&muts).unwrap();
+    }
+    let hist_shred_j =
+        parse_single_json_stdout(&run_cli(&dir, &["block", "history", &blk_id, "--json"], None));
+    let op1_e = hist_shred_j["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["op_id"] == op1)
+        .unwrap();
+    assert_eq!(op1_e["shredded"], true);
+    assert_eq!(op1_e["content_available"], false);
+
+    let shred_rev = run_cli(
+        &dir,
+        &["block", "revert", &blk_id, "--to-op", &op1, "--json"],
+        None,
+    );
+    assert_eq!(shred_rev.status.code(), Some(5));
+    assert_eq!(
+        parse_single_json_stdout(&shred_rev)["error"]["code"],
+        "KEY_SHREDDED"
+    );
+
+    // 5. Multi-leaf conflict block -> exit 4 CONFLICT_PRESENT on revert & dry-run
+    let (conflict_id, conflict_op1) = {
+        let mut store = LocalStore::open(&dir).unwrap();
+        let c1 = store
+            .add_block("scratch", "c-base", Some("text"), None, "human", None)
+            .unwrap();
+        let _c2 = store
+            .update_block(&c1.block_id, "c-local", &c1.head_op_ids, false, "human")
+            .unwrap();
+        let kr_json: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("smk_keyring.local.json")).unwrap()).unwrap();
+        let smk_kid_s = kr_json["current_smk_kid"].as_str().unwrap();
+        let smk_hex = kr_json["generations"][smk_kid_s].as_str().unwrap();
+        let mut smk = [0u8; 32];
+        for i in 0..32 {
+            smk[i] = u8::from_str_radix(&smk_hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        let smk_kid = mynote_core::ids::SmkKid::parse(smk_kid_s).unwrap();
+        let mut gen = MonotonicUlidGen::new();
+        let remote_dev = DeviceId::parse("dev_conf_tt01").unwrap();
+        let c_bid = BlockId::parse(&c1.block_id).unwrap();
+        let r_op = OpId::from_ulid(gen.next(1_795_750_000_000, [5u8; 10]));
+        let r_kid = KeyId::from_ulid(gen.next(1_795_750_000_001, [6u8; 10]));
+        let r_bdek = [0x44u8; 32];
+        let r_mnb1 = encrypt_mnb1(c_bid.as_bytes(), r_op, r_kid, &r_bdek, "c-remote", [7u8; 24]).unwrap();
+        let r_mnr1 = encrypt_mnr1(
+            smk_kid,
+            &smk,
+            1,
+            &KeyRecordV1 {
+                v: 1,
+                key_id: r_kid,
+                block_id: c_bid.0,
+                tier: 1,
+                created_hlc: Hlc::new(1_795_750_000_000, 0, remote_dev.clone()).canonical_string(),
+                created_by: remote_dev.clone(),
+                bdek: r_bdek.to_vec(),
+            },
+            [8u8; 24],
+        )
+        .unwrap();
+        store
+            .apply_remote_block_op_for_sync(RemoteBlockOpParams {
+                remote_device: remote_dev.clone(),
+                block_id: c_bid,
+                op_id: r_op,
+                parents: vec![OpId::parse(&c1.op_id).unwrap()],
+                op_type: OpType::Update,
+                hlc: Hlc::new(1_795_750_000_000, 0, remote_dev),
+                tier: 1,
+                key_id: r_kid,
+                new_key_record: Some((1, r_mnr1)),
+                mnb1: r_mnb1,
+                public_hint: None,
+            })
+            .unwrap();
+        store.set_local_meta("bootstrap_completed", "1").unwrap();
+        (c1.block_id, c1.op_id)
+    };
+
+    for argv in [
+        vec![
+            "block",
+            "revert",
+            &conflict_id,
+            "--to-op",
+            &conflict_op1,
+            "--json",
+        ],
+        vec![
+            "block",
+            "revert",
+            &conflict_id,
+            "--to-op",
+            &conflict_op1,
+            "--dry-run",
+            "--json",
+        ],
+    ] {
+        let out = run_cli(&dir, &argv, None);
+        assert_eq!(out.status.code(), Some(4));
+        assert_eq!(
+            parse_single_json_stdout(&out)["error"]["code"],
+            "CONFLICT_PRESENT"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -21,12 +21,47 @@ struct FormattersConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum CmdSpec {
+    String(String),
+    Array(Vec<String>),
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct ExternalFormatterSpec {
-    cmd: String,
+    cmd: CmdSpec,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default = "default_timeout")]
     timeout_ms: u64,
+}
+
+impl ExternalFormatterSpec {
+    fn resolve_command(&self) -> Result<(String, Vec<String>), CoreError> {
+        let (prog, args) = match &self.cmd {
+            CmdSpec::String(s) => (s.trim().to_string(), self.args.clone()),
+            CmdSpec::Array(parts) => {
+                let Some((first, rest)) = parts.split_first() else {
+                    return Err(CoreError::new(
+                        ErrorCode::FormatSyntaxError,
+                        "external formatter 'cmd' array cannot be empty",
+                        "Specify at least the executable in ~/.config/mynote/formatters.toml",
+                    ));
+                };
+                let mut combined = rest.to_vec();
+                combined.extend(self.args.iter().cloned());
+                (first.trim().to_string(), combined)
+            }
+        };
+        if prog.is_empty() {
+            return Err(CoreError::new(
+                ErrorCode::FormatSyntaxError,
+                "external formatter 'cmd' executable cannot be blank",
+                "Specify a non-empty command executable in ~/.config/mynote/formatters.toml",
+            ));
+        }
+        Ok((prog, args))
+    }
 }
 
 fn default_timeout() -> u64 {
@@ -73,7 +108,11 @@ fn load_external_spec(lang: &str) -> Result<Option<ExternalFormatterSpec>, CoreE
             "Fix TOML syntax in ~/.config/mynote/formatters.toml",
         )
     })?;
-    Ok(cfg.formatters.get(&lang.to_ascii_lowercase()).cloned())
+    Ok(cfg
+        .formatters
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(lang))
+        .map(|(_, v)| v.clone()))
 }
 
 /// Format snippet via Layer 1 built-in core, falling back to Layer 2 external formatter
@@ -88,8 +127,9 @@ pub fn format_content(input: &str, lang: &str, action: Option<&str>) -> Result<S
 }
 
 fn run_external_formatter(spec: &ExternalFormatterSpec, input: &str) -> Result<String, CoreError> {
-    let mut cmd = Command::new(&spec.cmd);
-    cmd.args(&spec.args)
+    let (prog, args) = spec.resolve_command()?;
+    let mut cmd = Command::new(&prog);
+    cmd.args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -103,7 +143,7 @@ fn run_external_formatter(spec: &ExternalFormatterSpec, input: &str) -> Result<S
     let mut child = cmd.spawn().map_err(|e| {
         CoreError::new(
             ErrorCode::FormatSyntaxError,
-            format!("failed to spawn external formatter '{}': {e}", spec.cmd),
+            format!("failed to spawn external formatter '{prog}': {e}"),
             "Verify the formatter binary exists on PATH in ~/.config/mynote/formatters.toml",
         )
     })?;
@@ -144,8 +184,8 @@ fn run_external_formatter(spec: &ExternalFormatterSpec, input: &str) -> Result<S
                     return Err(CoreError::new(
                         ErrorCode::FormatSyntaxError,
                         format!(
-                            "external formatter '{}' timed out after {} ms",
-                            spec.cmd, spec.timeout_ms
+                            "external formatter '{prog}' timed out after {} ms",
+                            spec.timeout_ms
                         ),
                         "Original block left untouched; check input or increase timeout_ms",
                     ));
@@ -155,7 +195,7 @@ fn run_external_formatter(spec: &ExternalFormatterSpec, input: &str) -> Result<S
             Err(e) => {
                 return Err(CoreError::new(
                     ErrorCode::FormatSyntaxError,
-                    format!("error waiting on formatter '{}': {e}", spec.cmd),
+                    format!("error waiting on formatter '{prog}': {e}"),
                     "Original block left untouched",
                 ));
             }
@@ -170,9 +210,7 @@ fn run_external_formatter(spec: &ExternalFormatterSpec, input: &str) -> Result<S
         return Err(CoreError::new(
             ErrorCode::FormatSyntaxError,
             format!(
-                "external formatter '{}' exited with {}: {}",
-                spec.cmd,
-                status,
+                "external formatter '{prog}' exited with {status}: {}",
                 stderr_str.trim()
             ),
             "Fix input syntax; original block was NOT modified",
@@ -183,10 +221,7 @@ fn run_external_formatter(spec: &ExternalFormatterSpec, input: &str) -> Result<S
     if !input.is_empty() && stdout_bytes.is_empty() {
         return Err(CoreError::new(
             ErrorCode::FormatSyntaxError,
-            format!(
-                "external formatter '{}' returned 0 bytes for non-empty input",
-                spec.cmd
-            ),
+            format!("external formatter '{prog}' returned 0 bytes for non-empty input"),
             "Refusing to overwrite block with empty output; inspect formatter configuration",
         ));
     }
@@ -194,7 +229,7 @@ fn run_external_formatter(spec: &ExternalFormatterSpec, input: &str) -> Result<S
     String::from_utf8(stdout_bytes).map_err(|_| {
         CoreError::new(
             ErrorCode::FormatSyntaxError,
-            format!("external formatter '{}' emitted non-UTF-8 output", spec.cmd),
+            format!("external formatter '{prog}' emitted non-UTF-8 output"),
             "Original block left untouched",
         )
     })

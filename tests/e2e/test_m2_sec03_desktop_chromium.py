@@ -133,7 +133,7 @@ def main():
             # 4. Edit locked Tier 2 block in CM6 to unformatted JSON containing Tier-2-only canary, then click Format!
             cm_content = card.locator(".cm-content")
             cm_content.click()
-            page.keyboard.press("Control+a")
+            page.keyboard.press("ControlOrMeta+a")
             page.keyboard.type(f'{{"secret":"{t2_canary}","n":1}}')
             # Click Format -> MUST run purely in browser WASM with ZERO /v1/local/format HTTP calls!
             card.get_by_role("button", name="Format").click()

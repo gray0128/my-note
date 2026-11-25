@@ -10,6 +10,7 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks(id) {
+          if (id.includes("node_modules/pele")) return "pele";
           if (id.includes("@replit/codemirror-vim")) return "cm-vim";
           const langMatch = id.match(/@codemirror\/lang-([a-z]+)/) ?? id.match(/@lezer\/(json|javascript|markdown|python|rust|html|css|xml|yaml)/);
           if (langMatch) return `lang-${langMatch[1]}`;

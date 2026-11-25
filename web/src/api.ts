@@ -2,6 +2,8 @@ import type {
   ApiErrorBody,
   BlockDto,
   BlockedTier2OpDto,
+  BlockHistoryContentDto,
+  BlockHistoryEntryDto,
   BootstrapResponse,
   BufferDto,
   LocalWsFrame,
@@ -137,7 +139,21 @@ export interface LocalApiClient {
   putVaultHeader?(gen: number, blobB64: string): Promise<VaultHeaderDto>;
   listBlockedOps?(): Promise<BlockedTier2OpDto[]>;
   rekeyBlockedOp?(opId: string, payload: Tier2WritePayload): Promise<BlockDto>;
-  formatSnippet(input: { content: string; lang: string; action?: string }): Promise<{ formatted: string }>;
+  getBlockHistory?(id: string, limit?: number): Promise<BlockHistoryEntryDto[]>;
+  getBlockHistoryOp?(id: string, opId: string): Promise<BlockHistoryContentDto>;
+  revertBlock?(
+    id: string,
+    input: {
+      to_op_id?: string;
+      undo_actor?: string;
+      expected_heads?: string[];
+      op_id?: string;
+      key_id?: string;
+      mnb1_b64?: string;
+      mnw1_b64?: string;
+    },
+  ): Promise<BlockDto>;
+  formatSnippet(input: { content: string; lang: string; action?: string; block_id?: string }): Promise<{ formatted: string }>;
   syncNow(): Promise<SyncStatusDto>;
   connectWs(
     onFrame: (frame: LocalWsFrame) => void,
@@ -188,6 +204,19 @@ export function createLocalApiClient(): LocalApiClient {
       reqJson<BlockDto>(`/v1/local/blocked-ops/${encodeURIComponent(opId)}/rekey`, {
         method: "POST",
         body: JSON.stringify(payload),
+      }),
+    getBlockHistory: (id, limit) => {
+      const q = limit !== undefined ? `?limit=${encodeURIComponent(String(limit))}` : "";
+      return reqJson<BlockHistoryEntryDto[]>(`/v1/local/blocks/${encodeURIComponent(id)}/history${q}`);
+    },
+    getBlockHistoryOp: (id, opId) =>
+      reqJson<BlockHistoryContentDto>(
+        `/v1/local/blocks/${encodeURIComponent(id)}/history/${encodeURIComponent(opId)}`,
+      ),
+    revertBlock: (id, input) =>
+      reqJson<BlockDto>(`/v1/local/blocks/${encodeURIComponent(id)}/revert`, {
+        method: "POST",
+        body: JSON.stringify(input),
       }),
     formatSnippet: (input) => reqJson<{ formatted: string }>("/v1/local/format", { method: "POST", body: JSON.stringify(input) }),
     syncNow: () => reqJson<SyncStatusDto>("/v1/local/sync/now", { method: "POST" }),

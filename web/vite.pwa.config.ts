@@ -24,6 +24,12 @@ export default defineConfig({
     sourcemap: false,
     rollupOptions: {
       input: "pwa.html",
+      output: {
+        manualChunks(id) {
+          if (id.includes("node_modules/pele")) return "pele";
+          return undefined;
+        },
+      },
     },
   },
 });

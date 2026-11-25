@@ -172,7 +172,7 @@ jobs:
           cargo check -p mynote-wasm --target wasm32-unknown-unknown --no-default-features --features pwa
 
   m2-e2e-security:
-    name: M2 Security Audits (CLI PTY Vault + Chromium SEC-03 + WebKit SEC-08)
+    name: M2 & M3 Security & Render Audits (PTY Vault + Chromium/WebKit SEC-03/06/08 + Pele + History)
     needs: [web-checks]
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -219,3 +219,5 @@ jobs:
         run: python3 tests/e2e/test_m2_sec03_desktop_chromium.py
       - name: Run SEC-08 Mobile Read-Only PWA + wrangler dev + WebKit Audit
         run: python3 tests/e2e/test_m2_sec08_mobile_webkit.py
+      - name: Run M3 SEC-06 / Pele Copy PNG (Chromium & WebKit) / Time Travel E2E
+        run: python3 tests/e2e/test_m3_sec06_pele_history.py
