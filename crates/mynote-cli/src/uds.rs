@@ -15,20 +15,46 @@ use std::os::unix::net::UnixStream;
 pub fn socket_path_for(data_dir: &Path) -> PathBuf {
     // Keep socket inside explicit / test data dirs for hermetic multi-instance isolation.
     let s = data_dir.to_string_lossy();
-    let is_custom = std::env::var("MYNOTE_DATA_DIR").is_ok() || s.starts_with("/tmp/") || s.contains("/.tmp");
-    if !is_custom {
+    let is_custom = std::env::var("MYNOTE_DATA_DIR").is_ok()
+        || s.starts_with("/tmp/")
+        || s.contains("/.tmp")
+        || data_dir.starts_with(std::env::temp_dir());
+    let candidate = if !is_custom {
         #[cfg(target_os = "linux")]
-        if let Ok(xdg_rt) = std::env::var("XDG_RUNTIME_DIR") {
-            if !xdg_rt.trim().is_empty() {
-                return PathBuf::from(xdg_rt).join("mynote").join("daemon.sock");
+        {
+            if let Ok(xdg_rt) = std::env::var("XDG_RUNTIME_DIR") {
+                if !xdg_rt.trim().is_empty() {
+                    PathBuf::from(xdg_rt).join("mynote").join("daemon.sock")
+                } else {
+                    data_dir.join("daemon.sock")
+                }
+            } else {
+                data_dir.join("daemon.sock")
             }
         }
         #[cfg(target_os = "macos")]
         {
-            return data_dir.join("run").join("daemon.sock");
+            data_dir.join("run").join("daemon.sock")
         }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            data_dir.join("daemon.sock")
+        }
+    } else {
+        data_dir.join("daemon.sock")
+    };
+
+    // macOS sockaddr_un.sun_path is strictly 104 bytes (Linux 108); deterministically hash long paths
+    // into /tmp/mn-<16hex>.sock so deep data dirs (e.g. macOS /var/folders/.../T) never hit ENAMETOOLONG.
+    if candidate.as_os_str().len() >= 96 {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(data_dir.to_string_lossy().as_bytes());
+        let digest = h.finalize();
+        let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+        return PathBuf::from("/tmp").join(format!("mn-{hex}.sock"));
     }
-    data_dir.join("daemon.sock")
+    candidate
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -259,4 +285,19 @@ pub fn try_send_uds(
     _timeout: Duration,
 ) -> Result<Option<UdsResponse>, CoreError> {
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_path_for_hashes_long_paths_under_macos_sun_len() {
+        let deep = Path::new(
+            "/var/folders/q2/p1t6rgxj5fj32g1dc7dmd49r0000gn/T/mynote_daemon_sync_sec05_1795589174499009000",
+        );
+        let sock = socket_path_for(deep);
+        assert!(sock.as_os_str().len() < 100, "sock too long: {}", sock.display());
+        assert_eq!(sock, socket_path_for(deep), "must be deterministic");
+    }
 }

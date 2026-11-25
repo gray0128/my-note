@@ -21,9 +21,14 @@ fn should_use_os_keychain(data_dir: &Path) -> bool {
     if let Ok(mode) = std::env::var("MYNOTE_KEYCHAIN") {
         return mode.eq_ignore_ascii_case("os");
     }
-    // Never touch the host OS keychain for temporary / explicit test data directories.
+    // Never touch the host OS keychain for temporary, CI, or explicit test data directories.
     let s = data_dir.to_string_lossy();
-    if s.starts_with("/tmp/") || s.contains("/.tmp") || std::env::var("MYNOTE_DATA_DIR").is_ok() {
+    if s.starts_with("/tmp/")
+        || s.contains("/.tmp")
+        || data_dir.starts_with(std::env::temp_dir())
+        || std::env::var("MYNOTE_DATA_DIR").is_ok()
+        || std::env::var("CI").is_ok()
+    {
         return false;
     }
     #[cfg(target_os = "macos")]
@@ -70,6 +75,30 @@ fn os_store_secret(service: &str, account: &str, payload: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Decodes secret output from OS keychain tools; handles macOS `security find-generic-password -w`
+/// hex-encoding secrets that contain newlines or non-ASCII bytes.
+#[allow(dead_code)]
+fn decode_keychain_secret(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.starts_with('{')
+        && trimmed.len().is_multiple_of(2)
+        && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        let mut bytes = Vec::with_capacity(trimmed.len() / 2);
+        for chunk in trimmed.as_bytes().as_chunks::<2>().0 {
+            let s = std::str::from_utf8(chunk).ok()?;
+            bytes.push(u8::from_str_radix(s, 16).ok()?);
+        }
+        if let Ok(decoded) = String::from_utf8(bytes) {
+            return Some(decoded);
+        }
+    }
+    Some(trimmed.to_string())
+}
+
 #[cfg(target_os = "macos")]
 fn os_load_secret(service: &str, account: &str) -> Option<String> {
     let out = Command::new("/usr/bin/security")
@@ -80,7 +109,8 @@ fn os_load_secret(service: &str, account: &str) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    String::from_utf8(out.stdout).ok().map(|s| s.trim().to_string())
+    let raw = String::from_utf8(out.stdout).ok()?;
+    decode_keychain_secret(&raw)
 }
 
 #[cfg(target_os = "linux")]
@@ -163,7 +193,8 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
 }
 
 pub fn save_device_credentials(data_dir: &Path, creds: &DeviceCredentials) -> Result<(), CoreError> {
-    let json = serde_json::to_string_pretty(creds)
+    // Compact single-line JSON avoids macOS `security find-generic-password -w` hex-encoding multiline secrets.
+    let json = serde_json::to_string(creds)
         .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "serialize credentials"))?;
     if should_use_os_keychain(data_dir) {
         let acct = keychain_account(data_dir);
@@ -223,5 +254,21 @@ pub fn exclude_from_os_backups(data_dir: &Path) {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = data_dir;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_keychain_secret_handles_plain_and_macos_hex_json() {
+        let plain =
+            r#"{"sync_url":"https://note.example.com","device_token":"mnt_abc","scope":"read-write"}"#;
+        assert_eq!(decode_keychain_secret(plain).as_deref(), Some(plain));
+
+        let multiline = "{\n  \"sync_url\": \"https://note.example.com\",\n  \"device_token\": \"mnt_abc\",\n  \"scope\": \"read-write\"\n}";
+        let hex_encoded: String = multiline.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(decode_keychain_secret(&hex_encoded).as_deref(), Some(multiline));
     }
 }
