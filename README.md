@@ -6,7 +6,7 @@
 
 ## 状态
 
-**S0 技术 Spike（除真实 CF Paid 账号控制台核验外均已真机闭环）与 M1 纯领域核 / 本地存储 / Agent CLI 已落地**。`ADR-01`（Rust Sans-I/O 核 + `ruzstd` WASM）、`ADR-06`（双桌面纯 CLI + Daemon + 内嵌 HTML + 手机只读 PWA，iPhone Argon2id 定值 `(32768, 2, 1)`）与 `ADR-07`（CodeMirror 6 候选 A 按块虚拟化）均已获实测证据转为 **Accepted**，其余云端/联调相关 ADR 诚实保持 **Proposed**（详见 [`docs/spikes/`](./docs/spikes/)）。Rust Workspace（`mynote-core`、`mynote-wasm`、`mynote-store`、`mynote-cli`）、`skill/SKILL.md`、200 种子 DST、CLI 合约测试与双平台 CI 均已就绪；开发与 Agent 协作红线见 [`AGENTS.md`](./AGENTS.md)。路线图：S0 spike → M1 替换 Heynote + iCloud → M2 手机只读 + Vault + 碎纸 → M3 渲染与打磨（详见 [`docs/architecture-proposal.md`](./docs/architecture-proposal.md) 与 [review §9.11](./review/2026-11-24-first-principles-review.md)）。
+**M1（替换 Heynote + iCloud）全栈工程代码与本地确定性门禁已全部落地并绿灯**（尚待个人真实 Cloudflare Paid 账号部署核验 Spend Management / R2 生命周期、独立 `[eval-only]` PR 冻结 `evals/golden/` 快照，以及 macOS + Omarchy 4 周日常使用准出观察）。已落地核心组件：`mynote-core`（同步核 `2,202 LOC` `[已测]`）、`mynote-store`、`mynote-cli`（CLI + 本地 Daemon + `0600` UDS `apply` + `SEC-05` + 云端同步客户端，Linux Release 剥离单二进制 `13.11 MiB` `[已测]`、无头常驻 `7.66 MiB` RSS `[已测]`、CLI 进程内读写 `7–8 ms` `[已测]`）、`web/` 内嵌桌面编辑器（候选 A 按块虚拟化 CM6，首屏 `116.75 kB` gzip `[已测]`，无头 Chromium 严格 CSP nonce 零违规 `[已测]`）、`cloud-cf/` 极薄盲同步中继（`493 LOC` TS `[已测]`，真实 `workerd` 契约与跨语言 `MNA1`/`MNKS` 离线恢复验证通过 `[已测]`）、`deploy/` 双桌面模板（Omarchy systemd/Hyprland & macOS launchd）以及 500 种子 PR CI / 100k 夜间长浸泡 / CI-only 云端部署工作流。`ADR-01`、`ADR-06`、`ADR-07` 为 **Accepted**，其余云端/联调相关 ADR 诚实保持 **Proposed**。开发与 Agent 协作红线见 [`AGENTS.md`](./AGENTS.md)。路线图：S0 spike → M1 替换 Heynote + iCloud → M2 手机只读 + Vault + 碎纸 → M3 渲染与打磨（详见 [`docs/architecture-proposal.md`](./docs/architecture-proposal.md) 与 [review §9.11](./review/2026-11-24-first-principles-review.md)）。
 
 ## 背景
 

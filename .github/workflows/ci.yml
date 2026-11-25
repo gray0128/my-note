@@ -39,6 +39,57 @@ jobs:
             fi
           fi
 
+  web-checks:
+    name: Web UI (TypeScript + Vite + Vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Install web dependencies
+        run: pnpm --dir web install --frozen-lockfile
+      - name: Typecheck web UI
+        run: pnpm --dir web typecheck
+      - name: Test web UI
+        run: pnpm --dir web test
+      - name: Build web UI
+        run: pnpm --dir web build
+
+  cloud-cf-checks:
+    name: Cloudflare Relay (workerd contract + shared scenarios)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: cloud-cf/pnpm-lock.yaml
+      - name: Install cloud-cf dependencies
+        run: pnpm --dir cloud-cf install --frozen-lockfile
+      - name: Enforce M1 LOC budget (< 500 lines in cloud-cf/src/)
+        shell: bash
+        run: |
+          LOC=$(wc -l cloud-cf/src/*.ts | tail -n 1 | awk '{print $1}')
+          echo "cloud-cf/src/*.ts total lines = ${LOC}"
+          if [ "$LOC" -ge 500 ]; then
+            echo "ERROR: cloud-cf/src/ exceeded M1 < 500 LOC target ($LOC lines)"
+            exit 1
+          fi
+      - name: Typecheck cloud-cf
+        run: pnpm --dir cloud-cf typecheck
+      - name: Run workerd contract & shared scenario tests
+        run: pnpm --dir cloud-cf test
+
   rust-checks:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -53,6 +104,16 @@ jobs:
       - name: Pin evals/ to PR base commit on non-[eval-only] PRs
         if: github.event_name == 'pull_request' && !startsWith(github.event.pull_request.title, '[eval-only]')
         run: git checkout "${{ github.event.pull_request.base.sha }}" -- evals/
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Build embedded web UI assets
+        run: pnpm --dir web install --frozen-lockfile && pnpm --dir web build
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -62,7 +123,9 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test workspace
+      - name: Test workspace (including 500-seed DST + INV-RECOVERY + SEC-05)
+        env:
+          MYNOTE_DST_SEEDS: "500"
         run: cargo test --workspace
       - name: Verify wasm32-unknown-unknown compilation
         run: cargo check -p mynote-core -p mynote-wasm --target wasm32-unknown-unknown

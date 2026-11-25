@@ -1,0 +1,35 @@
+name: Deploy Cloudflare Sync Relay
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "cloud-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-deploy:
+    name: Verify & Deploy cloud-cf Worker (CI-only Scoped Token)
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: cloud-cf/pnpm-lock.yaml
+      - name: Install cloud-cf dependencies
+        run: pnpm --dir cloud-cf install --frozen-lockfile
+      - name: Typecheck & run workerd contract tests before deploy
+        run: pnpm --dir cloud-cf typecheck && pnpm --dir cloud-cf test
+      - name: Deploy Worker via Scoped API Token
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm --dir cloud-cf exec wrangler deploy
