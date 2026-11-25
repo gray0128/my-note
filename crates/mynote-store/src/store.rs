@@ -23,7 +23,7 @@ use mynote_core::keys::KeyTableState;
 use mynote_core::materialize::{materialize_block, materialize_buffer, DecodedOp};
 use mynote_core::model::{
     BlockState, EntityType, InnerOpV1, KeyMaterialKind, KeyRecordRow, LeafBody, MaterializedBlock,
-    MaterializedBuffer, OpBodyV1, OpType,
+    MaterializedBuffer, OpBodyV1, OpType, ShredMarkState,
 };
 use mynote_core::sim::offline_restore_from_r2;
 use mynote_core::sync::{EngineSnapshot, LocalOpRecord, StoreMutation};
@@ -134,6 +134,10 @@ pub struct BlockSummaryDto {
     pub updated_at_ms: i64,
 }
 
+#[path = "m2_vault_shred.rs"]
+mod m2_vault_shred;
+pub use m2_vault_shred::{BlockedTier2OpDto, Tier2OpInput, VaultHeaderDto};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockVersionDto {
     pub op_id: String,
@@ -142,7 +146,13 @@ pub struct BlockVersionDto {
     pub actor: String,
     pub is_display: bool,
     pub is_locked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mnb1_b64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mnw1_b64: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -849,6 +859,9 @@ impl LocalStore {
                 key_record,
                 created_at_ms,
             });
+        }
+        for mark in self.load_shred_marks(true)? {
+            kt.insert_mark(mark);
         }
         if let Ok(mut mstmt) = self.conn.prepare("SELECT kind, gen, blob FROM key_material") {
             if let Ok(mrows) = mstmt.query_map([], |r| {
@@ -1654,6 +1667,11 @@ impl LocalStore {
             now as i64,
         )?;
         let mat = self.rematerialize_buffer(buf_id)?;
+        if self.key_self_check()?.0 {
+            let buf_keys = self.collect_entity_unshredded_key_ids(EntityType::Buffer, &buf_id.to_string())?;
+            let _ =
+                self.queue_local_shred_marks(&buf_keys, mynote_core::vault::T_GRACE_DEFAULT_MS, now as i64);
+        }
         self.refresh_mirror()?;
         Ok(BufferDto {
             id: mat.id.to_string(),
@@ -2175,6 +2193,7 @@ impl LocalStore {
             })?;
 
         if row.state == "TRASHED" {
+            let (_, nb_ms) = self.block_trash_shred_status(&blk_id.to_string());
             return Err(CoreError::new(
                 ErrorCode::InTrash,
                 format!(
@@ -2185,7 +2204,7 @@ impl LocalStore {
             )
             .with_details(serde_json::json!({
                 "deleted_at_ms": row.deleted_at_ms,
-                "shred_not_before_ms": serde_json::Value::Null,
+                "shred_not_before_ms": nb_ms,
             })));
         }
         if row.state == "SHREDDED" {
@@ -2242,7 +2261,10 @@ impl LocalStore {
                 actor: leaf.actor,
                 is_display,
                 is_locked: leaf.tier == Some(2),
+                key_id: None,
                 content: exposed_content,
+                mnb1_b64: None,
+                mnw1_b64: None,
             });
         }
 
@@ -2566,6 +2588,17 @@ impl LocalStore {
             now as i64,
         )?;
         let mat = self.rematerialize_block(blk_id)?;
+        let (shred_state, shred_not_before_ms) = if self.key_self_check()?.0 {
+            let keys = self.collect_entity_unshredded_key_ids(EntityType::Block, &blk_id.to_string())?;
+            if keys.is_empty() {
+                ("unscheduled".to_string(), None)
+            } else {
+                self.queue_local_shred_marks(&keys, mynote_core::vault::T_GRACE_DEFAULT_MS, now as i64)?;
+                ("pending_sync".to_string(), None)
+            }
+        } else {
+            ("withheld_self_check".to_string(), None)
+        };
         self.refresh_mirror()?;
 
         Ok(DeleteReceipt {
@@ -2574,8 +2607,8 @@ impl LocalStore {
             head_op_ids: mat.head_op_ids().into_iter().map(|o| o.to_string()).collect(),
             buffer_id: mat.buffer_id.to_string(),
             in_trash: true,
-            shred_not_before_ms: None,
-            shred_state: "unscheduled".to_string(), // M1 pure soft-delete recycle bin
+            shred_not_before_ms,
+            shred_state,
         })
     }
 
@@ -2607,6 +2640,7 @@ impl LocalStore {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .unwrap_or_else(|_| (self.device_id.to_string(), "human".to_string()));
+            let (shred_state, shred_not_before_ms) = self.block_trash_shred_status(&id);
             out.push(TrashItemDto {
                 id,
                 buffer_id,
@@ -2616,10 +2650,20 @@ impl LocalStore {
                 deleted_at_ms,
                 deleted_by_device: dev,
                 actor,
-                shred_not_before_ms: None,
-                shred_state: "unscheduled".to_string(),
+                shred_not_before_ms,
+                shred_state,
             });
         }
+        // `docs/interface-contracts.md` §2.6 #5: sort by `shred_not_before_ms` ASC NULLS LAST
+        out.sort_by(|a, b| match (a.shred_not_before_ms, b.shred_not_before_ms) {
+            (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.id.cmp(&b.id)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => b
+                .deleted_at_ms
+                .cmp(&a.deleted_at_ms)
+                .then_with(|| a.id.cmp(&b.id)),
+        });
         Ok(out)
     }
 
@@ -2689,8 +2733,19 @@ impl LocalStore {
                 ));
             }
         };
+        if self.is_key_executed(&key_id) {
+            return Err(CoreError::new(
+                ErrorCode::KeyShredded,
+                format!("key {key_id} has already been shredded"),
+                "Cannot restore a shredded block",
+            ));
+        }
         let bdek = self.unwrap_tier1_bdek(key_id)?;
         let restored_pt = decrypt_mnb1(blk_id.as_bytes(), last_content_op.op_id, key_id, &bdek, mnb1)?;
+
+        // Cancel all active local/remote shred marks for this block's keys
+        let all_keys = self.collect_entity_unshredded_key_ids(EntityType::Block, &blk_id.to_string())?;
+        self.cancel_local_shred_marks_for_keys(&all_keys)?;
 
         let parents = self.current_entity_leaves(EntityType::Block, &blk_id.to_string())?;
         let now = now_ms();
@@ -3044,16 +3099,28 @@ impl LocalStore {
                 "Verify recovery bundle matches this vault",
             ));
         }
-        let has_vault: bool = self
+        let vh_blob: Option<Vec<u8>> = self
             .conn
             .query_row(
-                "SELECT 1 FROM key_material WHERE kind = 'vault_header'",
+                "SELECT blob FROM key_material WHERE kind = 'vault_header'",
                 [],
-                |_| Ok(true),
+                |r| r.get(0),
             )
             .optional()
-            .unwrap_or(None)
-            .unwrap_or(false);
+            .unwrap_or(None);
+        let has_vault = if let Some(blob) = vh_blob {
+            let vh: mynote_core::crypto::VaultHeaderV1 = rmp_serde::from_slice(&blob).map_err(|e| {
+                CoreError::new(
+                    ErrorCode::IntegrityError,
+                    format!("corrupt VaultHeaderV1 during recovery drill: {e}"),
+                    "Sync the latest VaultHeaderV1",
+                )
+            })?;
+            let _ = mynote_core::vault::unseal_vault_with_recovery(&kp, &vh)?;
+            true
+        } else {
+            false
+        };
         let drilled_at_ms = now_ms() as i64;
         let _ = self.set_local_meta("recovery_drill_due", "0");
         let _ = self.set_local_meta("last_recovery_drill_ms", &drilled_at_ms.to_string());
@@ -3752,6 +3819,8 @@ impl LocalStore {
             snap.hlc = h;
         }
         snap.keys = self.load_key_table()?;
+        snap.pending_shred_marks = self.load_shred_marks(false)?;
+        snap.pending_cancel_key_ids = self.load_pending_cancel_keys();
         snap.smks = self.smks.clone();
 
         let mut stmt = self
@@ -3957,6 +4026,8 @@ impl LocalStore {
         let mut touched_buffers: BTreeSet<BufferId> = BTreeSet::new();
         let mut touched_blocks: BTreeSet<BlockId> = BTreeSet::new();
         let mut keys_changed = false;
+        let mut marks_changed = false;
+        let mut shred_keys_to_execute: BTreeMap<KeyId, Option<(u32, i64)>> = BTreeMap::new();
         let mut summary = SyncApplySummary::default();
 
         self.conn
@@ -4030,7 +4101,7 @@ impl LocalStore {
                         for a in acked {
                             self.conn
                                 .execute(
-                                    "UPDATE sync_ops SET server_seq = ?1 WHERE op_id = ?2",
+                                    "UPDATE sync_ops SET server_seq = ?1, sync_blocked_reason = NULL WHERE op_id = ?2",
                                     params![a.seq, a.op_id.to_string()],
                                 )
                                 .map_err(|e| {
@@ -4040,6 +4111,31 @@ impl LocalStore {
                         self.conn
                             .execute("UPDATE block_keys SET server_acked = 1", [])
                             .ok();
+                    }
+                    StoreMutation::MarkOpBlocked { op_id, reason } => {
+                        self.conn
+                            .execute(
+                                "UPDATE sync_ops SET sync_blocked_reason = ?1 WHERE op_id = ?2",
+                                params![reason, op_id.to_string()],
+                            )
+                            .map_err(|e| {
+                                CoreError::new(ErrorCode::IntegrityError, e.to_string(), "mark op blocked")
+                            })?;
+                        if reason == "NEEDS_VAULT_REKEY" {
+                            summary.needs_vault_rekey.push(op_id.to_string());
+                        }
+                    }
+                    StoreMutation::MarkShredMarksAcked {
+                        results,
+                        cancelled_keys,
+                    } => {
+                        self.apply_shred_results_acked(results, cancelled_keys)?;
+                        summary.trash_changed = true;
+                        for r in results {
+                            if r.state == ShredMarkState::PendingConfirm {
+                                summary.pending_confirm_count += 1;
+                            }
+                        }
                     }
                     StoreMutation::ClearServerSeqsForReconcile { new_epoch } => {
                         // NEVER delete sync_ops or blocks — only clear server_seq for Set-Union reconciliation!
@@ -4052,6 +4148,11 @@ impl LocalStore {
                         self.set_local_meta("last_seq", "0")?;
                     }
                     StoreMutation::UpsertBlockKey(rec) => {
+                        if rec.key_record.is_none() {
+                            // Defer destructive NULL write until AFTER outbox reconciliation & INV-KEY-LIVENESS!
+                            shred_keys_to_execute.insert(rec.key_id, Some((rec.wrap_gen, rec.created_at_ms)));
+                            continue;
+                        }
                         let zero_id = Ulid::ZERO.to_string();
                         let existing: Option<(String, i64, Option<Vec<u8>>)> = self
                             .conn
@@ -4065,11 +4166,7 @@ impl LocalStore {
                         let should_write = match existing {
                             None => true,
                             Some((_, _, None)) => false, // Executed shred is terminal
-                            Some((ref bid, g, Some(_))) => {
-                                rec.key_record.is_none()
-                                    || (rec.wrap_gen as i64) > g
-                                    || (bid == &zero_id && rec.key_record.is_some())
-                            }
+                            Some((ref bid, g, Some(_))) => (rec.wrap_gen as i64) > g || bid == &zero_id,
                         };
                         if should_write {
                             let (blk_id_s, tier) = if let Some(mnr1) = &rec.key_record {
@@ -4116,8 +4213,19 @@ impl LocalStore {
                             keys_changed = true;
                         }
                     }
-                    StoreMutation::UpsertShredMark(_) | StoreMutation::ExecuteShred { .. } => {
-                        // M1 does not execute physical key shredding (M2 feature).
+                    StoreMutation::UpsertShredMark(mark) => {
+                        self.upsert_shred_mark_row(mark, true)?;
+                        marks_changed = true;
+                        summary.trash_changed = true;
+                        if mark.state == ShredMarkState::PendingConfirm {
+                            summary.pending_confirm_count += 1;
+                        }
+                        if mark.state == ShredMarkState::Executed {
+                            shred_keys_to_execute.entry(mark.key_id).or_insert(None);
+                        }
+                    }
+                    StoreMutation::ExecuteShred { key_id } => {
+                        shred_keys_to_execute.entry(*key_id).or_insert(None);
                     }
                     StoreMutation::UpsertKeyMaterial {
                         kind,
@@ -4183,6 +4291,25 @@ impl LocalStore {
                         self.set_local_meta("clock_skew_ms", &w.skew_ms.to_string())?;
                         summary.clock_skew_ms = Some(w.skew_ms);
                     }
+                }
+            }
+
+            // Reconcile local outbox against newly received shred marks & imminent shreds BEFORE
+            // nullifying key_record so offline Tier 1 edits rekey & Tier 2 edits save mnw1!
+            if marks_changed || !shred_keys_to_execute.is_empty() {
+                let imminent: BTreeSet<KeyId> = shred_keys_to_execute.keys().copied().collect();
+                let rekey_ops = self.reconcile_outbox_with_imminent_shreds(&imminent)?;
+                if !rekey_ops.is_empty() {
+                    summary.needs_vault_rekey.extend(rekey_ops);
+                }
+            }
+
+            // Execute server-confirmed key shreds with INV-KEY-LIVENESS guard
+            for (kid, meta) in shred_keys_to_execute {
+                if self.execute_shred_in_tx(kid, meta)? {
+                    keys_changed = true;
+                    summary.trash_changed = true;
+                    summary.executed_shreds.push(kid.to_string());
                 }
             }
 
@@ -4281,7 +4408,10 @@ impl LocalStore {
             }
         }
 
-        if need_mirror_refresh {
+        if !summary.executed_shreds.is_empty() {
+            // SEC-01 / INV-SHRED-BOUND: scrub FTS5 segments, VACUUM under secure_delete=ON, truncate WAL, refresh mirror!
+            self.full_forensic_shred_scrub()?;
+        } else if need_mirror_refresh {
             self.refresh_mirror()?;
         }
         Ok(summary)
@@ -4302,6 +4432,9 @@ pub struct SyncApplySummary {
     pub trash_changed: bool,
     pub clock_skew_ms: Option<i64>,
     pub integrity_alerts: Vec<(String, String)>,
+    pub executed_shreds: Vec<String>,
+    pub needs_vault_rekey: Vec<String>,
+    pub pending_confirm_count: usize,
 }
 
 fn collect_mna1_files(dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Result<(), CoreError> {
@@ -4431,7 +4564,7 @@ mod tests {
             .delete_block(&r1.block_id, Some(&r2.head_op_ids), "human")
             .unwrap();
         assert!(del.in_trash);
-        assert_eq!(del.shred_state, "unscheduled");
+        assert_eq!(del.shred_state, "pending_sync");
         assert!(store.search_blocks("canary", None, 20).unwrap().is_empty());
         let mirror_after_del = std::fs::read_to_string(dir.join("mirror/scratch.md")).unwrap();
         assert!(!mirror_after_del.contains("canary"));
@@ -5082,5 +5215,212 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir_src);
         let _ = std::fs::remove_dir_all(&dir_dst);
+    }
+
+    #[test]
+    fn sec_01_and_inv_shred_bound_zero_plaintext_in_db_wal_fts_mirror_and_backup() {
+        let dir = temp_dir("sec01_shred");
+        let mut store = LocalStore::open(&dir).unwrap();
+        let canary = "CANARY_SECRET_TOKEN_987654321_XYZ_FORENSIC";
+        let blk = store
+            .add_block("scratch", canary, Some("text"), None, "human", None)
+            .unwrap();
+        assert_eq!(store.search_blocks("CANARY_SECRET", None, 10).unwrap().len(), 1);
+        let mirror_before = std::fs::read_to_string(dir.join("mirror/scratch.md")).unwrap();
+        assert!(mirror_before.contains(canary));
+
+        // 1. Delete block -> enters trash & queues local pending shred mark; mirror & FTS immediately scrubbed
+        let del = store.delete_block(&blk.block_id, None, "human").unwrap();
+        assert!(del.in_trash);
+        assert_eq!(del.shred_state, "pending_sync");
+        assert!(store.search_blocks("CANARY_SECRET", None, 10).unwrap().is_empty());
+
+        let snap = store.export_engine_snapshot().unwrap();
+        assert_eq!(snap.pending_shred_marks.len(), 1);
+        let key_id = snap.pending_shred_marks[0].key_id;
+
+        // 2. Simulate server executing shred after grace period expires
+        let mut executed_mark = snap.pending_shred_marks[0].clone();
+        executed_mark.state = ShredMarkState::Executed;
+        executed_mark.executed_at_ms = Some(now_ms() as i64);
+        let summary = store
+            .apply_store_mutations(&[
+                StoreMutation::UpsertShredMark(executed_mark),
+                StoreMutation::ExecuteShred { key_id },
+            ])
+            .unwrap();
+        assert_eq!(summary.executed_shreds, vec![key_id.to_string()]);
+        assert_eq!(
+            store.get_block(&blk.block_id).unwrap_err().code(),
+            ErrorCode::KeyShredded
+        );
+        assert!(store.list_trash().unwrap().is_empty());
+
+        // 3. Create fresh backup AFTER shred & drop store so WAL/SHM flush cleanly
+        let post_shred_backup = store.create_auto_backup("post-shred").unwrap();
+        drop(store);
+
+        // 4. Forensic raw-byte scan across mynote.db, .db-wal, .db-shm, mirror, and post-shred backup!
+        let needle = canary.as_bytes();
+        let mut scan_paths = vec![
+            dir.join("mynote.db"),
+            dir.join("mynote.db-wal"),
+            dir.join("mynote.db-shm"),
+            dir.join("mirror/scratch.md"),
+            post_shred_backup,
+        ];
+        for path in scan_paths.drain(..) {
+            if path.exists() {
+                let bytes = std::fs::read(&path).unwrap();
+                assert!(
+                    !bytes.windows(needle.len()).any(|w| w == needle),
+                    "SEC-01 / INV-SHRED-BOUND VIOLATION: canary found in {}",
+                    path.display()
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vault_tier2_roundtrip_rekey_blocked_op_and_recovery_drill_includes_vkek() {
+        use mynote_core::ids::VkekKid;
+        use mynote_core::vault::{create_vault_header, unlock_vault_with_passphrase};
+
+        let dir = temp_dir("vault_t2_store");
+        let mut store = LocalStore::open(&dir).unwrap();
+        let words = store
+            .initial_recovery_words
+            .clone()
+            .expect("24 words on first init");
+        let rpk = store.recovery_pk().unwrap();
+
+        // 1. Create VaultHeaderV1 + persist in key_material
+        let vkek_kid = VkekKid::from_ulid(Ulid::from_parts(1_700_000_000_000, [0x10; 10]));
+        let hdr = create_vault_header(
+            b"correct-horse-battery",
+            &rpk,
+            vkek_kid,
+            &[0x22; 32],
+            [0x11; 16],
+            [0x33; 24],
+            [0x44; 32],
+            [0x55; 24],
+            1_700_000_000_000,
+        )
+        .unwrap();
+        let hdr_bytes = rmp_serde::to_vec_named(&hdr).unwrap();
+        store.put_vault_header(1, &hdr_bytes).unwrap();
+        let fetched_hdr = store.get_vault_header().unwrap().unwrap();
+        assert_eq!(fetched_hdr.gen, 1);
+
+        // 2. Recovery drill MUST verify BOTH SMK keyring AND Vault VKEK!
+        let drill = store.recovery_drill(&words).unwrap();
+        assert!(drill.ok);
+        assert!(drill.includes_vkek);
+
+        // 3. Encrypt Tier 2 block in-memory (simulating WasmVaultSession) -> Daemon/Store NEVER sees plaintext or VKEK
+        let unlocked = unlock_vault_with_passphrase(b"correct-horse-battery", &hdr).unwrap();
+        let secret_body = "VAULT_SECRET_NEVER_ON_DISK_4242";
+        let blk_id = BlockId::from_ulid(Ulid::from_parts(1_700_000_001_000, [0xA1; 10]));
+        let op_id = OpId::from_ulid(Ulid::from_parts(1_700_000_001_001, [0xA2; 10]));
+        let key_id = KeyId::from_ulid(Ulid::from_parts(1_700_000_001_002, [0xA3; 10]));
+        let bdek = Zeroizing::new([0x77; 32]);
+        let mnb1 = encrypt_mnb1(blk_id.as_bytes(), op_id, key_id, &bdek, secret_body, [0x88; 24]).unwrap();
+        let mnw1 = unlocked.wrap_bdek(key_id, blk_id, &bdek, [0x99; 24]).unwrap();
+
+        let receipt = store
+            .add_tier2_block(
+                &blk_id.to_string(),
+                Tier2OpInput {
+                    op_id: &op_id.to_string(),
+                    key_id: &key_id.to_string(),
+                    mnb1: &mnb1,
+                    mnw1: Some(&mnw1),
+                },
+                "scratch",
+                "text",
+                None,
+                Some("prod api key"),
+                "human",
+            )
+            .unwrap();
+        assert_eq!(receipt.op_id, op_id.to_string()); // F-01: Daemon reused exact caller op_id!
+
+        // Daemon view returns ciphertext only, zero plaintext!
+        let daemon_blk = store.get_block_for_daemon(&blk_id.to_string()).unwrap();
+        assert!(daemon_blk.is_locked);
+        assert!(daemon_blk.content.is_none());
+        assert_eq!(daemon_blk.public_hint.as_deref(), Some("prod api key"));
+        assert!(daemon_blk.versions[0].mnb1_b64.is_some());
+        assert!(daemon_blk.versions[0].mnw1_b64.is_some());
+
+        // 4. Simulate remote shred execution while local Tier 2 op is still unpushed -> NEEDS_VAULT_REKEY!
+        let exec_mark = mynote_core::model::ShredMarkRow {
+            mark_id: mynote_core::ids::MarkId::from_ulid(Ulid::from_parts(1_700_000_002_000, [0xB1; 10])),
+            key_id,
+            seen_seq: 1,
+            requested_by: DeviceId::from_random_bytes([0xCC; 10]),
+            requested_at_ms: 1_700_000_002_000,
+            grace_ms: mynote_core::vault::T_GRACE_DEFAULT_MS,
+            not_before_ms: Some(1_700_000_002_000),
+            state: ShredMarkState::Executed,
+            confirmed_at_ms: None,
+            cancelled_by: None,
+            executed_at_ms: Some(1_700_000_002_000),
+        };
+        let sum = store
+            .apply_store_mutations(&[
+                StoreMutation::UpsertShredMark(exec_mark),
+                StoreMutation::ExecuteShred { key_id },
+            ])
+            .unwrap();
+        assert_eq!(sum.needs_vault_rekey, vec![op_id.to_string()]);
+        let blocked = store.list_blocked_tier2_ops().unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].op_id, op_id.to_string());
+        assert!(blocked[0].mnw1_b64.is_some()); // Saved mnw1 before shred so UI can rescue it!
+
+        // 5. Rekey blocked Tier 2 op on fresh key -> unblocks and becomes active again!
+        let new_op = OpId::from_ulid(Ulid::from_parts(1_700_000_003_000, [0xD1; 10]));
+        let new_key = KeyId::from_ulid(Ulid::from_parts(1_700_000_003_001, [0xD2; 10]));
+        let new_bdek = Zeroizing::new([0x66; 32]);
+        let new_mnb1 = encrypt_mnb1(
+            blk_id.as_bytes(),
+            new_op,
+            new_key,
+            &new_bdek,
+            secret_body,
+            [0x55; 24],
+        )
+        .unwrap();
+        let new_mnw1 = unlocked
+            .wrap_bdek(new_key, blk_id, &new_bdek, [0x44; 24])
+            .unwrap();
+        store
+            .rekey_blocked_tier2_op(
+                &op_id.to_string(),
+                Tier2OpInput {
+                    op_id: &new_op.to_string(),
+                    key_id: &new_key.to_string(),
+                    mnb1: &new_mnb1,
+                    mnw1: Some(&new_mnw1),
+                },
+                "human",
+            )
+            .unwrap();
+        assert!(store.list_blocked_tier2_ops().unwrap().is_empty());
+
+        // 6. Verify ZERO plaintext on disk in SQLite or mirror!
+        drop(store);
+        let needle = secret_body.as_bytes();
+        for rel in ["mynote.db", "mynote.db-wal", "mirror/scratch.md"] {
+            let p = dir.join(rel);
+            if p.exists() {
+                let bytes = std::fs::read(&p).unwrap();
+                assert!(!bytes.windows(needle.len()).any(|w| w == needle));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
