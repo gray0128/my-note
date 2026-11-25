@@ -116,7 +116,7 @@ function makeMockApi() {
         head_op_ids: [`01OP00000000000000000000${seq}`],
         display_op_id: `01OP00000000000000000000${seq}`,
         has_conflict: false,
-        content: input.content,
+        content: input.content ?? null,
         versions: [
           {
             op_id: `01OP00000000000000000000${seq}`,
@@ -126,7 +126,7 @@ function makeMockApi() {
             is_display: true,
             is_locked: false,
             key_id: "01KEYNEW",
-            content: input.content,
+            content: input.content ?? null,
           },
         ],
         updated_at_ms: 3000 + seq,
@@ -600,6 +600,217 @@ describe("M1 Embedded Desktop Web UI (Candidate A CM6)", () => {
     workTab.click();
     await new Promise((r) => setTimeout(r, 30));
     expect(savedBeforeSwitch).toContain('{"flushed":true}');
+
+    app.destroy();
+  });
+
+  it("M2 Vault & SEC-03: init Vault, lock block, format unlocked Tier 2 strictly in WASM (zero /v1/local/format), wipe on visibilitychange hidden, and two-step Trash confirm", async () => {
+    const fsMod = (await import(/* @vite-ignore */ "node:" + "fs")) as { readFileSync(p: string): Uint8Array };
+    const wasmBytes = fsMod.readFileSync("src/wasm/pkg/mynote_wasm_bg.wasm");
+    const { bytesToB64, initDesktopWasmSync } = await import("../src/wasm/desktop");
+    initDesktopWasmSync(new Uint8Array(wasmBytes));
+
+    const { api, pushWs } = makeMockApi();
+    const blk1 = "01J00000000000000000000001";
+    let formatHttpCalls = 0;
+    const patchPayloads: unknown[] = [];
+    let storedHeader: { gen: number; blob_b64: string; updated_at_ms: number } | null = null;
+    const recoveryPkB64 = bytesToB64(new Uint8Array(32).fill(7));
+    const preparedNonces = new Map<string, string>();
+    let committedNonce: string | null = null;
+    const lockedState = new Map<string, BlockDto>();
+    const validBlock: BlockDto = {
+      id: blk1,
+      buffer_id: "01BUF000000000000000000001",
+      position: "a5",
+      lang: "json",
+      is_locked: false,
+      has_unlocked_concurrent_version: false,
+      public_hint: null,
+      head_op_ids: ["01J00000000000000000000011"],
+      display_op_id: "01J00000000000000000000011",
+      has_conflict: false,
+      content: '{"a":1}',
+      versions: [
+        {
+          op_id: "01J00000000000000000000011",
+          hlc: "000000000001000-00000-dev_mac0000000001",
+          device_id: "dev_mac0000000001",
+          actor: "human",
+          is_display: true,
+          is_locked: false,
+          key_id: "01J00000000000000000000021",
+          content: '{"a":1}',
+        },
+      ],
+      updated_at_ms: 1000,
+    };
+    lockedState.set(blk1, validBlock);
+
+    const origBootstrap = api.bootstrap.bind(api);
+    api.bootstrap = async () => {
+      const b = await origBootstrap();
+      return {
+        ...b,
+        blocks: [validBlock, ...b.blocks],
+        vault_header: storedHeader,
+        recovery_pk_b64: recoveryPkB64,
+      };
+    };
+    api.putVaultHeader = async (gen, blob_b64) => {
+      storedHeader = { gen, blob_b64, updated_at_ms: Date.now() };
+      return storedHeader;
+    };
+    api.lockBlock = async (id, input) => {
+      const cur = lockedState.get(id)!;
+      const locked: BlockDto = {
+        ...cur,
+        is_locked: true,
+        public_hint: input.public_hint ?? null,
+        head_op_ids: [input.op_id],
+        display_op_id: input.op_id,
+        content: null,
+        versions: [
+          {
+            op_id: input.op_id,
+            hlc: "000000000009000-00000-dev_mac0000000001",
+            device_id: "dev_mac0000000001",
+            actor: "human",
+            is_display: true,
+            is_locked: true,
+            key_id: input.key_id,
+            content: null,
+            mnb1_b64: input.mnb1_b64,
+            mnw1_b64: input.mnw1_b64,
+          },
+        ],
+      };
+      lockedState.set(id, locked);
+      return locked;
+    };
+    const origListBlocks = api.listBlocks.bind(api);
+    api.listBlocks = async (bufId) => [lockedState.get(blk1)!, ...(await origListBlocks(bufId))];
+    const origPatch = api.patchBlock.bind(api);
+    api.patchBlock = async (id, input, opts) => {
+      patchPayloads.push(input);
+      const locked = lockedState.get(id);
+      if (locked && input.mnb1_b64 && input.op_id && input.key_id) {
+        const next: BlockDto = {
+          ...locked,
+          head_op_ids: [input.op_id],
+          display_op_id: input.op_id,
+          content: null,
+          versions: [
+            {
+              ...locked.versions[0],
+              op_id: input.op_id,
+              key_id: input.key_id,
+              mnb1_b64: input.mnb1_b64,
+            },
+          ],
+        };
+        lockedState.set(id, next);
+        return next;
+      }
+      return origPatch(id, input, opts);
+    };
+    api.formatSnippet = async (input) => {
+      formatHttpCalls++;
+      return { formatted: input.content };
+    };
+    api.listBlockedOps = async () => [];
+    api.prepareTrashAction = async (input) => {
+      const nonce = `nonce_${input.action}_123`;
+      preparedNonces.set(nonce, input.action);
+      return {
+        confirm_nonce: nonce,
+        expires_in_ms: 60_000,
+        summary: {
+          action: input.action,
+          block_count: input.block_ids?.length ?? 1,
+          key_count: 1,
+          grace_ms: input.grace_ms ?? 86_400_000,
+          earliest_not_before_ms: Date.now() + 86_400_000,
+        },
+      };
+    };
+    api.commitTrashAction = async (input) => {
+      committedNonce = input.confirm_nonce;
+      return { ok: true };
+    };
+
+    const app = new MyNoteApp(root, api);
+    await app.start();
+    void pushWs;
+
+    // 1. Setup Vault via modal
+    const vaultBtn = root.querySelector<HTMLButtonElement>('[data-testid="vault-btn"]')!;
+    expect(vaultBtn.textContent).toBe("Setup Vault");
+    vaultBtn.click();
+    const p1 = root.querySelector<HTMLInputElement>('[data-testid="vault-passphrase-input"]')!;
+    const p2 = root.querySelector<HTMLInputElement>('[data-testid="vault-passphrase-confirm"]')!;
+    p1.value = "correct horse battery staple";
+    p2.value = "correct horse battery staple";
+    root.querySelector<HTMLFormElement>(".dialog-form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await new Promise((r) => setTimeout(r, 150));
+    expect(app.isVaultUnlocked()).toBe(true);
+    expect(storedHeader).not.toBeNull();
+
+    // 2. Lock block into Tier 2 Vault
+    const card1 = root.querySelector<HTMLElement>(`[data-block-id="${blk1}"]`)!;
+    const lockBtn = [...card1.querySelectorAll("button")].find((b) => b.textContent === "🔒 Lock")!;
+    lockBtn.click();
+    const hintInput = root.querySelector<HTMLInputElement>('[data-testid="lock-hint-input"]')!;
+    hintInput.value = "API JSON secret";
+    root.querySelector<HTMLFormElement>(".dialog-form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(app.stream.getBlocks().find((b) => b.id === blk1)?.is_locked).toBe(true);
+
+    // 3. SEC-03: Format unlocked Tier 2 JSON block -> ZERO /v1/local/format HTTP calls, formatted in WASM, ciphertext-only PATCH!
+    const card1Locked = root.querySelector<HTMLElement>(`[data-block-id="${blk1}"]`)!;
+    const fmtBtn = [...card1Locked.querySelectorAll("button")].find((b) => b.textContent === "Format")!;
+    fmtBtn.click();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(formatHttpCalls).toBe(0);
+    expect(app.stream.getBlockDraftContent(blk1)).toBe('{\n  "a": 1\n}');
+    expect(JSON.stringify(patchPayloads)).not.toContain('"a": 1');
+    expect(JSON.stringify(patchPayloads)).toContain("mnb1_b64");
+
+    // 4. SEC-03: Trigger visibilitychange -> hidden => Vault immediately zeroizes & scrubs plaintext from DOM!
+    Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(app.isVaultUnlocked()).toBe(false);
+    expect(root.textContent).not.toContain('"a": 1');
+    expect(root.querySelector(`[data-block-id="${blk1}"] .locked-card`)).not.toBeNull();
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+
+    // 5. Unlock Vault again -> plaintext restored in RAM from MNB1 + MNW1!
+    vaultBtn.click();
+    const unlockInput = root.querySelector<HTMLInputElement>('[data-testid="vault-passphrase-input"]')!;
+    unlockInput.value = "correct horse battery staple";
+    root.querySelector<HTMLFormElement>(".dialog-form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await new Promise((r) => setTimeout(r, 150));
+    expect(app.isVaultUnlocked()).toBe(true);
+    expect(app.stream.getBlockDraftContent(blk1)).toBe('{\n  "a": 1\n}');
+
+    // 6. Trash two-step confirmation modal (prepare -> confirm -> commit with confirm_nonce)
+    const card2 = root.querySelector<HTMLElement>('[data-block-id="01BLK000000000000000000002"]')!;
+    const trashBtn = [...card2.querySelectorAll("button")].find((b) => b.textContent === "Trash")!;
+    trashBtn.click();
+    await new Promise((r) => setTimeout(r, 30));
+    const openTrash = [...root.querySelectorAll("button")].find((b) => b.textContent?.startsWith("Trash ("))!;
+    openTrash.click();
+    await new Promise((r) => setTimeout(r, 30));
+    const expediteBtn = [...root.querySelectorAll<HTMLButtonElement>(".trash-item button")].find(
+      (b) => b.textContent === "Expedite",
+    )!;
+    expediteBtn.click();
+    await new Promise((r) => setTimeout(r, 30));
+    const commitBtn = root.querySelector<HTMLButtonElement>('[data-testid="trash-confirm-commit-btn"]')!;
+    expect(commitBtn).not.toBeNull();
+    commitBtn.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(committedNonce).toBe("nonce_expedite_123");
 
     app.destroy();
   });
