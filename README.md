@@ -6,10 +6,10 @@
 
 ## 快速开始（交给本地 Agent 自举安装 / 更新）
 
-将下面这一句直接发送给你的本地 AI Coding Agent（Claude Code / Codex / Antigravity / OpenCode 等），即可自动完成预编译包下载校验、二进制与后台 Daemon 安装或升级、`skill/SKILL.md` 注册以及可用性核验：
+将下面这一句直接发送给你的本地 AI Coding Agent（Claude Code / Codex / Antigravity / OpenCode 等），即可自动完成预编译包下载校验、二进制安装或升级、守护配置模板部署、`skill/SKILL.md` 注册以及可用性核验：
 
 ```text
-请帮我安装或更新 gray0128/my-note：按本机系统与架构从 https://github.com/gray0128/my-note/releases/latest 下载对应的 mynote-<target>.tar.gz 与 SHA256SUMS.txt 并校验 SHA-256（若无对应架构预编译包则克隆仓库源码构建）；将 mynote 安装到系统 PATH（优先 /opt/homebrew/bin 或 /usr/local/bin，升级时保留现有 ~/.local/share/mynote 数据）并配置/重启后台 Daemon（macOS 用包内 deploy/launchd/com.mynote.daemon.plist，Linux 用 deploy/systemd/mynote-daemon.service，检测到 Hyprland 时一并提示接入 deploy/hyprland/mynote.conf）；将包内 skill/SKILL.md 安装到我当前 Agent 实际生效的 Skills 目录（遵循本机既有 Skills 管理方式，不覆盖无关 Skill）；最后执行 mynote --version 与 mynote sync status --json 验证可用性，完成后简明告诉我如何打开桌面 UI、完成首次云同步或设备配对并开始使用。
+请帮我安装或更新 gray0128/my-note：按本机系统与架构从 https://github.com/gray0128/my-note/releases/latest 下载对应的 mynote-<target>.tar.gz 与 SHA256SUMS.txt 并校验 SHA-256（若无对应架构预编译包则克隆仓库源码构建）；将 mynote 安装到系统 PATH（优先 /opt/homebrew/bin 或 /usr/local/bin，升级时保留现有 ~/.local/share/mynote 数据），安装或更新守护配置文件（macOS 写入 ~/Library/LaunchAgents/com.mynote.daemon.plist 并替换 __HOME__ 与实际二进制路径，Linux 写入 ~/.config/systemd/user/mynote-daemon.service 并修正 ExecStart，检测到 Hyprland 时一并提示接入 deploy/hyprland/mynote.conf），并将包内 skill/SKILL.md 安装到我当前 Agent 实际生效的 Skills 目录（遵循本机既有 Skills 管理方式，不覆盖无关 Skill）；接着按本地是否已初始化分流：若 ~/.local/share/mynote/mynote.db 已存在（升级场景），直接重启/加载后台 Daemon 并执行 mynote --version 与 mynote sync status --json 核验；若 mynote.db 尚不存在（全新设备），只保留守护配置文件，不要提前启动 Daemon 也不要执行 sync status 等会触发建库的命令（避免抢先生成孤立本地库阻断 device claim / 云端恢复或漏抄首次 24 词），仅执行 mynote --version 与 mynote --help 核验，最后简明告诉我如何完成首次云同步/设备配对、拉起守护并打开桌面 UI 开始使用。
 ```
 
 ### 发布包与启用速查
@@ -20,10 +20,10 @@
   - `mynote-aarch64-unknown-linux-gnu.tar.gz`（Linux ARM64）
   - 每个压缩包均内含剥离后的单体 `mynote`（已内嵌桌面 Web UI）、`skill/SKILL.md` 与 `deploy/{launchd,systemd,hyprland}` 模板。
 - **源码构建回退**：`./scripts/build-wasm.sh && pnpm --dir web install --frozen-lockfile && pnpm --dir web build && cargo build --release --locked --bin mynote`
-- **常用启用命令**：
-  - 打开桌面 UI：`mynote open`（仅放行 `http://localhost:19876`）
-  - 首台桌面接入云端：`mynote device bootstrap --url <你的-worker-url>`；记录 24 词恢复包：`mynote recovery show`
-  - 接入第二台桌面或手机只读 PWA：在已接入桌面运行 `mynote device add --name <设备名> --scope <read-write|read>`，目标桌面运行 `mynote device claim`（手机 Safari 打开 Worker URL 扫码或粘贴配对码）
+- **全新设备启用顺序（先配对/接入，再拉起守护）**：
+  1. **首台桌面接入云端**：`mynote device bootstrap --url <你的-worker-url>`（妥善离线抄录首次输出的 24 词恢复包，或引导会话内运行 `mynote recovery show`）；**第二台桌面配对**：在已接入桌面运行 `mynote device add --name <设备名> --scope read-write`，目标桌面运行 `mynote device claim`（纯离线试用可跳过本步）
+  2. **拉起后台守护**：macOS 执行 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mynote.daemon.plist`；Linux 执行 `systemctl --user daemon-reload && systemctl --user enable --now mynote-daemon.service`
+  3. **打开桌面 UI / 接入手机只读 PWA**：桌面执行 `mynote open`（仅放行 `http://localhost:19876`）；手机接入在桌面执行 `mynote device add --name iphone --scope read`，iPhone Safari 打开 Worker URL 扫码或粘贴配对码
 
 ## 状态
 
