@@ -19,6 +19,7 @@ import {
 import { createIcon, type IconName } from "./icons";
 import { computeLineDiff } from "./render/diff";
 import { copyDualFormat } from "./render/markdown";
+import { createShortcutHint, formatShortcutTitle, type ShortcutKeyToken } from "./shortcuts";
 import { initTheme } from "./theme";
 import type {
   AlertFrame,
@@ -86,6 +87,8 @@ export class MyNoteApp {
   private lastTrashCount = 0;
   private bufferFilterQuery = "";
   private bufferActiveIndex = 0;
+  private creatingBuffer = false;
+  private vaultFieldSeq = 0;
   private knownBufferBlockCounts = new Map<string, number>();
   private disconnectWs: (() => void) | null = null;
   private toastTimer: number | null = null;
@@ -149,8 +152,8 @@ export class MyNoteApp {
 
   async start(): Promise<void> {
     const boot = await this.api.bootstrap();
-    this.buffers = boot.buffers;
-    this.activeBufferId = boot.initial_buffer_id ?? boot.buffers[0]?.id ?? null;
+    this.setBuffers(boot.buffers);
+    this.activeBufferId = boot.initial_buffer_id ?? this.buffers[0]?.id ?? null;
     this.syncStatus = boot.sync_status;
     this.vaultHeader = boot.vault_header ?? null;
     this.recoveryPkB64 = boot.recovery_pk_b64 ?? null;
@@ -298,11 +301,10 @@ export class MyNoteApp {
     this.switcherLabelEl = document.createElement("span");
     this.switcherLabelEl.className = "sr-only";
     this.switcherLabelEl.textContent = t("topbar.buffers");
-    const switcherKbd = document.createElement("kbd");
-    switcherKbd.className = "kbd topbar-kbd-collapsible";
-    switcherKbd.textContent = "⌘P";
+    const switcherTokens: readonly ShortcutKeyToken[] = [{ kind: "mod" }, { kind: "char", label: "P" }];
+    const switcherKbd = createShortcutHint(switcherTokens, "topbar-kbd-collapsible");
     this.switcherBtnEl.append(createIcon("layers", "xs"), this.switcherLabelEl, switcherKbd);
-    this.switcherBtnEl.title = `${t("topbar.buffers")} (⌘P)`;
+    this.switcherBtnEl.title = `${t("topbar.buffers")} (${formatShortcutTitle(switcherTokens)})`;
     this.switcherBtnEl.addEventListener("click", () => this.openBufferModal());
     left.append(brand, this.createTopbarSep(), this.bufferTabsEl, this.createTopbarSep(), this.switcherBtnEl);
 
@@ -418,6 +420,7 @@ export class MyNoteApp {
       this.runFind(0);
     });
     this.findInputEl.addEventListener("keydown", (ev) => {
+      if (ev.isComposing || ev.keyCode === 229) return;
       if (ev.key === "Enter") {
         ev.preventDefault();
         this.runFind(ev.shiftKey ? -1 : 1);
@@ -573,6 +576,7 @@ export class MyNoteApp {
       this.renderBufferModalList();
     });
     this.bufferFilterInputEl.addEventListener("keydown", (ev) => {
+      if (ev.isComposing || ev.keyCode === 229) return;
       const options = this.getBufferModalOptions();
       if (ev.key === "ArrowDown") {
         ev.preventDefault();
@@ -648,7 +652,7 @@ export class MyNoteApp {
     syncDocumentLocale("app.title");
     this.bufferTabsEl.setAttribute("aria-label", t("topbar.buffersNav"));
     this.switcherLabelEl.textContent = t("topbar.buffers");
-    this.switcherBtnEl.title = `${t("topbar.buffers")} (⌘P)`;
+    this.switcherBtnEl.title = `${t("topbar.buffers")} (${formatShortcutTitle([{ kind: "mod" }, { kind: "char", label: "P" }])})`;
     this.newBlkLabelEl.textContent = t("topbar.newBlock");
     this.newBlkBtnEl.title = t("topbar.newBlockTitle");
     this.findBtnLabelEl.textContent = t("topbar.find");
@@ -744,14 +748,30 @@ export class MyNoteApp {
   };
 
   private onWindowKeyDown = (ev: KeyboardEvent): void => {
-    if (ev.defaultPrevented) return;
+    if (ev.defaultPrevented || ev.isComposing) return;
     const mod = ev.metaKey || ev.ctrlKey;
+    const modalOpen =
+      !this.modalBackdropEl.classList.contains("hidden") ||
+      !this.dialogBackdropEl.classList.contains("hidden");
     if (!mod) {
       if (ev.key === "Escape") {
         this.closeBufferModal();
         this.closeDialog();
         this.toggleFindBar(false);
         this.closeHistoryDrawer();
+      }
+      return;
+    }
+    if (modalOpen) return;
+    if (ev.altKey && (ev.key === "ArrowUp" || ev.key === "ArrowDown")) {
+      ev.preventDefault();
+      const dir: -1 | 1 = ev.key === "ArrowUp" ? -1 : 1;
+      if (ev.shiftKey) {
+        const id = this.stream.getActiveBlockId();
+        const blk = this.stream.getBlocks().find((b) => b.id === id);
+        if (blk) void this.moveBlock(blk, dir);
+      } else {
+        this.stream.navigateBlock(dir);
       }
       return;
     }
@@ -805,6 +825,30 @@ export class MyNoteApp {
     this.toastEl.className = `toast${isError ? " error" : ""}`;
     if (this.toastTimer !== null) window.clearTimeout(this.toastTimer);
     this.toastTimer = window.setTimeout(() => this.toastEl.classList.add("hidden"), 3200);
+  }
+
+  private setBuffers(list: readonly BufferDto[]): void {
+    const byId = new Map<string, BufferDto>();
+    for (const b of list) {
+      byId.set(b.id, b);
+    }
+    this.buffers = [...byId.values()].sort((a, b) =>
+      a.position < b.position ? -1 : a.position > b.position ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
+    );
+  }
+
+  private upsertBuffers(upserted: readonly BufferDto[], deletedIds: readonly string[] = []): void {
+    const del = new Set(deletedIds);
+    const byId = new Map<string, BufferDto>();
+    for (const b of this.buffers) {
+      if (!del.has(b.id)) byId.set(b.id, b);
+    }
+    for (const u of upserted) {
+      if (!del.has(u.id)) byId.set(u.id, u);
+    }
+    this.buffers = [...byId.values()].sort((a, b) =>
+      a.position < b.position ? -1 : a.position > b.position ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
+    );
   }
 
   private renderBuffers(): void {
@@ -1075,7 +1119,7 @@ export class MyNoteApp {
   private async resyncAfterReconnect(): Promise<void> {
     try {
       const boot = await this.api.bootstrap();
-      this.buffers = boot.buffers;
+      this.setBuffers(boot.buffers);
       this.syncStatus = boot.sync_status;
       this.vaultHeader = boot.vault_header ?? this.vaultHeader;
       this.recoveryPkB64 = boot.recovery_pk_b64 ?? this.recoveryPkB64;
@@ -1127,16 +1171,9 @@ export class MyNoteApp {
       }
     } else if (frame.type === "buffers_changed") {
       const del = new Set(frame.deleted_ids);
-      let next = this.buffers.filter((b) => !del.has(b.id));
-      for (const u of frame.upserted) {
-        const idx = next.findIndex((b) => b.id === u.id);
-        if (idx >= 0) next[idx] = u;
-        else next.push(u);
-      }
-      next.sort((a, b) => (a.position < b.position ? -1 : a.position > b.position ? 1 : a.id < b.id ? -1 : 1));
-      this.buffers = next;
+      this.upsertBuffers(frame.upserted, frame.deleted_ids);
       if (this.activeBufferId && del.has(this.activeBufferId)) {
-        const fallback = next[0]?.id ?? null;
+        const fallback = this.buffers[0]?.id ?? null;
         if (fallback) {
           void this.switchBuffer(fallback);
         } else {
@@ -1145,6 +1182,9 @@ export class MyNoteApp {
         }
       }
       this.renderBuffers();
+      if (!this.modalBackdropEl.classList.contains("hidden")) {
+        this.renderBufferModalList();
+      }
     } else if (frame.type === "trash_changed") {
       this.updateTrashCount(frame.count);
       if (frame.pending_confirm_count > 0) {
@@ -1569,6 +1609,7 @@ export class MyNoteApp {
     try {
       const updated = await this.api.patchBlock(block.id, dir === -1 ? { before_id: neighbor.id } : { after_id: neighbor.id });
       this.stream.upsertBlocks([updated], [], this.activeBufferId);
+      this.stream.scrollBlockIntoView(updated.id);
     } catch (e) {
       this.handleErr(e);
     }
@@ -1667,7 +1708,90 @@ export class MyNoteApp {
     }
   }
 
-  private openVaultModal(forceMode?: "init" | "unlock" | "recover" | "unlocked"): void {
+  private createPasswordField(opts: {
+    label: string;
+    name: string;
+    placeholder: string;
+    autocomplete: "current-password" | "new-password";
+    testId?: string;
+    required?: boolean;
+  }): { field: HTMLDivElement; input: HTMLInputElement } {
+    const id = `vault-field-${++this.vaultFieldSeq}`;
+    const field = document.createElement("div");
+    field.className = "dialog-field";
+
+    const labelEl = document.createElement("label");
+    labelEl.className = "dialog-label";
+    labelEl.htmlFor = id;
+    labelEl.textContent = opts.label;
+
+    const wrap = document.createElement("div");
+    wrap.className = "password-input-wrap";
+
+    const input = document.createElement("input");
+    input.id = id;
+    input.name = opts.name;
+    input.type = "password";
+    input.className = "input";
+    input.placeholder = opts.placeholder;
+    input.autocomplete = opts.autocomplete;
+    if (opts.required) input.required = true;
+    if (opts.testId) input.dataset.testid = opts.testId;
+    input.addEventListener("input", () => {
+      input.removeAttribute("aria-invalid");
+    });
+
+    const toggleBtn = document.createElement("button");
+    toggleBtn.type = "button";
+    toggleBtn.className = "btn btn-ghost btn-icon-only password-toggle-btn";
+    toggleBtn.setAttribute("aria-pressed", "false");
+    toggleBtn.setAttribute("aria-label", t("vault.showPass"));
+    toggleBtn.title = t("vault.showPass");
+    const syncToggleIcon = (shown: boolean): void => {
+      toggleBtn.setAttribute("aria-pressed", String(shown));
+      const lbl = shown ? t("vault.hidePass") : t("vault.showPass");
+      toggleBtn.setAttribute("aria-label", lbl);
+      toggleBtn.title = lbl;
+      toggleBtn.replaceChildren(createIcon(shown ? "eye-off" : "eye", "xs"));
+    };
+    syncToggleIcon(false);
+    toggleBtn.addEventListener("click", () => {
+      const nextShown = input.type === "password";
+      input.type = nextShown ? "text" : "password";
+      syncToggleIcon(nextShown);
+    });
+
+    wrap.append(input, toggleBtn);
+    field.append(labelEl, wrap);
+    return { field, input };
+  }
+
+  private createVaultLockedTabs(active: "unlock" | "passwd"): HTMLElement {
+    const tabs = document.createElement("div");
+    tabs.className = "mode-seg vault-mode-seg";
+    tabs.setAttribute("role", "tablist");
+    const items: Array<{ key: "unlock" | "passwd"; label: string; testId: string }> = [
+      { key: "unlock", label: t("vault.tabUnlock"), testId: "vault-tab-unlock" },
+      { key: "passwd", label: t("vault.tabChangePass"), testId: "vault-tab-passwd" },
+    ];
+    for (const item of items) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn btn-icon btn-static mode-seg-btn vault-mode-tab";
+      btn.setAttribute("role", "tab");
+      btn.setAttribute("aria-selected", String(active === item.key));
+      btn.setAttribute("aria-pressed", String(active === item.key));
+      btn.dataset.testid = item.testId;
+      btn.textContent = item.label;
+      btn.addEventListener("click", () => {
+        if (active !== item.key) this.openVaultModal(item.key);
+      });
+      tabs.appendChild(btn);
+    }
+    return tabs;
+  }
+
+  private openVaultModal(forceMode?: "init" | "unlock" | "passwd" | "recover" | "unlocked"): void {
     const mode = forceMode ?? (this.isVaultUnlocked() ? "unlocked" : this.vaultHeader ? "unlock" : "init");
     this.dialogModalEl.replaceChildren();
 
@@ -1680,40 +1804,49 @@ export class MyNoteApp {
 
     const form = document.createElement("form");
     form.className = "dialog-form";
+    form.noValidate = true;
 
     if (mode === "init") {
       title.textContent = t("vault.initTitle");
       const note = document.createElement("p");
       note.className = "dialog-note";
       note.textContent = t("vault.initNote");
-      const p1 = document.createElement("input");
-      p1.type = "password";
-      p1.className = "input";
-      p1.placeholder = t("vault.newPassPlaceholder");
-      p1.dataset.testid = "vault-passphrase-input";
-      p1.autocomplete = "new-password";
-      const p2 = document.createElement("input");
-      p2.type = "password";
-      p2.className = "input";
-      p2.placeholder = t("vault.confirmPassPlaceholder");
-      p2.dataset.testid = "vault-passphrase-confirm";
-      p2.autocomplete = "new-password";
+      const { field: f1, input: p1 } = this.createPasswordField({
+        label: t("vault.newPassLabel"),
+        name: "new_passphrase",
+        placeholder: t("vault.newPassPlaceholder"),
+        autocomplete: "new-password",
+        testId: "vault-passphrase-input",
+        required: true,
+      });
+      const { field: f2, input: p2 } = this.createPasswordField({
+        label: t("vault.confirmPassLabel"),
+        name: "confirm_passphrase",
+        placeholder: t("vault.confirmPassPlaceholder"),
+        autocomplete: "new-password",
+        testId: "vault-passphrase-confirm",
+        required: true,
+      });
       const submit = document.createElement("button");
       submit.type = "submit";
       submit.className = "btn btn-primary";
       submit.textContent = t("vault.initSubmit");
       submit.dataset.testid = "vault-submit-btn";
-      form.append(note, p1, p2, submit);
+      form.append(note, f1, f2, submit);
       form.addEventListener("submit", (ev) => {
         ev.preventDefault();
         void (async () => {
           const pass = p1.value;
           const confirm = p2.value;
           if (pass.length < 8) {
+            p1.setAttribute("aria-invalid", "true");
+            p1.focus();
             this.showToast(t("vault.errMinLen"), true);
             return;
           }
           if (pass !== confirm) {
+            p2.setAttribute("aria-invalid", "true");
+            p2.focus();
             this.showToast(t("vault.errMismatch"), true);
             return;
           }
@@ -1761,15 +1894,18 @@ export class MyNoteApp {
 
     if (mode === "unlock") {
       title.textContent = t("vault.unlockTitle");
+      this.dialogModalEl.appendChild(this.createVaultLockedTabs("unlock"));
       const note = document.createElement("p");
       note.className = "dialog-note";
       note.textContent = t("vault.unlockNote");
-      const p1 = document.createElement("input");
-      p1.type = "password";
-      p1.className = "input";
-      p1.placeholder = t("vault.passPlaceholder");
-      p1.dataset.testid = "vault-passphrase-input";
-      p1.autocomplete = "current-password";
+      const { field: f1, input: p1 } = this.createPasswordField({
+        label: t("vault.passLabel"),
+        name: "current_passphrase",
+        placeholder: t("vault.passPlaceholder"),
+        autocomplete: "current-password",
+        testId: "vault-passphrase-input",
+        required: true,
+      });
       const row = document.createElement("div");
       row.className = "dialog-actions";
       const submit = document.createElement("button");
@@ -1783,7 +1919,7 @@ export class MyNoteApp {
       recoverBtn.textContent = t("vault.forgotBtn");
       recoverBtn.addEventListener("click", () => this.openVaultModal("recover"));
       row.append(recoverBtn, submit);
-      form.append(note, p1, row);
+      form.append(note, f1, row);
       form.addEventListener("submit", (ev) => {
         ev.preventDefault();
         void (async () => {
@@ -1807,15 +1943,132 @@ export class MyNoteApp {
             this.showToast(t("vault.toastUnlocked"));
           } catch (e) {
             const parsed = parseWasmError(e);
+            p1.setAttribute("aria-invalid", "true");
             this.showToast(`${parsed.code}: ${parsed.message}`, true);
             submit.disabled = false;
             submit.textContent = t("vault.unlockSubmit");
+            p1.focus();
           }
         })();
       });
       this.dialogModalEl.appendChild(form);
       this.dialogBackdropEl.classList.remove("hidden");
       p1.focus();
+      return;
+    }
+
+    if (mode === "passwd") {
+      title.textContent = t("vault.changePassModalTitle");
+      this.dialogModalEl.appendChild(this.createVaultLockedTabs("passwd"));
+      const note = document.createElement("p");
+      note.className = "dialog-note";
+      note.textContent = t("vault.changePassLockedNote");
+      const { field: curField, input: curPassInput } = this.createPasswordField({
+        label: t("vault.currentPassLabel"),
+        name: "current_passphrase",
+        placeholder: t("vault.currentPassPlaceholder"),
+        autocomplete: "current-password",
+        testId: "vault-current-passphrase-input",
+        required: true,
+      });
+      const { field: np1Field, input: np1 } = this.createPasswordField({
+        label: t("vault.newPassLabel"),
+        name: "new_passphrase",
+        placeholder: t("vault.changeNewPassPlaceholder"),
+        autocomplete: "new-password",
+        testId: "vault-new-passphrase-input",
+        required: true,
+      });
+      const { field: np2Field, input: np2 } = this.createPasswordField({
+        label: t("vault.confirmPassLabel"),
+        name: "confirm_new_passphrase",
+        placeholder: t("vault.changeConfirmPlaceholder"),
+        autocomplete: "new-password",
+        testId: "vault-confirm-passphrase-input",
+        required: true,
+      });
+      const row = document.createElement("div");
+      row.className = "dialog-actions";
+      const recoverBtn = document.createElement("button");
+      recoverBtn.type = "button";
+      recoverBtn.className = "btn";
+      recoverBtn.textContent = t("vault.forgotBtn");
+      recoverBtn.addEventListener("click", () => this.openVaultModal("recover"));
+      const submit = document.createElement("button");
+      submit.type = "submit";
+      submit.className = "btn btn-primary";
+      submit.textContent = t("vault.updatePassBtn");
+      submit.dataset.testid = "vault-change-pass-submit";
+      row.append(recoverBtn, submit);
+      form.append(note, curField, np1Field, np2Field, row);
+      form.addEventListener("submit", (ev) => {
+        ev.preventDefault();
+        void (async () => {
+          if (!this.vaultHeader || !this.api.putVaultHeader) return;
+          const curPass = curPassInput.value;
+          const p1 = np1.value;
+          const p2 = np2.value;
+          if (!curPass) {
+            curPassInput.setAttribute("aria-invalid", "true");
+            curPassInput.focus();
+            this.showToast(t("vault.errCurrentRequired"), true);
+            return;
+          }
+          if (p1.length < 8) {
+            np1.setAttribute("aria-invalid", "true");
+            np1.focus();
+            this.showToast(t("vault.errNewMinLen"), true);
+            return;
+          }
+          if (p1 !== p2) {
+            np2.setAttribute("aria-invalid", "true");
+            np2.focus();
+            this.showToast(t("vault.errMismatch"), true);
+            return;
+          }
+          curPassInput.value = "";
+          np1.value = "";
+          np2.value = "";
+          submit.disabled = true;
+          submit.textContent = t("vault.updatingPass");
+          let tempSess: WasmVaultSession | null = null;
+          try {
+            const headerBlob = this.vaultHeader.blob_b64;
+            tempSess = await unlockVaultWithPassphraseWasm(curPass, headerBlob);
+            if (isPageHidden()) {
+              this.closeDialog();
+              return;
+            }
+            const raw = tempSess.changePassphrase(b64ToBytes(headerBlob), p1);
+            const parsed = JSON.parse(raw) as { gen: number; blob_b64: string };
+            this.vaultHeader = await this.api.putVaultHeader(parsed.gen, parsed.blob_b64);
+            this.closeDialog();
+            this.showToast(t("vault.toastPassUpdated"));
+          } catch (e) {
+            const parsed = parseWasmError(e);
+            curPassInput.setAttribute("aria-invalid", "true");
+            this.showToast(
+              parsed.code !== "WASM_ERROR" ? `${parsed.code}: ${parsed.message}` : parsed.message,
+              true,
+            );
+            submit.disabled = false;
+            submit.textContent = t("vault.updatePassBtn");
+            curPassInput.focus();
+          } finally {
+            if (tempSess) {
+              try {
+                tempSess.lockAndZeroize();
+                tempSess.free();
+              } catch {
+                // ignore if already freed
+              }
+            }
+          }
+        })();
+      });
+      this.dialogModalEl.appendChild(form);
+      this.dialogBackdropEl.classList.remove("hidden");
+      curPassInput.focus();
       return;
     }
 
@@ -1828,10 +2081,12 @@ export class MyNoteApp {
       words.className = "input";
       words.rows = 3;
       words.placeholder = t("vault.wordsPlaceholder");
-      const newPass = document.createElement("input");
-      newPass.type = "password";
-      newPass.className = "input";
-      newPass.placeholder = t("vault.optionalNewPass");
+      const { field: newPassField, input: newPass } = this.createPasswordField({
+        label: t("vault.newPassLabel"),
+        name: "optional_new_passphrase",
+        placeholder: t("vault.optionalNewPass"),
+        autocomplete: "new-password",
+      });
       const row = document.createElement("div");
       row.className = "dialog-actions";
       const backBtn = document.createElement("button");
@@ -1844,7 +2099,7 @@ export class MyNoteApp {
       submit.className = "btn btn-primary";
       submit.textContent = t("vault.recoverSubmit");
       row.append(backBtn, submit);
-      form.append(note, words, newPass, row);
+      form.append(note, words, newPassField, row);
       form.addEventListener("submit", (ev) => {
         ev.preventDefault();
         void (async () => {
@@ -1921,19 +2176,28 @@ export class MyNoteApp {
     const sub = document.createElement("div");
     sub.className = "dialog-subtitle";
     sub.textContent = t("vault.changePassSubtitle");
-    const np1 = document.createElement("input");
-    np1.type = "password";
-    np1.className = "input";
-    np1.placeholder = t("vault.changeNewPassPlaceholder");
-    const np2 = document.createElement("input");
-    np2.type = "password";
-    np2.className = "input";
-    np2.placeholder = t("vault.changeConfirmPlaceholder");
+    const { field: np1Field, input: np1 } = this.createPasswordField({
+      label: t("vault.newPassLabel"),
+      name: "new_passphrase",
+      placeholder: t("vault.changeNewPassPlaceholder"),
+      autocomplete: "new-password",
+      testId: "vault-new-passphrase-input",
+      required: true,
+    });
+    const { field: np2Field, input: np2 } = this.createPasswordField({
+      label: t("vault.confirmPassLabel"),
+      name: "confirm_new_passphrase",
+      placeholder: t("vault.changeConfirmPlaceholder"),
+      autocomplete: "new-password",
+      testId: "vault-confirm-passphrase-input",
+      required: true,
+    });
     const chgBtn = document.createElement("button");
     chgBtn.type = "submit";
     chgBtn.className = "btn btn-primary";
     chgBtn.textContent = t("vault.updatePassBtn");
-    form.append(note, lockBtn, sep, sub, np1, np2, chgBtn);
+    chgBtn.dataset.testid = "vault-change-pass-submit";
+    form.append(note, lockBtn, sep, sub, np1Field, np2Field, chgBtn);
     form.addEventListener("submit", (ev) => {
       ev.preventDefault();
       void (async () => {
@@ -1941,17 +2205,26 @@ export class MyNoteApp {
         const p1 = np1.value;
         const p2 = np2.value;
         if (p1.length < 8) {
+          np1.setAttribute("aria-invalid", "true");
+          np1.focus();
           this.showToast(t("vault.errNewMinLen"), true);
           return;
         }
         if (p1 !== p2) {
+          np2.setAttribute("aria-invalid", "true");
+          np2.focus();
           this.showToast(t("vault.errMismatch"), true);
           return;
         }
         np1.value = "";
         np2.value = "";
         chgBtn.disabled = true;
+        chgBtn.textContent = t("vault.updatingPass");
         try {
+          if (isPageHidden()) {
+            this.closeDialog();
+            return;
+          }
           const raw = this.vaultSession.changePassphrase(b64ToBytes(this.vaultHeader.blob_b64), p1);
           const parsed = JSON.parse(raw) as { gen: number; blob_b64: string };
           this.vaultHeader = await this.api.putVaultHeader(parsed.gen, parsed.blob_b64);
@@ -1960,6 +2233,7 @@ export class MyNoteApp {
         } catch (e) {
           this.handleErr(e);
           chgBtn.disabled = false;
+          chgBtn.textContent = t("vault.updatePassBtn");
         }
       })();
     });
@@ -2560,7 +2834,7 @@ export class MyNoteApp {
         topRow.appendChild(shredBadge);
       } else if (!entry.has_content) {
         const metaBadge = document.createElement("span");
-        metaBadge.className = "kbd";
+        metaBadge.className = "history-badge-meta";
         metaBadge.textContent = t("history.meta");
         topRow.appendChild(metaBadge);
       }
@@ -2996,21 +3270,19 @@ export class MyNoteApp {
 
   private renderBufferModalHints(): void {
     this.bufferFooterEl.replaceChildren();
-    const mkHint = (keyText: string, labelText: string): HTMLSpanElement => {
+    const mkHint = (tokens: readonly ShortcutKeyToken[], labelText: string): HTMLSpanElement => {
       const span = document.createElement("span");
       span.className = "modal-hint-item";
-      const kbd = document.createElement("kbd");
-      kbd.className = "kbd";
-      kbd.textContent = keyText;
+      const kbdGroup = createShortcutHint(tokens);
       const lbl = document.createElement("span");
       lbl.textContent = labelText;
-      span.append(kbd, lbl);
+      span.append(kbdGroup, lbl);
       return span;
     };
     this.bufferFooterEl.append(
-      mkHint("↑↓", t("buffer.hintNavigate")),
-      mkHint("↵", t("buffer.hintOpen")),
-      mkHint("Esc", t("buffer.hintClose")),
+      mkHint([{ kind: "up" }, { kind: "down" }], t("buffer.hintNavigate")),
+      mkHint([{ kind: "enter" }], t("buffer.hintOpen")),
+      mkHint([{ kind: "esc" }], t("buffer.hintClose")),
     );
   }
 
@@ -3107,7 +3379,7 @@ export class MyNoteApp {
         const nextName = window.prompt(t("buffer.renamePrompt"), buf.name);
         if (nextName && nextName.trim()) {
           void this.api.renameBuffer(buf.id, nextName.trim()).then((updated) => {
-            this.buffers = this.buffers.map((b) => (b.id === updated.id ? updated : b));
+            this.upsertBuffers([updated]);
             this.renderBuffers();
             this.renderBufferModalList();
           });
@@ -3155,16 +3427,19 @@ export class MyNoteApp {
 
   private async createBufferByName(rawName: string): Promise<void> {
     const name = rawName.trim();
-    if (!name) return;
+    if (!name || this.creatingBuffer) return;
+    this.creatingBuffer = true;
     try {
       const created = await this.api.createBuffer({ name });
-      this.buffers.push(created);
+      this.upsertBuffers([created]);
       this.bufferFilterQuery = "";
       this.bufferFilterInputEl.value = "";
       this.closeBufferModal();
       await this.switchBuffer(created.id);
     } catch (e) {
       this.handleErr(e);
+    } finally {
+      this.creatingBuffer = false;
     }
   }
 

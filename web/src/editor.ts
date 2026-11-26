@@ -8,8 +8,23 @@ import { loadLangExtension, loadVimExtension, SUPPORTED_LANGS } from "./langs";
 import { mountDiagramWidget, type DiagramWidgetHandle } from "./render/diagram";
 import { computeInlineWordDiff, type InlineDiffSegment } from "./render/diff";
 import { mountMarkdownPreview, type MountedMarkdownPreview } from "./render/markdown";
+import { createShortcutHint, formatShortcutTitle, type ShortcutKeyToken } from "./shortcuts";
 import type { BlockDto } from "./types";
 import { detectSecretPatternFast } from "./wasm/desktop";
+
+const MOVE_UP_SHORTCUT: readonly ShortcutKeyToken[] = [
+  { kind: "mod" },
+  { kind: "alt" },
+  { kind: "shift" },
+  { kind: "up" },
+];
+const MOVE_DOWN_SHORTCUT: readonly ShortcutKeyToken[] = [
+  { kind: "mod" },
+  { kind: "alt" },
+  { kind: "shift" },
+  { kind: "down" },
+];
+const NEW_BELOW_SHORTCUT: readonly ShortcutKeyToken[] = [{ kind: "mod" }, { kind: "enter" }];
 
 const REMOTE_SYNC_ANN = Annotation.define<boolean>();
 const INITIAL_MOUNT_WINDOW = 20;
@@ -216,7 +231,16 @@ export class BlockStreamController {
     }
     document.addEventListener("pointerdown", this.onDocPointerDown);
     document.addEventListener("keydown", this.onDocKeyDown);
+    this.container.addEventListener("click", this.onContainerClick);
   }
+
+  private onContainerClick = (ev: MouseEvent): void => {
+    if (ev.target !== this.container) return;
+    if (document.activeElement instanceof HTMLElement && this.container.contains(document.activeElement)) {
+      document.activeElement.blur();
+    }
+    this.setActive(null);
+  };
 
   private onDocPointerDown = (ev: PointerEvent): void => {
     if (!this.openOverflow) return;
@@ -586,9 +610,55 @@ export class BlockStreamController {
   }
 
   focusLangSelector(id: string): void {
+    this.setActive(id);
     const card = this.cards.get(id);
     const sel = card?.querySelector<HTMLSelectElement>(".lang-select");
     sel?.focus();
+  }
+
+  scrollBlockIntoView(id: string): void {
+    this.cards.get(id)?.scrollIntoView?.({ block: "nearest" });
+  }
+
+  navigateBlock(dir: -1 | 1): boolean {
+    if (this.blocks.length === 0) return false;
+    let targetIdx: number;
+    if (this.activeBlockId === null) {
+      targetIdx = dir === 1 ? 0 : this.blocks.length - 1;
+    } else {
+      const idx = this.blocks.findIndex((b) => b.id === this.activeBlockId);
+      if (idx < 0) {
+        targetIdx = dir === 1 ? 0 : this.blocks.length - 1;
+      } else {
+        targetIdx = idx + dir;
+      }
+    }
+    if (targetIdx < 0 || targetIdx >= this.blocks.length) return false;
+    const target = this.blocks[targetIdx];
+    this.bufferAllSelected = false;
+    this.container.classList.remove("buffer-all-selected");
+
+    if (this.isEditable(target) && this.getBlockViewMode(target.id) !== "preview") {
+      if (!this.mounted.has(target.id)) this.mountEditorForBlock(target);
+      const next = this.mounted.get(target.id);
+      if (next) {
+        const pos = dir === 1 ? 0 : next.view.state.doc.length;
+        next.view.dispatch({ selection: { anchor: pos } });
+        next.view.focus();
+        this.setActive(target.id);
+        this.cards.get(target.id)?.scrollIntoView?.({ block: "nearest" });
+        return true;
+      }
+    }
+
+    if (document.activeElement instanceof HTMLElement && this.container.contains(document.activeElement)) {
+      document.activeElement.blur();
+    }
+    this.setActive(target.id);
+    const card = this.cards.get(target.id);
+    card?.focus({ preventScroll: true });
+    card?.scrollIntoView?.({ block: "nearest" });
+    return true;
   }
 
   async flushAllDirty(opts: { keepalive?: boolean } = {}): Promise<void> {
@@ -765,6 +835,7 @@ export class BlockStreamController {
     this.closeOpenOverflow(false);
     document.removeEventListener("pointerdown", this.onDocPointerDown);
     document.removeEventListener("keydown", this.onDocKeyDown);
+    this.container.removeEventListener("click", this.onContainerClick);
     this.observer?.disconnect();
     for (const id of [...this.saveTimers.keys()]) this.clearTimer(id);
     for (const id of [...this.splitPreviewTimers.keys()]) this.clearSplitPreviewTimer(id);
@@ -1051,6 +1122,7 @@ export class BlockStreamController {
     next.view.dispatch({ selection: { anchor: targetPos } });
     next.view.focus();
     this.setActive(target.id);
+    this.cards.get(target.id)?.scrollIntoView?.({ block: "nearest" });
     this.bufferAllSelected = false;
     this.container.classList.remove("buffer-all-selected");
     return true;
@@ -1066,9 +1138,7 @@ export class BlockStreamController {
       const lbl = document.createElement("span");
       lbl.className = "stream-add-label";
       lbl.textContent = t("block.addBelowStream");
-      const kbd = document.createElement("kbd");
-      kbd.className = "kbd";
-      kbd.textContent = "⌘↵";
+      const kbd = createShortcutHint(NEW_BELOW_SHORTCUT);
       btn.append(createIcon("plus", "xs"), lbl, kbd);
       btn.addEventListener("click", () => {
         const lastId = this.blocks.at(-1)?.id ?? null;
@@ -1276,9 +1346,15 @@ export class BlockStreamController {
               : t("block.historyTitle"),
         };
       case "move-up":
-        return { label: t("block.moveUp"), title: t("block.moveUp") };
+        return {
+          label: t("block.moveUp"),
+          title: t("block.moveUpTitle", { shortcut: formatShortcutTitle(MOVE_UP_SHORTCUT) }),
+        };
       case "move-down":
-        return { label: t("block.moveDown"), title: t("block.moveDown") };
+        return {
+          label: t("block.moveDown"),
+          title: t("block.moveDownTitle", { shortcut: formatShortcutTitle(MOVE_DOWN_SHORTCUT) }),
+        };
       case "new-below":
         return { label: t("block.newBelow"), title: t("block.newBelowTitle") };
       case "trash":
@@ -1331,11 +1407,15 @@ export class BlockStreamController {
     const editable = this.isEditable(block);
     const effContent = this.getEffectiveContent(block);
     const card = document.createElement("section");
+    card.tabIndex = -1;
     card.className = `block-card${block.has_conflict ? " has-conflict" : ""}${block.id === this.activeBlockId ? " focused" : ""}${block.id === this.historyTargetBlockId ? " is-history-target" : ""}${block.is_locked ? " is-vault-block" : ""}${block.is_locked && editable ? " is-vault-unlocked" : ""}`;
     card.dataset.blockId = block.id;
     card.dataset.lang = block.lang;
     card.dataset.locked = String(block.is_locked);
     card.dataset.editable = String(editable);
+    card.addEventListener("focusin", () => {
+      this.setActive(block.id);
+    });
 
     const header = document.createElement("div");
     header.className = "block-header";
@@ -1431,6 +1511,7 @@ export class BlockStreamController {
       extraCls: string,
       onClick: () => void,
       testId?: string,
+      shortcut?: readonly ShortcutKeyToken[],
     ): HTMLButtonElement => {
       const { label, title } = this.getCardActionCopy(action, block, editable);
       const btn = document.createElement("button");
@@ -1444,6 +1525,9 @@ export class BlockStreamController {
       lbl.className = "menu-item-label";
       lbl.textContent = label;
       btn.append(createIcon(iconName, "xs", "menu-item-icon"), lbl);
+      if (shortcut) {
+        btn.appendChild(createShortcutHint(shortcut, "menu-item-kbd"));
+      }
       btn.addEventListener("mousedown", (ev) => ev.preventDefault());
       btn.addEventListener("click", () => {
         this.closeOpenOverflow(false);
@@ -1582,21 +1666,42 @@ export class BlockStreamController {
     menuList.appendChild(sep1);
 
     menuList.appendChild(
-      mkOverflowMenuItem("move-up", "arrow-up", "", () => {
-        const cur = this.blocks.find((x) => x.id === block.id);
-        if (cur) void this.cb.onMoveBlock(cur, -1);
-      }),
+      mkOverflowMenuItem(
+        "move-up",
+        "arrow-up",
+        "",
+        () => {
+          const cur = this.blocks.find((x) => x.id === block.id);
+          if (cur) void this.cb.onMoveBlock(cur, -1);
+        },
+        undefined,
+        MOVE_UP_SHORTCUT,
+      ),
     );
     menuList.appendChild(
-      mkOverflowMenuItem("move-down", "arrow-down", "", () => {
-        const cur = this.blocks.find((x) => x.id === block.id);
-        if (cur) void this.cb.onMoveBlock(cur, 1);
-      }),
+      mkOverflowMenuItem(
+        "move-down",
+        "arrow-down",
+        "",
+        () => {
+          const cur = this.blocks.find((x) => x.id === block.id);
+          if (cur) void this.cb.onMoveBlock(cur, 1);
+        },
+        undefined,
+        MOVE_DOWN_SHORTCUT,
+      ),
     );
     menuList.appendChild(
-      mkOverflowMenuItem("new-below", "plus", "", () => {
-        void this.cb.onInsertAfter(block.id);
-      }),
+      mkOverflowMenuItem(
+        "new-below",
+        "plus",
+        "",
+        () => {
+          void this.cb.onInsertAfter(block.id);
+        },
+        undefined,
+        NEW_BELOW_SHORTCUT,
+      ),
     );
 
     const sep2 = document.createElement("div");
@@ -1671,6 +1776,12 @@ export class BlockStreamController {
       const locked = document.createElement("div");
       locked.className = "locked-card";
       this.populateLockedCardContent(locked, block);
+      locked.addEventListener("click", (ev) => {
+        this.setActive(block.id);
+        if (!(ev.target instanceof Element && ev.target.closest("button, a, input, select"))) {
+          card.focus({ preventScroll: true });
+        }
+      });
       card.appendChild(locked);
     } else if (effContent === null) {
       const unreadable = document.createElement("div");
@@ -1679,6 +1790,10 @@ export class BlockStreamController {
       unreadableText.className = "unreadable-card-text";
       unreadableText.textContent = t("block.unreadableCard");
       unreadable.append(createIcon("alert-triangle", "sm"), unreadableText);
+      unreadable.addEventListener("click", () => {
+        this.setActive(block.id);
+        card.focus({ preventScroll: true });
+      });
       card.appendChild(unreadable);
     } else {
       const body = document.createElement("div");
@@ -1699,8 +1814,11 @@ export class BlockStreamController {
 
       const previewHost = document.createElement("div");
       previewHost.className = "block-preview-host hidden";
-      previewHost.addEventListener("click", () => {
+      previewHost.addEventListener("click", (ev) => {
         this.setActive(block.id);
+        if (!(ev.target instanceof Element && ev.target.closest("button, a, input, select, summary"))) {
+          card.focus({ preventScroll: true });
+        }
         const cur = this.blocks.find((x) => x.id === block.id);
         if (cur?.is_locked) this.cb.onVaultActivity?.();
       });
@@ -1877,6 +1995,36 @@ export class BlockStreamController {
         run: (view) => {
           const line = view.state.doc.lineAt(view.state.selection.main.head);
           return line.number === view.state.doc.lines ? this.jumpAdjacent(block.id, 1) : false;
+        },
+      },
+      {
+        key: "Mod-Alt-ArrowUp",
+        run: () => {
+          this.navigateBlock(-1);
+          return true;
+        },
+      },
+      {
+        key: "Mod-Alt-ArrowDown",
+        run: () => {
+          this.navigateBlock(1);
+          return true;
+        },
+      },
+      {
+        key: "Mod-Alt-Shift-ArrowUp",
+        run: () => {
+          const cur = this.blocks.find((x) => x.id === block.id);
+          if (cur) void this.cb.onMoveBlock(cur, -1);
+          return true;
+        },
+      },
+      {
+        key: "Mod-Alt-Shift-ArrowDown",
+        run: () => {
+          const cur = this.blocks.find((x) => x.id === block.id);
+          if (cur) void this.cb.onMoveBlock(cur, 1);
+          return true;
         },
       },
       {

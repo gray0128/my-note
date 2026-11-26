@@ -1705,4 +1705,213 @@ describe("M1 Embedded Desktop Web UI (Candidate A CM6)", () => {
     pwa.destroy();
     pwaRoot.remove();
   });
+
+  it("UX polish & fixes: buffer WS-before-HTTP dedup + IME guard, focus-only block header, block nav/reorder shortcuts, structured keycaps, and locked/unlocked Vault password change", async () => {
+    const fsMod = (await import(/* @vite-ignore */ "node:" + "fs")) as { readFileSync(p: string): Uint8Array };
+    const wasmBytes = fsMod.readFileSync("src/wasm/pkg/mynote_wasm_bg.wasm");
+    const { bytesToB64, initDesktopWasmSync } = await import("../src/wasm/desktop");
+    initDesktopWasmSync(new Uint8Array(wasmBytes));
+
+    const { api, pushWs } = makeMockApi();
+    const initialBoot = await api.bootstrap();
+    const blk1 = initialBoot.blocks[0].id;
+    const blk2 = initialBoot.blocks[1].id;
+    const scratchBufId = initialBoot.buffers[0].id;
+    const lockedBlkId = "01BLK000000000000000000003";
+    const lockedBlock: BlockDto = {
+      id: lockedBlkId,
+      buffer_id: scratchBufId,
+      position: "c0",
+      lang: "text",
+      is_locked: true,
+      has_unlocked_concurrent_version: false,
+      public_hint: "Vault note",
+      head_op_ids: ["01OP_LOCKED_3"],
+      display_op_id: "01OP_LOCKED_3",
+      has_conflict: false,
+      content: null,
+      versions: [
+        {
+          op_id: "01OP_LOCKED_3",
+          hlc: "000000000003000-00000-dev_mac",
+          device_id: "dev_mac",
+          actor: "human",
+          is_display: true,
+          is_locked: true,
+          key_id: "01KEY_LOCKED_3",
+          content: null,
+          mnb1_b64: "AAA",
+          mnw1_b64: "BBB",
+        },
+      ],
+      updated_at_ms: 3000,
+    };
+    const trackedBlocks: BlockDto[] = [...initialBoot.blocks, lockedBlock];
+    const trackedBuffers: BufferDto[] = [...initialBoot.buffers];
+
+    // Simulate real daemon behavior (`daemon.rs:handle_create_buffer`):
+    // WS `buffers_changed` arrives BEFORE `POST /v1/local/buffers` HTTP promise resolves!
+    let createBufferCalls = 0;
+    const origCreateBuffer = api.createBuffer.bind(api);
+    api.createBuffer = async (input) => {
+      createBufferCalls++;
+      const created = await origCreateBuffer(input);
+      trackedBuffers.push(created);
+      pushWs({ type: "buffers_changed", upserted: [...trackedBuffers], deleted_ids: [] });
+      return created;
+    };
+
+    const movedCalls: Array<{ id: string; before_id?: string; after_id?: string }> = [];
+    const origPatchBlock = api.patchBlock.bind(api);
+    api.patchBlock = async (id, input, opts) => {
+      if (input.before_id || input.after_id) {
+        movedCalls.push({ id, before_id: input.before_id, after_id: input.after_id });
+        const cur = trackedBlocks.find((b) => b.id === id)!;
+        const nextPos = input.before_id ? "a0" : "z0";
+        const updated = { ...cur, position: nextPos };
+        const idx = trackedBlocks.findIndex((b) => b.id === id);
+        if (idx >= 0) trackedBlocks[idx] = updated;
+        return updated;
+      }
+      return origPatchBlock(id, input, opts);
+    };
+
+    let storedVaultHeader: { gen: number; blob_b64: string; updated_at_ms: number } | null = null;
+    const recoveryPkB64 = bytesToB64(new Uint8Array(32).fill(9));
+    api.bootstrap = async () => ({
+      ...initialBoot,
+      buffers: [...trackedBuffers],
+      blocks: trackedBlocks.filter((b) => b.buffer_id === scratchBufId),
+      vault_header: storedVaultHeader,
+      recovery_pk_b64: recoveryPkB64,
+    });
+    api.listBlocks = async (bufferId) => trackedBlocks.filter((b) => b.buffer_id === bufferId);
+    api.putVaultHeader = async (gen, blob_b64) => {
+      storedVaultHeader = { gen, blob_b64, updated_at_ms: Date.now() };
+      return storedVaultHeader;
+    };
+
+    const root = document.getElementById("app")!;
+    const app = new MyNoteApp(root, api);
+    await app.start();
+
+    // 1. Buffer creation under WS-before-HTTP race MUST render exactly 1 tab (never duplicate) + ignore IME composing Enter
+    root.querySelector<HTMLButtonElement>('[data-testid="buffers-btn"]')!.click();
+    const filterInput = root.querySelector<HTMLInputElement>('[data-testid="buffer-filter-input"]')!;
+    filterInput.value = "生活";
+    filterInput.dispatchEvent(new Event("input"));
+    filterInput.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", isComposing: true, bubbles: true, cancelable: true }),
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    expect(createBufferCalls).toBe(0);
+
+    filterInput.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", isComposing: false, bubbles: true, cancelable: true }),
+    );
+    await new Promise((r) => setTimeout(r, 40));
+    expect(createBufferCalls).toBe(1);
+    const lifeTabs = [...root.querySelectorAll<HTMLButtonElement>(".buf-tab")].filter((b) => b.textContent === "生活");
+    expect(lifeTabs.length).toBe(1);
+
+    // Switch back to scratch buffer for block tests
+    const scratchTab = [...root.querySelectorAll<HTMLButtonElement>(".buf-tab")].find((b) => b.textContent === "scratch")!;
+    scratchTab.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // 2. Focus-only block header state: initially unfocused, clicking locked card or focusing block activates ONLY that block,
+    //    clicking empty .block-stream canvas clears .focused, and Mod+L activates card before focusing .lang-select.
+    expect(root.querySelectorAll(".block-card.focused").length).toBe(0);
+    app.stream.focusBlock(blk1, 0);
+    expect(root.querySelectorAll(".block-card.focused").length).toBe(1);
+    expect(root.querySelector(`[data-block-id="${blk1}"]`)?.classList.contains("focused")).toBe(true);
+
+    // Clicking empty stream background clears active block focus
+    root.querySelector<HTMLElement>(".block-stream")!.click();
+    expect(root.querySelectorAll(".block-card.focused").length).toBe(0);
+
+    // Mod+L activates first block and focuses its .lang-select
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "l", metaKey: true, cancelable: true }));
+    expect(root.querySelector(`[data-block-id="${blk1}"]`)?.classList.contains("focused")).toBe(true);
+
+    // 3. Mod+Alt+ArrowDown / ArrowUp navigates cleanly across editable AND locked blocks; Mod+Alt+Shift+ArrowUp reorders block
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", metaKey: true, altKey: true, cancelable: true }));
+    expect(app.stream.getActiveBlockId()).toBe(blk2);
+    expect(root.querySelector(`[data-block-id="${blk2}"]`)?.classList.contains("focused")).toBe(true);
+    expect(root.querySelector(`[data-block-id="${blk1}"]`)?.classList.contains("focused")).toBe(false);
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", metaKey: true, altKey: true, cancelable: true }));
+    expect(app.stream.getActiveBlockId()).toBe(lockedBlkId);
+    expect(root.querySelector(`[data-block-id="${lockedBlkId}"]`)?.classList.contains("focused")).toBe(true);
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", metaKey: true, altKey: true, cancelable: true }));
+    expect(app.stream.getActiveBlockId()).toBe(blk2);
+
+    // Mod+Alt+Shift+ArrowUp reorders active block up
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "ArrowUp", metaKey: true, altKey: true, shiftKey: true, cancelable: true }),
+    );
+    await new Promise((r) => setTimeout(r, 30));
+    expect(movedCalls.length).toBe(1);
+    expect(movedCalls[0]).toEqual({ id: blk2, before_id: blk1, after_id: undefined });
+
+    // 4. Structured shortcut keycaps (zero inline styles, separate keycap tokens, crisp icon-kbd SVG for Enter)
+    const switcherKeycaps = root.querySelectorAll('[data-testid="buffers-btn"] .kbd-group .kbd');
+    expect(switcherKeycaps.length).toBe(2);
+    const addBlockEnterIcon = root.querySelector('[data-testid="stream-add-block"] .kbd-group .kbd svg.icon-kbd');
+    expect(addBlockEnterIcon).not.toBeNull();
+    expect(addBlockEnterIcon?.getAttribute("style")).toBeNull();
+
+    // 5. Vault password change entry accessible in BOTH locked state (tabbed modal) and unlocked state
+    // 5a. Initialize Vault first
+    root.querySelector<HTMLButtonElement>('[data-testid="vault-btn"]')!.click();
+    root.querySelector<HTMLInputElement>('[data-testid="vault-passphrase-input"]')!.value = "initial-vault-pass";
+    root.querySelector<HTMLInputElement>('[data-testid="vault-passphrase-confirm"]')!.value = "initial-vault-pass";
+    root.querySelector<HTMLFormElement>(".dialog-form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await new Promise((r) => setTimeout(r, 180));
+    expect(app.isVaultUnlocked()).toBe(true);
+    const genAfterInit = storedVaultHeader!.gen;
+
+    // 5b. Lock Vault -> open Vault modal -> switch to "Change Password" tab directly from locked state!
+    app.lockVaultNow({ skipFlush: true, silent: true });
+    expect(app.isVaultUnlocked()).toBe(false);
+    root.querySelector<HTMLButtonElement>('[data-testid="vault-btn"]')!.click();
+    const changeTab = root.querySelector<HTMLButtonElement>('[data-testid="vault-tab-passwd"]')!;
+    expect(changeTab).not.toBeNull();
+    changeTab.click();
+
+    root.querySelector<HTMLInputElement>('[data-testid="vault-current-passphrase-input"]')!.value = "initial-vault-pass";
+    root.querySelector<HTMLInputElement>('[data-testid="vault-new-passphrase-input"]')!.value = "rotated-locked-pass";
+    root.querySelector<HTMLInputElement>('[data-testid="vault-confirm-passphrase-input"]')!.value = "rotated-locked-pass";
+    root.querySelector<HTMLFormElement>(".dialog-form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await new Promise((r) => setTimeout(r, 260));
+
+    expect(storedVaultHeader!.gen).toBeGreaterThan(genAfterInit);
+    // Changing password while locked MUST NOT silently leave Vault unlocked in RAM
+    expect(app.isVaultUnlocked()).toBe(false);
+
+    // Old password MUST now fail unlock, new password MUST succeed
+    root.querySelector<HTMLButtonElement>('[data-testid="vault-btn"]')!.click();
+    root.querySelector<HTMLInputElement>('[data-testid="vault-passphrase-input"]')!.value = "initial-vault-pass";
+    root.querySelector<HTMLFormElement>(".dialog-form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await new Promise((r) => setTimeout(r, 180));
+    expect(app.isVaultUnlocked()).toBe(false);
+
+    root.querySelector<HTMLInputElement>('[data-testid="vault-passphrase-input"]')!.value = "rotated-locked-pass";
+    root.querySelector<HTMLFormElement>(".dialog-form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await new Promise((r) => setTimeout(r, 180));
+    expect(app.isVaultUnlocked()).toBe(true);
+
+    // 5c. Also verify password change while unlocked works cleanly
+    const genBeforeUnlockedChange = storedVaultHeader!.gen;
+    root.querySelector<HTMLButtonElement>('[data-testid="vault-btn"]')!.click();
+    root.querySelector<HTMLInputElement>('[data-testid="vault-new-passphrase-input"]')!.value = "rotated-unlocked-pass";
+    root.querySelector<HTMLInputElement>('[data-testid="vault-confirm-passphrase-input"]')!.value = "rotated-unlocked-pass";
+    root.querySelector<HTMLFormElement>(".dialog-form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await new Promise((r) => setTimeout(r, 200));
+    expect(storedVaultHeader!.gen).toBeGreaterThan(genBeforeUnlockedChange);
+    expect(app.isVaultUnlocked()).toBe(true);
+
+    app.destroy();
+  });
 });

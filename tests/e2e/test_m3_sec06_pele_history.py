@@ -272,7 +272,7 @@ def run_check1_and_check2_desktop(p, browser_name: str, data_dir: Path, vectors:
     open_url, _ = wait_for_open_url(data_dir)
     browser_type = getattr(p, browser_name)
     browser = browser_type.launch()
-    context = browser.new_context(viewport={"width": 1280, "height": 900})
+    context = browser.new_context(viewport={"width": 1280, "height": 900}, locale="en-US")
     page = context.new_page()
     page.add_init_script(INIT_HARNESS_JS)
 
@@ -299,6 +299,7 @@ def run_check1_and_check2_desktop(p, browser_name: str, data_dir: Path, vectors:
     # ---- Check 2: Render all 4 Mermaid diagram types via Pele + Pan/Zoom + Taint-Free Copy PNG ----
     diagram_ids = vectors["diagram_ids"]
     for idx, (kind, blk_id) in enumerate(diagram_ids):
+        page.locator(f'[data-block-id="{blk_id}"] .cm-content').click()
         page.click(f'[data-testid="mode-preview-{blk_id}"]')
         svg_sel = f'[data-block-id="{blk_id}"] .diagram-viewport svg'
         page.wait_for_selector(svg_sel, timeout=15000)
@@ -365,6 +366,7 @@ def run_check1_and_check2_desktop(p, browser_name: str, data_dir: Path, vectors:
 
     # Split mode invalid syntax recovery: keep previous valid <svg> mounted (zero white flash) + show .diagram-syntax-hint
     split_id = vectors["split_diagram_id"]
+    page.locator(f'[data-block-id="{split_id}"] .cm-content').click()
     page.click(f'[data-testid="mode-split-{split_id}"]')
     split_svg_sel = f'[data-block-id="{split_id}"] .diagram-viewport svg'
     page.wait_for_selector(split_svg_sel, timeout=15000)
@@ -401,6 +403,7 @@ def run_check1_and_check2_desktop(p, browser_name: str, data_dir: Path, vectors:
     page.wait_for_selector(f'[data-block-id="{vectors["md_xss_id"]}"]', timeout=15000)
 
     for blk_id in [vectors["md_xss_id"], vectors["ext_img_id"], *vectors["mermaid_xss_ids"]]:
+        page.locator(f'[data-block-id="{blk_id}"] .cm-content').click()
         page.click(f'[data-testid="mode-preview-{blk_id}"]')
 
     page.wait_for_selector(f'[data-block-id="{vectors["md_xss_id"]}"] .md-preview', timeout=10000)
@@ -484,7 +487,7 @@ def run_check3_and_check4_desktop_chromium(p, data_dir: Path) -> None:
 
     open_url, _ = wait_for_open_url(data_dir)
     browser = p.chromium.launch()
-    context = browser.new_context(viewport={"width": 1280, "height": 900})
+    context = browser.new_context(viewport={"width": 1280, "height": 900}, locale="en-US")
     page = context.new_page()
     page.add_init_script(INIT_HARNESS_JS)
 
@@ -574,7 +577,7 @@ def run_check3_and_check4_desktop_chromium(p, data_dir: Path) -> None:
     print("[m3:chromium] Check 3 (Copy Rich / Code / TSV / MD + Task Checkbox SQLite writeback) PASS")
 
     # ---- Check 4A: Desktop History (Time Travel) Drawer + Actor Badge + Diff + Revert ----
-    page.locator(f'[data-block-id="{hist_blk_id}"]').hover()
+    page.locator(f'[data-block-id="{hist_blk_id}"] .cm-content').click()
     page.click(f'[data-testid="more-btn-{hist_blk_id}"]')
     page.click(f'[data-testid="history-btn-{hist_blk_id}"]')
     page.wait_for_selector('[data-testid="history-drawer"]:not(.hidden)', timeout=10000)
@@ -629,7 +632,7 @@ def run_check3_and_check4_desktop_chromium(p, data_dir: Path) -> None:
     )
 
     t2_card = page.locator(f'[data-block-id="{t2_hist_blk_id}"]')
-    t2_card.hover()
+    t2_card.locator(".cm-content").click()
     page.click(f'[data-testid="more-btn-{t2_hist_blk_id}"]')
     page.click(f'[data-testid="lock-btn-{t2_hist_blk_id}"]')
     page.fill('[data-testid="lock-hint-input"]', "M3 Tier 2 History Hint")
