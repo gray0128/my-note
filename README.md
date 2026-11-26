@@ -4,9 +4,30 @@
 
 一款面向开发者的**轻量、简洁、多端可靠同步、支持块级加密、Markdown/Mermaid 渲染与 CLI + Skill（Agent 友好）**的临时笔记 / Scratchpad 软件。
 
+## 快速开始（交给本地 Agent 自举安装 / 更新）
+
+将下面这一句直接发送给你的本地 AI Coding Agent（Claude Code / Codex / Antigravity / OpenCode 等），即可自动完成预编译包下载校验、二进制与后台 Daemon 安装或升级、`skill/SKILL.md` 注册以及可用性核验：
+
+```text
+请帮我安装或更新 gray0128/my-note：按本机系统与架构从 https://github.com/gray0128/my-note/releases/latest 下载对应的 mynote-<target>.tar.gz 与 SHA256SUMS.txt 并校验 SHA-256（若无对应架构预编译包则克隆仓库源码构建）；将 mynote 安装到系统 PATH（优先 /opt/homebrew/bin 或 /usr/local/bin，升级时保留现有 ~/.local/share/mynote 数据）并配置/重启后台 Daemon（macOS 用包内 deploy/launchd/com.mynote.daemon.plist，Linux 用 deploy/systemd/mynote-daemon.service，检测到 Hyprland 时一并提示接入 deploy/hyprland/mynote.conf）；将包内 skill/SKILL.md 安装到我当前 Agent 实际生效的 Skills 目录（遵循本机既有 Skills 管理方式，不覆盖无关 Skill）；最后执行 mynote --version 与 mynote sync status --json 验证可用性，完成后简明告诉我如何打开桌面 UI、完成首次云同步或设备配对并开始使用。
+```
+
+### 发布包与启用速查
+
+- **GitHub Release 预编译目标**（由 [`.github/workflows/release.yml`](./.github/workflows/release.yml) 在 `v*` tag 构建并附带 `SHA256SUMS.txt`）：
+  - `mynote-aarch64-apple-darwin.tar.gz`（macOS Apple Silicon）
+  - `mynote-x86_64-unknown-linux-gnu.tar.gz`（Linux x86_64 / Omarchy）
+  - `mynote-aarch64-unknown-linux-gnu.tar.gz`（Linux ARM64）
+  - 每个压缩包均内含剥离后的单体 `mynote`（已内嵌桌面 Web UI）、`skill/SKILL.md` 与 `deploy/{launchd,systemd,hyprland}` 模板。
+- **源码构建回退**：`./scripts/build-wasm.sh && pnpm --dir web install --frozen-lockfile && pnpm --dir web build && cargo build --release --locked --bin mynote`
+- **常用启用命令**：
+  - 打开桌面 UI：`mynote open`（仅放行 `http://localhost:19876`）
+  - 首台桌面接入云端：`mynote device bootstrap --url <你的-worker-url>`；记录 24 词恢复包：`mynote recovery show`
+  - 接入第二台桌面或手机只读 PWA：在已接入桌面运行 `mynote device add --name <设备名> --scope <read-write|read>`，目标桌面运行 `mynote device claim`（手机 Safari 打开 Worker URL 扫码或粘贴配对码）
+
 ## 状态
 
-**M1（替换 Heynote + iCloud）全栈工程代码与本地确定性门禁已全部落地并绿灯**（尚待个人真实 Cloudflare Paid 账号部署核验 Spend Management / R2 生命周期、独立 `[eval-only]` PR 冻结 `evals/golden/` 快照，以及 macOS + Omarchy 4 周日常使用准出观察）。已落地核心组件：`mynote-core`（同步核 `2,248 LOC` `[已测]`）、`mynote-store`、`mynote-cli`（CLI + 本地 Daemon + `0600` UDS `apply` + `SEC-05` + 云端同步客户端；Linux 本地手动实测 Release 剥离单二进制 `13.11 MiB` `[已测]`、无头常驻 `7.66 MiB` RSS `[已测]`、CLI 进程内读写 `7–8 ms` `[已测]`）、`web/` 内嵌桌面编辑器（候选 A 按块虚拟化 CM6，首屏 `119.29 kB` gzip `[已测]`，Linux 本地无头 Chromium 严格 CSP nonce 零违规 `[已测]`，当前为手动实测、尚未接入 CI）、`cloud-cf/` 极薄盲同步中继（`478 LOC` TS `[已测]`，真实 `workerd` 契约与共用场景 `5/5` 绿灯 `[已测]`，Linux 本地跨语言 `MNA1`/`MNKS` 离线恢复手动验证通过 `[已测]`）、`deploy/` 双桌面模板（Omarchy systemd/Hyprland & macOS launchd）以及 500 种子 PR CI / 100k 夜间长浸泡 / CI-only 云端部署工作流。`ADR-01`、`ADR-06`、`ADR-07` 为 **Accepted**，其余云端/联调相关 ADR 诚实保持 **Proposed**。开发与 Agent 协作红线见 [`AGENTS.md`](./AGENTS.md)。路线图：S0 spike → M1 替换 Heynote + iCloud → M2 手机只读 + Vault + 碎纸 → M3 渲染与打磨（详见 [`docs/architecture-proposal.md`](./docs/architecture-proposal.md) 与 [review §9.11](./review/2026-11-24-first-principles-review.md)）。
+**M1（替换 Heynote + iCloud）、M2（手机只读 PWA + Tier 2 Vault + 受控加密碎纸）与 M3（Markdown 双模 / `SEC-06` + 懒加载 `Pele` 纯 SVG 与跨端 `Copy PNG` + 块级历史时间旅行 + Layer 2 外部格式化熔断）全部工程实现与 Plane A 确定性门禁均已合入 `main` 并接入跨平台 CI**；`evals/golden/` CLI `G01–G11` 冻结快照门禁已在 `ubuntu-latest` 与 `macos-latest` 双平台自动化运行 `[已测]`；生产 Cloudflare Sync Relay（`cloud-cf/` `690 LOC` TS `[已测]`）与 M3 手机只读 PWA 已通过最小权限单 Worker `Workers: Editor` Scoped Token 经 CI 部署上线并完成 R2 `mynote-archive` 30 天前缀生命周期、前缀 Bucket Lock 兼容与严格 CSP 在线验证 `[已测]`。`ADR-01`、`ADR-05`、`ADR-06`、`ADR-07` 已升级为 **Accepted**，其余云端边缘 5 分钟 WS Hibernation 计费、真机双桌面 4 周观察与分发相关 ADR 诚实保持 **Proposed**。开发与 Agent 协作红线见 [`AGENTS.md`](./AGENTS.md)。路线图与全量指标见 [`docs/architecture-proposal.md`](./docs/architecture-proposal.md) 与 [review §9.11](./review/2026-11-24-first-principles-review.md)。
 
 ## 背景
 
@@ -31,7 +52,7 @@
 - **同步与云端**：两台桌面经 Cloudflare Worker + SQLite Durable Object 端到端加密同步（盲服务端：幂等追加、seq、epoch、令牌范围、WebSocket 唤醒、密钥表与碎纸标记、每日归档）；R2 保存 op 密文归档与密钥表快照。
 - **加密**：Tier 1 同步盲信封 + Tier 2 Vault（口令解锁）；一份统一恢复包（24 词）覆盖全部密钥。
 - **Agent 集成**：不做 MCP，通过 CLI（`--json`、稳定退出码与错误码，Daemon 未起亦可用）+ 极轻 `SKILL.md`。
-- **分发**：Homebrew tap / AUR / `cargo install`，不做自升级。
+- **分发**：GitHub Releases 预编译包（附 `SHA256SUMS.txt`、`skill/SKILL.md` 与 `deploy/` 模板）/ Homebrew tap / AUR / `cargo install`，不做自升级。
 
 ## 文档索引
 
