@@ -309,7 +309,7 @@ def main():
             subprocess.run([str(BIN), "--data-dir", str(tmp_desktop), "add", live_canary], check=True, capture_output=True)
             subprocess.run([str(BIN), "--data-dir", str(tmp_desktop), "sync", "push"], check=True, capture_output=True)
             page.wait_for_function(
-                f"() => document.body.innerText.includes('{live_canary}') && document.querySelector('.pwa-header')?.textContent?.includes('Synced #')",
+                f"() => document.body.innerText.includes('{live_canary}') && document.querySelector('[data-testid=\"pwa-sync-btn\"]')?.textContent?.includes('Synced')",
                 timeout=15000,
             )
             print("[sec-08] 6. WebKit received live WS wake & decrypted new tail op OK")

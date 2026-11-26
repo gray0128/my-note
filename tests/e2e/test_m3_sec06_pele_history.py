@@ -588,8 +588,8 @@ def run_check3_and_check4_desktop_chromium(p, data_dir: Path) -> None:
         "Expected 'Undo agent:claude-code batch' button in History drawer"
     )
 
-    # Select the original human CREATE entry
-    human_item = drawer.locator(".history-item:has(.actor-badge-human)").last
+    # Select the original human CREATE entry (only non-human actors carry an agent badge)
+    human_item = drawer.locator(".history-item:not(:has(.actor-badge-agent))").last
     human_item.click()
     page.wait_for_selector('[data-testid="history-diff-view"] .diff-add', timeout=10000)
     page.wait_for_selector('[data-testid="history-diff-view"] .diff-del', timeout=10000)
