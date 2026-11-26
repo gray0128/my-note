@@ -3,6 +3,7 @@
   "name": "mynote-sync-relay",
   "main": "src/index.ts",
   "compatibility_date": "2026-01-15",
+  "preview_urls": false,
   "durable_objects": {
     "bindings": [
       {
