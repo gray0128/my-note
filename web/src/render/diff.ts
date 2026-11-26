@@ -183,3 +183,136 @@ export function computeLineDiff(oldText: string, newText: string): DiffLine[] {
 
   return result;
 }
+
+export interface InlineDiffSegment {
+  readonly kind: "same" | "changed";
+  readonly text: string;
+}
+
+const MAX_INLINE_DIFF_TOKENS = 600;
+const MAX_INLINE_DIFF_CELLS = 120_000;
+
+function tokenizeForInlineDiff(text: string): string[] {
+  return text.match(/\s+|[A-Za-z0-9_\u4e00-\u9fff]+|./gu) ?? [];
+}
+
+function coalesceSegments(raw: InlineDiffSegment[]): InlineDiffSegment[] {
+  const out: InlineDiffSegment[] = [];
+  for (const seg of raw) {
+    if (!seg.text) continue;
+    const prev = out[out.length - 1];
+    if (prev && prev.kind === seg.kind) {
+      out[out.length - 1] = { kind: prev.kind, text: prev.text + seg.text };
+    } else {
+      out.push(seg);
+    }
+  }
+  return out;
+}
+
+/**
+ * Word-level inline diff between two sibling versions for conflict resolution panels.
+ * Falls back cleanly to a single unchanged/changed span for very large blocks.
+ */
+export function computeInlineWordDiff(
+  leftText: string,
+  rightText: string,
+): { readonly left: InlineDiffSegment[]; readonly right: InlineDiffSegment[] } {
+  if (leftText === rightText) {
+    return {
+      left: leftText ? [{ kind: "same", text: leftText }] : [],
+      right: rightText ? [{ kind: "same", text: rightText }] : [],
+    };
+  }
+  const a = tokenizeForInlineDiff(leftText);
+  const b = tokenizeForInlineDiff(rightText);
+
+  let prefix = 0;
+  const minLen = Math.min(a.length, b.length);
+  while (prefix < minLen && a[prefix] === b[prefix]) {
+    prefix += 1;
+  }
+
+  let suffix = 0;
+  while (
+    suffix < a.length - prefix &&
+    suffix < b.length - prefix &&
+    a[a.length - 1 - suffix] === b[b.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+
+  const leftRaw: InlineDiffSegment[] = [];
+  const rightRaw: InlineDiffSegment[] = [];
+
+  for (let i = 0; i < prefix; i += 1) {
+    leftRaw.push({ kind: "same", text: a[i] });
+    rightRaw.push({ kind: "same", text: b[i] });
+  }
+
+  const aMid = a.slice(prefix, a.length - suffix);
+  const bMid = b.slice(prefix, b.length - suffix);
+  const m = aMid.length;
+  const n = bMid.length;
+
+  if (m === 0 && n > 0) {
+    rightRaw.push({ kind: "changed", text: bMid.join("") });
+  } else if (n === 0 && m > 0) {
+    leftRaw.push({ kind: "changed", text: aMid.join("") });
+  } else if (m > 0 && n > 0) {
+    if (m <= MAX_INLINE_DIFF_TOKENS && n <= MAX_INLINE_DIFF_TOKENS && m * n <= MAX_INLINE_DIFF_CELLS) {
+      const stride = n + 1;
+      const dp = new Uint32Array((m + 1) * stride);
+      for (let i = m - 1; i >= 0; i -= 1) {
+        const row = i * stride;
+        const nextRow = (i + 1) * stride;
+        for (let j = n - 1; j >= 0; j -= 1) {
+          if (aMid[i] === bMid[j]) {
+            dp[row + j] = dp[nextRow + j + 1] + 1;
+          } else {
+            const down = dp[nextRow + j];
+            const right = dp[row + j + 1];
+            dp[row + j] = down >= right ? down : right;
+          }
+        }
+      }
+      let i = 0;
+      let j = 0;
+      while (i < m && j < n) {
+        if (aMid[i] === bMid[j]) {
+          leftRaw.push({ kind: "same", text: aMid[i] });
+          rightRaw.push({ kind: "same", text: bMid[j] });
+          i += 1;
+          j += 1;
+        } else if (dp[(i + 1) * stride + j] >= dp[i * stride + j + 1]) {
+          leftRaw.push({ kind: "changed", text: aMid[i] });
+          i += 1;
+        } else {
+          rightRaw.push({ kind: "changed", text: bMid[j] });
+          j += 1;
+        }
+      }
+      while (i < m) {
+        leftRaw.push({ kind: "changed", text: aMid[i] });
+        i += 1;
+      }
+      while (j < n) {
+        rightRaw.push({ kind: "changed", text: bMid[j] });
+        j += 1;
+      }
+    } else {
+      leftRaw.push({ kind: "changed", text: aMid.join("") });
+      rightRaw.push({ kind: "changed", text: bMid.join("") });
+    }
+  }
+
+  for (let s = 0; s < suffix; s += 1) {
+    leftRaw.push({ kind: "same", text: a[a.length - suffix + s] });
+    rightRaw.push({ kind: "same", text: b[b.length - suffix + s] });
+  }
+
+  return {
+    left: coalesceSegments(leftRaw),
+    right: coalesceSegments(rightRaw),
+  };
+}

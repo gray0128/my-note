@@ -1,9 +1,12 @@
-import { Annotation, Compartment, EditorState, type Extension } from "@codemirror/state";
-import { EditorView, keymap } from "@codemirror/view";
+import { Annotation, Compartment, EditorState, RangeSetBuilder, StateEffect, StateField, type Extension } from "@codemirror/state";
+import { Decoration, EditorView, keymap, type DecorationSet } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
-import { defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
+import { myNoteCmExtensions } from "./cmTheme";
+import { formatDeviceName, t } from "./i18n";
+import { createIcon, createIconSwap, type IconName } from "./icons";
 import { loadLangExtension, loadVimExtension, SUPPORTED_LANGS } from "./langs";
 import { mountDiagramWidget, type DiagramWidgetHandle } from "./render/diagram";
+import { computeInlineWordDiff, type InlineDiffSegment } from "./render/diff";
 import { mountMarkdownPreview, type MountedMarkdownPreview } from "./render/markdown";
 import type { BlockDto } from "./types";
 import { detectSecretPatternFast } from "./wasm/desktop";
@@ -14,6 +17,58 @@ const LARGE_BLOCK_BYTES = 64 * 1024;
 const SPLIT_PREVIEW_DEBOUNCE_MS = 150;
 
 export type BlockViewMode = "source" | "preview" | "split";
+
+interface FindHighlightSpec {
+  readonly query: string;
+  readonly activeFrom: number | null;
+  readonly activeTo: number | null;
+}
+
+const EMPTY_FIND_SPEC: FindHighlightSpec = { query: "", activeFrom: null, activeTo: null };
+const SET_FIND_HIGHLIGHT = StateEffect.define<FindHighlightSpec>();
+const FIND_MATCH_MARK = Decoration.mark({ class: "cm-find-match" });
+const FIND_ACTIVE_MARK = Decoration.mark({ class: "cm-find-match-active" });
+
+function buildFindDecorations(docText: string, spec: FindHighlightSpec): DecorationSet {
+  if (!spec.query) return Decoration.none;
+  const lowerDoc = docText.toLowerCase();
+  const lowerQuery = spec.query.toLowerCase();
+  const step = Math.max(1, lowerQuery.length);
+  const builder = new RangeSetBuilder<Decoration>();
+  let idx = 0;
+  while ((idx = lowerDoc.indexOf(lowerQuery, idx)) !== -1) {
+    const to = idx + lowerQuery.length;
+    const isActive = spec.activeFrom === idx && spec.activeTo === to;
+    builder.add(idx, to, isActive ? FIND_ACTIVE_MARK : FIND_MATCH_MARK);
+    idx += step;
+  }
+  return builder.finish();
+}
+
+const findHighlightField = StateField.define<{ spec: FindHighlightSpec; decos: DecorationSet }>({
+  create() {
+    return { spec: EMPTY_FIND_SPEC, decos: Decoration.none };
+  },
+  update(value, tr) {
+    let nextSpec = value.spec;
+    let changed = false;
+    for (const eff of tr.effects) {
+      if (eff.is(SET_FIND_HIGHLIGHT)) {
+        nextSpec = eff.value;
+        changed = true;
+      }
+    }
+    if (!changed && !tr.docChanged) return value;
+    if (!nextSpec.query) {
+      return { spec: EMPTY_FIND_SPEC, decos: Decoration.none };
+    }
+    return {
+      spec: nextSpec,
+      decos: buildFindDecorations(tr.state.doc.toString(), nextSpec),
+    };
+  },
+  provide: (f) => EditorView.decorations.from(f, (v) => v.decos),
+});
 
 function isMarkdownLang(lang: string): boolean {
   const norm = lang.toLowerCase();
@@ -41,7 +96,7 @@ export interface BlockEditorCallbacks {
     opts: { fastSync: boolean; isMerge: boolean; keepalive?: boolean },
   ): Promise<SaveContentResult>;
   onChangeLang(block: BlockDto, lang: string): Promise<void>;
-  onInsertAfter(afterBlockId: string): Promise<void>;
+  onInsertAfter(afterBlockId: string | null): Promise<void>;
   onFormatBlock(block: BlockDto): Promise<void>;
   onCopyBlock(block: BlockDto, content: string): Promise<void>;
   onMoveBlock(block: BlockDto, dir: -1 | 1): Promise<void>;
@@ -76,6 +131,27 @@ interface DirtyDraft {
   mismatch: boolean;
 }
 
+type DirtyBadgeState = "clean" | "unsaved" | "conflict" | "save_failed";
+
+type CardActionKey =
+  | "format"
+  | "copy"
+  | "lock"
+  | "to-tier1"
+  | "purge"
+  | "history"
+  | "move-up"
+  | "move-down"
+  | "new-below"
+  | "trash";
+
+interface OverflowMenuState {
+  readonly anchor: HTMLElement;
+  readonly trigger: HTMLButtonElement;
+  readonly menu: HTMLElement;
+  readonly supportsPopover: boolean;
+}
+
 /**
  * Candidate A (ADR-07 Accepted): Viewport-virtualized per-block CodeMirror 6 stream.
  * - Physically isolates block boundaries against Vim `dd`/`dG` and `Mod-a`+`Backspace`.
@@ -90,6 +166,8 @@ export class BlockStreamController {
   private mounted = new Map<string, MountedEditor>();
   private cards = new Map<string, HTMLElement>();
   private dirty = new Map<string, DirtyDraft>();
+  private dirtyBadgeState = new Map<string, DirtyBadgeState>();
+  private copyFeedbackTimers = new Map<string, number>();
   private saving = new Set<string>();
   private savingPromises = new Map<string, Promise<void>>();
   private pendingResave = new Map<string, { fastSync: boolean; isMerge: boolean; keepalive?: boolean }>();
@@ -101,9 +179,14 @@ export class BlockStreamController {
   private unlockedLeafPlaintext = new Map<string, Map<string, string>>();
   private vaultLockEpoch = 0;
   private activeBlockId: string | null = null;
+  private historyTargetBlockId: string | null = null;
   private bufferAllSelected = false;
   private vimMode = false;
   private observer: IntersectionObserver | null = null;
+  private activeFindQuery = "";
+  private activeFindHit: { blockId: string; from: number; to: number } | null = null;
+  private openOverflow: OverflowMenuState | null = null;
+  private streamAddBtnEl: HTMLButtonElement | null = null;
 
   constructor(private container: HTMLElement, private cb: BlockEditorCallbacks) {
     if (typeof IntersectionObserver !== "undefined") {
@@ -130,6 +213,44 @@ export class BlockStreamController {
         },
         { root: container, rootMargin: "400px 0px" },
       );
+    }
+    document.addEventListener("pointerdown", this.onDocPointerDown);
+    document.addEventListener("keydown", this.onDocKeyDown);
+  }
+
+  private onDocPointerDown = (ev: PointerEvent): void => {
+    if (!this.openOverflow) return;
+    if (ev.target instanceof Node && !this.openOverflow.anchor.contains(ev.target)) {
+      this.closeOpenOverflow(false);
+    }
+  };
+
+  private onDocKeyDown = (ev: KeyboardEvent): void => {
+    if (ev.key === "Escape" && this.openOverflow) {
+      ev.preventDefault();
+      this.closeOpenOverflow(true);
+    }
+  };
+
+  private closeOpenOverflow(restoreFocus: boolean): void {
+    const cur = this.openOverflow;
+    if (!cur) return;
+    this.openOverflow = null;
+    if (cur.supportsPopover) {
+      try {
+        if (cur.menu.matches(":popover-open")) {
+          (cur.menu as HTMLElement & { hidePopover(): void }).hidePopover();
+        }
+      } catch {
+        // ignore
+      }
+    } else {
+      delete cur.menu.dataset.open;
+      cur.menu.classList.remove("is-open");
+    }
+    cur.trigger.setAttribute("aria-expanded", "false");
+    if (restoreFocus) {
+      cur.trigger.focus({ preventScroll: true });
     }
   }
 
@@ -181,12 +302,14 @@ export class BlockStreamController {
   /** Immediately wipe all transient Tier 2 plaintext from RAM, destroy Tier 2 CM6 views & previews, and restore locked cards (`SEC-03`). */
   clearUnlockedVaultPlaintext(): void {
     this.vaultLockEpoch++;
+    this.closeOpenOverflow(false);
     const lockedIds = new Set(this.blocks.filter((b) => b.is_locked).map((b) => b.id));
     for (const id of [...this.unlockedPlaintext.keys(), ...lockedIds]) {
       this.clearTimer(id);
       this.clearSplitPreviewTimer(id);
       this.destroyPreviewForBlock(id);
       this.dirty.delete(id);
+      this.dirtyBadgeState.delete(id);
       this.pendingResave.delete(id);
       const m = this.mounted.get(id);
       if (m) {
@@ -265,6 +388,23 @@ export class BlockStreamController {
     return this.activeBlockId;
   }
 
+  /** Visually anchor and scroll to the block currently inspected in the History drawer. */
+  setHistoryTargetBlock(blockId: string | null, opts: { scrollIntoView?: boolean } = {}): void {
+    if (this.historyTargetBlockId && this.historyTargetBlockId !== blockId) {
+      this.cards.get(this.historyTargetBlockId)?.classList.remove("is-history-target");
+    }
+    this.historyTargetBlockId = blockId;
+    if (blockId) {
+      const card = this.cards.get(blockId);
+      if (card) {
+        card.classList.add("is-history-target");
+        if (opts.scrollIntoView) {
+          card.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+        }
+      }
+    }
+  }
+
   hasDirtyBlocks(): boolean {
     return this.dirty.size > 0;
   }
@@ -288,7 +428,7 @@ export class BlockStreamController {
     this.clearTimer(id);
     this.dirty.delete(id);
     this.pendingResave.delete(id);
-    this.updateDirtyBadge(id, false);
+    this.updateDirtyBadge(id, "clean");
     this.renderMismatchNotice(id, false);
   }
 
@@ -323,6 +463,7 @@ export class BlockStreamController {
   }
 
   setBlocks(nextBlocks: BlockDto[]): void {
+    this.closeOpenOverflow(false);
     const nextIds = new Set(nextBlocks.map((b) => b.id));
     for (const id of [...this.saveTimers.keys()]) {
       if (!nextIds.has(id)) this.clearTimer(id);
@@ -337,7 +478,10 @@ export class BlockStreamController {
       if (!nextIds.has(id)) this.viewModes.delete(id);
     }
     for (const id of [...this.dirty.keys()]) {
-      if (!nextIds.has(id)) this.dirty.delete(id);
+      if (!nextIds.has(id)) {
+        this.dirty.delete(id);
+        this.dirtyBadgeState.delete(id);
+      }
     }
     for (const id of [...this.pendingResave.keys()]) {
       if (!nextIds.has(id)) this.pendingResave.delete(id);
@@ -376,6 +520,7 @@ export class BlockStreamController {
       this.destroyPreviewForBlock(id);
       this.viewModes.delete(id);
       this.dirty.delete(id);
+      this.dirtyBadgeState.delete(id);
       this.pendingResave.delete(id);
       if (this.activeBlockId === id) this.activeBlockId = null;
     }
@@ -399,6 +544,25 @@ export class BlockStreamController {
     this.setActive(id);
   }
 
+  /** Apply or clear Find highlight marks across ALL mounted blocks (visible even while focus remains in Find bar). */
+  setFindHighlights(
+    query: string,
+    activeHit: { blockId: string; from: number; to: number } | null,
+  ): void {
+    this.activeFindQuery = query;
+    this.activeFindHit = activeHit;
+    for (const [blockId, m] of this.mounted.entries()) {
+      const spec: FindHighlightSpec = query
+        ? {
+            query,
+            activeFrom: activeHit?.blockId === blockId ? activeHit.from : null,
+            activeTo: activeHit?.blockId === blockId ? activeHit.to : null,
+          }
+        : EMPTY_FIND_SPEC;
+      m.view.dispatch({ effects: SET_FIND_HIGHLIGHT.of(spec) });
+    }
+  }
+
   /** Highlight a search match inside a block WITHOUT stealing keyboard focus from the Find bar input. */
   highlightBlockMatch(id: string, from: number, to: number): void {
     const blk = this.blocks.find((b) => b.id === id);
@@ -412,7 +576,11 @@ export class BlockStreamController {
     const max = m.view.state.doc.length;
     const a = Math.max(0, Math.min(from, max));
     const b = Math.max(a, Math.min(to, max));
+    this.activeFindHit = { blockId: id, from: a, to: b };
     m.view.dispatch({ selection: { anchor: a, head: b }, scrollIntoView: true });
+    if (this.activeFindQuery) {
+      this.setFindHighlights(this.activeFindQuery, this.activeFindHit);
+    }
     this.cards.get(id)?.scrollIntoView?.({ block: "nearest" });
     this.setActive(id);
   }
@@ -465,8 +633,6 @@ export class BlockStreamController {
 
     const draft = this.getBlockDraftContent(id);
     const lockEpochAtStart = this.vaultLockEpoch;
-    // Use ORIGINAL baseHeads captured when editing began (so concurrent remote updates trigger HEAD_MISMATCH
-    // rather than silently overwriting!). Explicit merge intentionally passes all current remote head_op_ids.
     const expectedHeads = isMerge ? [...blk.head_op_ids] : [...(entry?.baseHeads ?? blk.head_op_ids)];
 
     this.saving.add(id);
@@ -481,7 +647,6 @@ export class BlockStreamController {
           blk.is_locked && (lockEpochAtStart !== this.vaultLockEpoch || !this.unlockedPlaintext.has(id));
         if (res.status === "ok") {
           if (lockedDuringSave) {
-            // C4: Vault was locked & CM6 view destroyed while PATCH was in flight; NEVER read getBlockDraftContent() -> ""!
             this.dirty.delete(id);
             this.pendingResave.delete(id);
             this.upsertBlocks([res.updated], [], res.updated.buffer_id);
@@ -490,12 +655,11 @@ export class BlockStreamController {
           const currentDraft = this.getBlockDraftContent(id);
           if (currentDraft === draft) {
             this.dirty.delete(id);
-            this.updateDirtyBadge(id, false);
+            this.updateDirtyBadge(id, "clean");
             this.renderMismatchNotice(id, false);
           } else {
-            // User continued typing while PATCH was in flight: advance baseHeads to the saved head and re-queue save!
             this.dirty.set(id, { text: currentDraft, baseHeads: [...res.updated.head_op_ids], mismatch: false });
-            this.updateDirtyBadge(id, true);
+            this.updateDirtyBadge(id, "unsaved");
             this.renderMismatchNotice(id, false);
             const prev = this.pendingResave.get(id);
             this.pendingResave.set(id, {
@@ -509,23 +673,24 @@ export class BlockStreamController {
           this.clearTimer(id);
           if (lockedDuringSave) {
             this.dirty.delete(id);
+            this.dirtyBadgeState.delete(id);
             this.pendingResave.delete(id);
             return;
           }
-          // Keep the user's draft intact in the editor, halt auto-save, and offer explicit Merge or Reload!
           this.dirty.set(id, {
             text: this.getBlockDraftContent(id),
             baseHeads: expectedHeads,
             mismatch: true,
           });
-          this.updateDirtyBadge(id, true, "● conflict (unsaved draft)");
+          this.updateDirtyBadge(id, "conflict");
           this.renderMismatchNotice(id, true);
         } else {
           if (lockedDuringSave) {
             this.dirty.delete(id);
+            this.dirtyBadgeState.delete(id);
             this.pendingResave.delete(id);
           } else {
-            this.updateDirtyBadge(id, true, "● save failed");
+            this.updateDirtyBadge(id, "save_failed");
           }
         }
       } finally {
@@ -585,7 +750,6 @@ export class BlockStreamController {
       }
       const res = await this.cb.onSaveContent(cur, next, expectedHeads, { fastSync: true, isMerge: false });
       if (res.status === "ok") {
-        // H18: Never re-insert plaintext into RAM if Vault was locked while PATCH was awaiting!
         const keepUnlocked = cur.is_locked && lockEpochAtStart === this.vaultLockEpoch && this.unlockedPlaintext.has(cur.id);
         this.applyAuthoritativeBlock(res.updated, cur.buffer_id, keepUnlocked ? next : undefined);
       }
@@ -598,9 +762,14 @@ export class BlockStreamController {
   }
 
   destroy(): void {
+    this.closeOpenOverflow(false);
+    document.removeEventListener("pointerdown", this.onDocPointerDown);
+    document.removeEventListener("keydown", this.onDocKeyDown);
     this.observer?.disconnect();
     for (const id of [...this.saveTimers.keys()]) this.clearTimer(id);
     for (const id of [...this.splitPreviewTimers.keys()]) this.clearSplitPreviewTimer(id);
+    for (const timer of this.copyFeedbackTimers.values()) window.clearTimeout(timer);
+    this.copyFeedbackTimers.clear();
     for (const id of [...this.previewMounts.keys()]) this.destroyPreviewForBlock(id);
     for (const m of this.mounted.values()) m.view.destroy();
     this.mounted.clear();
@@ -608,8 +777,105 @@ export class BlockStreamController {
     this.viewModes.clear();
     this.cards.clear();
     this.dirty.clear();
+    this.dirtyBadgeState.clear();
     this.saving.clear();
     this.pendingResave.clear();
+    this.streamAddBtnEl = null;
+  }
+
+  /**
+   * Update all localized chrome across block cards, headers, conflicts, and previews in place
+   * WITHOUT unmounting CodeMirror views or losing drafts/cursor/undo/Vault RAM.
+   */
+  refreshLocale(): void {
+    if (this.blocks.length === 0) {
+      const emptyEl = this.container.querySelector<HTMLElement>(".empty-state");
+      if (emptyEl) emptyEl.textContent = t("block.emptyStream");
+      return;
+    }
+
+    if (this.streamAddBtnEl) {
+      const lbl = this.streamAddBtnEl.querySelector<HTMLElement>(".stream-add-label");
+      if (lbl) lbl.textContent = t("block.addBelowStream");
+      this.streamAddBtnEl.title = t("topbar.newBlockTitle");
+    }
+
+    for (const block of this.blocks) {
+      const card = this.cards.get(block.id);
+      if (!card) continue;
+      const editable = this.isEditable(block);
+
+      const sel = card.querySelector<HTMLSelectElement>(".lang-select");
+      if (sel) sel.setAttribute("aria-label", t("block.langAria"));
+
+      const seg = card.querySelector<HTMLElement>(".mode-seg");
+      if (seg) {
+        seg.setAttribute("aria-label", t("block.viewModeAria"));
+        for (const btn of Array.from(seg.querySelectorAll<HTMLButtonElement>("button[data-mode]"))) {
+          const modeKey = btn.dataset.mode as BlockViewMode | undefined;
+          if (modeKey === "source") {
+            btn.textContent = t("block.modeSource");
+            btn.title = t("block.modeSourceTitle");
+          } else if (modeKey === "preview") {
+            btn.textContent = t("block.modePreview");
+            btn.title = t("block.modePreviewTitle");
+          } else if (modeKey === "split") {
+            btn.textContent = t("block.modeSplit");
+            btn.title = t("block.modeSplitTitle");
+          }
+        }
+      }
+
+      const vBadgeLabel = card.querySelector<HTMLElement>(".vault-badge-label");
+      if (vBadgeLabel) {
+        vBadgeLabel.textContent = editable ? t("vault.badgeUnlocked") : t("vault.badgeLocked");
+      }
+
+      this.syncConflictBadge(card, block);
+      this.renderDirtyBadge(card, block.id);
+
+      const moreBtn = card.querySelector<HTMLButtonElement>(".block-more-trigger");
+      if (moreBtn) {
+        moreBtn.title = t("block.more");
+        const sr = moreBtn.querySelector<HTMLElement>(".sr-only");
+        if (sr) sr.textContent = t("block.more");
+      }
+
+      const copyRichBtn = card.querySelector<HTMLButtonElement>(".copy-rich-slot button");
+      if (copyRichBtn) {
+        copyRichBtn.title = t("block.copyRichTitle");
+        const labelSpan = copyRichBtn.querySelector<HTMLElement>(".menu-item-label");
+        if (labelSpan) labelSpan.textContent = t("block.copyRich");
+      }
+
+      for (const btn of Array.from(card.querySelectorAll<HTMLButtonElement>(".block-header-right button[data-action]"))) {
+        const action = btn.dataset.action as CardActionKey | undefined;
+        if (!action) continue;
+        const { label, title } = this.getCardActionCopy(action, block, editable);
+        btn.title = title;
+        const sr = btn.querySelector<HTMLElement>(".sr-only");
+        if (sr) sr.textContent = label;
+        const menuLbl = btn.querySelector<HTMLElement>(".menu-item-label");
+        if (menuLbl) menuLbl.textContent = label;
+      }
+
+      const lockedCard = card.querySelector<HTMLElement>(".locked-card");
+      if (lockedCard) {
+        this.populateLockedCardContent(lockedCard, block);
+      }
+
+      const unreadableText = card.querySelector<HTMLElement>(".unreadable-card-text");
+      if (unreadableText) {
+        unreadableText.textContent = t("block.unreadableCard");
+      }
+
+      this.renderConflictSection(card, block);
+      if (this.dirty.get(block.id)?.mismatch) {
+        this.renderMismatchNotice(block.id, true);
+      }
+
+      this.previewMounts.get(block.id)?.handle.refreshLocale?.();
+    }
   }
 
   private clearTimer(id: string): void {
@@ -666,9 +932,61 @@ export class BlockStreamController {
     this.cb.onActiveChange(id);
   }
 
-  private updateDirtyBadge(id: string, isDirty: boolean, label = "● unsaved"): void {
-    const badge = this.cards.get(id)?.querySelector<HTMLElement>(".dirty-badge");
-    if (badge) badge.textContent = isDirty ? label : "";
+  private dirtyLabelFor(state: DirtyBadgeState): string {
+    switch (state) {
+      case "unsaved":
+        return t("block.dirtyUnsaved");
+      case "conflict":
+        return t("block.dirtyConflict");
+      case "save_failed":
+        return t("block.dirtySaveFailed");
+      case "clean":
+        return "";
+      default: {
+        const _exhaustive: never = state;
+        return _exhaustive;
+      }
+    }
+  }
+
+  private renderDirtyBadge(card: HTMLElement, id: string): void {
+    const badge = card.querySelector<HTMLElement>(".dirty-badge");
+    if (!badge) return;
+    const state = this.dirtyBadgeState.get(id) ?? "clean";
+    badge.replaceChildren();
+    if (state === "clean") return;
+    const dot = document.createElement("span");
+    dot.className = "status-dot";
+    dot.setAttribute("aria-hidden", "true");
+    const text = document.createElement("span");
+    text.textContent = this.dirtyLabelFor(state);
+    badge.append(dot, text);
+  }
+
+  private syncConflictBadge(card: HTMLElement, block: BlockDto): void {
+    const badge = card.querySelector<HTMLElement>(".conflict-badge");
+    if (!badge) return;
+    const count = Math.max(block.versions.length, block.head_op_ids.length);
+    const hasConflict = block.has_conflict || block.versions.length > 1;
+    badge.replaceChildren();
+    if (!hasConflict) {
+      badge.classList.add("hidden");
+      return;
+    }
+    badge.classList.remove("hidden");
+    const lbl = document.createElement("span");
+    lbl.textContent = t("conflict.badge", { count });
+    badge.append(createIcon("git-branch", "xs"), lbl);
+  }
+
+  private updateDirtyBadge(id: string, state: DirtyBadgeState): void {
+    if (state === "clean") {
+      this.dirtyBadgeState.delete(id);
+    } else {
+      this.dirtyBadgeState.set(id, state);
+    }
+    const card = this.cards.get(id);
+    if (card) this.renderDirtyBadge(card, id);
   }
 
   private renderMismatchNotice(id: string, show: boolean): void {
@@ -680,20 +998,21 @@ export class BlockStreamController {
       slot.className = "mismatch-slot";
       card.appendChild(slot);
     }
-    slot.innerHTML = "";
+    slot.replaceChildren();
     if (!show) return;
 
     const bar = document.createElement("div");
     bar.className = "conflict-panel mismatch-panel";
     const msg = document.createElement("span");
-    msg.textContent = "Concurrent edit detected on server — your unsaved draft is preserved.";
+    msg.className = "mismatch-panel-msg";
+    msg.append(createIcon("alert-triangle", "xs"), document.createTextNode(t("mismatch.notice")));
     const actions = document.createElement("div");
-    actions.className = "block-header-right";
+    actions.className = "mismatch-actions";
 
     const mergeBtn = document.createElement("button");
     mergeBtn.type = "button";
     mergeBtn.className = "btn btn-primary btn-icon";
-    mergeBtn.textContent = "Save My Draft Over Latest";
+    mergeBtn.textContent = t("mismatch.saveOver");
     mergeBtn.addEventListener("click", () => {
       void this.flushDirtyBlock(id, { fastSync: true, isMerge: true });
     });
@@ -701,7 +1020,7 @@ export class BlockStreamController {
     const reloadBtn = document.createElement("button");
     reloadBtn.type = "button";
     reloadBtn.className = "btn btn-icon";
-    reloadBtn.textContent = "Discard Draft & Load Latest";
+    reloadBtn.textContent = t("mismatch.discardReload");
     reloadBtn.addEventListener("click", () => {
       this.clearDirty(id);
       const blk = this.blocks.find((b) => b.id === id);
@@ -737,7 +1056,31 @@ export class BlockStreamController {
     return true;
   }
 
+  private ensureStreamAddButton(): void {
+    if (!this.streamAddBtnEl) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "stream-add-block";
+      btn.dataset.testid = "stream-add-block";
+      btn.title = t("topbar.newBlockTitle");
+      const lbl = document.createElement("span");
+      lbl.className = "stream-add-label";
+      lbl.textContent = t("block.addBelowStream");
+      const kbd = document.createElement("kbd");
+      kbd.className = "kbd";
+      kbd.textContent = "⌘↵";
+      btn.append(createIcon("plus", "xs"), lbl, kbd);
+      btn.addEventListener("click", () => {
+        const lastId = this.blocks.at(-1)?.id ?? null;
+        void this.cb.onInsertAfter(lastId);
+      });
+      this.streamAddBtnEl = btn;
+    }
+    this.container.appendChild(this.streamAddBtnEl);
+  }
+
   private renderStream(): void {
+    this.closeOpenOverflow(false);
     this.observer?.disconnect();
     for (const id of [...this.previewMounts.keys()]) this.destroyPreviewForBlock(id);
     for (const m of this.mounted.values()) m.view.destroy();
@@ -748,8 +1091,9 @@ export class BlockStreamController {
     if (this.blocks.length === 0) {
       const empty = document.createElement("div");
       empty.className = "empty-state";
-      empty.textContent = "This buffer has no blocks yet. Press Ctrl/Cmd+Enter or click '+ New Block' to start writing.";
+      empty.textContent = t("block.emptyStream");
       this.container.appendChild(empty);
+      this.ensureStreamAddButton();
       return;
     }
 
@@ -774,6 +1118,8 @@ export class BlockStreamController {
         this.renderMismatchNotice(block.id, true);
       }
     });
+
+    this.ensureStreamAddButton();
   }
 
   /**
@@ -791,6 +1137,9 @@ export class BlockStreamController {
     const desiredIds = new Set(this.blocks.map((b) => b.id));
     for (const [id, card] of [...this.cards.entries()]) {
       if (!desiredIds.has(id)) {
+        if (this.openOverflow && card.contains(this.openOverflow.anchor)) {
+          this.closeOpenOverflow(false);
+        }
         this.observer?.unobserve(card);
         this.destroyPreviewForBlock(id);
         this.viewModes.delete(id);
@@ -817,6 +1166,9 @@ export class BlockStreamController {
 
       if (modeChanged) {
         if (card) {
+          if (this.openOverflow && card.contains(this.openOverflow.anchor)) {
+            this.closeOpenOverflow(false);
+          }
           this.observer?.unobserve(card);
           this.destroyPreviewForBlock(b.id);
           const oldMounted = this.mounted.get(b.id);
@@ -847,11 +1199,14 @@ export class BlockStreamController {
 
       card!.classList.toggle("has-conflict", b.has_conflict);
       card!.classList.toggle("focused", b.id === this.activeBlockId);
+      card!.classList.toggle("is-history-target", b.id === this.historyTargetBlockId);
+      card!.classList.toggle("is-vault-unlocked", b.is_locked && desiredEditable);
       card!.dataset.lang = b.lang;
 
       const sel = card!.querySelector<HTMLSelectElement>(".lang-select");
       if (sel && sel.value !== b.lang) sel.value = b.lang;
 
+      this.syncConflictBadge(card!, b);
       this.syncCardHeaderControls(card!, b);
 
       const m = this.mounted.get(b.id);
@@ -889,13 +1244,94 @@ export class BlockStreamController {
         this.renderMismatchNotice(b.id, true);
       }
     });
+
+    this.ensureStreamAddButton();
+  }
+
+  private getCardActionCopy(
+    action: CardActionKey,
+    block: BlockDto,
+    editable: boolean,
+  ): { label: string; title: string } {
+    switch (action) {
+      case "format":
+        return {
+          label: t("block.format"),
+          title: block.is_locked ? t("block.formatWasmTitle") : t("block.formatTitle"),
+        };
+      case "copy":
+        return { label: t("block.copy"), title: t("block.copyTitle") };
+      case "lock":
+        return { label: t("block.lock"), title: t("block.lockTitle") };
+      case "to-tier1":
+        return { label: t("block.toTier1"), title: t("block.toTier1Title") };
+      case "purge":
+        return { label: t("block.purgeHist"), title: t("block.purgeHistTitle") };
+      case "history":
+        return {
+          label: t("block.history"),
+          title:
+            block.is_locked && !editable
+              ? t("block.historyLockedTitle")
+              : t("block.historyTitle"),
+        };
+      case "move-up":
+        return { label: t("block.moveUp"), title: t("block.moveUp") };
+      case "move-down":
+        return { label: t("block.moveDown"), title: t("block.moveDown") };
+      case "new-below":
+        return { label: t("block.newBelow"), title: t("block.newBelowTitle") };
+      case "trash":
+        return { label: t("block.trash"), title: t("block.trashTitle") };
+      default: {
+        const _exhaustive: never = action;
+        return _exhaustive;
+      }
+    }
+  }
+
+  private populateLockedCardContent(locked: HTMLElement, block: BlockDto): void {
+    locked.replaceChildren();
+    const msg = document.createElement("span");
+    msg.className = "locked-card-msg";
+    msg.appendChild(createIcon("lock", "xs"));
+
+    if (block.public_hint) {
+      const title = document.createElement("span");
+      title.className = "locked-card-title";
+      title.textContent = block.public_hint;
+      const sub = document.createElement("span");
+      sub.className = "locked-card-sub";
+      sub.textContent = t("block.lockedCard");
+      msg.append(title, sub);
+    } else {
+      const primary = document.createElement("span");
+      primary.className = "locked-card-text";
+      primary.textContent = t("block.lockedCard");
+      msg.appendChild(primary);
+    }
+    if (block.has_unlocked_concurrent_version) {
+      const warn = document.createElement("span");
+      warn.className = "locked-card-warn";
+      warn.append(createIcon("alert-triangle", "xs"), document.createTextNode(t("block.lockedConcurrentNote")));
+      msg.appendChild(warn);
+    }
+    locked.appendChild(msg);
+    if (this.cb.onUnlockVaultRequest) {
+      const unlockBtn = document.createElement("button");
+      unlockBtn.type = "button";
+      unlockBtn.className = "btn btn-icon";
+      unlockBtn.textContent = t("vault.unlockAction");
+      unlockBtn.addEventListener("click", () => this.cb.onUnlockVaultRequest?.());
+      locked.appendChild(unlockBtn);
+    }
   }
 
   private buildCard(block: BlockDto): HTMLElement {
     const editable = this.isEditable(block);
     const effContent = this.getEffectiveContent(block);
     const card = document.createElement("section");
-    card.className = `block-card${block.has_conflict ? " has-conflict" : ""}${block.id === this.activeBlockId ? " focused" : ""}${block.is_locked ? " is-vault-block" : ""}`;
+    card.className = `block-card${block.has_conflict ? " has-conflict" : ""}${block.id === this.activeBlockId ? " focused" : ""}${block.id === this.historyTargetBlockId ? " is-history-target" : ""}${block.is_locked ? " is-vault-block" : ""}${block.is_locked && editable ? " is-vault-unlocked" : ""}`;
     card.dataset.blockId = block.id;
     card.dataset.lang = block.lang;
     card.dataset.locked = String(block.is_locked);
@@ -909,7 +1345,7 @@ export class BlockStreamController {
 
     const select = document.createElement("select");
     select.className = "lang-select";
-    select.setAttribute("aria-label", "Block language");
+    select.setAttribute("aria-label", t("block.langAria"));
     const langs = SUPPORTED_LANGS.includes(block.lang as (typeof SUPPORTED_LANGS)[number])
       ? [...SUPPORTED_LANGS]
       : [block.lang, ...SUPPORTED_LANGS];
@@ -927,17 +1363,25 @@ export class BlockStreamController {
     left.appendChild(select);
 
     const modeControls = document.createElement("div");
-    modeControls.className = "mode-seg";
+    modeControls.className = "mode-seg hidden";
     modeControls.setAttribute("role", "group");
-    modeControls.setAttribute("aria-label", "Block view mode");
+    modeControls.setAttribute("aria-label", t("block.viewModeAria"));
     left.appendChild(modeControls);
 
     if (block.is_locked) {
       const vBadge = document.createElement("span");
       vBadge.className = `vault-badge${editable ? " unlocked" : ""}`;
-      vBadge.textContent = editable ? "🔓 Vault (RAM)" : "🔒 Tier 2";
+      const vLabel = document.createElement("span");
+      vLabel.className = "vault-badge-label";
+      vLabel.textContent = editable ? t("vault.badgeUnlocked") : t("vault.badgeLocked");
+      vBadge.append(createIcon(editable ? "lock-open" : "lock", "xs"), vLabel);
       left.appendChild(vBadge);
     }
+
+    const conflictBadge = document.createElement("span");
+    conflictBadge.className = "conflict-badge hidden";
+    conflictBadge.dataset.testid = `conflict-badge-${block.id}`;
+    left.appendChild(conflictBadge);
 
     const displayLeaf = block.versions.find((v) => v.is_display);
     if (displayLeaf && displayLeaf.actor && displayLeaf.actor !== "human") {
@@ -949,130 +1393,292 @@ export class BlockStreamController {
 
     const dirtyBadge = document.createElement("span");
     dirtyBadge.className = "dirty-badge";
-    const d = this.dirty.get(block.id);
-    dirtyBadge.textContent = d ? (d.mismatch ? "● conflict (unsaved draft)" : "● unsaved") : "";
     left.appendChild(dirtyBadge);
+    const d = this.dirty.get(block.id);
+    if (d && !this.dirtyBadgeState.has(block.id)) {
+      this.dirtyBadgeState.set(block.id, d.mismatch ? "conflict" : "unsaved");
+    }
 
     const right = document.createElement("div");
     right.className = "block-header-right";
 
-    const mkBtn = (label: string, title: string, cls: string, onClick: () => void) => {
+    const mkIconActionBtn = (
+      action: CardActionKey,
+      iconNode: Element,
+      extraCls: string,
+      onClick: (btn: HTMLButtonElement) => void,
+      testId?: string,
+    ): HTMLButtonElement => {
+      const { label, title } = this.getCardActionCopy(action, block, editable);
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.className = `btn btn-icon ${cls}`.trim();
-      btn.textContent = label;
+      btn.className = `btn btn-ghost btn-icon btn-icon-only ${extraCls}`.trim();
+      btn.dataset.action = action;
+      if (testId) btn.dataset.testid = testId;
       btn.title = title;
+      const sr = document.createElement("span");
+      sr.className = "sr-only";
+      sr.textContent = label;
+      btn.append(iconNode, sr);
       btn.addEventListener("mousedown", (ev) => ev.preventDefault());
-      btn.addEventListener("click", onClick);
+      btn.addEventListener("click", () => onClick(btn));
       return btn;
     };
 
-    const copyRichSlot = document.createElement("span");
-    copyRichSlot.className = "copy-rich-slot";
-    right.appendChild(copyRichSlot);
+    const mkOverflowMenuItem = (
+      action: CardActionKey,
+      iconName: IconName,
+      extraCls: string,
+      onClick: () => void,
+      testId?: string,
+    ): HTMLButtonElement => {
+      const { label, title } = this.getCardActionCopy(action, block, editable);
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `menu-item ${extraCls}`.trim();
+      btn.setAttribute("role", "menuitem");
+      btn.dataset.action = action;
+      if (testId) btn.dataset.testid = testId;
+      btn.title = title;
+      const lbl = document.createElement("span");
+      lbl.className = "menu-item-label";
+      lbl.textContent = label;
+      btn.append(createIcon(iconName, "xs", "menu-item-icon"), lbl);
+      btn.addEventListener("mousedown", (ev) => ev.preventDefault());
+      btn.addEventListener("click", () => {
+        this.closeOpenOverflow(false);
+        onClick();
+      });
+      return btn;
+    };
 
     if (editable) {
       right.appendChild(
-        mkBtn("Format", block.is_locked ? "Format in browser WASM only (zero network)" : "Format block (Cmd/Ctrl+Shift+F)", "", () => {
-          const cur = this.blocks.find((x) => x.id === block.id);
-          if (cur) void this.cb.onFormatBlock(cur);
-        }),
+        mkIconActionBtn(
+          "format",
+          createIcon("code-format", "xs"),
+          "",
+          () => {
+            const cur = this.blocks.find((x) => x.id === block.id);
+            if (cur) void this.cb.onFormatBlock(cur);
+          },
+          `format-btn-${block.id}`,
+        ),
       );
       right.appendChild(
-        mkBtn("Copy", "Copy entire block (Cmd/Ctrl+Shift+C)", "", () => {
-          const cur = this.blocks.find((x) => x.id === block.id);
-          if (cur) void this.cb.onCopyBlock(cur, this.getBlockDraftContent(block.id));
-        }),
-      );
-      if (!block.is_locked && this.cb.onLockBlock) {
-        right.appendChild(
-          mkBtn("🔒 Lock", "Encrypt block into Tier 2 Vault", "", () => {
+        mkIconActionBtn(
+          "copy",
+          createIconSwap("copy", "check", "xs"),
+          "",
+          (btn) => {
             const cur = this.blocks.find((x) => x.id === block.id);
-            if (cur) void this.cb.onLockBlock?.(cur);
-          }),
+            if (cur) {
+              void this.cb.onCopyBlock(cur, this.getBlockDraftContent(block.id));
+              btn.setAttribute("data-copied", "");
+              const prevTimer = this.copyFeedbackTimers.get(block.id);
+              if (prevTimer !== undefined) window.clearTimeout(prevTimer);
+              this.copyFeedbackTimers.set(
+                block.id,
+                window.setTimeout(() => {
+                  btn.removeAttribute("data-copied");
+                  this.copyFeedbackTimers.delete(block.id);
+                }, 1400),
+              );
+            }
+          },
+          `copy-btn-${block.id}`,
+        ),
+      );
+    }
+
+    // Overflow `···` menu consolidating secondary & destructive block actions
+    const moreAnchor = document.createElement("div");
+    moreAnchor.className = "popover-anchor block-more-anchor";
+    const moreBtn = document.createElement("button");
+    moreBtn.type = "button";
+    moreBtn.className = "btn btn-ghost btn-icon btn-icon-only block-more-trigger";
+    moreBtn.setAttribute("aria-haspopup", "menu");
+    moreBtn.setAttribute("aria-expanded", "false");
+    moreBtn.title = t("block.more");
+    moreBtn.dataset.testid = `more-btn-${block.id}`;
+    const moreSr = document.createElement("span");
+    moreSr.className = "sr-only";
+    moreSr.textContent = t("block.more");
+    moreBtn.append(createIcon("more-horizontal", "xs"), moreSr);
+    moreBtn.addEventListener("mousedown", (ev) => ev.preventDefault());
+
+    const menuEl = document.createElement("div");
+    menuEl.className = "block-overflow-popover";
+    menuEl.setAttribute("popover", "auto");
+    const menuList = document.createElement("div");
+    menuList.className = "menu-list";
+    menuList.setAttribute("role", "menu");
+
+    const copyRichSlot = document.createElement("div");
+    copyRichSlot.className = "copy-rich-slot";
+    menuList.appendChild(copyRichSlot);
+
+    if (this.cb.onOpenHistory) {
+      menuList.appendChild(
+        mkOverflowMenuItem(
+          "history",
+          "history",
+          "",
+          () => {
+            const cur = this.blocks.find((x) => x.id === block.id);
+            if (cur) this.cb.onOpenHistory?.(cur);
+          },
+          `history-btn-${block.id}`,
+        ),
+      );
+    }
+    if (editable) {
+      if (!block.is_locked && this.cb.onLockBlock) {
+        menuList.appendChild(
+          mkOverflowMenuItem(
+            "lock",
+            "lock",
+            "",
+            () => {
+              const cur = this.blocks.find((x) => x.id === block.id);
+              if (cur) void this.cb.onLockBlock?.(cur);
+            },
+            `lock-btn-${block.id}`,
+          ),
         );
       } else if (block.is_locked && this.cb.onUnlockBlockToTier1) {
-        right.appendChild(
-          mkBtn("To Tier 1", "Downgrade block back to Tier 1", "", () => {
-            const cur = this.blocks.find((x) => x.id === block.id);
-            if (cur) void this.cb.onUnlockBlockToTier1?.(cur);
-          }),
+        menuList.appendChild(
+          mkOverflowMenuItem(
+            "to-tier1",
+            "shield-off",
+            "",
+            () => {
+              const cur = this.blocks.find((x) => x.id === block.id);
+              if (cur) void this.cb.onUnlockBlockToTier1?.(cur);
+            },
+            `lock-btn-${block.id}`,
+          ),
         );
       }
       if (this.cb.onPurgeHistory) {
-        right.appendChild(
-          mkBtn("Purge Hist", "Schedule old historical keys for cryptographic shred (24h min grace)", "", () => {
-            const cur = this.blocks.find((x) => x.id === block.id);
-            if (cur) void this.cb.onPurgeHistory?.(cur);
-          }),
+        menuList.appendChild(
+          mkOverflowMenuItem(
+            "purge",
+            "eraser",
+            "",
+            () => {
+              const cur = this.blocks.find((x) => x.id === block.id);
+              if (cur) void this.cb.onPurgeHistory?.(cur);
+            },
+            `purge-btn-${block.id}`,
+          ),
         );
       }
     }
-    if (this.cb.onOpenHistory) {
-      const histBtn = mkBtn(
-        "History",
-        block.is_locked && !editable
-          ? "Unlock Vault to inspect Tier 2 block history"
-          : "View version history & revert",
-        "",
-        () => {
-          const cur = this.blocks.find((x) => x.id === block.id);
-          if (cur) this.cb.onOpenHistory?.(cur);
-        },
-      );
-      histBtn.dataset.testid = `history-btn-${block.id}`;
-      right.appendChild(histBtn);
-    }
-    right.appendChild(
-      mkBtn("↑", "Move block up", "", () => {
+
+    const sep1 = document.createElement("div");
+    sep1.className = "menu-sep";
+    sep1.setAttribute("role", "separator");
+    menuList.appendChild(sep1);
+
+    menuList.appendChild(
+      mkOverflowMenuItem("move-up", "arrow-up", "", () => {
         const cur = this.blocks.find((x) => x.id === block.id);
         if (cur) void this.cb.onMoveBlock(cur, -1);
       }),
     );
-    right.appendChild(
-      mkBtn("↓", "Move block down", "", () => {
+    menuList.appendChild(
+      mkOverflowMenuItem("move-down", "arrow-down", "", () => {
         const cur = this.blocks.find((x) => x.id === block.id);
         if (cur) void this.cb.onMoveBlock(cur, 1);
       }),
     );
-    right.appendChild(
-      mkBtn("+ Below", "New block below (Cmd/Ctrl+Enter)", "", () => {
+    menuList.appendChild(
+      mkOverflowMenuItem("new-below", "plus", "", () => {
         void this.cb.onInsertAfter(block.id);
       }),
     );
-    right.appendChild(
-      mkBtn("Trash", "Move block to recycle bin", "btn-danger", () => {
-        const cur = this.blocks.find((x) => x.id === block.id);
-        if (cur) void this.cb.onDeleteBlock(cur);
-      }),
+
+    const sep2 = document.createElement("div");
+    sep2.className = "menu-sep";
+    sep2.setAttribute("role", "separator");
+    menuList.appendChild(sep2);
+
+    menuList.appendChild(
+      mkOverflowMenuItem(
+        "trash",
+        "trash",
+        "menu-item-danger",
+        () => {
+          const cur = this.blocks.find((x) => x.id === block.id);
+          if (cur) void this.cb.onDeleteBlock(cur);
+        },
+        `trash-btn-${block.id}`,
+      ),
     );
+
+    menuEl.appendChild(menuList);
+
+    const supportsPopover =
+      typeof HTMLElement !== "undefined" &&
+      "popover" in HTMLElement.prototype &&
+      typeof (menuEl as HTMLElement & { showPopover?: unknown }).showPopover === "function" &&
+      typeof (menuEl as HTMLElement & { hidePopover?: unknown }).hidePopover === "function";
+
+    if (!supportsPopover) {
+      menuEl.classList.add("popover-fallback");
+    } else {
+      menuEl.addEventListener("toggle", (ev) => {
+        const opened = (ev as Event & { newState?: string }).newState === "open";
+        moreBtn.setAttribute("aria-expanded", String(opened));
+        if (opened) {
+          this.openOverflow = { anchor: moreAnchor, trigger: moreBtn, menu: menuEl, supportsPopover };
+        } else if (this.openOverflow?.menu === menuEl) {
+          this.openOverflow = null;
+        }
+      });
+    }
+
+    moreBtn.addEventListener("click", () => {
+      const isSameOpen = this.openOverflow?.menu === menuEl;
+      this.closeOpenOverflow(false);
+      if (isSameOpen) return;
+      if (supportsPopover) {
+        try {
+          (menuEl as HTMLElement & { showPopover(opts?: { source?: HTMLElement }): void }).showPopover({
+            source: moreBtn,
+          });
+        } catch {
+          (menuEl as HTMLElement & { showPopover(): void }).showPopover();
+        }
+      } else {
+        menuEl.dataset.open = "true";
+        menuEl.classList.add("is-open");
+        moreBtn.setAttribute("aria-expanded", "true");
+        this.openOverflow = { anchor: moreAnchor, trigger: moreBtn, menu: menuEl, supportsPopover };
+      }
+    });
+
+    moreAnchor.append(moreBtn, menuEl);
+    right.appendChild(moreAnchor);
 
     header.append(left, right);
     card.appendChild(header);
+    this.syncConflictBadge(card, block);
+    this.renderDirtyBadge(card, block.id);
 
     if (block.is_locked && !editable) {
       const locked = document.createElement("div");
       locked.className = "locked-card";
-      const label = document.createElement("span");
-      label.textContent = `🔒 Locked Tier 2 Block${block.public_hint ? ` (${block.public_hint})` : ""}${
-        block.has_unlocked_concurrent_version ? " — ⚠ has unlocked concurrent version" : ""
-      }`;
-      locked.appendChild(label);
-      if (this.cb.onUnlockVaultRequest) {
-        const unlockBtn = document.createElement("button");
-        unlockBtn.type = "button";
-        unlockBtn.className = "btn btn-primary btn-icon";
-        unlockBtn.textContent = "Unlock Vault";
-        unlockBtn.addEventListener("click", () => this.cb.onUnlockVaultRequest?.());
-        locked.appendChild(unlockBtn);
-      }
+      this.populateLockedCardContent(locked, block);
       card.appendChild(locked);
     } else if (effContent === null) {
-      // Anti-wipe UI guard: NEVER mount an editable empty editor over KEY_UNAVAILABLE / DECRYPT_FAILED!
       const unreadable = document.createElement("div");
       unreadable.className = "unreadable-card";
-      unreadable.textContent =
-        "⚠ Block content unavailable (missing encryption key or decryption failed) — read-only until keys sync or keyring is unlocked.";
+      const unreadableText = document.createElement("span");
+      unreadableText.className = "unreadable-card-text";
+      unreadableText.textContent = t("block.unreadableCard");
+      unreadable.append(createIcon("alert-triangle", "sm"), unreadableText);
       card.appendChild(unreadable);
     } else {
       const body = document.createElement("div");
@@ -1116,24 +1722,50 @@ export class BlockStreamController {
     return card;
   }
 
+  private appendInlineDiffSegments(
+    container: HTMLElement,
+    segments: readonly InlineDiffSegment[],
+    changeClass: string,
+  ): void {
+    const frag = document.createDocumentFragment();
+    for (const seg of segments) {
+      if (seg.kind === "changed") {
+        const mark = document.createElement("span");
+        mark.className = changeClass;
+        mark.textContent = seg.text;
+        frag.appendChild(mark);
+      } else {
+        frag.appendChild(document.createTextNode(seg.text));
+      }
+    }
+    container.replaceChildren(frag);
+  }
+
   private renderConflictSection(card: HTMLElement, block: BlockDto): void {
     const slot = card.querySelector<HTMLElement>(".conflict-slot");
     if (!slot) return;
-    slot.innerHTML = "";
+    slot.replaceChildren();
     if (block.versions.length <= 1) return;
     if (block.is_locked && !this.isEditable(block)) return;
 
     const panel = document.createElement("div");
     panel.className = "conflict-panel";
 
+    const hasLocalMergeEdit = this.dirty.has(block.id);
     const title = document.createElement("div");
     title.className = "conflict-title";
     const span = document.createElement("span");
-    span.textContent = `⚡ ${block.versions.length} concurrent versions — review & merge manually (zero silent overwrite)`;
+    span.className = "conflict-title-msg";
+    span.append(
+      createIcon("git-branch", "xs"),
+      document.createTextNode(t("conflict.title", { count: block.versions.length })),
+    );
     const commitBtn = document.createElement("button");
     commitBtn.type = "button";
-    commitBtn.className = "btn btn-primary btn-icon";
-    commitBtn.textContent = "Commit Merged Editor Text";
+    commitBtn.className = hasLocalMergeEdit
+      ? "btn btn-primary btn-icon conflict-commit-btn"
+      : "btn btn-icon conflict-commit-btn";
+    commitBtn.textContent = t("conflict.commitMerged");
     commitBtn.disabled = !this.isEditable(block);
     commitBtn.addEventListener("click", () => {
       void this.flushDirtyBlock(block.id, { fastSync: true, isMerge: true });
@@ -1141,23 +1773,38 @@ export class BlockStreamController {
     title.append(span, commitBtn);
     panel.appendChild(title);
 
+    const resolveLeafText = (v: BlockDto["versions"][number]): string | null =>
+      v.content ?? this.unlockedLeafPlaintext.get(block.id)?.get(v.op_id) ?? null;
+
+    const displayVersion = block.versions.find((v) => v.is_display) ?? block.versions[0];
+    const displayText = displayVersion ? resolveLeafText(displayVersion) : null;
+    const firstOtherText =
+      block.versions
+        .filter((v) => v !== displayVersion)
+        .map((v) => resolveLeafText(v))
+        .find((txt): txt is string => txt !== null) ?? null;
+
     const leavesGrid = document.createElement("div");
     leavesGrid.className = "conflict-leaves";
     for (const v of block.versions) {
       const leafCard = document.createElement("div");
-      leafCard.className = "leaf-card";
+      leafCard.className = `leaf-card${v.is_display ? " is-display-leaf" : ""}`;
       const meta = document.createElement("div");
       meta.className = "leaf-meta";
       const label = document.createElement("span");
-      label.textContent = `${v.is_display ? "Displayed" : "Other device"} · ${v.device_id} · ${v.actor}`;
+      label.className = "leaf-meta-label";
+      const devName = formatDeviceName(v.device_id);
+      const actorPart = v.actor && v.actor !== "human" ? ` · ${v.actor}` : "";
+      label.textContent = `${v.is_display ? t("conflict.displayed") : t("conflict.otherDevice")} · ${devName}${actorPart}`;
+      label.title = v.device_id;
       const keepBtn = document.createElement("button");
       keepBtn.type = "button";
-      keepBtn.className = "btn btn-amber btn-icon";
-      keepBtn.textContent = "Keep this version";
-      const leafText = v.content ?? this.unlockedLeafPlaintext.get(block.id)?.get(v.op_id) ?? null;
+      keepBtn.className = "btn btn-icon";
+      keepBtn.textContent = v.is_display ? t("conflict.keepShown") : t("conflict.useVersion");
+      const leafText = resolveLeafText(v);
       if (leafText === null) {
         keepBtn.disabled = true;
-        keepBtn.title = "Cannot keep an unreadable or sealed version";
+        keepBtn.title = t("conflict.cannotKeepTitle");
       } else {
         keepBtn.addEventListener("click", () => {
           const cur = this.blocks.find((x) => x.id === block.id);
@@ -1167,7 +1814,17 @@ export class BlockStreamController {
       meta.append(label, keepBtn);
       const body = document.createElement("pre");
       body.className = "leaf-body";
-      body.textContent = leafText ?? (v.is_locked ? "<sealed>" : "<unavailable — missing key or decrypt failed>");
+      if (leafText === null) {
+        body.textContent = v.is_locked ? t("conflict.sealed") : t("conflict.unavailable");
+      } else if (v.is_display && firstOtherText !== null) {
+        const diff = computeInlineWordDiff(leafText, firstOtherText);
+        this.appendInlineDiffSegments(body, diff.left, "conflict-diff-shown");
+      } else if (!v.is_display && displayText !== null) {
+        const diff = computeInlineWordDiff(displayText, leafText);
+        this.appendInlineDiffSegments(body, diff.right, "conflict-diff-other");
+      } else {
+        body.textContent = leafText;
+      }
       leafCard.append(meta, body);
       leavesGrid.appendChild(leafCard);
     }
@@ -1262,10 +1919,11 @@ export class BlockStreamController {
     const cspNonce = document.querySelector<HTMLMetaElement>('meta[name="csp-nonce"]')?.content ?? "";
     const exts: Extension[] = [
       ...(cspNonce ? [EditorView.cspNonce.of(cspNonce)] : []),
+      ...myNoteCmExtensions,
+      findHighlightField,
       vimComp.of([]),
       bridgeKeymap,
       history(),
-      syntaxHighlighting(defaultHighlightStyle),
       langComp.of([]),
       keymap.of([...defaultKeymap, ...historyKeymap]),
       EditorView.domEventHandlers({
@@ -1296,7 +1954,14 @@ export class BlockStreamController {
           const baseHeads = prevDirty ? prevDirty.baseHeads : [...(cur?.head_op_ids ?? block.head_op_ids)];
           const mismatch = prevDirty?.mismatch ?? false;
           this.dirty.set(block.id, { text, baseHeads, mismatch });
-          this.updateDirtyBadge(block.id, true, mismatch ? "● conflict (unsaved draft)" : "● unsaved");
+          this.updateDirtyBadge(block.id, mismatch ? "conflict" : "unsaved");
+          if (cur?.has_conflict) {
+            const commitBtn = this.cards.get(block.id)?.querySelector<HTMLButtonElement>(".conflict-commit-btn");
+            if (commitBtn) {
+              commitBtn.classList.remove("btn-ghost");
+              commitBtn.classList.add("btn-primary");
+            }
+          }
           if (this.getBlockViewMode(block.id) === "split") {
             this.scheduleSplitPreviewUpdate(block.id);
           }
@@ -1311,7 +1976,6 @@ export class BlockStreamController {
             const secretHit = detectSecretPatternFast(pasted || text);
             if (secretHit) this.cb.onSecretPasted(cur, secretHit);
           }
-          // Conflicted or mismatched blocks require explicit merge confirmation so edits never silently discard sibling leaves
           if (!cur || cur.has_conflict || mismatch) return;
           const delayMs = isPaste ? 50 : text.length > LARGE_BLOCK_BYTES ? 3500 : 450;
           this.clearTimer(block.id);
@@ -1332,6 +1996,16 @@ export class BlockStreamController {
     });
     const entry: MountedEditor = { view, langComp, vimComp, langLoaded: block.lang };
     this.mounted.set(block.id, entry);
+
+    if (this.activeFindQuery) {
+      view.dispatch({
+        effects: SET_FIND_HIGHLIGHT.of({
+          query: this.activeFindQuery,
+          activeFrom: this.activeFindHit?.blockId === block.id ? this.activeFindHit.from : null,
+          activeTo: this.activeFindHit?.blockId === block.id ? this.activeFindHit.to : null,
+        }),
+      });
+    }
 
     const initialLang = block.lang;
     void loadLangExtension(initialLang).then((ext) => {
@@ -1369,16 +2043,17 @@ export class BlockStreamController {
         } else {
           seg.replaceChildren();
           const items: Array<{ key: BlockViewMode; label: string; title: string }> = [
-            { key: "source", label: "Source", title: "Source view (Cmd/Ctrl+E)" },
-            { key: "preview", label: "Preview", title: "Preview view (Cmd/Ctrl+E)" },
-            { key: "split", label: "Split", title: "Split source & live preview" },
+            { key: "source", label: t("block.modeSource"), title: t("block.modeSourceTitle") },
+            { key: "preview", label: t("block.modePreview"), title: t("block.modePreviewTitle") },
+            { key: "split", label: t("block.modeSplit"), title: t("block.modeSplitTitle") },
           ];
           for (const item of items) {
             const btn = document.createElement("button");
             btn.type = "button";
-            btn.className = "btn btn-icon mode-seg-btn";
+            btn.className = "btn btn-icon btn-static mode-seg-btn";
             btn.textContent = item.label;
             btn.title = item.title;
+            btn.dataset.mode = item.key;
             btn.dataset.testid = `mode-${item.key}-${block.id}`;
             btn.setAttribute("aria-pressed", String(mode === item.key));
             btn.addEventListener("mousedown", (ev) => ev.preventDefault());
@@ -1399,12 +2074,17 @@ export class BlockStreamController {
       } else if (richSlot.childElementCount === 0) {
         const btn = document.createElement("button");
         btn.type = "button";
-        btn.className = "btn btn-icon";
-        btn.textContent = "Copy Rich";
-        btn.title = "Copy clean semantic HTML + plain text";
+        btn.className = "menu-item";
+        btn.setAttribute("role", "menuitem");
+        const lbl = document.createElement("span");
+        lbl.className = "menu-item-label";
+        lbl.textContent = t("block.copyRich");
+        btn.append(createIcon("file-rich", "xs", "menu-item-icon"), lbl);
+        btn.title = t("block.copyRichTitle");
         btn.dataset.testid = `copy-rich-${block.id}`;
         btn.addEventListener("mousedown", (ev) => ev.preventDefault());
         btn.addEventListener("click", () => {
+          this.closeOpenOverflow(false);
           const cur = this.blocks.find((x) => x.id === block.id);
           const mounted = this.previewMounts.get(block.id);
           if (!cur || !mounted || mounted.kind !== "markdown") return;
@@ -1522,7 +2202,7 @@ export class BlockStreamController {
     if (!cur || !this.isEditable(cur)) return;
     if (cur.is_locked) this.cb.onVaultActivity?.();
     if (cur.has_conflict || this.dirty.get(blockId)?.mismatch) {
-      this.cb.onFeedback?.("Resolve concurrent conflict before toggling tasks", true);
+      this.cb.onFeedback?.(t("block.toastResolveBeforeTaskToggle"), true);
       const card = this.cards.get(blockId);
       if (card) this.syncPreviewForBlock(card, cur, true);
       return;
@@ -1535,7 +2215,7 @@ export class BlockStreamController {
 
     const expectedHeads = this.getExpectedHeadsForBlock(blockId);
     this.dirty.set(blockId, { text: nextSource, baseHeads: expectedHeads, mismatch: false });
-    this.updateDirtyBadge(blockId, true);
+    this.updateDirtyBadge(blockId, "unsaved");
 
     const m = this.mounted.get(blockId);
     if (m) {

@@ -122,9 +122,11 @@ def main():
             )
             print("[sec-03] 1. Vault initialized & unlocked in real Chromium WASM OK")
 
-            # 3. Lock the JSON block into Tier 2 Vault
+            # 3. Lock the JSON block into Tier 2 Vault (via block overflow popover)
             card = page.locator(f'[data-block-id="{blk_id}"]')
-            card.get_by_role("button", name="🔒 Lock").click()
+            card.hover()
+            page.click(f'[data-testid="more-btn-{blk_id}"]')
+            page.click(f'[data-testid="lock-btn-{blk_id}"]')
             page.fill('[data-testid="lock-hint-input"]', "SEC03 Vault Hint")
             page.click('[data-testid="lock-confirm-btn"]')
             page.wait_for_selector(f'[data-block-id="{blk_id}"][data-locked="true"]', timeout=10000)
@@ -136,7 +138,8 @@ def main():
             page.keyboard.press("ControlOrMeta+a")
             page.keyboard.type(f'{{"secret":"{t2_canary}","n":1}}')
             # Click Format -> MUST run purely in browser WASM with ZERO /v1/local/format HTTP calls!
-            card.get_by_role("button", name="Format").click()
+            card.hover()
+            page.click(f'[data-testid="format-btn-{blk_id}"]')
             try:
                 page.wait_for_function(
                     f"""() => {{

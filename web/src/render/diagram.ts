@@ -1,4 +1,6 @@
 import createDOMPurify, { type DOMPurify as DOMPurifyInstance } from "dompurify";
+import { t } from "../i18n";
+import { createIcon, createIconSwap } from "../icons";
 
 export interface DiagramRenderResult {
   svg: string;
@@ -29,6 +31,7 @@ export interface DiagramWidgetOptions {
 export interface DiagramWidgetHandle {
   readonly ready: Promise<boolean>;
   update(nextSource: string): Promise<boolean>;
+  refreshLocale?(): void;
   destroy(): void;
 }
 
@@ -90,30 +93,30 @@ const SAFE_DASHARRAY_RE = /^(?:none|\d+(?:\.\d+)?(?:[\s,]+\d+(?:\.\d+)?)*)$/;
 const SAFE_FONT_WEIGHT_RE = /^(?:normal|bold|bolder|lighter|italic|[1-9]00)$/;
 
 const PELE_DEFAULT_TOKENS: Readonly<Record<string, string>> = {
-  "--_bg": "#ffffff",
-  "--_fg": "#1f1f1f",
-  "--_m": "#6e6e6e",
-  "--_l": "#1f1f1f",
-  "--_s": "#f3f3f3",
-  "--_a": "#e6e6e6",
-  "--_b": "#8a8a8a",
-  "--_c": "#5b7bd5",
-  "--_r": "4",
-  "--_hw": "bold",
+  "--_bg": "#FFFFFF",
+  "--_fg": "#181715",
+  "--_m": "#5F5A51",
+  "--_l": "#4A463F",
+  "--_s": "#FAF8F4",
+  "--_a": "#EFECE5",
+  "--_b": "#878073",
+  "--_c": "#2E5A88",
+  "--_r": "6",
+  "--_hw": "600",
   "--_fm": "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-  "--pele-bg": "#ffffff",
-  "--pele-fg": "#1f1f1f",
-  "--pele-fg-on-light": "#1f1f1f",
-  "--pele-fg-on-dark": "#ffffff",
-  "--pele-muted": "#6e6e6e",
-  "--pele-line": "#1f1f1f",
-  "--pele-surface": "#f3f3f3",
-  "--pele-surface-alt": "#e6e6e6",
-  "--pele-border": "#8a8a8a",
-  "--pele-accent": "#5b7bd5",
-  "--pele-radius": "4",
-  "--pele-heading-weight": "bold",
-  "--pele-font": "-apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif",
+  "--pele-bg": "#FFFFFF",
+  "--pele-fg": "#181715",
+  "--pele-fg-on-light": "#181715",
+  "--pele-fg-on-dark": "#ECEAE4",
+  "--pele-muted": "#5F5A51",
+  "--pele-line": "#4A463F",
+  "--pele-surface": "#FAF8F4",
+  "--pele-surface-alt": "#EFECE5",
+  "--pele-border": "#878073",
+  "--pele-accent": "#2E5A88",
+  "--pele-radius": "6",
+  "--pele-heading-weight": "600",
+  "--pele-font": '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif',
   "--pele-font-mono": "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
 };
 
@@ -953,30 +956,24 @@ function reportWidgetCopyFeedback(
 
 function formatDiagramError(err: unknown): string {
   if (err instanceof Error && err.message.trim()) {
-    return `Diagram syntax error: ${err.message.trim()}`;
+    return t("diagram.syntaxError", { msg: err.message.trim() });
   }
-  return "Diagram syntax error: unable to render Mermaid diagram";
+  return t("diagram.syntaxFallback");
 }
 
-function createCopyControl(label: string, extraClass: string): {
-  wrapper: HTMLSpanElement;
+function createCopyMenuItem(label: string, extraClass: string): {
   button: HTMLButtonElement;
-  tip: HTMLSpanElement;
+  labelEl: HTMLSpanElement;
 } {
-  const wrapper = document.createElement("span");
-  wrapper.className = "copy";
-
   const button = document.createElement("button");
   button.type = "button";
-  button.className = `btn btn-icon copy-button ${extraClass}`;
-  button.textContent = label;
-
-  const tip = document.createElement("span");
-  tip.className = "copy-tip";
-  tip.setAttribute("role", "status");
-
-  wrapper.append(button, tip);
-  return { wrapper, button, tip };
+  button.className = `menu-item ${extraClass}`;
+  button.setAttribute("role", "menuitem");
+  const labelEl = document.createElement("span");
+  labelEl.className = "menu-item-label";
+  labelEl.textContent = label;
+  button.appendChild(labelEl);
+  return { button, labelEl };
 }
 
 export function mountDiagramWidget(
@@ -993,37 +990,168 @@ export function mountDiagramWidget(
   const toolbar = document.createElement("div");
   toolbar.className = "diagram-toolbar";
   toolbar.setAttribute("role", "toolbar");
-  toolbar.setAttribute("aria-label", "Diagram controls");
+  toolbar.setAttribute("aria-label", t("diagram.controlsAria"));
+
+  const zoomGroup = document.createElement("div");
+  zoomGroup.className = "diagram-toolbar-group";
 
   const zoomInBtn = document.createElement("button");
   zoomInBtn.type = "button";
-  zoomInBtn.className = "btn btn-icon diagram-btn";
-  zoomInBtn.setAttribute("aria-label", "Zoom in");
-  zoomInBtn.textContent = "+";
+  zoomInBtn.className = "btn btn-icon btn-icon-only diagram-btn";
+  zoomInBtn.setAttribute("aria-label", t("diagram.zoomIn"));
+  zoomInBtn.title = t("diagram.zoomIn");
+  zoomInBtn.appendChild(createIcon("zoom-in", "xs"));
 
   const zoomOutBtn = document.createElement("button");
   zoomOutBtn.type = "button";
-  zoomOutBtn.className = "btn btn-icon diagram-btn";
-  zoomOutBtn.setAttribute("aria-label", "Zoom out");
-  zoomOutBtn.textContent = "-";
+  zoomOutBtn.className = "btn btn-icon btn-icon-only diagram-btn";
+  zoomOutBtn.setAttribute("aria-label", t("diagram.zoomOut"));
+  zoomOutBtn.title = t("diagram.zoomOut");
+  zoomOutBtn.appendChild(createIcon("zoom-out", "xs"));
 
   const resetBtn = document.createElement("button");
   resetBtn.type = "button";
-  resetBtn.className = "btn btn-icon diagram-btn";
-  resetBtn.textContent = "Reset";
+  resetBtn.className = "btn btn-icon btn-has-icon diagram-btn";
+  const resetLabel = document.createElement("span");
+  resetLabel.textContent = t("diagram.reset");
+  resetBtn.append(createIcon("rotate-ccw", "xs"), resetLabel);
 
-  const copyPngCtrl = createCopyControl("Copy PNG", "diagram-copy-png");
-  const copySvgCtrl = createCopyControl("Copy SVG", "diagram-copy-svg");
-  const copySrcCtrl = createCopyControl("Copy Source", "diagram-copy-source");
+  zoomGroup.append(zoomOutBtn, zoomInBtn, resetBtn);
 
-  toolbar.append(
-    zoomInBtn,
-    zoomOutBtn,
-    resetBtn,
-    copyPngCtrl.wrapper,
-    copySvgCtrl.wrapper,
-    copySrcCtrl.wrapper,
+  // Single collapsed Copy menu keeps the diagram toolbar strictly single-row in every locale & split width.
+  const copyCluster = document.createElement("div");
+  copyCluster.className = "diagram-copy-cluster";
+
+  const copyTip = document.createElement("span");
+  copyTip.className = "copy-tip";
+  copyTip.setAttribute("role", "status");
+
+  const copyAnchor = document.createElement("div");
+  copyAnchor.className = "popover-anchor diagram-copy-anchor";
+
+  const copyTrigger = document.createElement("button");
+  copyTrigger.type = "button";
+  copyTrigger.className = "btn btn-icon btn-has-icon copy-button diagram-btn diagram-copy-trigger";
+  copyTrigger.setAttribute("aria-haspopup", "menu");
+  copyTrigger.setAttribute("aria-expanded", "false");
+  const copyTriggerLabel = document.createElement("span");
+  copyTriggerLabel.className = "copy-btn-label";
+  copyTriggerLabel.textContent = t("diagram.copyMenu");
+  copyTrigger.append(
+    createIconSwap("copy", "check", "xs"),
+    copyTriggerLabel,
+    createIcon("chevron-down", "xs", "diagram-copy-chevron"),
   );
+
+  const copyMenuEl = document.createElement("div");
+  copyMenuEl.className = "diagram-copy-popover";
+  copyMenuEl.setAttribute("popover", "auto");
+
+  const copyMenuList = document.createElement("div");
+  copyMenuList.className = "menu-list";
+  copyMenuList.setAttribute("role", "menu");
+
+  const copyPngItem = createCopyMenuItem(t("diagram.copyPng"), "diagram-copy-png");
+  const copySvgItem = createCopyMenuItem(t("diagram.copySvg"), "diagram-copy-svg");
+  const copySrcItem = createCopyMenuItem(t("diagram.copySource"), "diagram-copy-source");
+  copyMenuList.append(copyPngItem.button, copySvgItem.button, copySrcItem.button);
+  copyMenuEl.appendChild(copyMenuList);
+  copyAnchor.append(copyTrigger, copyMenuEl);
+  copyCluster.append(copyTip, copyAnchor);
+
+  toolbar.append(zoomGroup, copyCluster);
+
+  const supportsPopover =
+    typeof HTMLElement !== "undefined" &&
+    "popover" in HTMLElement.prototype &&
+    typeof (copyMenuEl as HTMLElement & { showPopover?: unknown }).showPopover === "function" &&
+    typeof (copyMenuEl as HTMLElement & { hidePopover?: unknown }).hidePopover === "function";
+
+  if (!supportsPopover) {
+    copyMenuEl.classList.add("popover-fallback");
+  }
+
+  let copyMenuFallbackOpen = false;
+  const isCopyMenuOpen = (): boolean => {
+    if (supportsPopover) {
+      try {
+        return copyMenuEl.matches(":popover-open");
+      } catch {
+        return copyTrigger.getAttribute("aria-expanded") === "true";
+      }
+    }
+    return copyMenuFallbackOpen;
+  };
+
+  const closeCopyMenu = (restoreFocus: boolean): void => {
+    if (supportsPopover) {
+      if (isCopyMenuOpen()) {
+        try {
+          (copyMenuEl as HTMLElement & { hidePopover(): void }).hidePopover();
+        } catch {
+          // ignore
+        }
+      }
+      copyTrigger.setAttribute("aria-expanded", "false");
+    } else if (copyMenuFallbackOpen) {
+      copyMenuFallbackOpen = false;
+      delete copyMenuEl.dataset.open;
+      copyMenuEl.classList.remove("is-open");
+      copyTrigger.setAttribute("aria-expanded", "false");
+    }
+    if (restoreFocus) {
+      copyTrigger.focus({ preventScroll: true });
+    }
+  };
+
+  const onCopyTriggerClick = (): void => {
+    if (isCopyMenuOpen()) {
+      closeCopyMenu(false);
+      return;
+    }
+    if (supportsPopover) {
+      try {
+        (copyMenuEl as HTMLElement & { showPopover(opts?: { source?: HTMLElement }): void }).showPopover({
+          source: copyTrigger,
+        });
+      } catch {
+        (copyMenuEl as HTMLElement & { showPopover(): void }).showPopover();
+      }
+      copyTrigger.setAttribute("aria-expanded", "true");
+    } else {
+      copyMenuFallbackOpen = true;
+      copyMenuEl.dataset.open = "true";
+      copyMenuEl.classList.add("is-open");
+      copyTrigger.setAttribute("aria-expanded", "true");
+    }
+  };
+
+  const onCopyMenuToggle = (ev: Event): void => {
+    const opened = (ev as Event & { newState?: string }).newState === "open";
+    copyTrigger.setAttribute("aria-expanded", String(opened));
+  };
+
+  const onDocPointerDown = (ev: PointerEvent): void => {
+    if (!copyMenuFallbackOpen) return;
+    if (ev.target instanceof Node && !copyAnchor.contains(ev.target)) {
+      closeCopyMenu(false);
+    }
+  };
+
+  const onDocKeyDown = (ev: KeyboardEvent): void => {
+    if (ev.key === "Escape" && isCopyMenuOpen()) {
+      ev.preventDefault();
+      closeCopyMenu(true);
+    }
+  };
+
+  copyTrigger.addEventListener("click", onCopyTriggerClick);
+  if (supportsPopover) {
+    copyMenuEl.addEventListener("toggle", onCopyMenuToggle);
+  } else {
+    document.addEventListener("pointerdown", onDocPointerDown);
+  }
+  document.addEventListener("keydown", onDocKeyDown);
 
   const hintEl = document.createElement("div");
   hintEl.className = "diagram-syntax-hint hidden";
@@ -1041,19 +1169,22 @@ export function mountDiagramWidget(
   let panZoom: PanZoomController | null = null;
   let renderSeq = 0;
   let destroyed = false;
+  let lastError: unknown = null;
+  let hasError = false;
 
   const onZoomIn = (): void => panZoom?.zoomIn();
   const onZoomOut = (): void => panZoom?.zoomOut();
   const onReset = (): void => panZoom?.reset();
 
   const onCopyPng = async (): Promise<void> => {
+    closeCopyMenu(false);
     if (!currentSvgEl) {
       reportWidgetCopyFeedback(
-        copyPngCtrl.button,
-        copyPngCtrl.tip,
+        copyTrigger,
+        copyTip,
         false,
-        "PNG copied",
-        "Copy failed",
+        t("diagram.pngCopied"),
+        t("md.copyFailed"),
         onFeedback,
       );
       return;
@@ -1061,33 +1192,34 @@ export function mountDiagramWidget(
     try {
       await copyDiagramPng(currentSvgEl, widget);
       reportWidgetCopyFeedback(
-        copyPngCtrl.button,
-        copyPngCtrl.tip,
+        copyTrigger,
+        copyTip,
         true,
-        "PNG copied",
-        "Copy failed",
+        t("diagram.pngCopied"),
+        t("md.copyFailed"),
         onFeedback,
       );
     } catch {
       reportWidgetCopyFeedback(
-        copyPngCtrl.button,
-        copyPngCtrl.tip,
+        copyTrigger,
+        copyTip,
         false,
-        "PNG copied",
-        "Copy failed",
+        t("diagram.pngCopied"),
+        t("md.copyFailed"),
         onFeedback,
       );
     }
   };
 
   const onCopySvg = async (): Promise<void> => {
+    closeCopyMenu(false);
     if (!currentSvgEl) {
       reportWidgetCopyFeedback(
-        copySvgCtrl.button,
-        copySvgCtrl.tip,
+        copyTrigger,
+        copyTip,
         false,
-        "SVG copied",
-        "Copy failed",
+        t("diagram.svgCopied"),
+        t("md.copyFailed"),
         onFeedback,
       );
       return;
@@ -1099,46 +1231,47 @@ export function mountDiagramWidget(
       }
       await navigator.clipboard.writeText(standalone);
       reportWidgetCopyFeedback(
-        copySvgCtrl.button,
-        copySvgCtrl.tip,
+        copyTrigger,
+        copyTip,
         true,
-        "SVG copied",
-        "Copy failed",
+        t("diagram.svgCopied"),
+        t("md.copyFailed"),
         onFeedback,
       );
     } catch {
       reportWidgetCopyFeedback(
-        copySvgCtrl.button,
-        copySvgCtrl.tip,
+        copyTrigger,
+        copyTip,
         false,
-        "SVG copied",
-        "Copy failed",
+        t("diagram.svgCopied"),
+        t("md.copyFailed"),
         onFeedback,
       );
     }
   };
 
   const onCopySource = async (): Promise<void> => {
+    closeCopyMenu(false);
     try {
       if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
         throw new Error("Clipboard unavailable");
       }
       await navigator.clipboard.writeText(currentSource);
       reportWidgetCopyFeedback(
-        copySrcCtrl.button,
-        copySrcCtrl.tip,
+        copyTrigger,
+        copyTip,
         true,
-        "Copied",
-        "Copy failed",
+        t("md.copied"),
+        t("md.copyFailed"),
         onFeedback,
       );
     } catch {
       reportWidgetCopyFeedback(
-        copySrcCtrl.button,
-        copySrcCtrl.tip,
+        copyTrigger,
+        copyTip,
         false,
-        "Copied",
-        "Copy failed",
+        t("md.copied"),
+        t("md.copyFailed"),
         onFeedback,
       );
     }
@@ -1147,9 +1280,9 @@ export function mountDiagramWidget(
   zoomInBtn.addEventListener("click", onZoomIn);
   zoomOutBtn.addEventListener("click", onZoomOut);
   resetBtn.addEventListener("click", onReset);
-  copyPngCtrl.button.addEventListener("click", onCopyPng);
-  copySvgCtrl.button.addEventListener("click", onCopySvg);
-  copySrcCtrl.button.addEventListener("click", onCopySource);
+  copyPngItem.button.addEventListener("click", onCopyPng);
+  copySvgItem.button.addEventListener("click", onCopySvg);
+  copySrcItem.button.addEventListener("click", onCopySource);
 
   const update = async (nextSource: string): Promise<boolean> => {
     currentSource = nextSource;
@@ -1165,6 +1298,8 @@ export function mountDiagramWidget(
       viewportEl.replaceChildren(adoptedSvg);
       currentSvgEl = adoptedSvg;
       panZoom = attachSvgViewBoxPanZoom(viewportEl, adoptedSvg);
+      hasError = false;
+      lastError = null;
       hintEl.textContent = "";
       hintEl.classList.add("hidden");
       hintEl.hidden = true;
@@ -1173,6 +1308,8 @@ export function mountDiagramWidget(
       if (destroyed || seq !== renderSeq) {
         return false;
       }
+      hasError = true;
+      lastError = err;
       hintEl.textContent = formatDiagramError(err);
       hintEl.classList.remove("hidden");
       hintEl.hidden = false;
@@ -1185,23 +1322,44 @@ export function mountDiagramWidget(
   return {
     ready,
     update,
+    refreshLocale() {
+      toolbar.setAttribute("aria-label", t("diagram.controlsAria"));
+      zoomInBtn.setAttribute("aria-label", t("diagram.zoomIn"));
+      zoomInBtn.title = t("diagram.zoomIn");
+      zoomOutBtn.setAttribute("aria-label", t("diagram.zoomOut"));
+      zoomOutBtn.title = t("diagram.zoomOut");
+      resetLabel.textContent = t("diagram.reset");
+      copyTriggerLabel.textContent = t("diagram.copyMenu");
+      copyPngItem.labelEl.textContent = t("diagram.copyPng");
+      copySvgItem.labelEl.textContent = t("diagram.copySvg");
+      copySrcItem.labelEl.textContent = t("diagram.copySource");
+      if (hasError) {
+        hintEl.textContent = formatDiagramError(lastError);
+      }
+    },
     destroy() {
       destroyed = true;
+      closeCopyMenu(false);
       panZoom?.destroy();
       panZoom = null;
       currentSvgEl = null;
+      copyTrigger.removeEventListener("click", onCopyTriggerClick);
+      if (supportsPopover) {
+        copyMenuEl.removeEventListener("toggle", onCopyMenuToggle);
+      } else {
+        document.removeEventListener("pointerdown", onDocPointerDown);
+      }
+      document.removeEventListener("keydown", onDocKeyDown);
       zoomInBtn.removeEventListener("click", onZoomIn);
       zoomOutBtn.removeEventListener("click", onZoomOut);
       resetBtn.removeEventListener("click", onReset);
-      copyPngCtrl.button.removeEventListener("click", onCopyPng);
-      copySvgCtrl.button.removeEventListener("click", onCopySvg);
-      copySrcCtrl.button.removeEventListener("click", onCopySource);
-      for (const btn of [copyPngCtrl.button, copySvgCtrl.button, copySrcCtrl.button]) {
-        const timer = copyTimers.get(btn);
-        if (timer !== undefined) {
-          clearTimeout(timer);
-          copyTimers.delete(btn);
-        }
+      copyPngItem.button.removeEventListener("click", onCopyPng);
+      copySvgItem.button.removeEventListener("click", onCopySvg);
+      copySrcItem.button.removeEventListener("click", onCopySource);
+      const timer = copyTimers.get(copyTrigger);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        copyTimers.delete(copyTrigger);
       }
     },
   };

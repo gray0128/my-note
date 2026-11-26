@@ -342,8 +342,9 @@ def run_check1_and_check2_desktop(p, browser_name: str, data_dir: Path, vectors:
             vb_reset = page.locator(svg_sel).get_attribute("viewBox")
             assert vb_reset == vb0, f"[{browser_name}] Reset did not restore viewBox: got {vb_reset!r}, expected {vb0!r}"
 
-            # Taint-free Copy PNG in real Chromium / real WebKit
+            # Taint-free Copy PNG in real Chromium / real WebKit (via collapsed Copy menu)
             page.evaluate("() => { window.__clipboardWrites = []; }")
+            card.locator(".diagram-copy-trigger").click()
             card.locator(".diagram-copy-png").click()
             page.wait_for_function(
                 """() => window.__clipboardWrites.some(w => w.kind === 'write' && w.items.some(it => 'image/png' in it))""",
@@ -356,7 +357,7 @@ def run_check1_and_check2_desktop(p, browser_name: str, data_dir: Path, vectors:
                 }"""
             )
             assert_png_bytes(png_bytes, f"{browser_name} Desktop Copy PNG")
-            failed_attr = card.locator(".diagram-copy-png").get_attribute("data-failed")
+            failed_attr = card.locator(".diagram-copy-trigger").get_attribute("data-failed")
             assert failed_attr is None, f"[{browser_name}] Copy PNG set data-failed"
             print(
                 f"[m3:{browser_name}] Pele flowchart Pan/Zoom + Taint-Free Copy PNG PASS ({len(png_bytes)} bytes)"
@@ -515,8 +516,10 @@ def run_check3_and_check4_desktop_chromium(p, data_dir: Path) -> None:
     page.keyboard.press(f"{MOD_KEY}+e")
     page.wait_for_selector(f'[data-block-id="{md_blk_id}"][data-view-mode="preview"] .md-preview', timeout=10000)
 
-    # 3a. Copy Rich
+    # 3a. Copy Rich (via block overflow popover)
     page.evaluate("() => { window.__clipboardWrites = []; }")
+    md_card.hover()
+    page.click(f'[data-testid="more-btn-{md_blk_id}"]')
     page.click(f'[data-testid="copy-rich-{md_blk_id}"]')
     page.wait_for_function("() => window.__clipboardWrites.length >= 1", timeout=5000)
     rich_write = page.evaluate("() => window.__clipboardWrites[0]")
@@ -539,8 +542,9 @@ def run_check3_and_check4_desktop_chromium(p, data_dir: Path) -> None:
     assert code_write["text"] == 'print("hi")', f"Copy Code mismatch: {code_write['text']!r}"
     assert "```" not in code_write["text"]
 
-    # 3c. Copy TSV
+    # 3c. Copy TSV (hover table wrap to reveal floating table toolbar)
     page.evaluate("() => { window.__clipboardWrites = []; }")
+    md_card.locator(".md-table-wrap").hover()
     md_card.locator(".md-copy-tsv").click()
     page.wait_for_function("() => window.__clipboardWrites.length >= 1", timeout=5000)
     tsv_text = page.evaluate("() => window.__clipboardWrites[0].text")
@@ -549,6 +553,7 @@ def run_check3_and_check4_desktop_chromium(p, data_dir: Path) -> None:
 
     # 3d. Copy MD
     page.evaluate("() => { window.__clipboardWrites = []; }")
+    md_card.locator(".md-table-wrap").hover()
     md_card.locator(".md-copy-md").click()
     page.wait_for_function("() => window.__clipboardWrites.length >= 1", timeout=5000)
     md_table_text = page.evaluate("() => window.__clipboardWrites[0].text")
@@ -569,6 +574,8 @@ def run_check3_and_check4_desktop_chromium(p, data_dir: Path) -> None:
     print("[m3:chromium] Check 3 (Copy Rich / Code / TSV / MD + Task Checkbox SQLite writeback) PASS")
 
     # ---- Check 4A: Desktop History (Time Travel) Drawer + Actor Badge + Diff + Revert ----
+    page.locator(f'[data-block-id="{hist_blk_id}"]').hover()
+    page.click(f'[data-testid="more-btn-{hist_blk_id}"]')
     page.click(f'[data-testid="history-btn-{hist_blk_id}"]')
     page.wait_for_selector('[data-testid="history-drawer"]:not(.hidden)', timeout=10000)
     page.wait_for_selector(".history-item", timeout=10000)
@@ -622,7 +629,9 @@ def run_check3_and_check4_desktop_chromium(p, data_dir: Path) -> None:
     )
 
     t2_card = page.locator(f'[data-block-id="{t2_hist_blk_id}"]')
-    t2_card.get_by_role("button", name="🔒 Lock").click()
+    t2_card.hover()
+    page.click(f'[data-testid="more-btn-{t2_hist_blk_id}"]')
+    page.click(f'[data-testid="lock-btn-{t2_hist_blk_id}"]')
     page.fill('[data-testid="lock-hint-input"]', "M3 Tier 2 History Hint")
     page.click('[data-testid="lock-confirm-btn"]')
     page.wait_for_selector(f'[data-block-id="{t2_hist_blk_id}"][data-locked="true"]', timeout=10000)
@@ -647,6 +656,8 @@ def run_check3_and_check4_desktop_chromium(p, data_dir: Path) -> None:
     )
 
     # Open History drawer on Tier 2 block & inspect the v1 Tier 2 revision (decrypted strictly in WASM RAM!)
+    t2_card.hover()
+    page.click(f'[data-testid="more-btn-{t2_hist_blk_id}"]')
     page.click(f'[data-testid="history-btn-{t2_hist_blk_id}"]')
     page.wait_for_selector('[data-testid="history-drawer"]:not(.hidden) .history-item', timeout=10000)
     # Entries are newest-first: [0] is v2 (current), [1] is v1 (both UPDATE with locked badge)
@@ -836,9 +847,10 @@ def run_check5_mobile_pwa_webkit(p, raw_vectors: dict) -> None:
         assert len(dom_findings) == 0, f"SEC-06 Mobile WebKit DOM VIOLATIONS: {dom_findings}"
         assert len(outbound_urls) == 0, f"SEC-06 Mobile WebKit EXFILTRATION: {outbound_urls}"
 
-        # Taint-Free Copy PNG in Mobile WebKit PWA
+        # Taint-Free Copy PNG in Mobile WebKit PWA (via collapsed Copy menu)
         page.evaluate("() => { window.__clipboardWrites = []; }")
         mermaid_card = page.locator(f'[data-block-id="{mermaid_blk_id}"]')
+        mermaid_card.locator(".diagram-copy-trigger").click()
         mermaid_card.locator(".diagram-copy-png").click()
         page.wait_for_function(
             """() => window.__clipboardWrites.some(w => w.kind === 'write' && w.items.some(it => 'image/png' in it))""",

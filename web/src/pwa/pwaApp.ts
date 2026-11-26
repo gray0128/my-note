@@ -1,4 +1,13 @@
 import {
+  createLocaleSwitch,
+  createThemeMenu,
+  type LocaleSwitchHandle,
+  type ThemeMenuHandle,
+} from "../components/themeMenu";
+import { formatDeviceName, subscribeLocale, syncDocumentLocale, t } from "../i18n";
+import { createIcon, type IconName } from "../icons";
+import { initTheme } from "../theme";
+import {
   b64ToBytes,
   ensurePwaWasm,
   parseWasmError,
@@ -26,7 +35,6 @@ import {
 } from "./idb";
 
 const MOBILE_VAULT_IDLE_MS = 5 * 60 * 1000;
-const PWA_BUILD_VERSION = "M3-0.3.0";
 const isPageHidden = (): boolean => document.visibilityState === "hidden";
 
 function isPwaMarkdownLang(lang: string): boolean {
@@ -108,6 +116,13 @@ function validateSyncUrl(raw: string): string {
   return u.toString().replace(/\/+$/, "");
 }
 
+type PwaSyncStatus =
+  | { readonly kind: "idle" }
+  | { readonly kind: "syncing" }
+  | { readonly kind: "synced"; readonly seq: number }
+  | { readonly kind: "partial"; readonly seq: number }
+  | { readonly kind: "offline" };
+
 /**
  * Mobile Read-Only PWA (`#19 [M2-5]`, D1, `SEC-08`).
  * - Strictly read-only (zero editing, zero outbox, zero CM6, zero soft keyboard on note cards).
@@ -137,16 +152,23 @@ export class MobilePwaApp {
   private wsConnected = false;
   private disconnectWs: (() => void) | null = null;
   private revoked = false;
-  private pairingErrorBanner: string | null = null;
-  private syncTruncatedBanner: string | null = null;
+  private pairingSnatchWarning = false;
+  private syncTruncated = false;
   private pendingSwWorker: ServiceWorker | null = null;
   private swReloadWired = false;
-  private statusText = "Idle";
+  private syncStatus: PwaSyncStatus = { kind: "idle" };
   private toastTimer: number | null = null;
   private activeMediaStream: MediaStream | null = null;
   private qrCancelToken = 0;
 
+  private themeMenu!: ThemeMenuHandle;
+  private localeSwitch!: LocaleSwitchHandle;
+  private unsubLocale: (() => void) | null = null;
+
   private headerEl!: HTMLElement;
+  private roPillEl!: HTMLSpanElement;
+  private headerDynamicActionsEl!: HTMLElement;
+  private headerSubEl!: HTMLElement;
   private bannerEl!: HTMLElement;
   private mainEl!: HTMLElement;
   private footerEl!: HTMLElement;
@@ -155,7 +177,10 @@ export class MobilePwaApp {
   private toastEl!: HTMLElement;
 
   constructor(private root: HTMLElement) {
+    initTheme();
+    syncDocumentLocale("pwa.title");
     this.buildShell();
+    this.unsubLocale = subscribeLocale(() => this.applyLocale());
     document.addEventListener("visibilitychange", this.onVisibilityChange);
     window.addEventListener("beforeunload", this.onPageHide);
     window.addEventListener("pagehide", this.onPageHide);
@@ -192,6 +217,10 @@ export class MobilePwaApp {
   }
 
   destroy(): void {
+    this.unsubLocale?.();
+    this.unsubLocale = null;
+    this.themeMenu?.destroy();
+    this.localeSwitch?.destroy();
     this.syncAbort?.abort();
     this.stopCamera();
     this.closeModal();
@@ -204,6 +233,10 @@ export class MobilePwaApp {
       this.engine.free();
       this.engine = null;
     }
+    if (this.toastTimer !== null) {
+      window.clearTimeout(this.toastTimer);
+      this.toastTimer = null;
+    }
     document.removeEventListener("visibilitychange", this.onVisibilityChange);
     window.removeEventListener("beforeunload", this.onPageHide);
     window.removeEventListener("pagehide", this.onPageHide);
@@ -212,9 +245,33 @@ export class MobilePwaApp {
   }
 
   private buildShell(): void {
-    this.root.innerHTML = "";
+    this.root.replaceChildren();
+    this.themeMenu = createThemeMenu({ idPrefix: "pwa-" });
+    this.localeSwitch = createLocaleSwitch({ idPrefix: "pwa-" });
     this.headerEl = document.createElement("header");
     this.headerEl.className = "pwa-header";
+    const row1 = document.createElement("div");
+    row1.className = "pwa-header-row";
+    const brand = document.createElement("div");
+    brand.className = "pwa-brand";
+    const brandName = document.createElement("span");
+    brandName.textContent = "my-note";
+    this.roPillEl = document.createElement("span");
+    this.roPillEl.className = "ro-pill";
+    this.roPillEl.textContent = t("pwa.readOnlyPill");
+    brand.append(createIcon("brand-mark", "sm"), brandName, this.roPillEl);
+
+    const actions = document.createElement("div");
+    actions.className = "pwa-actions";
+    this.headerDynamicActionsEl = document.createElement("div");
+    this.headerDynamicActionsEl.className = "pwa-dynamic-actions";
+    // Keep Theme popover & Language toggle stably mounted so background sync/visibility re-renders never detach an open popover
+    actions.append(this.headerDynamicActionsEl, this.themeMenu.element, this.localeSwitch.element);
+
+    row1.append(brand, actions);
+    this.headerSubEl = document.createElement("div");
+    this.headerSubEl.className = "pwa-header-sub hidden";
+    this.headerEl.append(row1, this.headerSubEl);
     this.bannerEl = document.createElement("div");
     this.mainEl = document.createElement("main");
     this.mainEl.className = "pwa-main";
@@ -227,11 +284,22 @@ export class MobilePwaApp {
     });
     this.modalCardEl = document.createElement("div");
     this.modalCardEl.className = "modal-card";
+    this.modalCardEl.setAttribute("role", "dialog");
+    this.modalCardEl.setAttribute("aria-modal", "true");
     this.modalBackdropEl.appendChild(this.modalCardEl);
     this.toastEl = document.createElement("div");
     this.toastEl.className = "toast hidden";
+    this.toastEl.setAttribute("role", "status");
+    this.toastEl.setAttribute("aria-live", "polite");
 
     this.root.append(this.headerEl, this.bannerEl, this.mainEl, this.footerEl, this.modalBackdropEl, this.toastEl);
+  }
+
+  private applyLocale(): void {
+    syncDocumentLocale("pwa.title");
+    this.themeMenu.refreshLocale();
+    this.localeSwitch.refreshLocale();
+    this.render();
   }
 
   private onVisibilityChange = (): void => {
@@ -340,8 +408,8 @@ export class MobilePwaApp {
     this.syncInFlight = true;
     this.syncAbort = new AbortController();
     const signal = this.syncAbort.signal;
-    this.syncTruncatedBanner = null;
-    this.statusText = "Syncing…";
+    this.syncTruncated = false;
+    this.syncStatus = { kind: "syncing" };
     this.renderHeader();
     try {
       const { sync_url, device_token } = this.creds;
@@ -435,10 +503,10 @@ export class MobilePwaApp {
         await saveEngineState(lastOut.state, lastOut.keys_digest);
       }
       if (truncated) {
-        this.syncTruncatedBanner = "Sync reached page limit with more updates on relay — tap Sync to continue.";
-        this.statusText = `Partial #${parsedState.last_seq ?? 0}`;
+        this.syncTruncated = true;
+        this.syncStatus = { kind: "partial", seq: parsedState.last_seq ?? 0 };
       } else {
-        this.statusText = `Synced #${parsedState.last_seq ?? 0}`;
+        this.syncStatus = { kind: "synced", seq: parsedState.last_seq ?? 0 };
       }
     } catch (e) {
       if (signal.aborted || (e instanceof DOMException && e.name === "AbortError")) {
@@ -448,8 +516,8 @@ export class MobilePwaApp {
         this.handleDeviceRevoked();
         return;
       }
-      this.statusText = "Offline (cached)";
-      this.showToast(e instanceof Error ? e.message : "Sync failed", true);
+      this.syncStatus = { kind: "offline" };
+      this.showToast(e instanceof Error ? e.message : t("pwa.toastSyncFailed"), true);
     } finally {
       this.syncAbort = null;
       this.syncInFlight = false;
@@ -465,7 +533,7 @@ export class MobilePwaApp {
   }
 
   private async handlePairSubmit(code: string, isRefresh = false): Promise<void> {
-    this.pairingErrorBanner = null;
+    this.pairingSnatchWarning = false;
     try {
       await ensurePwaWasm();
       const parsed = JSON.parse(WasmSyncEngine.parsePairingCode(code)) as {
@@ -508,7 +576,7 @@ export class MobilePwaApp {
         await saveCredentials(this.creds);
         this.initEngine();
         this.closeModal();
-        this.showToast("Keys refreshed — re-syncing…");
+        this.showToast(t("pwa.toastKeysRefreshed"));
         await this.syncNow();
         return;
       }
@@ -522,13 +590,12 @@ export class MobilePwaApp {
       this.stopCamera();
       this.render();
       this.connectWs();
-      this.showToast("Paired read-only device — syncing…");
+      this.showToast(t("pwa.toastPairedSyncing"));
       await this.syncNow();
     } catch (e) {
       this.stopCamera();
       if (e instanceof CloudApiError && (e.status === 404 || e.status === 410)) {
-        this.pairingErrorBanner =
-          "Pairing ticket missing, expired, or ALREADY CLAIMED! If you did not claim it, run 'mynote device ls' and 'mynote device revoke' on your desktop immediately.";
+        this.pairingSnatchWarning = true;
         this.render();
         return;
       }
@@ -565,7 +632,7 @@ export class MobilePwaApp {
     }
     this.unlockedPlaintext.clear();
     this.render();
-    if (!silent) this.showToast("Vault locked — keys & plaintext wiped");
+    if (!silent) this.showToast(t("pwa.toastVaultLocked"));
   }
 
   private resetVaultIdleTimer(): void {
@@ -628,23 +695,22 @@ export class MobilePwaApp {
 
   private openVaultUnlockModal(): void {
     if (!this.vaultHeaderB64) {
-      this.showToast("No Vault configured yet — initialize Vault on desktop first", true);
+      this.showToast(t("pwa.noVaultConfigured"), true);
       return;
     }
-    this.modalCardEl.innerHTML = "";
+    this.modalCardEl.replaceChildren();
     const title = document.createElement("h3");
     title.className = "onboard-title";
-    title.textContent = "Unlock Mobile Vault";
+    title.textContent = t("pwa.unlockTitle");
     const note = document.createElement("p");
     note.className = "muted";
-    note.textContent =
-      "VKEK is decrypted in browser WASM RAM only (never written to IndexedDB) and auto-locks immediately when you switch apps.";
+    note.textContent = t("pwa.unlockNote");
     const form = document.createElement("form");
     form.className = "pwa-form";
     const pass = document.createElement("input");
     pass.type = "password";
     pass.className = "input";
-    pass.placeholder = "Vault passphrase";
+    pass.placeholder = t("vault.passPlaceholder");
     pass.dataset.testid = "pwa-vault-passphrase";
     pass.autocomplete = "current-password";
     const row = document.createElement("div");
@@ -652,13 +718,13 @@ export class MobilePwaApp {
     const cancel = document.createElement("button");
     cancel.type = "button";
     cancel.className = "btn";
-    cancel.textContent = "Cancel";
+    cancel.textContent = t("common.cancel");
     cancel.addEventListener("click", () => this.closeModal());
     const submit = document.createElement("button");
     submit.type = "submit";
     submit.className = "btn btn-primary";
     submit.dataset.testid = "pwa-vault-unlock-submit";
-    submit.textContent = "Unlock";
+    submit.textContent = t("pwa.unlockSubmit");
     row.append(cancel, submit);
     form.append(pass, row);
     form.addEventListener("submit", (ev) => {
@@ -667,7 +733,7 @@ export class MobilePwaApp {
       const passphrase = pass.value;
       pass.value = "";
       submit.disabled = true;
-      submit.textContent = "Deriving key…";
+      submit.textContent = t("pwa.derivingKey");
       window.setTimeout(() => {
         if (isPageHidden() || !this.vaultHeaderB64) {
           this.closeModal();
@@ -687,12 +753,12 @@ export class MobilePwaApp {
           this.resetVaultIdleTimer();
           this.closeModal();
           this.render();
-          this.showToast("Vault unlocked in RAM (auto-locks on app switch)");
+          this.showToast(t("pwa.toastVaultUnlocked"));
         } catch (e) {
           const parsed = parseWasmError(e);
           this.showToast(`${parsed.code}: ${parsed.message}`, true);
           submit.disabled = false;
-          submit.textContent = "Unlock";
+          submit.textContent = t("pwa.unlockSubmit");
         }
       }, 0);
     });
@@ -702,36 +768,45 @@ export class MobilePwaApp {
   }
 
   private openRefreshKeysModal(): void {
-    this.modalCardEl.innerHTML = "";
+    this.modalCardEl.replaceChildren();
     const title = document.createElement("h3");
     title.className = "onboard-title";
-    title.textContent = "Refresh Device Keys";
+    title.textContent = t("pwa.refreshKeysTitle");
     const note = document.createElement("p");
     note.className = "muted";
-    note.textContent = "Paste the refresh code from 'mynote device refresh <device_id>' on your desktop:";
+    note.textContent = t("pwa.refreshKeysNote");
+    const cliChip = document.createElement("pre");
+    cliChip.className = "cli-chip";
+    const cliCode = document.createElement("code");
+    cliCode.textContent = `mynote device refresh ${this.creds?.device_id ?? "<device_id>"}`;
+    cliChip.appendChild(cliCode);
     const form = document.createElement("form");
     form.className = "pwa-form";
     const input = document.createElement("input");
-    input.className = "input";
+    input.className = "input pwa-pair-input";
     input.placeholder = "mynote-pair:v1:...";
     const row = document.createElement("div");
     row.className = "pwa-row-end";
     const cancel = document.createElement("button");
     cancel.type = "button";
     cancel.className = "btn";
-    cancel.textContent = "Cancel";
+    cancel.textContent = t("common.cancel");
     cancel.addEventListener("click", () => this.closeModal());
     const submit = document.createElement("button");
     submit.type = "submit";
     submit.className = "btn btn-primary";
-    submit.textContent = "Refresh Keys";
+    submit.textContent = t("pwa.refreshKeysSubmit");
+    submit.disabled = true;
+    input.addEventListener("input", () => {
+      submit.disabled = input.value.trim().length === 0;
+    });
     row.append(cancel, submit);
     form.append(input, row);
     form.addEventListener("submit", (ev) => {
       ev.preventDefault();
       if (input.value.trim()) void this.handlePairSubmit(input.value.trim(), true);
     });
-    this.modalCardEl.append(title, note, form);
+    this.modalCardEl.append(title, note, cliChip, form);
     this.modalBackdropEl.classList.remove("hidden");
     input.focus();
   }
@@ -741,13 +816,13 @@ export class MobilePwaApp {
       el.value = "";
     }
     this.modalBackdropEl.classList.add("hidden");
-    this.modalCardEl.innerHTML = "";
+    this.modalCardEl.replaceChildren();
   }
 
   private stopCamera(): void {
     this.qrCancelToken++;
     if (this.activeMediaStream) {
-      for (const t of this.activeMediaStream.getTracks()) t.stop();
+      for (const tTrack of this.activeMediaStream.getTracks()) tTrack.stop();
       this.activeMediaStream = null;
     }
   }
@@ -755,12 +830,12 @@ export class MobilePwaApp {
   private copyTextGesture(text: string, isTier2: boolean): void {
     const finish = (ok: boolean) => {
       if (!ok) {
-        this.showToast("Clipboard unavailable — tap & hold text to copy", true);
+        this.showToast(t("pwa.toastClipboardUnavailable"), true);
       } else if (isTier2) {
         this.resetVaultIdleTimer();
-        this.showToast("Copied Vault secret (Note: iOS/Universal Clipboard cannot be auto-cleared)");
+        this.showToast(t("pwa.toastCopiedVault"));
       } else {
-        this.showToast("Copied to clipboard");
+        this.showToast(t("pwa.toastCopied"));
       }
     };
     if (navigator.clipboard?.writeText) {
@@ -774,10 +849,32 @@ export class MobilePwaApp {
   }
 
   private showToast(msg: string, isError = false): void {
-    this.toastEl.textContent = msg;
+    const span = document.createElement("span");
+    span.textContent = msg;
+    this.toastEl.replaceChildren(createIcon(isError ? "alert-triangle" : "check-circle", "xs"), span);
     this.toastEl.className = `toast${isError ? " error" : ""}`;
     if (this.toastTimer !== null) window.clearTimeout(this.toastTimer);
     this.toastTimer = window.setTimeout(() => this.toastEl.classList.add("hidden"), 3400);
+  }
+
+  private formatSyncStatusLabel(): { icon: IconName; label: string } {
+    if (this.syncInFlight || this.syncStatus.kind === "syncing") {
+      return { icon: "refresh-cw", label: t("sync.syncing") };
+    }
+    switch (this.syncStatus.kind) {
+      case "synced":
+        return { icon: "check-circle", label: t("pwa.statusSynced", { seq: this.syncStatus.seq }) };
+      case "partial":
+        return { icon: "alert-triangle", label: t("pwa.statusPartial", { seq: this.syncStatus.seq }) };
+      case "offline":
+        return { icon: "cloud-off", label: t("pwa.statusOffline") };
+      case "idle":
+        return { icon: "refresh-cw", label: t("pwa.statusIdle") };
+      default: {
+        const _exhaustive: never = this.syncStatus;
+        return _exhaustive;
+      }
+    }
   }
 
   private render(): void {
@@ -788,59 +885,68 @@ export class MobilePwaApp {
   }
 
   private renderHeader(): void {
-    this.headerEl.innerHTML = "";
-    const row1 = document.createElement("div");
-    row1.className = "pwa-header-row";
-    const brand = document.createElement("div");
-    brand.className = "pwa-brand";
-    brand.textContent = "my-note";
-    const ro = document.createElement("span");
-    ro.className = "ro-pill";
-    ro.textContent = "READ-ONLY";
-    brand.appendChild(ro);
+    const prevSearch = this.headerSubEl.querySelector<HTMLInputElement>('input[type="search"]');
+    const searchHadFocus = prevSearch !== null && document.activeElement === prevSearch;
+    const selStart = searchHadFocus ? prevSearch.selectionStart : null;
+    const selEnd = searchHadFocus ? prevSearch.selectionEnd : null;
 
-    const actions = document.createElement("div");
-    actions.className = "pwa-actions";
+    this.roPillEl.textContent = t("pwa.readOnlyPill");
+
+    const dynamicActions: HTMLElement[] = [];
     if (this.creds && !this.revoked) {
       if (this.vaultSession && !this.vaultSession.isLocked()) {
         const lockBtn = document.createElement("button");
         lockBtn.type = "button";
-        lockBtn.className = "btn btn-amber btn-sm";
+        lockBtn.className = "btn btn-amber btn-sm btn-has-icon";
         lockBtn.dataset.testid = "pwa-vault-lock-btn";
-        lockBtn.textContent = "🔓 Lock";
+        const lbl = document.createElement("span");
+        lbl.textContent = t("pwa.lockBtn");
+        lockBtn.append(createIcon("lock-open", "xs"), lbl);
         lockBtn.addEventListener("click", () => this.lockVaultNow(false));
-        actions.appendChild(lockBtn);
+        dynamicActions.push(lockBtn);
       } else if (this.vaultHeaderB64) {
         const unlockBtn = document.createElement("button");
         unlockBtn.type = "button";
-        unlockBtn.className = "btn btn-sm";
+        unlockBtn.className = "btn btn-sm btn-has-icon";
         unlockBtn.dataset.testid = "pwa-vault-unlock-btn";
-        unlockBtn.textContent = "🔒 Vault";
+        const lbl = document.createElement("span");
+        lbl.textContent = t("pwa.vaultBtn");
+        unlockBtn.append(createIcon("lock", "xs"), lbl);
         unlockBtn.addEventListener("click", () => this.openVaultUnlockModal());
-        actions.appendChild(unlockBtn);
+        dynamicActions.push(unlockBtn);
       }
+
+      const { icon, label } = this.formatSyncStatusLabel();
       const syncBtn = document.createElement("button");
       syncBtn.type = "button";
-      syncBtn.className = "btn btn-sm";
-      syncBtn.textContent = this.syncInFlight ? "Syncing…" : this.wsConnected ? `● ${this.statusText}` : this.statusText;
+      syncBtn.className = "btn btn-ghost btn-sm btn-has-icon";
+      syncBtn.dataset.testid = "pwa-sync-btn";
+      syncBtn.appendChild(createIcon(icon, "xs"));
+      const syncLbl = document.createElement("span");
+      syncLbl.textContent = label;
+      syncBtn.appendChild(syncLbl);
       syncBtn.addEventListener("click", () => void this.syncNow());
-      actions.appendChild(syncBtn);
+      dynamicActions.push(syncBtn);
 
       const keysBtn = document.createElement("button");
       keysBtn.type = "button";
-      keysBtn.className = "btn btn-sm";
-      keysBtn.textContent = "Keys";
-      keysBtn.title = "Refresh device keys";
+      keysBtn.className = "btn btn-sm btn-has-icon";
+      keysBtn.dataset.testid = "pwa-keys-btn";
+      const keysLbl = document.createElement("span");
+      keysLbl.textContent = t("pwa.keysBtn");
+      keysBtn.append(createIcon("key", "xs"), keysLbl);
+      keysBtn.title = t("pwa.keysTitle");
       keysBtn.addEventListener("click", () => this.openRefreshKeysModal());
-      actions.appendChild(keysBtn);
+      dynamicActions.push(keysBtn);
     }
-    row1.append(brand, actions);
-    this.headerEl.appendChild(row1);
+    this.headerDynamicActionsEl.replaceChildren(...dynamicActions);
 
+    this.headerSubEl.replaceChildren();
     if (this.creds && !this.revoked && this.buffers.length > 0) {
+      this.headerSubEl.classList.remove("hidden");
       const tabs = document.createElement("nav");
       tabs.className = "pwa-tabs";
-      tabs.setAttribute("aria-label", "Buffers");
+      tabs.setAttribute("aria-label", t("topbar.buffersNav"));
       for (const b of this.buffers) {
         const btn = document.createElement("button");
         btn.type = "button";
@@ -852,18 +958,26 @@ export class MobilePwaApp {
         });
         tabs.appendChild(btn);
       }
-      this.headerEl.appendChild(tabs);
+      this.headerSubEl.appendChild(tabs);
 
       const search = document.createElement("input");
       search.type = "search";
       search.className = "input";
-      search.placeholder = "Filter blocks in memory…";
+      search.placeholder = t("pwa.searchPlaceholder");
       search.value = this.searchQuery;
       search.addEventListener("input", () => {
         this.searchQuery = search.value;
         this.renderMain();
       });
-      this.headerEl.appendChild(search);
+      this.headerSubEl.appendChild(search);
+      if (searchHadFocus) {
+        search.focus({ preventScroll: true });
+        if (selStart !== null && selEnd !== null) {
+          search.setSelectionRange(selStart, selEnd);
+        }
+      }
+    } else {
+      this.headerSubEl.classList.add("hidden");
     }
   }
 
@@ -893,21 +1007,24 @@ export class MobilePwaApp {
     this.selectedVersionByBlock.clear();
     this.viewModeByBlock.clear();
     this.cleanupMountedPreviews();
-    this.syncTruncatedBanner = null;
+    this.syncTruncated = false;
+    this.pairingSnatchWarning = false;
+    this.syncStatus = { kind: "idle" };
   }
 
   private renderBanner(): void {
-    this.bannerEl.innerHTML = "";
+    this.bannerEl.replaceChildren();
     if (this.revoked) {
       const b = document.createElement("div");
       b.className = "banner banner-error";
       b.dataset.testid = "pwa-revoked-banner";
       const msg = document.createElement("span");
-      msg.textContent = "DEVICE_REVOKED: This mobile device was revoked on the relay. Clear local cache and re-pair from desktop.";
+      msg.className = "banner-msg";
+      msg.append(createIcon("shield-alert", "xs"), document.createTextNode(t("pwa.revoked")));
       const resetBtn = document.createElement("button");
       resetBtn.type = "button";
       resetBtn.className = "btn btn-danger btn-sm";
-      resetBtn.textContent = "Reset & Re-Pair";
+      resetBtn.textContent = t("pwa.resetRepair");
       resetBtn.addEventListener("click", () => {
         this.resetLocalStateSync();
         void clearAllPwaStorage().then(() => {
@@ -916,18 +1033,24 @@ export class MobilePwaApp {
       });
       b.append(msg, resetBtn);
       this.bannerEl.appendChild(b);
-    } else if (this.pairingErrorBanner) {
+    } else if (this.pairingSnatchWarning) {
       const b = document.createElement("div");
       b.className = "banner banner-error";
       b.dataset.testid = "pwa-snatch-warning";
-      b.textContent = this.pairingErrorBanner;
+      const msg = document.createElement("span");
+      msg.className = "banner-msg";
+      msg.append(createIcon("shield-alert", "xs"), document.createTextNode(t("pwa.snatchWarning")));
+      b.appendChild(msg);
       this.bannerEl.appendChild(b);
     }
-    if (this.syncTruncatedBanner) {
+    if (this.syncTruncated) {
       const b = document.createElement("div");
       b.className = "banner banner-warn";
       b.dataset.testid = "pwa-truncated-banner";
-      b.textContent = this.syncTruncatedBanner;
+      const msg = document.createElement("span");
+      msg.className = "banner-msg";
+      msg.append(createIcon("alert-triangle", "xs"), document.createTextNode(t("pwa.truncatedBanner")));
+      b.appendChild(msg);
       this.bannerEl.appendChild(b);
     }
     if (this.pendingSwWorker) {
@@ -936,11 +1059,12 @@ export class MobilePwaApp {
       b.className = "banner banner-info";
       b.dataset.testid = "pwa-sw-update-banner";
       const msg = document.createElement("span");
-      msg.textContent = "New app version available.";
+      msg.className = "banner-msg";
+      msg.append(createIcon("refresh-cw", "xs"), document.createTextNode(t("pwa.swUpdate")));
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "btn btn-primary btn-sm";
-      btn.textContent = "Update & Reload";
+      btn.textContent = t("pwa.swReload");
       btn.addEventListener("click", () => {
         if (!this.swReloadWired && "serviceWorker" in navigator) {
           this.swReloadWired = true;
@@ -957,7 +1081,8 @@ export class MobilePwaApp {
 
   private renderMain(): void {
     this.cleanupMountedPreviews();
-    this.mainEl.innerHTML = "";
+    this.mainEl.replaceChildren();
+    this.mainEl.classList.toggle("is-onboarding", !this.creds);
     if (!this.creds) {
       this.renderOnboarding();
       return;
@@ -979,7 +1104,7 @@ export class MobilePwaApp {
     if (visible.length === 0) {
       const empty = document.createElement("div");
       empty.className = "onboard-card";
-      empty.textContent = this.blocks.length === 0 ? "No notes synced yet." : "No matching blocks in this buffer.";
+      empty.textContent = this.blocks.length === 0 ? t("pwa.emptyNoNotes") : t("pwa.emptyNoMatch");
       this.mainEl.appendChild(empty);
       return;
     }
@@ -994,30 +1119,55 @@ export class MobilePwaApp {
     card.className = "onboard-card";
     const h = document.createElement("h2");
     h.className = "onboard-title";
-    h.textContent = "Pair Read-Only Mobile Device";
+    h.textContent = t("pwa.onboardTitle");
     const p = document.createElement("p");
     p.className = "muted";
-    p.textContent =
-      "Run 'mynote device add --name iPhone --scope read' on your desktop and paste or scan the pairing code below. Keys stay encrypted in IndexedDB; zero plaintext is ever persisted.";
+    p.textContent = t("pwa.onboardBody");
+
+    const cliChip = document.createElement("pre");
+    cliChip.className = "cli-chip";
+    const cliCode = document.createElement("code");
+    const cmdHead = document.createElement("span");
+    cmdHead.className = "cli-nowrap";
+    cmdHead.textContent = "mynote device add";
+    const flagName = document.createElement("span");
+    flagName.className = "cli-nowrap";
+    flagName.textContent = "--name iPhone";
+    const flagScope = document.createElement("span");
+    flagScope.className = "cli-nowrap";
+    flagScope.textContent = "--scope read";
+    cliCode.append(cmdHead, document.createTextNode(" "), flagName, document.createTextNode(" "), flagScope);
+    cliChip.appendChild(cliCode);
 
     const form = document.createElement("form");
     form.className = "pwa-form";
     const input = document.createElement("input");
-    input.className = "input";
+    input.className = "input pwa-pair-input";
     input.placeholder = "mynote-pair:v1:...";
     input.dataset.testid = "pwa-pair-input";
     const btnRow = document.createElement("div");
-    btnRow.className = "pwa-row-wrap";
-    const pairBtn = document.createElement("button");
-    pairBtn.type = "submit";
-    pairBtn.className = "btn btn-primary";
-    pairBtn.dataset.testid = "pwa-pair-submit";
-    pairBtn.textContent = "Pair Device";
+    btnRow.className = "pwa-onboard-actions";
     const qrBtn = document.createElement("button");
     qrBtn.type = "button";
-    qrBtn.className = "btn";
-    qrBtn.textContent = "Scan QR (Camera)";
-    btnRow.append(pairBtn, qrBtn);
+    qrBtn.className = "btn btn-primary btn-has-icon";
+    qrBtn.dataset.testid = "pwa-scan-qr-btn";
+    const qrLbl = document.createElement("span");
+    qrLbl.textContent = t("pwa.scanQr");
+    qrBtn.append(createIcon("qr-code", "xs"), qrLbl);
+    const pairBtn = document.createElement("button");
+    pairBtn.type = "submit";
+    pairBtn.className = "btn";
+    pairBtn.dataset.testid = "pwa-pair-submit";
+    pairBtn.textContent = t("pwa.pairSubmit");
+    pairBtn.disabled = true;
+    const syncPairActionState = (): void => {
+      const hasCode = input.value.trim().length > 0;
+      pairBtn.disabled = !hasCode;
+      pairBtn.className = hasCode ? "btn btn-primary" : "btn";
+      qrBtn.className = hasCode ? "btn btn-has-icon" : "btn btn-primary btn-has-icon";
+    };
+    input.addEventListener("input", syncPairActionState);
+    btnRow.append(qrBtn, pairBtn);
     const qrHost = document.createElement("div");
     qrBtn.addEventListener("click", () => void this.startQrScanner(qrHost, input));
     form.append(input, btnRow, qrHost);
@@ -1025,26 +1175,31 @@ export class MobilePwaApp {
       ev.preventDefault();
       if (input.value.trim()) void this.handlePairSubmit(input.value.trim(), false);
     });
-    card.append(h, p, form);
+
+    const privacy = document.createElement("p");
+    privacy.className = "onboard-privacy";
+    privacy.textContent = t("pwa.onboardPrivacy");
+
+    card.append(h, p, cliChip, form, privacy);
     this.mainEl.appendChild(card);
   }
 
   private async startQrScanner(host: HTMLElement, targetInput: HTMLInputElement): Promise<void> {
     this.stopCamera();
     const token = this.qrCancelToken;
-    host.innerHTML = "";
+    host.replaceChildren();
     const BD = (globalThis as unknown as { BarcodeDetector?: new (opts: { formats: string[] }) => { detect(v: HTMLVideoElement): Promise<{ rawValue: string }[]> } }).BarcodeDetector;
     if (!navigator.mediaDevices?.getUserMedia || !BD) {
       const msg = document.createElement("p");
       msg.className = "muted";
-      msg.textContent = "In-app QR camera scanning is unavailable in this browser — paste the pairing code directly above.";
+      msg.textContent = t("pwa.qrUnavailable");
       host.appendChild(msg);
       return;
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
       if (token !== this.qrCancelToken || isPageHidden()) {
-        for (const t of stream.getTracks()) t.stop();
+        for (const tr of stream.getTracks()) tr.stop();
         return;
       }
       this.activeMediaStream = stream;
@@ -1062,10 +1217,10 @@ export class MobilePwaApp {
       const stopBtn = document.createElement("button");
       stopBtn.type = "button";
       stopBtn.className = "btn btn-sm";
-      stopBtn.textContent = "Stop Camera";
+      stopBtn.textContent = t("pwa.stopCamera");
       stopBtn.addEventListener("click", () => {
         this.stopCamera();
-        host.innerHTML = "";
+        host.replaceChildren();
       });
       host.append(video, stopBtn);
       const detector = new BD({ formats: ["qr_code"] });
@@ -1076,7 +1231,7 @@ export class MobilePwaApp {
           const found = hits.find((h) => h.rawValue.startsWith("mynote-pair:v1:"));
           if (found) {
             this.stopCamera();
-            host.innerHTML = "";
+            host.replaceChildren();
             targetInput.value = found.rawValue;
             await this.handlePairSubmit(found.rawValue, false);
             return;
@@ -1091,16 +1246,12 @@ export class MobilePwaApp {
       this.stopCamera();
       const msg = document.createElement("p");
       msg.className = "muted";
-      msg.textContent = "Camera permission denied — paste the pairing code directly above.";
+      msg.textContent = t("pwa.qrDenied");
       host.appendChild(msg);
     }
   }
 
   private renderReadOnlyBlock(blk: MobileBlockView): HTMLElement {
-    const card = document.createElement("article");
-    card.className = `ro-block${blk.is_locked ? " locked" : ""}`;
-    card.dataset.blockId = blk.id;
-
     const vaultOpen = this.isVaultUnlocked();
     const selectedOpId = this.selectedVersionByBlock.get(blk.id) ?? blk.display_op_id ?? blk.versions[0]?.op_id;
     const selectedLeaf = blk.versions.find((v) => v.op_id === selectedOpId) ?? blk.versions[0];
@@ -1113,6 +1264,10 @@ export class MobilePwaApp {
       blk.is_locked && !vaultOpen ? null : selectedLeaf ? (selectedLeaf.content ?? ramPlain) : null;
     const isUnlockedTier2 = blk.is_locked && vaultOpen && effectiveText !== null;
 
+    const card = document.createElement("article");
+    card.className = `ro-block${blk.is_locked ? " locked" : ""}${isUnlockedTier2 ? " unlocked" : ""}`;
+    card.dataset.blockId = blk.id;
+
     const head = document.createElement("div");
     head.className = "ro-block-head";
     const meta = document.createElement("div");
@@ -1124,7 +1279,9 @@ export class MobilePwaApp {
     if (blk.is_locked) {
       const vb = document.createElement("span");
       vb.className = `badge ${isUnlockedTier2 ? "badge-vault-open" : "badge-vault"}`;
-      vb.textContent = isUnlockedTier2 ? "🔓 Vault (RAM)" : "🔒 Tier 2";
+      const vbLbl = document.createElement("span");
+      vbLbl.textContent = isUnlockedTier2 ? t("vault.badgeUnlocked") : t("vault.badgeLocked");
+      vb.append(createIcon(isUnlockedTier2 ? "lock-open" : "lock", "xs"), vbLbl);
       meta.appendChild(vb);
     }
     if (blk.public_hint) {
@@ -1151,7 +1308,7 @@ export class MobilePwaApp {
         modeBtn.className = "btn btn-sm";
         modeBtn.dataset.testid = `pwa-toggle-mode-${blk.id}`;
         modeBtn.setAttribute("aria-pressed", String(viewMode === "preview"));
-        modeBtn.textContent = viewMode === "preview" ? "Source" : "Preview";
+        modeBtn.textContent = viewMode === "preview" ? t("block.modeSource") : t("block.modePreview");
         modeBtn.addEventListener("click", () => {
           this.viewModeByBlock.set(blk.id, viewMode === "preview" ? "source" : "preview");
           this.renderMain();
@@ -1162,20 +1319,22 @@ export class MobilePwaApp {
       if (isPwaMarkdownLang(blk.lang) && viewMode === "preview") {
         const copyRichBtn = document.createElement("button");
         copyRichBtn.type = "button";
-        copyRichBtn.className = "btn btn-sm";
+        copyRichBtn.className = "btn btn-sm btn-has-icon";
         copyRichBtn.dataset.testid = `pwa-copy-rich-${blk.id}`;
-        copyRichBtn.textContent = "Copy Rich";
+        const crLbl = document.createElement("span");
+        crLbl.textContent = t("block.copyRich");
+        copyRichBtn.append(createIcon("file-rich", "xs"), crLbl);
         copyRichBtn.addEventListener("click", () => {
           const payload = getRichCopyPayload?.();
           if (!payload) return;
           void copyDualFormat(payload.html, payload.text).then((ok) => {
             if (!ok) {
-              this.showToast("Clipboard unavailable — tap & hold text to copy", true);
+              this.showToast(t("pwa.toastClipboardUnavailable"), true);
             } else if (blk.is_locked) {
               this.resetVaultIdleTimer();
-              this.showToast("Copied rich Vault secret (Note: iOS/Universal Clipboard cannot be auto-cleared)");
+              this.showToast(t("pwa.toastCopiedRichVault"));
             } else {
-              this.showToast("Copied rich HTML + plain text");
+              this.showToast(t("block.toastCopiedRich"));
             }
           });
         });
@@ -1184,9 +1343,11 @@ export class MobilePwaApp {
 
       const copyBtn = document.createElement("button");
       copyBtn.type = "button";
-      copyBtn.className = "btn btn-sm";
+      copyBtn.className = "btn btn-sm btn-has-icon";
       copyBtn.dataset.testid = `copy-${blk.id}`;
-      copyBtn.textContent = "Copy";
+      const cLbl = document.createElement("span");
+      cLbl.textContent = t("block.copy");
+      copyBtn.append(createIcon("copy", "xs"), cLbl);
       copyBtn.addEventListener("click", () => this.copyTextGesture(effectiveText, blk.is_locked));
       actions.appendChild(copyBtn);
       head.appendChild(actions);
@@ -1197,13 +1358,19 @@ export class MobilePwaApp {
       const vbar = document.createElement("div");
       vbar.className = "version-bar";
       const lbl = document.createElement("span");
-      lbl.textContent = `⚡ ${blk.versions.length} concurrent versions:`;
+      lbl.className = "version-bar-label";
+      lbl.append(
+        createIcon("git-branch", "xs"),
+        document.createTextNode(t("pwa.concurrentVersions", { count: blk.versions.length })),
+      );
       vbar.appendChild(lbl);
       blk.versions.forEach((v, idx) => {
         const b = document.createElement("button");
         b.type = "button";
         b.className = `btn btn-sm${v.op_id === selectedLeaf?.op_id ? " btn-primary" : ""}`;
-        b.textContent = v.is_display ? `Display (#${idx + 1})` : `Version #${idx + 1} (${v.device_id.slice(0, 8)})`;
+        b.textContent = v.is_display
+          ? t("pwa.versionDisplay", { num: idx + 1 })
+          : t("pwa.versionOther", { num: idx + 1, dev: formatDeviceName(v.device_id) });
         b.addEventListener("click", () => {
           this.selectedVersionByBlock.set(blk.id, v.op_id);
           this.renderMain();
@@ -1217,20 +1384,34 @@ export class MobilePwaApp {
       const locked = document.createElement("div");
       locked.className = "ro-locked-body";
       const txt = document.createElement("span");
-      txt.textContent = `🔒 Locked Tier 2 Block${blk.public_hint ? ` (${blk.public_hint})` : ""}${
-        blk.has_unlocked_concurrent_version ? " — has unlocked concurrent version" : ""
-      }`;
+      txt.className = "ro-locked-msg";
+      txt.append(createIcon("lock", "xs"), document.createTextNode(t("block.lockedCard")));
+      if (blk.public_hint) {
+        const hint = document.createElement("span");
+        hint.className = "locked-card-hint";
+        hint.textContent = blk.public_hint;
+        txt.appendChild(hint);
+      }
+      if (blk.has_unlocked_concurrent_version) {
+        const warn = document.createElement("span");
+        warn.className = "locked-card-warn";
+        warn.textContent = t("block.lockedConcurrentNote");
+        txt.appendChild(warn);
+      }
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.className = "btn btn-primary btn-sm";
-      btn.textContent = "Unlock Vault";
+      btn.className = "btn btn-sm";
+      btn.textContent = t("vault.unlockAction");
       btn.addEventListener("click", () => this.openVaultUnlockModal());
       locked.append(txt, btn);
       card.appendChild(locked);
     } else if (effectiveText === null) {
       const locked = document.createElement("div");
       locked.className = "ro-locked-body";
-      locked.textContent = "⚠ Content unavailable (missing key or awaiting key refresh).";
+      const txt = document.createElement("span");
+      txt.className = "ro-locked-msg";
+      txt.append(createIcon("alert-triangle", "sm"), document.createTextNode(t("pwa.unreadable")));
+      locked.appendChild(txt);
       card.appendChild(locked);
     } else if (viewMode === "preview" && isPwaMarkdownLang(blk.lang)) {
       const previewHost = document.createElement("div");
@@ -1241,7 +1422,7 @@ export class MobilePwaApp {
         onCopyFeedback: (msg, isError) => {
           if (!isError && blk.is_locked) {
             this.resetVaultIdleTimer();
-            this.showToast(`${msg} (Vault secret — iOS/Universal Clipboard cannot be auto-cleared)`);
+            this.showToast(t("pwa.toastVaultSecretSuffix", { msg }));
           } else {
             this.showToast(msg, isError);
           }
@@ -1259,7 +1440,7 @@ export class MobilePwaApp {
         onFeedback: (msg, isError) => {
           if (!isError && blk.is_locked) {
             this.resetVaultIdleTimer();
-            this.showToast(`${msg} (Vault secret — iOS/Universal Clipboard cannot be auto-cleared)`);
+            this.showToast(t("pwa.toastVaultSecretSuffix", { msg }));
           } else {
             this.showToast(msg, isError);
           }
@@ -1279,24 +1460,23 @@ export class MobilePwaApp {
   }
 
   private renderFooter(): void {
-    this.footerEl.innerHTML = "";
-    const span = document.createElement("span");
-    span.textContent = `my-note Mobile Read-Only PWA ${PWA_BUILD_VERSION} · Zero-Plaintext IDB`;
-    this.footerEl.appendChild(span);
-    if (this.creds) {
-      const sep = document.createTextNode(" · ");
-      const unpair = document.createElement("button");
-      unpair.type = "button";
-      unpair.className = "btn btn-sm btn-danger pwa-unpair-btn";
-      unpair.textContent = "Unpair";
-      unpair.addEventListener("click", () => {
-        this.resetLocalStateSync();
-        void clearAllPwaStorage().then(() => {
-          this.render();
-          this.showToast("Unpaired and wiped local IndexedDB");
-        });
-      });
-      this.footerEl.append(sep, unpair);
+    this.footerEl.replaceChildren();
+    if (!this.creds) {
+      this.footerEl.classList.add("hidden");
+      return;
     }
+    this.footerEl.classList.remove("hidden");
+    const unpair = document.createElement("button");
+    unpair.type = "button";
+    unpair.className = "btn btn-ghost btn-sm btn-danger pwa-unpair-btn";
+    unpair.textContent = t("pwa.unpair");
+    unpair.addEventListener("click", () => {
+      this.resetLocalStateSync();
+      void clearAllPwaStorage().then(() => {
+        this.render();
+        this.showToast(t("pwa.toastUnpaired"));
+      });
+    });
+    this.footerEl.appendChild(unpair);
   }
 }
