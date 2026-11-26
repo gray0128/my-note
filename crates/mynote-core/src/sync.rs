@@ -400,10 +400,15 @@ impl EngineSnapshot {
         let mut referenced_keys = BTreeSet::new();
         let mut op_keys: BTreeMap<OpId, Option<KeyId>> = BTreeMap::new();
         for rec in self.ops.values() {
-            if rec.server_seq.is_none() || rec.entity_type != entity_type || rec.entity_id != entity_id {
+            if rec.entity_type != entity_type || rec.entity_id != entity_id {
                 continue;
             }
+            // Index key_id across all known ops (including unacked/reconciling parents) so a remote
+            // DELETE whose parent CREATE is awaiting PITR re-ack still resolves `parent -> kid`.
             op_keys.insert(rec.op_id, rec.key_id);
+            if rec.server_seq.is_none() {
+                continue;
+            }
             if let Some(k) = rec.key_id {
                 referenced_keys.insert(k);
             }
@@ -522,7 +527,7 @@ impl EngineSnapshot {
     }
 
     /// Collect keys currently referenced by live leaves of any `ACTIVE` block or `ACTIVE` buffer.
-    fn active_live_keys(&self) -> BTreeSet<KeyId> {
+    pub(crate) fn active_live_keys(&self) -> BTreeSet<KeyId> {
         let mut live = BTreeSet::new();
         for buf in self.all_buffers() {
             if buf.state == crate::model::BlockState::Active {
@@ -569,7 +574,7 @@ impl EngineSnapshot {
             .filter(|k| !self.keys.is_shredded(k))
             .collect();
 
-        let mut pending: Vec<&LocalOpRecord> = self
+        let mut raw_candidates: Vec<&LocalOpRecord> = self
             .ops
             .values()
             .filter(|o| o.server_seq.is_none() && o.sync_blocked_reason.is_none())
@@ -584,7 +589,36 @@ impl EngineSnapshot {
                 OutboxKeyAction::NeedsRekey { .. } => false,
             })
             .collect();
-        pending.sort_by_key(|a| (a.created_at_ms, a.op_id));
+        raw_candidates.sort_by_key(|a| (a.created_at_ms, a.op_id));
+
+        // Topological causal filter: never emit an op ahead of or without an unpushed local parent,
+        // preventing orphan Tombstone/Update ops on DO under clock skew or blocked Tier 2 ancestors.
+        let candidate_ids: BTreeSet<OpId> = raw_candidates.iter().map(|o| o.op_id).collect();
+        let mut pending: Vec<&LocalOpRecord> = Vec::with_capacity(raw_candidates.len());
+        let mut ready_ids: BTreeSet<OpId> = BTreeSet::new();
+        let mut remaining = raw_candidates;
+        while !remaining.is_empty() {
+            let mut progressed = false;
+            let mut next_remaining = Vec::new();
+            for o in remaining {
+                let parents_ready = o.parent_op_ids.iter().all(|pid| match self.ops.get(pid) {
+                    None => true,
+                    Some(p) if p.server_seq.is_some() => true,
+                    Some(_) => candidate_ids.contains(pid) && ready_ids.contains(pid),
+                });
+                if parents_ready {
+                    ready_ids.insert(o.op_id);
+                    pending.push(o);
+                    progressed = true;
+                } else {
+                    next_remaining.push(o);
+                }
+            }
+            if !progressed {
+                break;
+            }
+            remaining = next_remaining;
+        }
 
         let mut needed_keys = BTreeSet::new();
         let mut ops = Vec::with_capacity(pending.len().min(MAX_PUSH_BATCH_OPS));
@@ -778,6 +812,32 @@ impl EngineSnapshot {
                     for op in self.ops.values_mut() {
                         op.server_seq = None;
                     }
+                    // Demote non-Executed server marks so DO PITR / new-epoch reconciliation re-pushes
+                    // active shred marks (G4) and re-asserts cancellations (Update-Wins G1), converging keys_digest.
+                    let existing_pending: BTreeSet<crate::ids::MarkId> =
+                        self.pending_shred_marks.iter().map(|m| m.mark_id).collect();
+                    let mut kept_marks = BTreeMap::new();
+                    for (mid, mut m) in std::mem::take(&mut self.keys.marks) {
+                        if m.state == ShredMarkState::Executed || self.keys.is_shredded(&m.key_id) {
+                            kept_marks.insert(mid, m);
+                            continue;
+                        }
+                        match m.state {
+                            ShredMarkState::PendingConfirm | ShredMarkState::Scheduled => {
+                                if !existing_pending.contains(&mid) {
+                                    m.state = ShredMarkState::PendingConfirm;
+                                    m.not_before_ms = None;
+                                    m.confirmed_at_ms = None;
+                                    self.pending_shred_marks.push(m);
+                                }
+                            }
+                            ShredMarkState::Cancelled => {
+                                self.pending_cancel_key_ids.insert(m.key_id);
+                            }
+                            ShredMarkState::Executed => {}
+                        }
+                    }
+                    self.keys.marks = kept_marks;
                     self.reconciling_epoch = Some(*new_epoch);
                     self.last_seq = 0;
                 }

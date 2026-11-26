@@ -88,6 +88,7 @@ def main():
             context = browser.new_context()
             page = context.new_page()
             page.on("pageerror", lambda err: console_errors.append(str(err)))
+            page.on("console", lambda m: console_errors.append(f"console.error: {m.text}") if m.type == "error" else None)
 
             def on_request(req):
                 if "/v1/local/format" in req.url:

@@ -22,7 +22,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run nightly DST soak
+      - name: Run Tier 0 static architecture & budget guard
+        run: |
+          python3 scripts/check-architecture.py --selftest
+          python3 scripts/check-architecture.py
+      - name: Run nightly M1 + M2 DST soak
         env:
           MYNOTE_DST_SEEDS: ${{ inputs.seeds || '100000' }}
         run: |
