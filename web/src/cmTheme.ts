@@ -84,7 +84,7 @@ export const myNoteEditorTheme: Extension = EditorView.theme({
     lineHeight: "1.6",
   },
   ".cm-content": {
-    padding: "12px 6px",
+    padding: "8px 6px",
     caretColor: "var(--accent)",
     fontFamily: "var(--mono)",
   },

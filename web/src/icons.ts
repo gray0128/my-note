@@ -1,6 +1,6 @@
 const SVG_NS = "http://www.w3.org/2000/svg";
 
-export type IconSize = "xs" | "sm" | "md";
+export type IconSize = "kbd" | "xs" | "sm" | "md";
 
 export type IconName =
   | "brand-mark"
@@ -35,6 +35,9 @@ export type IconName =
   | "x"
   | "arrow-up"
   | "arrow-down"
+  | "corner-down-left"
+  | "eye"
+  | "eye-off"
   | "git-branch"
   | "alert-triangle"
   | "image-off"
@@ -202,6 +205,20 @@ const ICON_DEFS: Readonly<Record<IconName, readonly SvgPrimitive[]>> = {
     { tag: "line", attrs: { x1: "12", y1: "5", x2: "12", y2: "19" } },
     { tag: "polyline", attrs: { points: "6 13 12 19 18 13" } },
   ],
+  "corner-down-left": [
+    { tag: "polyline", attrs: { points: "9 10 4 15 9 20" } },
+    { tag: "path", attrs: { d: "M20 4v7a4 4 0 0 1-4 4H4" } },
+  ],
+  eye: [
+    { tag: "path", attrs: { d: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" } },
+    { tag: "circle", attrs: { cx: "12", cy: "12", r: "3" } },
+  ],
+  "eye-off": [
+    { tag: "path", attrs: { d: "M9.9 4.2A10.4 10.4 0 0 1 12 4c6.5 0 10 8 10 8a17.7 17.7 0 0 1-3.2 4.3" } },
+    { tag: "path", attrs: { d: "M6.6 6.6A17.7 17.7 0 0 0 2 12s3.5 8 10 8a10.2 10.2 0 0 0 5.4-1.6" } },
+    { tag: "path", attrs: { d: "M14.1 14.1a3 3 0 0 1-4.2-4.2" } },
+    { tag: "line", attrs: { x1: "2", y1: "2", x2: "22", y2: "22" } },
+  ],
   "git-branch": [
     { tag: "line", attrs: { x1: "6", y1: "3", x2: "6", y2: "15" } },
     { tag: "circle", attrs: { cx: "18", cy: "6", r: "3" } },
@@ -232,6 +249,7 @@ const ICON_DEFS: Readonly<Record<IconName, readonly SvgPrimitive[]>> = {
 };
 
 function resolveSizeClass(size: IconSize | number): string {
+  if (size === "kbd" || (typeof size === "number" && size <= 11)) return "icon-kbd";
   if (size === "xs" || (typeof size === "number" && size <= 14)) return "icon-xs";
   if (size === "md" || (typeof size === "number" && size >= 18)) return "icon-md";
   return "icon-sm";

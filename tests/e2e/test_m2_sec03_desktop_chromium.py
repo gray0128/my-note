@@ -122,9 +122,9 @@ def main():
             )
             print("[sec-03] 1. Vault initialized & unlocked in real Chromium WASM OK")
 
-            # 3. Lock the JSON block into Tier 2 Vault (via block overflow popover)
+            # 3. Lock the JSON block into Tier 2 Vault (focus block to reveal focus-only header, then open overflow popover)
             card = page.locator(f'[data-block-id="{blk_id}"]')
-            card.hover()
+            card.locator(".cm-content").click()
             page.click(f'[data-testid="more-btn-{blk_id}"]')
             page.click(f'[data-testid="lock-btn-{blk_id}"]')
             page.fill('[data-testid="lock-hint-input"]', "SEC03 Vault Hint")
