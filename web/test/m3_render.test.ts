@@ -17,7 +17,7 @@ import {
   mountDiagramWidget,
   type DiagramRenderer,
 } from "../src/render/diagram";
-import { computeLineDiff } from "../src/render/diff";
+import { computeInlineWordDiff, computeLineDiff } from "../src/render/diff";
 
 function assertDomTreeCleanOfXss(root: Element): void {
   const forbiddenTags = new Set([
@@ -332,6 +332,16 @@ describe("GFM tables, code copy, and Dual-Format clean copy payload", () => {
       readOnly: true,
       onCopyFeedback: (msg, isError) => feedback.push({ msg, isError }),
     });
+    // Wait deterministically for lazy Lezer syntax highlighting to decorate <code> with CSP-safe .tok-* spans
+    const codeEl = host.querySelector(".md-code-wrap pre code")!;
+    await vi.waitFor(
+      () => {
+        expect(codeEl.querySelector(".tok-kw")?.textContent).toBe("fn");
+      },
+      { timeout: 5000 },
+    );
+    expect(codeEl.textContent).toBe("fn main() {}");
+    assertDomTreeCleanOfXss(host);
 
     const btn = host.querySelector(".md-copy-code") as HTMLButtonElement;
     const tip = btn.nextElementSibling as HTMLSpanElement;
@@ -638,6 +648,49 @@ describe("Pele SVG diagram rendering, export, pan/zoom, and last-valid-frame pre
     expect(write).toHaveBeenCalledTimes(1);
     const items = (write.mock.calls[0][0] as FakeClipboardItem[])[0].items;
     expect(items["image/png"]).toBe(fakePng);
+  });
+
+  it("collapses Copy PNG/SVG/Source into a single Copy menu popover on the diagram toolbar", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    const widget = mountDiagramWidget(host, "flowchart LR\n  A[One] --> B[Two]");
+    expect(await widget.ready).toBe(true);
+
+    const trigger = host.querySelector<HTMLButtonElement>(".diagram-copy-trigger")!;
+    expect(trigger).not.toBeNull();
+    expect(host.querySelectorAll(".diagram-toolbar > button").length).toBe(0);
+    expect(host.querySelectorAll(".diagram-copy-popover .menu-item").length).toBe(3);
+
+    trigger.click();
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    host.querySelector<HTMLButtonElement>(".diagram-copy-source")!.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(writeText).toHaveBeenCalledWith("flowchart LR\n  A[One] --> B[Two]");
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+
+    widget.destroy();
+  });
+});
+
+describe("computeInlineWordDiff", () => {
+  it("highlights exact changed tokens across sibling conflict versions", () => {
+    const d = computeInlineWordDiff("version from omarchy", "version from macos");
+    expect(d.left).toEqual([
+      { kind: "same", text: "version from " },
+      { kind: "changed", text: "omarchy" },
+    ]);
+    expect(d.right).toEqual([
+      { kind: "same", text: "version from " },
+      { kind: "changed", text: "macos" },
+    ]);
+    expect(computeInlineWordDiff("same", "same")).toEqual({
+      left: [{ kind: "same", text: "same" }],
+      right: [{ kind: "same", text: "same" }],
+    });
   });
 });
 

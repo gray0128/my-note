@@ -1,7 +1,25 @@
 import { LocalApiError, type LocalApiClient, type Tier2WritePayload } from "./api";
+import {
+  createLocaleSwitch,
+  createThemeMenu,
+  type LocaleSwitchHandle,
+  type ThemeMenuHandle,
+} from "./components/themeMenu";
 import { BlockStreamController, type SaveContentResult } from "./editor";
+import {
+  formatDeviceName,
+  formatHistoryTimestamp,
+  formatLocalDateTime,
+  formatOpTypeLabel,
+  formatShredStateLabel,
+  subscribeLocale,
+  syncDocumentLocale,
+  t,
+} from "./i18n";
+import { createIcon, type IconName } from "./icons";
 import { computeLineDiff } from "./render/diff";
 import { copyDualFormat } from "./render/markdown";
+import { initTheme } from "./theme";
 import type {
   AlertFrame,
   BlockDto,
@@ -64,37 +82,69 @@ export class MyNoteApp {
   private historyOpSeq = 0;
   private vimEnabled = false;
   private findIndex = 0;
+  private lastFindMatchCount = 0;
+  private lastTrashCount = 0;
+  private bufferFilterQuery = "";
+  private bufferActiveIndex = 0;
+  private knownBufferBlockCounts = new Map<string, number>();
   private disconnectWs: (() => void) | null = null;
   private toastTimer: number | null = null;
+  private themeMenu!: ThemeMenuHandle;
+  private localeSwitch!: LocaleSwitchHandle;
+  private unsubLocale: (() => void) | null = null;
 
   private bufferTabsEl!: HTMLElement;
+  private switcherBtnEl!: HTMLButtonElement;
+  private switcherLabelEl!: HTMLSpanElement;
+  private newBlkBtnEl!: HTMLButtonElement;
+  private newBlkLabelEl!: HTMLSpanElement;
+  private findBtnEl!: HTMLButtonElement;
+  private findBtnLabelEl!: HTMLSpanElement;
+  private vimBtnEl!: HTMLButtonElement;
   private vaultBtnEl!: HTMLButtonElement;
   private syncPillEl!: HTMLButtonElement;
+  private syncIconEl!: HTMLSpanElement;
   private trashBtnEl!: HTMLButtonElement;
+  private trashCountEl!: HTMLSpanElement;
   private alertStackEl!: HTMLElement;
   private findBarEl!: HTMLElement;
   private findInputEl!: HTMLInputElement;
   private replaceInputEl!: HTMLInputElement;
   private findCountEl!: HTMLElement;
+  private findPrevBtnEl!: HTMLButtonElement;
+  private findNextBtnEl!: HTMLButtonElement;
+  private findReplaceBtnEl!: HTMLButtonElement;
+  private findCloseBtnEl!: HTMLButtonElement;
   private trashDrawerEl!: HTMLElement;
+  private trashTitleEl!: HTMLSpanElement;
+  private trashHeaderActionsEl!: HTMLElement;
+  private trashCloseBtnEl!: HTMLButtonElement;
   private trashActionsEl!: HTMLElement;
   private trashListEl!: HTMLElement;
   private historyDrawerEl!: HTMLElement;
   private historyTitleEl!: HTMLElement;
+  private historyHeaderActionsEl!: HTMLElement;
+  private historyCloseBtnEl!: HTMLButtonElement;
   private historyActionsEl!: HTMLElement;
   private historyListEl!: HTMLElement;
   private historyDiffEl!: HTMLElement;
   private modalBackdropEl!: HTMLElement;
+  private bufferModalEl!: HTMLElement;
+  private bufferModalCloseBtnEl!: HTMLButtonElement;
+  private bufferFilterInputEl!: HTMLInputElement;
   private modalListEl!: HTMLElement;
-  private newBufInputEl!: HTMLInputElement;
+  private bufferFooterEl!: HTMLElement;
   private dialogBackdropEl!: HTMLElement;
   private dialogModalEl!: HTMLElement;
   private toastEl!: HTMLElement;
   public stream!: BlockStreamController;
 
   constructor(private root: HTMLElement, private api: LocalApiClient) {
+    initTheme();
+    syncDocumentLocale("app.title");
     this.buildShell();
     this.bindGlobalKeys();
+    this.unsubLocale = subscribeLocale(() => this.applyLocale());
   }
 
   async start(): Promise<void> {
@@ -110,6 +160,9 @@ export class MyNoteApp {
     this.renderSyncPill();
     this.updateTrashCount(boot.trash_count);
     this.stream.setBlocks(boot.blocks);
+    if (this.activeBufferId) {
+      this.knownBufferBlockCounts.set(this.activeBufferId, boot.blocks.length);
+    }
 
     this.disconnectWs = this.api.connectWs(
       (frame) => this.handleWsFrame(frame),
@@ -134,6 +187,10 @@ export class MyNoteApp {
   }
 
   destroy(): void {
+    this.unsubLocale?.();
+    this.unsubLocale = null;
+    this.themeMenu?.destroy();
+    this.localeSwitch?.destroy();
     this.lockVaultNow({ skipFlush: true, silent: true });
     this.disconnectWs?.();
     if (this.toastTimer !== null) {
@@ -171,7 +228,7 @@ export class MyNoteApp {
     }
     this.renderVaultBtn();
     if (!opts.silent) {
-      this.showToast("Vault locked — keys & plaintext wiped from RAM");
+      this.showToast(t("vault.toastLocked"));
     }
   }
 
@@ -187,8 +244,37 @@ export class MyNoteApp {
     }, VAULT_IDLE_MS);
   }
 
+  private createCloseButton(onClick: () => void, testId?: string): HTMLButtonElement {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-ghost btn-icon btn-icon-only";
+    if (testId) btn.dataset.testid = testId;
+    btn.setAttribute("aria-label", t("topbar.close"));
+    btn.title = t("topbar.close");
+    const sr = document.createElement("span");
+    sr.className = "sr-only";
+    sr.textContent = t("topbar.close");
+    btn.append(createIcon("x", "xs"), sr);
+    btn.addEventListener("click", onClick);
+    return btn;
+  }
+
+  private updateCloseButtonLocale(btn: HTMLButtonElement): void {
+    btn.setAttribute("aria-label", t("topbar.close"));
+    btn.title = t("topbar.close");
+    const sr = btn.querySelector<HTMLElement>(".sr-only");
+    if (sr) sr.textContent = t("topbar.close");
+  }
+
+  private createTopbarSep(): HTMLSpanElement {
+    const sep = document.createElement("span");
+    sep.className = "topbar-sep";
+    sep.setAttribute("aria-hidden", "true");
+    return sep;
+  }
+
   private buildShell(): void {
-    this.root.innerHTML = "";
+    this.root.replaceChildren();
 
     const topbar = document.createElement("header");
     topbar.className = "topbar";
@@ -197,71 +283,119 @@ export class MyNoteApp {
     left.className = "topbar-left";
     const brand = document.createElement("span");
     brand.className = "brand";
-    brand.textContent = "my-note";
+    const brandText = document.createElement("span");
+    brandText.textContent = "my-note";
+    brand.append(createIcon("brand-mark", "sm"), brandText);
+
     this.bufferTabsEl = document.createElement("nav");
     this.bufferTabsEl.className = "buffer-tabs";
-    this.bufferTabsEl.setAttribute("aria-label", "Buffers");
-    const switcherBtn = document.createElement("button");
-    switcherBtn.type = "button";
-    switcherBtn.className = "btn";
-    switcherBtn.textContent = "Buffers ⌘P";
-    switcherBtn.addEventListener("click", () => this.openBufferModal());
-    left.append(brand, this.bufferTabsEl, switcherBtn);
+    this.bufferTabsEl.setAttribute("aria-label", t("topbar.buffersNav"));
+
+    this.switcherBtnEl = document.createElement("button");
+    this.switcherBtnEl.type = "button";
+    this.switcherBtnEl.className = "btn btn-ghost btn-has-icon switcher-btn";
+    this.switcherBtnEl.dataset.testid = "buffers-btn";
+    this.switcherLabelEl = document.createElement("span");
+    this.switcherLabelEl.className = "sr-only";
+    this.switcherLabelEl.textContent = t("topbar.buffers");
+    const switcherKbd = document.createElement("kbd");
+    switcherKbd.className = "kbd topbar-kbd-collapsible";
+    switcherKbd.textContent = "⌘P";
+    this.switcherBtnEl.append(createIcon("layers", "xs"), this.switcherLabelEl, switcherKbd);
+    this.switcherBtnEl.title = `${t("topbar.buffers")} (⌘P)`;
+    this.switcherBtnEl.addEventListener("click", () => this.openBufferModal());
+    left.append(brand, this.createTopbarSep(), this.bufferTabsEl, this.createTopbarSep(), this.switcherBtnEl);
 
     const right = document.createElement("div");
     right.className = "topbar-right";
 
-    const newBlkBtn = document.createElement("button");
-    newBlkBtn.type = "button";
-    newBlkBtn.className = "btn btn-primary";
-    newBlkBtn.textContent = "+ New Block";
-    newBlkBtn.title = "Insert new block (Cmd/Ctrl+Enter)";
-    newBlkBtn.addEventListener("click", () => void this.insertBlockAfter(this.stream.getActiveBlockId()));
+    this.newBlkBtnEl = document.createElement("button");
+    this.newBlkBtnEl.type = "button";
+    this.newBlkBtnEl.className = "btn btn-ghost btn-icon-only";
+    this.newBlkBtnEl.dataset.testid = "new-block-btn";
+    this.newBlkLabelEl = document.createElement("span");
+    this.newBlkLabelEl.className = "sr-only";
+    this.newBlkLabelEl.textContent = t("topbar.newBlock");
+    this.newBlkBtnEl.append(createIcon("plus", "xs"), this.newBlkLabelEl);
+    this.newBlkBtnEl.title = t("topbar.newBlockTitle");
+    this.newBlkBtnEl.addEventListener("click", () =>
+      void this.insertBlockAfter(this.stream.getActiveBlockId()),
+    );
 
-    const findBtn = document.createElement("button");
-    findBtn.type = "button";
-    findBtn.className = "btn";
-    findBtn.textContent = "Find";
-    findBtn.title = "Find & replace across blocks (Cmd/Ctrl+F)";
-    findBtn.addEventListener("click", () => this.toggleFindBar(true));
+    this.findBtnEl = document.createElement("button");
+    this.findBtnEl.type = "button";
+    this.findBtnEl.className = "btn btn-ghost btn-icon-only";
+    this.findBtnEl.dataset.testid = "find-btn";
+    this.findBtnLabelEl = document.createElement("span");
+    this.findBtnLabelEl.className = "sr-only";
+    this.findBtnLabelEl.textContent = t("topbar.find");
+    this.findBtnEl.append(createIcon("search", "xs"), this.findBtnLabelEl);
+    this.findBtnEl.title = t("topbar.findTitle");
+    this.findBtnEl.addEventListener("click", () => this.toggleFindBar(true));
 
-    const vimBtn = document.createElement("button");
-    vimBtn.type = "button";
-    vimBtn.className = "btn";
-    vimBtn.textContent = "Vim: Off";
-    vimBtn.addEventListener("click", () => {
+    this.vimBtnEl = document.createElement("button");
+    this.vimBtnEl.type = "button";
+    this.vimBtnEl.className = "btn btn-chip btn-toggle";
+    this.vimBtnEl.dataset.testid = "vim-btn";
+    this.vimBtnEl.setAttribute("aria-pressed", "false");
+    this.vimBtnEl.textContent = t("topbar.vim");
+    this.vimBtnEl.title = t("topbar.vimTitleOff");
+    this.vimBtnEl.addEventListener("click", () => {
       this.vimEnabled = !this.vimEnabled;
-      vimBtn.textContent = this.vimEnabled ? "Vim: On" : "Vim: Off";
+      this.vimBtnEl.setAttribute("aria-pressed", String(this.vimEnabled));
+      this.vimBtnEl.title = this.vimEnabled ? t("topbar.vimTitleOn") : t("topbar.vimTitleOff");
       this.stream.setVimMode(this.vimEnabled);
     });
 
     this.vaultBtnEl = document.createElement("button");
     this.vaultBtnEl.type = "button";
-    this.vaultBtnEl.className = "btn";
+    this.vaultBtnEl.className = "btn btn-ghost btn-has-icon";
     this.vaultBtnEl.dataset.testid = "vault-btn";
-    this.vaultBtnEl.textContent = "Setup Vault";
     this.vaultBtnEl.addEventListener("click", () => this.openVaultModal());
+    this.renderVaultBtn();
 
     this.trashBtnEl = document.createElement("button");
     this.trashBtnEl.type = "button";
-    this.trashBtnEl.className = "btn";
-    this.trashBtnEl.textContent = "Trash (0)";
+    this.trashBtnEl.className = "btn btn-ghost btn-has-icon trash-btn";
+    this.trashBtnEl.dataset.testid = "trash-btn";
+    this.trashBtnEl.setAttribute("aria-pressed", "false");
+    this.trashCountEl = document.createElement("span");
+    this.trashCountEl.className = "trash-count";
+    this.trashBtnEl.append(createIcon("trash", "xs"), this.trashCountEl);
     this.trashBtnEl.addEventListener("click", () => void this.toggleTrash());
+    this.updateTrashCount(0);
 
     this.syncPillEl = document.createElement("button");
     this.syncPillEl.type = "button";
     this.syncPillEl.className = "sync-pill";
+    this.syncPillEl.dataset.testid = "sync-pill";
     this.syncPillEl.dataset.state = "unconfigured";
-    const syncDot = document.createElement("span");
-    syncDot.className = "sync-dot";
+    this.syncIconEl = document.createElement("span");
+    this.syncIconEl.className = "sync-icon";
     const syncLabel = document.createElement("span");
     syncLabel.className = "sync-label";
-    syncLabel.textContent = "Local Only";
-    this.syncPillEl.append(syncDot, syncLabel);
-    this.syncPillEl.title = "Click to sync now";
+    syncLabel.textContent = t("sync.localOnly");
+    this.syncPillEl.append(this.syncIconEl, syncLabel);
+    this.syncPillEl.title = t("sync.title");
     this.syncPillEl.addEventListener("click", () => void this.triggerSyncNow());
+    this.renderSyncPill();
 
-    right.append(newBlkBtn, findBtn, vimBtn, this.vaultBtnEl, this.trashBtnEl, this.syncPillEl);
+    this.themeMenu = createThemeMenu();
+    this.localeSwitch = createLocaleSwitch();
+
+    right.append(
+      this.newBlkBtnEl,
+      this.findBtnEl,
+      this.vimBtnEl,
+      this.createTopbarSep(),
+      this.vaultBtnEl,
+      this.trashBtnEl,
+      this.createTopbarSep(),
+      this.syncPillEl,
+      this.createTopbarSep(),
+      this.themeMenu.element,
+      this.localeSwitch.element,
+    );
     topbar.append(left, right);
 
     this.alertStackEl = document.createElement("div");
@@ -270,9 +404,15 @@ export class MyNoteApp {
     // Find & replace bar
     this.findBarEl = document.createElement("div");
     this.findBarEl.className = "find-bar hidden";
+    const findInner = document.createElement("div");
+    findInner.className = "find-bar-inner";
+
+    const findInputWrap = document.createElement("div");
+    findInputWrap.className = "find-input-wrap";
+    findInputWrap.appendChild(createIcon("search", "xs", "find-input-icon"));
     this.findInputEl = document.createElement("input");
     this.findInputEl.className = "input";
-    this.findInputEl.placeholder = "Find across buffer...";
+    this.findInputEl.placeholder = t("find.placeholder");
     this.findInputEl.addEventListener("input", () => {
       this.findIndex = 0;
       this.runFind(0);
@@ -283,28 +423,42 @@ export class MyNoteApp {
         this.runFind(ev.shiftKey ? -1 : 1);
       }
     });
+    findInputWrap.appendChild(this.findInputEl);
+
     this.replaceInputEl = document.createElement("input");
-    this.replaceInputEl.className = "input";
-    this.replaceInputEl.placeholder = "Replace with...";
+    this.replaceInputEl.className = "input find-replace-input";
+    this.replaceInputEl.placeholder = t("find.replacePlaceholder");
     this.findCountEl = document.createElement("span");
-    this.findCountEl.className = "kbd";
-    this.findCountEl.textContent = "0 matches";
-    const nextBtn = document.createElement("button");
-    nextBtn.type = "button";
-    nextBtn.className = "btn btn-icon";
-    nextBtn.textContent = "Next";
-    nextBtn.addEventListener("click", () => this.runFind(1));
-    const repBtn = document.createElement("button");
-    repBtn.type = "button";
-    repBtn.className = "btn btn-icon";
-    repBtn.textContent = "Replace All";
-    repBtn.addEventListener("click", () => void this.runReplaceAll());
-    const closeFindBtn = document.createElement("button");
-    closeFindBtn.type = "button";
-    closeFindBtn.className = "btn btn-icon";
-    closeFindBtn.textContent = "✕";
-    closeFindBtn.addEventListener("click", () => this.toggleFindBar(false));
-    this.findBarEl.append(this.findInputEl, this.replaceInputEl, this.findCountEl, nextBtn, repBtn, closeFindBtn);
+    this.findCountEl.className = "find-count";
+    this.findCountEl.textContent = "";
+    this.findPrevBtnEl = document.createElement("button");
+    this.findPrevBtnEl.type = "button";
+    this.findPrevBtnEl.className = "btn btn-icon";
+    this.findPrevBtnEl.dataset.testid = "find-prev-btn";
+    this.findPrevBtnEl.textContent = t("find.prev");
+    this.findPrevBtnEl.addEventListener("click", () => this.runFind(-1));
+    this.findNextBtnEl = document.createElement("button");
+    this.findNextBtnEl.type = "button";
+    this.findNextBtnEl.className = "btn btn-icon";
+    this.findNextBtnEl.dataset.testid = "find-next-btn";
+    this.findNextBtnEl.textContent = t("find.next");
+    this.findNextBtnEl.addEventListener("click", () => this.runFind(1));
+    this.findReplaceBtnEl = document.createElement("button");
+    this.findReplaceBtnEl.type = "button";
+    this.findReplaceBtnEl.className = "btn btn-icon";
+    this.findReplaceBtnEl.textContent = t("find.replaceAll");
+    this.findReplaceBtnEl.addEventListener("click", () => void this.runReplaceAll());
+    this.findCloseBtnEl = this.createCloseButton(() => this.toggleFindBar(false));
+    findInner.append(
+      findInputWrap,
+      this.replaceInputEl,
+      this.findCountEl,
+      this.findPrevBtnEl,
+      this.findNextBtnEl,
+      this.findReplaceBtnEl,
+      this.findCloseBtnEl,
+    );
+    this.findBarEl.appendChild(findInner);
 
     // Main workspace
     const workspace = document.createElement("main");
@@ -341,17 +495,20 @@ export class MyNoteApp {
     this.trashDrawerEl.className = "drawer hidden";
     const drawerHdr = document.createElement("div");
     drawerHdr.className = "drawer-header";
-    const drawerTitle = document.createElement("span");
-    drawerTitle.textContent = "Recycle Bin (Recoverable)";
-    const closeDrawer = document.createElement("button");
-    closeDrawer.type = "button";
-    closeDrawer.className = "btn btn-icon";
-    closeDrawer.textContent = "✕";
-    closeDrawer.addEventListener("click", () => {
+    this.trashTitleEl = document.createElement("span");
+    this.trashTitleEl.className = "drawer-header-title";
+    this.trashTitleEl.textContent = t("trash.title");
+    this.trashHeaderActionsEl = document.createElement("div");
+    this.trashHeaderActionsEl.className = "drawer-header-actions";
+    this.trashCloseBtnEl = this.createCloseButton(() => {
       this.trashOpen = false;
       this.trashDrawerEl.classList.add("hidden");
+      this.syncTrashBtnState();
     });
-    drawerHdr.append(drawerTitle, closeDrawer);
+    const trashHdrRight = document.createElement("div");
+    trashHdrRight.className = "drawer-header-right";
+    trashHdrRight.append(this.trashHeaderActionsEl, this.trashCloseBtnEl);
+    drawerHdr.append(this.trashTitleEl, trashHdrRight);
     this.trashActionsEl = document.createElement("div");
     this.trashActionsEl.className = "drawer-actions";
     this.trashListEl = document.createElement("div");
@@ -365,14 +522,15 @@ export class MyNoteApp {
     const histHdr = document.createElement("div");
     histHdr.className = "drawer-header";
     this.historyTitleEl = document.createElement("span");
-    this.historyTitleEl.textContent = "Block History";
-    const closeHist = document.createElement("button");
-    closeHist.type = "button";
-    closeHist.className = "btn btn-icon";
-    closeHist.dataset.testid = "history-close-btn";
-    closeHist.textContent = "✕";
-    closeHist.addEventListener("click", () => this.closeHistoryDrawer());
-    histHdr.append(this.historyTitleEl, closeHist);
+    this.historyTitleEl.className = "drawer-header-title";
+    this.historyTitleEl.textContent = t("history.title");
+    this.historyHeaderActionsEl = document.createElement("div");
+    this.historyHeaderActionsEl.className = "drawer-header-actions";
+    this.historyCloseBtnEl = this.createCloseButton(() => this.closeHistoryDrawer(), "history-close-btn");
+    const histHdrRight = document.createElement("div");
+    histHdrRight.className = "drawer-header-right";
+    histHdrRight.append(this.historyHeaderActionsEl, this.historyCloseBtnEl);
+    histHdr.append(this.historyTitleEl, histHdrRight);
     this.historyActionsEl = document.createElement("div");
     this.historyActionsEl.className = "drawer-actions";
     this.historyListEl = document.createElement("div");
@@ -381,33 +539,81 @@ export class MyNoteApp {
     this.historyDiffEl.className = "history-diff-pane";
     this.historyDrawerEl.append(histHdr, this.historyActionsEl, this.historyListEl, this.historyDiffEl);
 
-    workspace.append(streamEl, this.trashDrawerEl, this.historyDrawerEl);
+    const workspaceMain = document.createElement("div");
+    workspaceMain.className = "workspace-main";
+    workspaceMain.append(this.findBarEl, streamEl);
+    workspace.append(workspaceMain, this.trashDrawerEl, this.historyDrawerEl);
 
-    // Buffer Switcher modal
+    // Buffer Switcher modal (Quick Switcher ⌘P — single unified Filter / Create command bar)
     this.modalBackdropEl = document.createElement("div");
     this.modalBackdropEl.className = "modal-backdrop hidden";
     this.modalBackdropEl.addEventListener("click", (ev) => {
       if (ev.target === this.modalBackdropEl) this.closeBufferModal();
     });
     const modal = document.createElement("div");
-    modal.className = "modal";
-    const modalHdr = document.createElement("div");
-    modalHdr.className = "drawer-header";
-    modalHdr.textContent = "Switch or Create Buffer";
+    modal.className = "modal buffer-switcher-modal";
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-label", t("buffer.modalTitle"));
+    this.bufferModalEl = modal;
+
+    const filterRow = document.createElement("div");
+    filterRow.className = "modal-search-row";
+    const filterWrap = document.createElement("div");
+    filterWrap.className = "find-input-wrap modal-filter-wrap";
+    filterWrap.appendChild(createIcon("search", "xs", "find-input-icon"));
+    this.bufferFilterInputEl = document.createElement("input");
+    this.bufferFilterInputEl.type = "search";
+    this.bufferFilterInputEl.className = "input";
+    this.bufferFilterInputEl.placeholder = t("buffer.filterPlaceholder");
+    this.bufferFilterInputEl.dataset.testid = "buffer-filter-input";
+    this.bufferFilterInputEl.addEventListener("input", () => {
+      this.bufferFilterQuery = this.bufferFilterInputEl.value;
+      this.bufferActiveIndex = 0;
+      this.renderBufferModalList();
+    });
+    this.bufferFilterInputEl.addEventListener("keydown", (ev) => {
+      const options = this.getBufferModalOptions();
+      if (ev.key === "ArrowDown") {
+        ev.preventDefault();
+        if (options.length > 0) {
+          this.bufferActiveIndex = (this.bufferActiveIndex + 1) % options.length;
+          this.syncBufferModalHighlight();
+        }
+      } else if (ev.key === "ArrowUp") {
+        ev.preventDefault();
+        if (options.length > 0) {
+          this.bufferActiveIndex = (this.bufferActiveIndex - 1 + options.length) % options.length;
+          this.syncBufferModalHighlight();
+        }
+      } else if (ev.key === "Enter") {
+        ev.preventDefault();
+        const picked = options[this.bufferActiveIndex];
+        if (!picked) return;
+        if (picked.kind === "buffer") {
+          this.closeBufferModal();
+          void this.switchBuffer(picked.buffer.id);
+        } else {
+          void this.createBufferByName(picked.name);
+        }
+      } else if (ev.key === "Escape") {
+        ev.preventDefault();
+        this.closeBufferModal();
+      }
+    });
+    filterWrap.appendChild(this.bufferFilterInputEl);
+    this.bufferModalCloseBtnEl = this.createCloseButton(() => this.closeBufferModal(), "buffer-modal-close");
+    filterRow.append(filterWrap, this.bufferModalCloseBtnEl);
+
     this.modalListEl = document.createElement("div");
     this.modalListEl.className = "modal-list";
-    const createRow = document.createElement("div");
-    createRow.className = "topbar-left";
-    this.newBufInputEl = document.createElement("input");
-    this.newBufInputEl.className = "input";
-    this.newBufInputEl.placeholder = "New buffer name...";
-    const createBtn = document.createElement("button");
-    createBtn.type = "button";
-    createBtn.className = "btn btn-primary";
-    createBtn.textContent = "Create";
-    createBtn.addEventListener("click", () => void this.createBuffer());
-    createRow.append(this.newBufInputEl, createBtn);
-    modal.append(modalHdr, this.modalListEl, createRow);
+    this.modalListEl.setAttribute("role", "listbox");
+
+    this.bufferFooterEl = document.createElement("div");
+    this.bufferFooterEl.className = "modal-hints";
+    this.renderBufferModalHints();
+
+    modal.append(filterRow, this.modalListEl, this.bufferFooterEl);
     this.modalBackdropEl.appendChild(modal);
 
     // Generic M2 Dialog modal (Vault, Lock/Unlock, Trash Shred Confirmation)
@@ -419,20 +625,75 @@ export class MyNoteApp {
     });
     this.dialogModalEl = document.createElement("div");
     this.dialogModalEl.className = "modal";
+    this.dialogModalEl.setAttribute("role", "dialog");
+    this.dialogModalEl.setAttribute("aria-modal", "true");
     this.dialogBackdropEl.appendChild(this.dialogModalEl);
 
     this.toastEl = document.createElement("div");
     this.toastEl.className = "toast hidden";
+    this.toastEl.setAttribute("role", "status");
+    this.toastEl.setAttribute("aria-live", "polite");
 
     this.root.append(
       topbar,
       this.alertStackEl,
-      this.findBarEl,
       workspace,
       this.modalBackdropEl,
       this.dialogBackdropEl,
       this.toastEl,
     );
+  }
+
+  private applyLocale(): void {
+    syncDocumentLocale("app.title");
+    this.bufferTabsEl.setAttribute("aria-label", t("topbar.buffersNav"));
+    this.switcherLabelEl.textContent = t("topbar.buffers");
+    this.switcherBtnEl.title = `${t("topbar.buffers")} (⌘P)`;
+    this.newBlkLabelEl.textContent = t("topbar.newBlock");
+    this.newBlkBtnEl.title = t("topbar.newBlockTitle");
+    this.findBtnLabelEl.textContent = t("topbar.find");
+    this.findBtnEl.title = t("topbar.findTitle");
+    this.vimBtnEl.textContent = t("topbar.vim");
+    this.vimBtnEl.title = this.vimEnabled ? t("topbar.vimTitleOn") : t("topbar.vimTitleOff");
+
+    this.findInputEl.placeholder = t("find.placeholder");
+    this.replaceInputEl.placeholder = t("find.replacePlaceholder");
+    this.findCountEl.textContent = this.formatFindCounter();
+    this.findPrevBtnEl.textContent = t("find.prev");
+    this.findNextBtnEl.textContent = t("find.next");
+    this.findReplaceBtnEl.textContent = t("find.replaceAll");
+    this.updateCloseButtonLocale(this.findCloseBtnEl);
+
+    this.trashTitleEl.textContent = t("trash.title");
+    this.updateCloseButtonLocale(this.trashCloseBtnEl);
+    this.updateCloseButtonLocale(this.historyCloseBtnEl);
+
+    this.bufferModalEl.setAttribute("aria-label", t("buffer.modalTitle"));
+    this.updateCloseButtonLocale(this.bufferModalCloseBtnEl);
+    this.bufferFilterInputEl.placeholder = t("buffer.filterPlaceholder");
+    this.renderBufferModalHints();
+
+    this.themeMenu.refreshLocale();
+    this.localeSwitch.refreshLocale();
+    this.renderVaultBtn();
+    this.renderSyncPill();
+    this.updateTrashCount(this.lastTrashCount);
+    this.renderAlerts();
+
+    if (this.trashOpen) {
+      this.renderTrash();
+    }
+    if (this.historyOpen) {
+      this.renderHistoryDrawer();
+    } else {
+      this.historyTitleEl.textContent = t("history.title");
+    }
+    if (!this.modalBackdropEl.classList.contains("hidden")) {
+      this.renderBufferModalList();
+    }
+
+    // In-place update across all block cards without unmounting CM6 views or clearing Vault RAM
+    this.stream.refreshLocale();
   }
 
   private bindGlobalKeys(): void {
@@ -538,14 +799,16 @@ export class MyNoteApp {
   };
 
   private showToast(msg: string, isError = false): void {
-    this.toastEl.textContent = msg;
+    const textSpan = document.createElement("span");
+    textSpan.textContent = msg;
+    this.toastEl.replaceChildren(createIcon(isError ? "alert-triangle" : "check-circle", "xs"), textSpan);
     this.toastEl.className = `toast${isError ? " error" : ""}`;
     if (this.toastTimer !== null) window.clearTimeout(this.toastTimer);
     this.toastTimer = window.setTimeout(() => this.toastEl.classList.add("hidden"), 3200);
   }
 
   private renderBuffers(): void {
-    this.bufferTabsEl.innerHTML = "";
+    this.bufferTabsEl.replaceChildren();
     for (const buf of this.buffers) {
       const btn = document.createElement("button");
       btn.type = "button";
@@ -557,51 +820,123 @@ export class MyNoteApp {
   }
 
   private renderVaultBtn(): void {
+    const labelSpan = document.createElement("span");
+    labelSpan.className = "btn-label";
     if (this.isVaultUnlocked()) {
-      this.vaultBtnEl.className = "btn btn-amber";
-      this.vaultBtnEl.textContent = "🔓 Vault: Unlocked";
-      this.vaultBtnEl.title = "Vault unlocked in browser WASM RAM — click to lock or change passphrase";
+      this.vaultBtnEl.className = "btn btn-amber btn-has-icon";
+      labelSpan.textContent = t("vault.unlocked");
+      this.vaultBtnEl.title = t("vault.unlockedTitle");
+      this.vaultBtnEl.replaceChildren(createIcon("lock-open", "xs"), labelSpan);
     } else if (this.vaultHeader) {
-      this.vaultBtnEl.className = "btn";
-      this.vaultBtnEl.textContent = "🔒 Vault: Locked";
-      this.vaultBtnEl.title = "Unlock Tier 2 Vault in browser WASM RAM";
+      this.vaultBtnEl.className = "btn btn-ghost btn-has-icon";
+      labelSpan.textContent = t("vault.locked");
+      this.vaultBtnEl.title = t("vault.lockedTitle");
+      this.vaultBtnEl.replaceChildren(createIcon("lock", "xs"), labelSpan);
     } else {
-      this.vaultBtnEl.className = "btn";
-      this.vaultBtnEl.textContent = "Setup Vault";
-      this.vaultBtnEl.title = "Initialize Tier 2 Vault passphrase";
+      this.vaultBtnEl.className = "btn btn-ghost btn-has-icon";
+      labelSpan.textContent = t("vault.setup");
+      this.vaultBtnEl.title = t("vault.setupTitle");
+      this.vaultBtnEl.replaceChildren(createIcon("lock", "xs"), labelSpan);
     }
   }
 
   private renderSyncPill(): void {
-    const label = this.syncPillEl.querySelector(".sync-label")!;
+    const label = this.syncPillEl.querySelector<HTMLElement>(".sync-label")!;
+    const setIcon = (name: IconName): void => {
+      this.syncIconEl.replaceChildren(createIcon(name, "xs"));
+    };
+    const setQuietDot = (): void => {
+      const dot = document.createElement("span");
+      dot.className = "sync-dot";
+      dot.setAttribute("aria-hidden", "true");
+      this.syncIconEl.replaceChildren(dot);
+    };
+
     if (!this.wsConnected) {
       this.syncPillEl.dataset.state = "pending_offline";
-      label.textContent = this.alerts.has("AUTH_REQUIRED") ? "Session Expired" : "Daemon Disconnected";
+      this.syncPillEl.classList.remove("is-quiet");
+      setIcon("cloud-off");
+      label.className = "sync-label";
+      label.textContent = this.alerts.has("AUTH_REQUIRED")
+        ? t("sync.sessionExpired")
+        : t("sync.daemonDisconnected");
+      this.syncPillEl.title = t("sync.title");
       return;
     }
+
     const state: SyncStateLabel = this.syncStatus?.sync_state ?? "unconfigured";
     const pending = this.syncStatus?.pending_ops ?? 0;
     this.syncPillEl.dataset.state = state;
+
     switch (state) {
       case "synced":
-        label.textContent = "Synced";
+        this.syncPillEl.classList.add("is-quiet");
+        setQuietDot();
+        label.className = "sync-label btn-label-collapsible";
+        label.textContent = t("sync.synced");
+        this.syncPillEl.title = t("sync.syncedTitle");
         break;
       case "syncing":
-        label.textContent = "Syncing…";
+        this.syncPillEl.classList.remove("is-quiet");
+        setIcon("refresh-cw");
+        label.className = "sync-label";
+        label.textContent = t("sync.syncing");
+        this.syncPillEl.title = t("sync.title");
         break;
       case "pending_offline":
-        label.textContent = pending > 0 ? `Offline (${pending} pending)` : "Offline";
+        this.syncPillEl.classList.remove("is-quiet");
+        setIcon("cloud-off");
+        label.className = "sync-label";
+        label.textContent =
+          pending > 0 ? t("sync.offlinePending", { count: pending }) : t("sync.offline");
+        this.syncPillEl.title = t("sync.title");
         break;
       case "conflict_present":
-        label.textContent = "Conflict";
+        this.syncPillEl.classList.remove("is-quiet");
+        setIcon("alert-triangle");
+        label.className = "sync-label";
+        label.textContent = t("sync.conflict");
+        this.syncPillEl.title = t("sync.title");
         break;
       default:
-        label.textContent = "Local Only";
+        this.syncPillEl.classList.add("is-quiet");
+        setQuietDot();
+        label.className = "sync-label btn-label-collapsible";
+        label.textContent = t("sync.localOnly");
+        this.syncPillEl.title = t("sync.localOnlyTitle");
     }
   }
 
+  private syncTrashBtnState(): void {
+    this.trashBtnEl.setAttribute("aria-pressed", String(this.trashOpen));
+    this.trashBtnEl.classList.toggle("is-active", this.trashOpen);
+  }
+
   private updateTrashCount(count: number): void {
-    this.trashBtnEl.textContent = `Trash (${count})`;
+    this.lastTrashCount = count;
+    const fullText = t("topbar.trashCount", { count });
+    this.trashBtnEl.title = fullText;
+    const numStr = String(count);
+    const idx = fullText.indexOf(numStr);
+    this.trashCountEl.replaceChildren();
+    if (idx >= 0) {
+      const before = document.createElement("span");
+      before.className = "sr-only";
+      before.textContent = fullText.slice(0, idx);
+      const num = document.createElement("span");
+      num.className = count > 0 ? "trash-badge-num" : "sr-only";
+      num.textContent = numStr;
+      const after = document.createElement("span");
+      after.className = "sr-only";
+      after.textContent = fullText.slice(idx + numStr.length);
+      this.trashCountEl.append(before, num, after);
+    } else {
+      const fallback = document.createElement("span");
+      fallback.className = "sr-only";
+      fallback.textContent = fullText;
+      this.trashCountEl.appendChild(fallback);
+    }
+    this.trashBtnEl.classList.toggle("has-items", count > 0);
   }
 
   private updateAlertsFromStatus(status: SyncStatusDto): void {
@@ -642,7 +977,7 @@ export class MyNoteApp {
   }
 
   private renderAlerts(): void {
-    this.alertStackEl.innerHTML = "";
+    this.alertStackEl.replaceChildren();
     if (this.secretNudge) {
       const nudge = this.secretNudge;
       const div = document.createElement("div");
@@ -650,13 +985,19 @@ export class MyNoteApp {
       div.dataset.code = "SECRET_PASTE_NUDGE";
       div.dataset.severity = "warn";
       const text = document.createElement("span");
-      text.textContent = `Possible secret (${nudge.secretType}) pasted into Tier 1 block — consider encrypting it in Tier 2 Vault.`;
+      text.className = "alert-banner-msg";
+      text.append(
+        createIcon("alert-triangle", "xs"),
+        document.createTextNode(t("alert.secretNudge", { type: nudge.secretType })),
+      );
       const actions = document.createElement("div");
       actions.className = "block-header-right";
       const lockBtn = document.createElement("button");
       lockBtn.type = "button";
-      lockBtn.className = "btn btn-amber btn-icon";
-      lockBtn.textContent = "🔒 Lock Block";
+      lockBtn.className = "btn btn-amber btn-icon btn-has-icon";
+      const lockLbl = document.createElement("span");
+      lockLbl.textContent = t("alert.lockBlock");
+      lockBtn.append(createIcon("lock", "xs"), lockLbl);
       lockBtn.addEventListener("click", () => {
         const blk = this.stream.getBlocks().find((b) => b.id === nudge.blockId);
         this.secretNudge = null;
@@ -666,7 +1007,7 @@ export class MyNoteApp {
       const dismissBtn = document.createElement("button");
       dismissBtn.type = "button";
       dismissBtn.className = "btn btn-icon";
-      dismissBtn.textContent = "Dismiss";
+      dismissBtn.textContent = t("alert.dismiss");
       dismissBtn.addEventListener("click", () => {
         this.secretNudge = null;
         this.renderAlerts();
@@ -677,40 +1018,43 @@ export class MyNoteApp {
     }
 
     for (const alert of this.alerts.values()) {
+      const isErr =
+        alert.code === "KEY_MISSING" || alert.code === "AUTH_REQUIRED" || alert.code === "DEVICE_REVOKED";
       const div = document.createElement("div");
       div.className = "alert-banner";
       div.dataset.code = alert.code;
-      div.dataset.severity =
-        alert.code === "KEY_MISSING" || alert.code === "AUTH_REQUIRED" || alert.code === "DEVICE_REVOKED"
-          ? "error"
-          : "warn";
+      div.dataset.severity = isErr ? "error" : "warn";
       const text = document.createElement("span");
+      text.className = "alert-banner-msg";
+      let msgText: string;
       if (alert.code === "KEY_MISSING") {
-        text.textContent = "KEY_MISSING: Active block missing encryption key — run 'mynote sync pull' and do not delete data.";
+        msgText = t("alert.keyMissing");
       } else if (alert.code === "AUTH_REQUIRED") {
-        text.textContent = "AUTH_REQUIRED: Local daemon session expired — run 'mynote open' to obtain a fresh login ticket.";
+        msgText = t("alert.authRequired");
       } else if (alert.code === "DEVICE_REVOKED") {
-        text.textContent = "DEVICE_REVOKED: This device token was revoked on the relay — re-pair or re-bootstrap before syncing.";
+        msgText = t("alert.deviceRevoked");
       } else if (alert.code === "CLOCK_SKEW") {
-        text.textContent = `CLOCK_SKEW: Remote clock skew detected (${JSON.stringify(alert.details)}). All versions preserved safely.`;
+        msgText = t("alert.clockSkew", { details: JSON.stringify(alert.details) });
       } else if (alert.code === "RECOVERY_DRILL_DUE") {
-        text.textContent = "RECOVERY_DRILL_DUE: Keyring rotated — run 'mynote recovery drill' to verify your 24-word bundle.";
+        msgText = t("alert.recoveryDrillDue");
       } else if (alert.code === "SHRED_PENDING_CONFIRM") {
-        text.textContent =
-          "SHRED_PENDING_CONFIRM: Batch/high-volume shred marks require explicit desktop UI confirmation before countdown starts.";
+        msgText = t("alert.shredPendingConfirm");
       } else if (alert.code === "NEEDS_VAULT_REKEY") {
-        text.textContent =
-          "NEEDS_VAULT_REKEY: Offline Tier 2 edit(s) referenced a key pending shred — unlock Vault to re-encrypt under a fresh key automatically.";
+        msgText = t("alert.needsVaultRekey");
       } else {
-        text.textContent = `${alert.code}: ${JSON.stringify(alert.details)}`;
+        msgText = `${alert.code}: ${JSON.stringify(alert.details)}`;
       }
+      text.append(
+        createIcon(isErr ? "shield-alert" : "alert-triangle", "xs"),
+        document.createTextNode(msgText),
+      );
       div.appendChild(text);
 
       if (alert.code === "SHRED_PENDING_CONFIRM") {
         const btn = document.createElement("button");
         btn.type = "button";
         btn.className = "btn btn-amber btn-icon";
-        btn.textContent = "Review Trash";
+        btn.textContent = t("alert.reviewTrash");
         btn.addEventListener("click", () => {
           if (!this.trashOpen) void this.toggleTrash();
           else void this.refreshTrash();
@@ -720,7 +1064,7 @@ export class MyNoteApp {
         const btn = document.createElement("button");
         btn.type = "button";
         btn.className = "btn btn-primary btn-icon";
-        btn.textContent = "Unlock Vault to Rekey";
+        btn.textContent = t("alert.unlockRekey");
         btn.addEventListener("click", () => this.openVaultModal());
         div.appendChild(btn);
       }
@@ -748,9 +1092,13 @@ export class MyNoteApp {
             .map((b) => b.id),
           this.activeBufferId,
         );
+        this.knownBufferBlockCounts.set(this.activeBufferId, this.stream.getBlocks().length);
       } else {
         this.activeBufferId = boot.initial_buffer_id ?? boot.buffers[0]?.id ?? null;
         this.stream.setBlocks(boot.blocks);
+        if (this.activeBufferId) {
+          this.knownBufferBlockCounts.set(this.activeBufferId, boot.blocks.length);
+        }
       }
       this.decryptVisibleLockedBlocks();
       this.renderBuffers();
@@ -764,6 +1112,9 @@ export class MyNoteApp {
   private handleWsFrame(frame: LocalWsFrame): void {
     if (frame.type === "blocks_changed") {
       this.stream.upsertBlocks(frame.upserted, frame.deleted_ids, this.activeBufferId);
+      if (this.activeBufferId) {
+        this.knownBufferBlockCounts.set(this.activeBufferId, this.stream.getBlocks().length);
+      }
       if (this.isVaultUnlocked()) {
         this.decryptVisibleLockedBlocks();
       }
@@ -837,6 +1188,7 @@ export class MyNoteApp {
       this.closeHistoryDrawer();
       this.renderBuffers();
       this.stream.setBlocks(blocks);
+      this.knownBufferBlockCounts.set(bufferId, blocks.length);
       if (this.isVaultUnlocked()) {
         this.decryptVisibleLockedBlocks();
       }
@@ -856,6 +1208,7 @@ export class MyNoteApp {
         fast_sync: true,
       });
       this.stream.upsertBlocks([created], [], this.activeBufferId);
+      this.knownBufferBlockCounts.set(this.activeBufferId, this.stream.getBlocks().length);
       this.stream.focusBlock(created.id, 0);
     } catch (e) {
       this.handleErr(e);
@@ -989,9 +1342,16 @@ export class MyNoteApp {
       if (rescued === blocked.length && failed === 0) {
         this.alerts.delete("NEEDS_VAULT_REKEY");
         this.renderAlerts();
-        this.showToast(`Rescued ${rescued} blocked Tier 2 op(s) with fresh keys`);
+        this.showToast(t("vault.toastRescuedAll", { count: rescued }));
       } else if (rescued > 0) {
-        this.showToast(`Rescued ${rescued}/${blocked.length} blocked Tier 2 op(s); ${blocked.length - rescued} still pending`, true);
+        this.showToast(
+          t("vault.toastRescuedPartial", {
+            rescued,
+            total: blocked.length,
+            remaining: blocked.length - rescued,
+          }),
+          true,
+        );
       }
     } catch (e) {
       this.handleErr(e);
@@ -1022,12 +1382,12 @@ export class MyNoteApp {
       if (block.is_locked) {
         const session = this.vaultSession;
         if (!session || session.isLocked()) {
-          this.showToast("Vault is locked — unlock Vault to save Tier 2 changes", true);
+          this.showToast(t("vault.errLockedSave"), true);
           return { status: "error" };
         }
         const mat = this.findTier2KeyMaterial(block);
         if (!mat) {
-          this.showToast("Missing MNW1 key material for Tier 2 block", true);
+          this.showToast(t("vault.errMissingMnw1"), true);
           return { status: "error" };
         }
         // Encrypt synchronously BEFORE awaiting fetch so visibilitychange keepalive flush completes cleanly before lockVaultNow!
@@ -1074,11 +1434,11 @@ export class MyNoteApp {
       ) {
         this.stream.setUnlockedPlaintext(updated.id, content);
       }
-      if (opts.isMerge) this.showToast("Merged versions cleanly");
+      if (opts.isMerge) this.showToast(t("block.toastMerged"));
       return { status: "ok", updated };
     } catch (e) {
       if (e instanceof LocalApiError && e.body.code === "HEAD_MISMATCH") {
-        this.showToast("Concurrent update detected — your draft is preserved; choose Save Over or Reload", true);
+        this.showToast(t("block.toastHeadMismatch"), true);
         if (this.activeBufferId) {
           try {
             const latest = await this.api.listBlocks(this.activeBufferId);
@@ -1109,13 +1469,13 @@ export class MyNoteApp {
     const cur = this.stream.getBlocks().find((b) => b.id === block.id) ?? block;
     if (!this.stream.isBlockEditable(cur.id)) {
       this.showToast(
-        cur.is_locked ? "Unlock Vault to format this Tier 2 block in browser WASM" : "Cannot format an unreadable block",
+        cur.is_locked ? t("vault.errUnlockToFormat") : t("block.toastCannotFormatUnreadable"),
         true,
       );
       return;
     }
     if (cur.has_conflict) {
-      this.showToast("Resolve concurrent versions before formatting", true);
+      this.showToast(t("block.toastResolveBeforeFormat"), true);
       return;
     }
     try {
@@ -1126,12 +1486,12 @@ export class MyNoteApp {
         const session = this.vaultSession;
         const lockEpoch = this.stream.getVaultLockEpoch();
         if (!session || session.isLocked()) {
-          this.showToast("Vault is locked", true);
+          this.showToast(t("vault.errLocked"), true);
           return;
         }
         const mat = this.findTier2KeyMaterial(cur);
         if (!mat) {
-          this.showToast("Missing MNW1 key material for Tier 2 block", true);
+          this.showToast(t("vault.errMissingMnw1"), true);
           return;
         }
         const formatted = await formatSnippetWasm(content, cur.lang);
@@ -1165,7 +1525,7 @@ export class MyNoteApp {
         const keepUnlocked =
           this.isVaultUnlocked() && !isPageHidden() && this.stream.getVaultLockEpoch() === lockEpoch;
         this.stream.applyAuthoritativeBlock(updated, this.activeBufferId, keepUnlocked ? formatted : undefined);
-        this.showToast(`Formatted (${cur.lang}) in WASM`);
+        this.showToast(t("block.toastFormattedWasm", { lang: cur.lang }));
         return;
       }
 
@@ -1176,7 +1536,7 @@ export class MyNoteApp {
         fast_sync: true,
       });
       this.stream.applyAuthoritativeBlock(updated, this.activeBufferId);
-      this.showToast(`Formatted (${cur.lang})`);
+      this.showToast(t("block.toastFormatted", { lang: cur.lang }));
     } catch (e) {
       this.handleErr(e);
     }
@@ -1185,9 +1545,9 @@ export class MyNoteApp {
   private async copyBlockContent(content: string): Promise<void> {
     try {
       await navigator.clipboard.writeText(content);
-      this.showToast("Copied block to clipboard");
+      this.showToast(t("block.toastCopied"));
     } catch {
-      this.showToast("Clipboard permission unavailable", true);
+      this.showToast(t("block.toastClipboardUnavailable"), true);
     }
   }
 
@@ -1195,9 +1555,9 @@ export class MyNoteApp {
     const ok = await copyDualFormat(html, text);
     if (ok) {
       if (block.is_locked) this.resetVaultIdleTimer();
-      this.showToast("Copied rich HTML + plain text");
+      this.showToast(t("block.toastCopiedRich"));
     } else {
-      this.showToast("Clipboard permission unavailable", true);
+      this.showToast(t("block.toastClipboardUnavailable"), true);
     }
   }
 
@@ -1223,7 +1583,10 @@ export class MyNoteApp {
         this.closeHistoryDrawer();
       }
       this.stream.upsertBlocks([], [cur.id], this.activeBufferId);
-      this.showToast("Moved block to Recycle Bin");
+      if (this.activeBufferId) {
+        this.knownBufferBlockCounts.set(this.activeBufferId, this.stream.getBlocks().length);
+      }
+      this.showToast(t("block.toastMovedToTrash"));
       await this.refreshTrash();
     } catch (e) {
       this.handleErr(e);
@@ -1244,7 +1607,7 @@ export class MyNoteApp {
           block.versions.find((v) => v.op_id === opId)?.content ??
           null;
         if (chosen === null) {
-          this.showToast("Selected version cannot be decrypted", true);
+          this.showToast(t("block.toastCannotDecryptSelected"), true);
           return;
         }
         const mat = this.findTier2KeyMaterial(block);
@@ -1276,7 +1639,7 @@ export class MyNoteApp {
         const keepUnlocked =
           this.isVaultUnlocked() && !isPageHidden() && this.stream.getVaultLockEpoch() === lockEpoch;
         this.stream.applyAuthoritativeBlock(updated, this.activeBufferId, keepUnlocked ? chosen : undefined);
-        this.showToast("Tier 2 conflict resolved");
+        this.showToast(t("block.toastConflictResolvedT2"));
         return;
       }
 
@@ -1285,7 +1648,7 @@ export class MyNoteApp {
         keep_op_id: opId,
       });
       this.stream.applyAuthoritativeBlock(updated, this.activeBufferId);
-      this.showToast("Conflict resolved to selected version");
+      this.showToast(t("block.toastConflictResolved"));
     } catch (e) {
       this.handleErr(e);
     }
@@ -1306,16 +1669,12 @@ export class MyNoteApp {
 
   private openVaultModal(forceMode?: "init" | "unlock" | "recover" | "unlocked"): void {
     const mode = forceMode ?? (this.isVaultUnlocked() ? "unlocked" : this.vaultHeader ? "unlock" : "init");
-    this.dialogModalEl.innerHTML = "";
+    this.dialogModalEl.replaceChildren();
 
     const hdr = document.createElement("div");
     hdr.className = "drawer-header";
     const title = document.createElement("span");
-    const closeBtn = document.createElement("button");
-    closeBtn.type = "button";
-    closeBtn.className = "btn btn-icon";
-    closeBtn.textContent = "✕";
-    closeBtn.addEventListener("click", () => this.closeDialog());
+    const closeBtn = this.createCloseButton(() => this.closeDialog());
     hdr.append(title, closeBtn);
     this.dialogModalEl.appendChild(hdr);
 
@@ -1323,27 +1682,26 @@ export class MyNoteApp {
     form.className = "dialog-form";
 
     if (mode === "init") {
-      title.textContent = "Initialize Tier 2 Vault";
+      title.textContent = t("vault.initTitle");
       const note = document.createElement("p");
       note.className = "dialog-note";
-      note.textContent =
-        "Set a Vault passphrase. Your VKEK is wrapped by both Argon2id(passphrase) and your 24-word recovery public key, and stays strictly in browser WASM RAM while unlocked.";
+      note.textContent = t("vault.initNote");
       const p1 = document.createElement("input");
       p1.type = "password";
       p1.className = "input";
-      p1.placeholder = "New Vault passphrase (min 8 chars)";
+      p1.placeholder = t("vault.newPassPlaceholder");
       p1.dataset.testid = "vault-passphrase-input";
       p1.autocomplete = "new-password";
       const p2 = document.createElement("input");
       p2.type = "password";
       p2.className = "input";
-      p2.placeholder = "Confirm Vault passphrase";
+      p2.placeholder = t("vault.confirmPassPlaceholder");
       p2.dataset.testid = "vault-passphrase-confirm";
       p2.autocomplete = "new-password";
       const submit = document.createElement("button");
       submit.type = "submit";
       submit.className = "btn btn-primary";
-      submit.textContent = "Initialize & Unlock Vault";
+      submit.textContent = t("vault.initSubmit");
       submit.dataset.testid = "vault-submit-btn";
       form.append(note, p1, p2, submit);
       form.addEventListener("submit", (ev) => {
@@ -1352,21 +1710,21 @@ export class MyNoteApp {
           const pass = p1.value;
           const confirm = p2.value;
           if (pass.length < 8) {
-            this.showToast("Passphrase must be at least 8 characters", true);
+            this.showToast(t("vault.errMinLen"), true);
             return;
           }
           if (pass !== confirm) {
-            this.showToast("Passphrases do not match", true);
+            this.showToast(t("vault.errMismatch"), true);
             return;
           }
           if (!this.recoveryPkB64 || !this.api.putVaultHeader) {
-            this.showToast("Recovery public key unavailable from local daemon", true);
+            this.showToast(t("vault.errNoRecoveryPk"), true);
             return;
           }
           p1.value = "";
           p2.value = "";
           submit.disabled = true;
-          submit.textContent = "Deriving Argon2id key…";
+          submit.textContent = t("vault.deriving");
           try {
             const { gen, blob_b64 } = await createVaultHeaderWasm(pass, this.recoveryPkB64);
             const saved = await this.api.putVaultHeader(gen, blob_b64);
@@ -1387,11 +1745,11 @@ export class MyNoteApp {
             this.vaultSession = sess;
             this.closeDialog(false);
             await this.onVaultUnlocked();
-            this.showToast("Vault initialized and unlocked in RAM");
+            this.showToast(t("vault.toastInitOk"));
           } catch (e) {
             this.handleErr(e);
             submit.disabled = false;
-            submit.textContent = "Initialize & Unlock Vault";
+            submit.textContent = t("vault.initSubmit");
           }
         })();
       });
@@ -1402,14 +1760,14 @@ export class MyNoteApp {
     }
 
     if (mode === "unlock") {
-      title.textContent = "Unlock Tier 2 Vault";
+      title.textContent = t("vault.unlockTitle");
       const note = document.createElement("p");
       note.className = "dialog-note";
-      note.textContent = "VKEK is decrypted in browser WASM RAM only and auto-zeroizes on tab switch or 5 min idle.";
+      note.textContent = t("vault.unlockNote");
       const p1 = document.createElement("input");
       p1.type = "password";
       p1.className = "input";
-      p1.placeholder = "Vault passphrase";
+      p1.placeholder = t("vault.passPlaceholder");
       p1.dataset.testid = "vault-passphrase-input";
       p1.autocomplete = "current-password";
       const row = document.createElement("div");
@@ -1417,12 +1775,12 @@ export class MyNoteApp {
       const submit = document.createElement("button");
       submit.type = "submit";
       submit.className = "btn btn-primary";
-      submit.textContent = "Unlock Vault";
+      submit.textContent = t("vault.unlockSubmit");
       submit.dataset.testid = "vault-submit-btn";
       const recoverBtn = document.createElement("button");
       recoverBtn.type = "button";
       recoverBtn.className = "btn";
-      recoverBtn.textContent = "Forgot? Use 24 Words";
+      recoverBtn.textContent = t("vault.forgotBtn");
       recoverBtn.addEventListener("click", () => this.openVaultModal("recover"));
       row.append(recoverBtn, submit);
       form.append(note, p1, row);
@@ -1433,7 +1791,7 @@ export class MyNoteApp {
           const pass = p1.value;
           p1.value = "";
           submit.disabled = true;
-          submit.textContent = "Unlocking…";
+          submit.textContent = t("vault.unlocking");
           try {
             const sess = await unlockVaultWithPassphraseWasm(pass, this.vaultHeader.blob_b64);
             // H18 / SEC-03: If tab hid during Argon2id derivation, zeroize immediately and do NOT install session!
@@ -1446,12 +1804,12 @@ export class MyNoteApp {
             this.vaultSession = sess;
             this.closeDialog(false);
             await this.onVaultUnlocked();
-            this.showToast("Vault unlocked in browser WASM RAM");
+            this.showToast(t("vault.toastUnlocked"));
           } catch (e) {
             const parsed = parseWasmError(e);
             this.showToast(`${parsed.code}: ${parsed.message}`, true);
             submit.disabled = false;
-            submit.textContent = "Unlock Vault";
+            submit.textContent = t("vault.unlockSubmit");
           }
         })();
       });
@@ -1462,29 +1820,29 @@ export class MyNoteApp {
     }
 
     if (mode === "recover") {
-      title.textContent = "Recover Vault with 24-Word Bundle";
+      title.textContent = t("vault.recoverTitle");
       const note = document.createElement("p");
       note.className = "dialog-note";
-      note.textContent = "Enter your 24 recovery words to unseal VKEK locally and optionally set a new Vault passphrase.";
+      note.textContent = t("vault.recoverNote");
       const words = document.createElement("textarea");
       words.className = "input";
       words.rows = 3;
-      words.placeholder = "24 BIP39 recovery words separated by spaces…";
+      words.placeholder = t("vault.wordsPlaceholder");
       const newPass = document.createElement("input");
       newPass.type = "password";
       newPass.className = "input";
-      newPass.placeholder = "Optional new Vault passphrase (min 8 chars)";
+      newPass.placeholder = t("vault.optionalNewPass");
       const row = document.createElement("div");
       row.className = "dialog-actions";
       const backBtn = document.createElement("button");
       backBtn.type = "button";
       backBtn.className = "btn";
-      backBtn.textContent = "Back";
+      backBtn.textContent = t("vault.back");
       backBtn.addEventListener("click", () => this.openVaultModal("unlock"));
       const submit = document.createElement("button");
       submit.type = "submit";
       submit.className = "btn btn-primary";
-      submit.textContent = "Recover & Unlock";
+      submit.textContent = t("vault.recoverSubmit");
       row.append(backBtn, submit);
       form.append(note, words, newPass, row);
       form.addEventListener("submit", (ev) => {
@@ -1508,7 +1866,7 @@ export class MyNoteApp {
               if (nextPass.length < 8) {
                 sess.lockAndZeroize();
                 sess.free();
-                this.showToast("New passphrase must be at least 8 characters", true);
+                this.showToast(t("vault.errNewMinLen"), true);
                 submit.disabled = false;
                 return;
               }
@@ -1527,7 +1885,7 @@ export class MyNoteApp {
             this.vaultSession = sess;
             this.closeDialog(false);
             await this.onVaultUnlocked();
-            this.showToast("Vault recovered and unlocked");
+            this.showToast(t("vault.toastRecovered"));
           } catch (e) {
             const parsed = parseWasmError(e);
             this.showToast(`${parsed.code}: ${parsed.message}`, true);
@@ -1542,16 +1900,17 @@ export class MyNoteApp {
     }
 
     // mode === "unlocked"
-    title.textContent = "Tier 2 Vault (Unlocked in RAM)";
+    title.textContent = t("vault.unlockedModalTitle");
     const note = document.createElement("p");
     note.className = "dialog-note";
-    note.textContent =
-      "Unlocked in browser WASM RAM only. Local daemon never sees VKEK or Tier 2 plaintext. Auto-locks on tab switch or 5 min idle.";
+    note.textContent = t("vault.unlockedModalNote");
     const lockBtn = document.createElement("button");
     lockBtn.type = "button";
-    lockBtn.className = "btn btn-danger";
+    lockBtn.className = "btn btn-danger btn-has-icon";
     lockBtn.dataset.testid = "vault-lock-now-btn";
-    lockBtn.textContent = "🔒 Lock Vault Now (Zeroize RAM)";
+    const lockNowLbl = document.createElement("span");
+    lockNowLbl.textContent = t("vault.lockNowBtn");
+    lockBtn.append(createIcon("lock", "xs"), lockNowLbl);
     lockBtn.addEventListener("click", () => {
       this.closeDialog();
       this.lockVaultNow();
@@ -1561,19 +1920,19 @@ export class MyNoteApp {
     sep.className = "dialog-sep";
     const sub = document.createElement("div");
     sub.className = "dialog-subtitle";
-    sub.textContent = "Change Vault Passphrase";
+    sub.textContent = t("vault.changePassSubtitle");
     const np1 = document.createElement("input");
     np1.type = "password";
     np1.className = "input";
-    np1.placeholder = "New passphrase (min 8 chars)";
+    np1.placeholder = t("vault.changeNewPassPlaceholder");
     const np2 = document.createElement("input");
     np2.type = "password";
     np2.className = "input";
-    np2.placeholder = "Confirm new passphrase";
+    np2.placeholder = t("vault.changeConfirmPlaceholder");
     const chgBtn = document.createElement("button");
     chgBtn.type = "submit";
     chgBtn.className = "btn btn-primary";
-    chgBtn.textContent = "Update Passphrase";
+    chgBtn.textContent = t("vault.updatePassBtn");
     form.append(note, lockBtn, sep, sub, np1, np2, chgBtn);
     form.addEventListener("submit", (ev) => {
       ev.preventDefault();
@@ -1582,11 +1941,11 @@ export class MyNoteApp {
         const p1 = np1.value;
         const p2 = np2.value;
         if (p1.length < 8) {
-          this.showToast("New passphrase must be at least 8 characters", true);
+          this.showToast(t("vault.errNewMinLen"), true);
           return;
         }
         if (p1 !== p2) {
-          this.showToast("Passphrases do not match", true);
+          this.showToast(t("vault.errMismatch"), true);
           return;
         }
         np1.value = "";
@@ -1597,7 +1956,7 @@ export class MyNoteApp {
           const parsed = JSON.parse(raw) as { gen: number; blob_b64: string };
           this.vaultHeader = await this.api.putVaultHeader(parsed.gen, parsed.blob_b64);
           this.closeDialog();
-          this.showToast("Vault passphrase updated");
+          this.showToast(t("vault.toastPassUpdated"));
         } catch (e) {
           this.handleErr(e);
           chgBtn.disabled = false;
@@ -1614,39 +1973,36 @@ export class MyNoteApp {
       this.openVaultModal();
       return;
     }
-    this.dialogModalEl.innerHTML = "";
+    this.dialogModalEl.replaceChildren();
     const hdr = document.createElement("div");
     hdr.className = "drawer-header";
     const title = document.createElement("span");
-    title.textContent = "Lock Block in Tier 2 Vault";
-    const closeBtn = document.createElement("button");
-    closeBtn.type = "button";
-    closeBtn.className = "btn btn-icon";
-    closeBtn.textContent = "✕";
-    closeBtn.addEventListener("click", () => this.closeDialog());
+    title.textContent = t("lockModal.title");
+    const closeBtn = this.createCloseButton(() => this.closeDialog());
     hdr.append(title, closeBtn);
 
     const form = document.createElement("form");
     form.className = "dialog-form";
     const note = document.createElement("p");
     note.className = "dialog-note";
-    note.textContent =
-      "Content will be re-encrypted inside browser WASM with a new Vault-wrapped key (MNW1). Old Tier 1 key will be scheduled for cryptographic shred (24h min grace).";
+    note.textContent = t("lockModal.note");
     const hintInput = document.createElement("input");
     hintInput.className = "input";
-    hintInput.placeholder = "Optional public hint (e.g. 'Prod AWS root') — stored unencrypted in Tier 1 metadata";
+    hintInput.placeholder = t("lockModal.hintPlaceholder");
     hintInput.dataset.testid = "lock-hint-input";
     const actions = document.createElement("div");
     actions.className = "dialog-actions";
     const cancelBtn = document.createElement("button");
     cancelBtn.type = "button";
     cancelBtn.className = "btn";
-    cancelBtn.textContent = "Cancel";
+    cancelBtn.textContent = t("common.cancel");
     cancelBtn.addEventListener("click", () => this.closeDialog());
     const confirmBtn = document.createElement("button");
     confirmBtn.type = "submit";
-    confirmBtn.className = "btn btn-primary";
-    confirmBtn.textContent = "🔒 Lock Block";
+    confirmBtn.className = "btn btn-primary btn-has-icon";
+    const confirmLbl = document.createElement("span");
+    confirmLbl.textContent = t("lockModal.confirm");
+    confirmBtn.append(createIcon("lock", "xs"), confirmLbl);
     confirmBtn.dataset.testid = "lock-confirm-btn";
     actions.append(cancelBtn, confirmBtn);
     form.append(note, hintInput, actions);
@@ -1691,7 +2047,7 @@ export class MyNoteApp {
           if (keepUnlocked) this.resetVaultIdleTimer();
           this.stream.applyAuthoritativeBlock(updated, this.activeBufferId, keepUnlocked ? content : undefined);
           this.closeDialog();
-          this.showToast("Block locked in Tier 2 Vault");
+          this.showToast(t("lockModal.toastLocked"));
         } catch (e) {
           this.handleErr(e);
           confirmBtn.disabled = false;
@@ -1708,24 +2064,19 @@ export class MyNoteApp {
       this.openVaultModal();
       return;
     }
-    this.dialogModalEl.innerHTML = "";
+    this.dialogModalEl.replaceChildren();
     const hdr = document.createElement("div");
     hdr.className = "drawer-header";
     const title = document.createElement("span");
-    title.textContent = "Downgrade Block to Tier 1";
-    const closeBtn = document.createElement("button");
-    closeBtn.type = "button";
-    closeBtn.className = "btn btn-icon";
-    closeBtn.textContent = "✕";
-    closeBtn.addEventListener("click", () => this.closeDialog());
+    title.textContent = t("downgradeModal.title");
+    const closeBtn = this.createCloseButton(() => this.closeDialog());
     hdr.append(title, closeBtn);
 
     const form = document.createElement("form");
     form.className = "dialog-form";
     const note = document.createElement("p");
     note.className = "dialog-note";
-    note.textContent =
-      "Downgrading removes the Tier 2 Vault lock and re-encrypts this block under Tier 1 (accessible to CLI and AI agents on this device).";
+    note.textContent = t("downgradeModal.note");
     const chkLabel = document.createElement("label");
     chkLabel.className = "dialog-check";
     const chk = document.createElement("input");
@@ -1733,19 +2084,19 @@ export class MyNoteApp {
     // Per docs/sync-protocol.md §4.2, default retains old Tier 2 key unless explicitly opted in.
     chk.checked = false;
     const chkText = document.createElement("span");
-    chkText.textContent = "Also schedule old Tier 2 key for cryptographic shred (24h min grace)";
+    chkText.textContent = t("downgradeModal.shredOpt");
     chkLabel.append(chk, chkText);
     const actions = document.createElement("div");
     actions.className = "dialog-actions";
     const cancelBtn = document.createElement("button");
     cancelBtn.type = "button";
     cancelBtn.className = "btn";
-    cancelBtn.textContent = "Cancel";
+    cancelBtn.textContent = t("common.cancel");
     cancelBtn.addEventListener("click", () => this.closeDialog());
     const confirmBtn = document.createElement("button");
     confirmBtn.type = "submit";
     confirmBtn.className = "btn btn-amber";
-    confirmBtn.textContent = "Downgrade to Tier 1";
+    confirmBtn.textContent = t("downgradeModal.confirm");
     actions.append(cancelBtn, confirmBtn);
     form.append(note, chkLabel, actions);
     form.addEventListener("submit", (ev) => {
@@ -1771,7 +2122,7 @@ export class MyNoteApp {
           });
           this.stream.applyAuthoritativeBlock(updated, this.activeBufferId);
           this.closeDialog();
-          this.showToast("Block downgraded to Tier 1");
+          this.showToast(t("downgradeModal.toastDowngraded"));
         } catch (e) {
           this.handleErr(e);
           confirmBtn.disabled = false;
@@ -1804,8 +2155,10 @@ export class MyNoteApp {
     this.historyLoading = false;
     this.historyOpLoading = false;
     this.historyError = null;
+    this.stream.setHistoryTargetBlock(null);
     this.historyDrawerEl.classList.add("hidden");
-    this.historyTitleEl.textContent = "Block History";
+    this.historyTitleEl.textContent = t("history.title");
+    this.historyHeaderActionsEl.replaceChildren();
     this.historyActionsEl.replaceChildren();
     this.historyListEl.replaceChildren();
     this.historyDiffEl.replaceChildren();
@@ -1813,7 +2166,7 @@ export class MyNoteApp {
 
   private async openHistoryDrawer(block: BlockDto): Promise<void> {
     if (!this.api.getBlockHistory) {
-      this.showToast("Block history API unavailable", true);
+      this.showToast(t("history.apiUnavailable"), true);
       return;
     }
     const cur = this.stream.getBlocks().find((b) => b.id === block.id) ?? block;
@@ -1825,6 +2178,7 @@ export class MyNoteApp {
     if (this.trashOpen) {
       this.trashOpen = false;
       this.trashDrawerEl.classList.add("hidden");
+      this.syncTrashBtnState();
     }
 
     const reqSeq = ++this.historyLoadSeq;
@@ -1841,6 +2195,7 @@ export class MyNoteApp {
     this.historyOpLoading = false;
     this.historyError = null;
     this.historyDrawerEl.classList.remove("hidden");
+    this.stream.setHistoryTargetBlock(cur.id, { scrollIntoView: true });
     this.renderHistoryDrawer();
 
     try {
@@ -1859,7 +2214,7 @@ export class MyNoteApp {
     } catch (e) {
       if (reqSeq !== this.historyLoadSeq || !this.historyOpen) return;
       this.historyLoading = false;
-      this.historyError = e instanceof Error ? e.message : "Failed to load block history";
+      this.historyError = e instanceof Error ? e.message : t("history.loadFailed");
       this.renderHistoryDrawer();
       this.handleErr(e);
     }
@@ -1896,7 +2251,7 @@ export class MyNoteApp {
           return;
         }
         if (!dto.mnb1_b64 || !dto.mnw1_b64) {
-          throw new Error("Missing Tier 2 ciphertext or key wrap for historical version");
+          throw new Error(t("history.missingTier2Blob"));
         }
         const dec = session.decryptBlock(
           dto.block_id,
@@ -1918,7 +2273,7 @@ export class MyNoteApp {
     } catch (e) {
       if (reqSeq !== this.historyOpSeq || !this.historyOpen) return;
       this.historyOpLoading = false;
-      this.historyError = e instanceof Error ? e.message : "Failed to load historical content";
+      this.historyError = e instanceof Error ? e.message : t("history.loadOpFailed");
       this.renderHistoryDrawer();
       this.handleErr(e);
     }
@@ -1964,7 +2319,7 @@ export class MyNoteApp {
     const cur = this.stream.getBlocks().find((b) => b.id === blockId);
     if (!cur) return;
     if (cur.has_conflict) {
-      this.showToast("Resolve concurrent versions before reverting", true);
+      this.showToast(t("history.resolveBeforeRevert"), true);
       return;
     }
     const expectedHeads = this.stream.getExpectedHeadsForBlock(cur.id);
@@ -1977,7 +2332,7 @@ export class MyNoteApp {
           return;
         }
         if (targetPlaintext === null) {
-          this.showToast("Selected version content is unavailable", true);
+          this.showToast(t("history.selectedUnavailable"), true);
           return;
         }
         const payload = this.encryptTier2RevertPayload(cur, targetPlaintext, session);
@@ -1996,7 +2351,7 @@ export class MyNoteApp {
         });
         this.stream.applyAuthoritativeBlock(updated, this.activeBufferId);
       }
-      this.showToast("Reverted block to selected version");
+      this.showToast(t("history.toastReverted"));
       if (this.historyOpen && this.historyBlockId === cur.id) {
         await this.openHistoryDrawer(updated);
       }
@@ -2014,7 +2369,7 @@ export class MyNoteApp {
     const cur = this.stream.getBlocks().find((b) => b.id === blockId);
     if (!cur) return;
     if (cur.has_conflict) {
-      this.showToast("Resolve concurrent versions before reverting", true);
+      this.showToast(t("history.resolveBeforeRevert"), true);
       return;
     }
     const expectedHeads = this.stream.getExpectedHeadsForBlock(cur.id);
@@ -2040,7 +2395,7 @@ export class MyNoteApp {
         let plain: string;
         if (dto.is_locked) {
           if (!dto.mnb1_b64 || !dto.mnw1_b64) {
-            throw new Error("Missing Tier 2 ciphertext or key wrap for predecessor version");
+            throw new Error(t("history.missingTier2PredBlob"));
           }
           const dec = session.decryptBlock(
             dto.block_id,
@@ -2070,7 +2425,7 @@ export class MyNoteApp {
         });
         this.stream.applyAuthoritativeBlock(updated, this.activeBufferId);
       }
-      this.showToast(`Undid ${actor} batch`);
+      this.showToast(t("history.toastUndidActor", { actor }));
       if (this.historyOpen && this.historyBlockId === cur.id) {
         await this.openHistoryDrawer(updated);
       }
@@ -2080,17 +2435,22 @@ export class MyNoteApp {
   }
 
   private formatHistoryTime(ms: number): string {
+    return formatHistoryTimestamp(ms);
+  }
+
+  private formatIsoTitle(ms: number): string {
     if (!Number.isFinite(ms) || ms <= 0) return "";
-    return new Date(ms).toISOString().slice(0, 19).replace("T", " ") + "Z";
+    return new Date(ms).toISOString();
   }
 
   private renderHistoryDrawer(): void {
     if (!this.historyOpen || !this.historyBlockId) return;
     const cur = this.stream.getBlocks().find((b) => b.id === this.historyBlockId) ?? null;
     this.historyTitleEl.textContent = cur
-      ? `History · ${cur.lang} · ${cur.id.slice(0, 8)}`
-      : `History · ${this.historyBlockId.slice(0, 8)}`;
+      ? t("history.titleWithBlock", { lang: cur.lang })
+      : t("history.titleFallback");
 
+    this.historyHeaderActionsEl.replaceChildren();
     this.historyActionsEl.replaceChildren();
     this.historyListEl.replaceChildren();
     this.historyDiffEl.replaceChildren();
@@ -2098,12 +2458,12 @@ export class MyNoteApp {
     if (this.historyLoading) {
       const loading = document.createElement("div");
       loading.className = "empty-state";
-      loading.textContent = "Loading history…";
+      loading.textContent = t("history.loading");
       this.historyListEl.appendChild(loading);
       return;
     }
 
-    // Undo <actor> batch button when the most recent content-bearing op(s) came from a non-human actor
+    // Place Undo <actor> batch in the dedicated action strip below the drawer header (away from the close button).
     const contentEntries = this.historyEntries.filter((e) => e.has_content);
     const latestContent = contentEntries[0];
     if (latestContent && latestContent.actor && latestContent.actor !== "human") {
@@ -2111,15 +2471,15 @@ export class MyNoteApp {
       const predecessor = contentEntries.find((e) => e.actor !== badActor) ?? null;
       const undoBtn = document.createElement("button");
       undoBtn.type = "button";
-      undoBtn.className = "btn btn-amber btn-icon";
+      undoBtn.className = "btn btn-accent-soft btn-icon";
       undoBtn.dataset.testid = "history-undo-actor-btn";
-      undoBtn.textContent = `Undo ${badActor} batch`;
+      undoBtn.textContent = t("history.undoActor", { actor: badActor });
       if (!predecessor) {
         undoBtn.disabled = true;
-        undoBtn.title = `No earlier version outside actor '${badActor}'`;
+        undoBtn.title = t("history.noPredecessor", { actor: badActor });
       } else if (predecessor.shredded || !predecessor.content_available) {
         undoBtn.disabled = true;
-        undoBtn.title = "Predecessor version is shredded or unavailable";
+        undoBtn.title = t("history.predUnavailable");
       } else {
         undoBtn.addEventListener("click", () => void this.undoActorBatch(badActor, predecessor));
       }
@@ -2129,51 +2489,66 @@ export class MyNoteApp {
     if (cur?.has_conflict) {
       const conflictHint = document.createElement("div");
       conflictHint.className = "history-conflict-note";
-      conflictHint.textContent = "Conflict present — resolve concurrent versions before reverting.";
+      conflictHint.textContent = t("history.conflictHint");
       this.historyActionsEl.appendChild(conflictHint);
     }
 
     if (this.historyEntries.length === 0) {
       const empty = document.createElement("div");
       empty.className = "empty-state";
-      empty.textContent = this.historyError ? `Error: ${this.historyError}` : "No history entries found.";
+      empty.textContent = this.historyError
+        ? t("history.errorPrefix", { msg: this.historyError })
+        : t("history.empty");
       this.historyListEl.appendChild(empty);
       return;
     }
 
     for (const entry of this.historyEntries) {
-      const row = document.createElement("div");
+      const row = document.createElement("button");
+      row.type = "button";
       const isSelected = entry.op_id === this.historySelectedOpId;
       const unavailable = entry.shredded || (entry.has_content && !entry.content_available);
       const selectable = entry.has_content && !unavailable;
       row.className = `history-item${isSelected ? " selected" : ""}${unavailable ? " unavailable" : ""}`;
       row.dataset.opId = entry.op_id;
+      row.dataset.testid = `history-select-${entry.op_id}`;
+      row.disabled = !selectable;
+      row.setAttribute("aria-pressed", String(isSelected));
+      if (selectable) {
+        row.addEventListener("click", () => void this.selectHistoryEntry(entry));
+      }
 
       const topRow = document.createElement("div");
       topRow.className = "history-item-top";
 
-      const opBadge = document.createElement("span");
-      opBadge.className = "kbd";
-      opBadge.textContent = entry.op_type;
-      topRow.appendChild(opBadge);
+      const opLabel = document.createElement("span");
+      opLabel.className = "history-op-label";
+      opLabel.textContent = formatOpTypeLabel(entry.op_type);
+      topRow.appendChild(opLabel);
 
-      const actorBadge = document.createElement("span");
-      actorBadge.className = entry.actor !== "human" ? "actor-badge actor-badge-agent" : "actor-badge actor-badge-human";
-      actorBadge.textContent = entry.actor;
-      topRow.appendChild(actorBadge);
+      // Only badge non-human actors so real badges (agent:*, Shredded, Current) retain clear visual signal.
+      if (entry.actor && entry.actor !== "human") {
+        const actorBadge = document.createElement("span");
+        actorBadge.className = "actor-badge actor-badge-agent";
+        actorBadge.textContent = entry.actor;
+        topRow.appendChild(actorBadge);
+      }
 
       if (entry.is_locked) {
         const lockBadge = document.createElement("span");
         lockBadge.className = "vault-badge";
-        lockBadge.textContent = "🔒";
-        lockBadge.title = "Tier 2 Vault version";
+        const sr = document.createElement("span");
+        sr.className = "sr-only";
+        sr.textContent = t("vault.badgeLocked");
+        lockBadge.append(createIcon("lock", "xs"), sr);
+        lockBadge.title = t("history.vaultVersionTitle");
         topRow.appendChild(lockBadge);
       }
 
       if (cur && cur.display_op_id === entry.op_id) {
         const curBadge = document.createElement("span");
         curBadge.className = "history-current-badge";
-        curBadge.textContent = "Current";
+        curBadge.textContent = t("history.current");
         topRow.appendChild(curBadge);
       }
 
@@ -2181,37 +2556,23 @@ export class MyNoteApp {
         const shredBadge = document.createElement("span");
         shredBadge.className = "history-badge-shredded";
         shredBadge.dataset.testid = "history-shredded-badge";
-        shredBadge.textContent = "Shredded / Unavailable";
+        shredBadge.textContent = t("history.shredded");
         topRow.appendChild(shredBadge);
       } else if (!entry.has_content) {
         const metaBadge = document.createElement("span");
         metaBadge.className = "kbd";
-        metaBadge.textContent = "meta";
+        metaBadge.textContent = t("history.meta");
         topRow.appendChild(metaBadge);
       }
 
       const metaRow = document.createElement("div");
       metaRow.className = "history-item-meta";
-      metaRow.textContent = `${this.formatHistoryTime(entry.created_at_ms)} · ${entry.device_id}`;
+      const timeStr = this.formatHistoryTime(entry.created_at_ms);
+      const devStr = formatDeviceName(entry.device_id);
+      metaRow.textContent = devStr ? `${timeStr} · ${devStr}` : timeStr;
+      metaRow.title = `${this.formatIsoTitle(entry.created_at_ms)} · ${entry.device_id}`;
 
-      const btnRow = document.createElement("div");
-      btnRow.className = "history-item-actions";
-      const viewBtn = document.createElement("button");
-      viewBtn.type = "button";
-      viewBtn.className = `btn btn-icon${isSelected ? " btn-primary" : ""}`;
-      viewBtn.dataset.testid = `history-select-${entry.op_id}`;
-      viewBtn.textContent = isSelected ? "Inspecting" : "Diff & Inspect";
-      viewBtn.disabled = !selectable;
-      if (selectable) {
-        viewBtn.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          void this.selectHistoryEntry(entry);
-        });
-        row.addEventListener("click", () => void this.selectHistoryEntry(entry));
-      }
-      btnRow.appendChild(viewBtn);
-
-      row.append(topRow, metaRow, btnRow);
+      row.append(topRow, metaRow);
       this.historyListEl.appendChild(row);
     }
 
@@ -2219,7 +2580,7 @@ export class MyNoteApp {
     if (this.historyOpLoading) {
       const loading = document.createElement("div");
       loading.className = "history-diff-empty";
-      loading.textContent = "Loading version content…";
+      loading.textContent = t("history.loadingOp");
       this.historyDiffEl.appendChild(loading);
     } else if (this.historyError) {
       const errEl = document.createElement("div");
@@ -2230,13 +2591,13 @@ export class MyNoteApp {
       const diffHdr = document.createElement("div");
       diffHdr.className = "history-diff-header";
       const titleSpan = document.createElement("span");
-      titleSpan.textContent = `Selected (${this.historySelectedOpId.slice(0, 8)}) → Current`;
+      titleSpan.textContent = t("history.diffTitle");
 
       const revertBtn = document.createElement("button");
       revertBtn.type = "button";
       revertBtn.className = "btn btn-primary btn-icon";
       revertBtn.dataset.testid = "history-revert-btn";
-      revertBtn.textContent = "Revert to this version";
+      revertBtn.textContent = t("history.revertBtn");
       revertBtn.addEventListener("click", () => void this.revertToSelectedHistory());
       diffHdr.append(titleSpan, revertBtn);
 
@@ -2249,7 +2610,7 @@ export class MyNoteApp {
       if (diffLines.length === 0) {
         const emptyLine = document.createElement("div");
         emptyLine.className = "diff-line diff-ctx";
-        emptyLine.textContent = "(empty)";
+        emptyLine.textContent = t("history.diffEmpty");
         diffView.appendChild(emptyLine);
       } else {
         for (const line of diffLines) {
@@ -2273,7 +2634,10 @@ export class MyNoteApp {
       const rawDetails = document.createElement("details");
       rawDetails.className = "history-raw-details";
       const rawSummary = document.createElement("summary");
-      rawSummary.textContent = "Raw historical content";
+      rawSummary.className = "history-raw-summary";
+      const rawSummaryLbl = document.createElement("span");
+      rawSummaryLbl.textContent = t("history.rawDetails");
+      rawSummary.append(createIcon("chevron-right", "xs", "history-raw-chevron"), rawSummaryLbl);
       const rawPre = document.createElement("pre");
       rawPre.className = "history-raw-pre";
       rawPre.textContent = this.historySelectedContent;
@@ -2289,6 +2653,7 @@ export class MyNoteApp {
     this.trashOpen = !this.trashOpen;
     if (this.trashOpen) this.closeHistoryDrawer();
     this.trashDrawerEl.classList.toggle("hidden", !this.trashOpen);
+    this.syncTrashBtnState();
     if (this.trashOpen) await this.refreshTrash();
   }
 
@@ -2304,31 +2669,32 @@ export class MyNoteApp {
 
   private formatShredTime(ms: number | null): string {
     if (!ms) return "";
-    const d = new Date(ms);
-    return ` · ≥ ${d.toISOString().slice(0, 16).replace("T", " ")}Z`;
+    return t("trash.shredEarliest", { time: formatLocalDateTime(ms) });
   }
 
   private renderTrash(): void {
-    this.trashActionsEl.innerHTML = "";
-    const pendingConfirm = this.trashItems.filter((t) => t.shred_state === "pending_confirm");
+    this.trashHeaderActionsEl.replaceChildren();
+    this.trashActionsEl.replaceChildren();
+    const pendingConfirm = this.trashItems.filter((tItem) => tItem.shred_state === "pending_confirm");
     if (pendingConfirm.length > 0 && this.api.prepareTrashAction) {
       const confirmBtn = document.createElement("button");
       confirmBtn.type = "button";
       confirmBtn.className = "btn btn-amber btn-icon";
-      confirmBtn.textContent = `Confirm Pending (${pendingConfirm.length})`;
+      confirmBtn.textContent = t("trash.confirmPending", { count: pendingConfirm.length });
       confirmBtn.addEventListener("click", () =>
         void this.openTrashConfirmModal("confirm_pending", pendingConfirm.map((x) => x.id), undefined),
       );
       this.trashActionsEl.appendChild(confirmBtn);
     }
     const expeditableItems = this.trashItems.filter(
-      (t) => t.shred_state !== "executed" && t.shred_state !== "pending_confirm",
+      (tItem) => tItem.shred_state !== "executed" && tItem.shred_state !== "pending_confirm",
     );
     if (expeditableItems.length > 0 && this.api.prepareTrashAction) {
       const expAllBtn = document.createElement("button");
       expAllBtn.type = "button";
       expAllBtn.className = "btn btn-danger btn-icon";
-      expAllBtn.textContent = "Expedite All (24h min)";
+      expAllBtn.textContent = t("trash.expediteAll");
+      expAllBtn.title = t("trash.expediteAllTitle");
       expAllBtn.addEventListener("click", () =>
         void this.openTrashConfirmModal(
           "expedite",
@@ -2339,11 +2705,11 @@ export class MyNoteApp {
       this.trashActionsEl.appendChild(expAllBtn);
     }
 
-    this.trashListEl.innerHTML = "";
+    this.trashListEl.replaceChildren();
     if (this.trashItems.length === 0) {
       const empty = document.createElement("div");
       empty.className = "empty-state";
-      empty.textContent = "Recycle Bin is empty.";
+      empty.textContent = t("trash.empty");
       this.trashListEl.appendChild(empty);
       return;
     }
@@ -2351,32 +2717,66 @@ export class MyNoteApp {
       const card = document.createElement("div");
       card.className = "trash-item";
       card.dataset.trashId = item.id;
-      const meta = document.createElement("div");
-      meta.className = "leaf-meta";
-      const info = document.createElement("span");
-      info.textContent = `${item.buffer_name} · ${item.shred_state}${this.formatShredTime(item.shred_not_before_ms)}`;
+
+      const head = document.createElement("div");
+      head.className = "trash-item-head";
+      const titleGroup = document.createElement("div");
+      titleGroup.className = "trash-item-title-group";
+      const bufName = document.createElement("span");
+      bufName.className = "trash-buffer-name";
+      bufName.textContent = item.buffer_name;
+      titleGroup.appendChild(bufName);
+      // Suppress default "Scheduled" / "Recoverable" pills (timestamp underneath conveys default state);
+      // show pills strictly for non-default states like Pending Confirmation, Expedited, or Shredded.
+      if (item.shred_state && item.shred_state !== "scheduled" && item.shred_state !== "unscheduled") {
+        const statePill = document.createElement("span");
+        statePill.className = `trash-state-pill trash-state-${item.shred_state}`;
+        statePill.textContent = formatShredStateLabel(item.shred_state);
+        titleGroup.appendChild(statePill);
+      }
+
       const btns = document.createElement("div");
-      btns.className = "block-header-right";
+      btns.className = "trash-item-actions";
       const restoreBtn = document.createElement("button");
       restoreBtn.type = "button";
-      restoreBtn.className = "btn btn-primary btn-icon";
-      restoreBtn.textContent = "Restore";
+      restoreBtn.className = "btn btn-icon";
+      restoreBtn.textContent = t("trash.restore");
       restoreBtn.addEventListener("click", () => void this.restoreTrashItem(item));
       btns.appendChild(restoreBtn);
       if (this.api.prepareTrashAction && item.shred_state !== "executed" && item.shred_state !== "pending_confirm") {
         const expBtn = document.createElement("button");
         expBtn.type = "button";
-        expBtn.className = "btn btn-danger btn-icon";
-        expBtn.textContent = "Expedite";
-        expBtn.title = "Shorten shred countdown to 24h minimum grace";
+        expBtn.className = "btn btn-ghost btn-danger btn-icon";
+        expBtn.textContent = t("trash.expedite");
+        expBtn.title = t("trash.expediteTitle");
         expBtn.addEventListener("click", () => void this.openTrashConfirmModal("expedite", [item.id], T_GRACE_MIN_MS));
         btns.appendChild(expBtn);
       }
-      meta.append(info, btns);
-      const preview = document.createElement("pre");
-      preview.className = "trash-preview";
-      preview.textContent = item.is_locked ? "🔒 <locked Tier 2 block>" : item.preview ?? "";
-      card.append(meta, preview);
+      head.append(titleGroup, btns);
+      card.appendChild(head);
+
+      const shredStr = this.formatShredTime(item.shred_not_before_ms);
+      if (shredStr) {
+        const sub = document.createElement("div");
+        sub.className = "trash-item-sub";
+        sub.textContent = shredStr;
+        if (item.shred_not_before_ms) {
+          sub.title = new Date(item.shred_not_before_ms).toISOString();
+        }
+        card.appendChild(sub);
+      }
+
+      if (item.is_locked) {
+        const lockedRow = document.createElement("div");
+        lockedRow.className = "trash-preview-locked-row";
+        lockedRow.append(createIcon("lock", "xs"), document.createTextNode(t("trash.lockedPreview")));
+        card.appendChild(lockedRow);
+      } else {
+        const preview = document.createElement("pre");
+        preview.className = "trash-preview";
+        preview.textContent = item.preview ?? "";
+        card.appendChild(preview);
+      }
       this.trashListEl.appendChild(card);
     }
   }
@@ -2388,7 +2788,7 @@ export class MyNoteApp {
     targetBlock?: BlockDto,
   ): Promise<void> {
     if (!this.api.prepareTrashAction || !this.api.commitTrashAction) {
-      this.showToast("Trash confirmation API unavailable", true);
+      this.showToast(t("trash.apiUnavailable"), true);
       return;
     }
     if (action === "purge_history" && targetBlock) {
@@ -2406,21 +2806,17 @@ export class MyNoteApp {
       return;
     }
 
-    this.dialogModalEl.innerHTML = "";
+    this.dialogModalEl.replaceChildren();
     const hdr = document.createElement("div");
     hdr.className = "drawer-header";
     const title = document.createElement("span");
     title.textContent =
       action === "expedite"
-        ? "Confirm Expedite Cryptographic Shred"
+        ? t("shred.titleExpedite")
         : action === "confirm_pending"
-          ? "Confirm Pending Batch Shred"
-          : "Confirm Purge Historical Versions";
-    const closeBtn = document.createElement("button");
-    closeBtn.type = "button";
-    closeBtn.className = "btn btn-icon";
-    closeBtn.textContent = "✕";
-    closeBtn.addEventListener("click", () => this.closeDialog());
+          ? t("shred.titlePending")
+          : t("shred.titlePurge");
+    const closeBtn = this.createCloseButton(() => this.closeDialog());
     hdr.append(title, closeBtn);
 
     const body = document.createElement("div");
@@ -2429,33 +2825,32 @@ export class MyNoteApp {
     const details = document.createElement("div");
     details.className = "confirm-summary";
     details.textContent = [
-      `Action: ${prep.summary.action}`,
-      `Target blocks: ${prep.summary.block_count}`,
-      `Keys affected: ${prep.summary.key_count}`,
-      `Grace period: ${graceHours}h (server enforces ≥ 24h mandatory minimum)`,
+      t("shred.summaryAction", { action: prep.summary.action }),
+      t("shred.summaryBlocks", { count: prep.summary.block_count }),
+      t("shred.summaryKeys", { count: prep.summary.key_count }),
+      t("shred.summaryGrace", { hours: graceHours }),
       prep.summary.earliest_not_before_ms
-        ? `Current earliest shred: ${new Date(prep.summary.earliest_not_before_ms).toISOString()}`
+        ? t("shred.summaryEarliest", { iso: new Date(prep.summary.earliest_not_before_ms).toISOString() })
         : "",
     ]
       .filter(Boolean)
       .join("\n");
     const warn = document.createElement("p");
     warn.className = "dialog-note";
-    warn.textContent =
-      "Once the server-enforced grace countdown expires, affected encryption keys are permanently erased and ciphertext becomes unreadable. You may still restore or cancel before execution.";
+    warn.textContent = t("shred.warn");
 
     const actions = document.createElement("div");
     actions.className = "dialog-actions";
     const cancelBtn = document.createElement("button");
     cancelBtn.type = "button";
     cancelBtn.className = "btn";
-    cancelBtn.textContent = "Cancel";
+    cancelBtn.textContent = t("common.cancel");
     cancelBtn.addEventListener("click", () => this.closeDialog());
     const confirmBtn = document.createElement("button");
     confirmBtn.type = "button";
     confirmBtn.className = "btn btn-danger";
     confirmBtn.dataset.testid = "trash-confirm-commit-btn";
-    confirmBtn.textContent = "Confirm Shred Schedule";
+    confirmBtn.textContent = t("shred.confirmBtn");
     confirmBtn.addEventListener("click", () => {
       void (async () => {
         confirmBtn.disabled = true;
@@ -2470,7 +2865,7 @@ export class MyNoteApp {
             if (cur.is_locked) {
               const session = this.vaultSession;
               if (!session || session.isLocked()) {
-                this.showToast("Vault must be unlocked to rekey a locked block", true);
+                this.showToast(t("vault.errUnlockToRekey"), true);
                 confirmBtn.disabled = false;
                 return;
               }
@@ -2498,14 +2893,14 @@ export class MyNoteApp {
             ) {
               this.stream.setUnlockedPlaintext(targetBlock.id, plainForRam);
             }
-            this.showToast("Current version rekeyed; old history keys scheduled for shred (≥24h)");
+            this.showToast(t("trash.toastPurgeScheduled"));
           } else {
             await this.refreshTrash();
             if (this.api.getSyncStatus) {
               this.syncStatus = await this.api.getSyncStatus();
               this.updateAlertsFromStatus(this.syncStatus);
             }
-            this.showToast(`Confirmed ${action} schedule`);
+            this.showToast(t("trash.toastActionConfirmed", { action }));
           }
         } catch (e) {
           this.handleErr(e);
@@ -2569,60 +2964,203 @@ export class MyNoteApp {
         document.visibilityState !== "hidden" &&
         this.stream.getVaultLockEpoch() === lockEpoch;
       this.stream.applyAuthoritativeBlock(restored, this.activeBufferId, keepUnlocked ? restoredPlain : undefined);
+      if (this.activeBufferId) {
+        this.knownBufferBlockCounts.set(this.activeBufferId, this.stream.getBlocks().length);
+      }
       await this.refreshTrash();
-      this.showToast("Restored block from Recycle Bin");
+      this.showToast(t("trash.toastRestored"));
     } catch (e) {
       this.handleErr(e);
     }
   }
 
-  private openBufferModal(): void {
-    this.modalListEl.innerHTML = "";
-    for (const buf of this.buffers) {
+  private getFilteredBuffers(): BufferDto[] {
+    const q = this.bufferFilterQuery.trim().toLowerCase();
+    if (!q) return this.buffers;
+    return this.buffers.filter((b) => b.name.toLowerCase().includes(q));
+  }
+
+  private getBufferModalOptions(): Array<
+    { readonly kind: "buffer"; readonly buffer: BufferDto } | { readonly kind: "create"; readonly name: string }
+  > {
+    const filtered = this.getFilteredBuffers();
+    const out: Array<
+      { readonly kind: "buffer"; readonly buffer: BufferDto } | { readonly kind: "create"; readonly name: string }
+    > = filtered.map((buffer) => ({ kind: "buffer", buffer }));
+    const trimmed = this.bufferFilterQuery.trim();
+    if (trimmed && !this.buffers.some((b) => b.name.toLowerCase() === trimmed.toLowerCase())) {
+      out.push({ kind: "create", name: trimmed });
+    }
+    return out;
+  }
+
+  private renderBufferModalHints(): void {
+    this.bufferFooterEl.replaceChildren();
+    const mkHint = (keyText: string, labelText: string): HTMLSpanElement => {
+      const span = document.createElement("span");
+      span.className = "modal-hint-item";
+      const kbd = document.createElement("kbd");
+      kbd.className = "kbd";
+      kbd.textContent = keyText;
+      const lbl = document.createElement("span");
+      lbl.textContent = labelText;
+      span.append(kbd, lbl);
+      return span;
+    };
+    this.bufferFooterEl.append(
+      mkHint("↑↓", t("buffer.hintNavigate")),
+      mkHint("↵", t("buffer.hintOpen")),
+      mkHint("Esc", t("buffer.hintClose")),
+    );
+  }
+
+  private renderBufferModalList(): void {
+    this.modalListEl.replaceChildren();
+    const options = this.getBufferModalOptions();
+    if (options.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "modal-empty";
+      empty.textContent = t("buffer.emptyFilter");
+      this.modalListEl.appendChild(empty);
+      return;
+    }
+    if (this.bufferActiveIndex >= options.length) {
+      this.bufferActiveIndex = 0;
+    }
+    options.forEach((opt, idx) => {
+      const isHighlighted = idx === this.bufferActiveIndex;
+      if (opt.kind === "create") {
+        const row = document.createElement("div");
+        row.className = `modal-row modal-row-create${isHighlighted ? " is-highlighted" : ""}`;
+        row.setAttribute("role", "option");
+        row.setAttribute("aria-selected", String(isHighlighted));
+        row.dataset.testid = "buffer-create-inline-row";
+
+        const leftGroup = document.createElement("span");
+        leftGroup.className = "modal-row-main";
+        leftGroup.appendChild(createIcon("plus", "xs", "modal-row-create-icon"));
+        const name = document.createElement("span");
+        name.className = "modal-row-name";
+        name.textContent = t("buffer.createInline", { name: opt.name });
+        leftGroup.appendChild(name);
+        row.appendChild(leftGroup);
+
+        row.addEventListener("mouseenter", () => {
+          if (this.bufferActiveIndex !== idx) {
+            this.bufferActiveIndex = idx;
+            this.syncBufferModalHighlight();
+          }
+        });
+        row.addEventListener("click", () => {
+          void this.createBufferByName(opt.name);
+        });
+        this.modalListEl.appendChild(row);
+        return;
+      }
+
+      const buf = opt.buffer;
+      const isCurrent = buf.id === this.activeBufferId;
       const row = document.createElement("div");
-      row.className = "modal-row";
+      row.className = `modal-row${isCurrent ? " is-current" : ""}${isHighlighted ? " is-highlighted" : ""}`;
+      row.setAttribute("role", "option");
+      row.setAttribute("aria-selected", String(isHighlighted));
+
+      const leftGroup = document.createElement("span");
+      leftGroup.className = "modal-row-main";
+      if (isCurrent) {
+        leftGroup.appendChild(createIcon("check", "xs", "modal-row-check"));
+      } else {
+        const spacer = document.createElement("span");
+        spacer.className = "modal-row-check-spacer";
+        spacer.setAttribute("aria-hidden", "true");
+        leftGroup.appendChild(spacer);
+      }
       const name = document.createElement("span");
+      name.className = "modal-row-name";
       name.textContent = buf.name;
+      leftGroup.appendChild(name);
+
       const right = document.createElement("div");
-      right.className = "block-header-right";
+      right.className = "modal-row-actions";
+      const allCountsKnown = options.every(
+        (item) => item.kind !== "buffer" || this.knownBufferBlockCounts.has(item.buffer.id),
+      );
+      const knownCount = allCountsKnown ? this.knownBufferBlockCounts.get(buf.id) : undefined;
+      if (knownCount !== undefined) {
+        const countEl = document.createElement("span");
+        countEl.className = "modal-row-count";
+        countEl.textContent =
+          knownCount === 1 ? t("buffer.blockCountOne") : t("buffer.blockCount", { count: knownCount });
+        right.appendChild(countEl);
+      }
+
       const renBtn = document.createElement("button");
       renBtn.type = "button";
-      renBtn.className = "btn btn-icon";
-      renBtn.textContent = "Rename";
+      renBtn.className = "btn btn-ghost btn-icon btn-icon-only modal-row-rename";
+      renBtn.title = t("buffer.rename");
+      const renSr = document.createElement("span");
+      renSr.className = "sr-only";
+      renSr.textContent = t("buffer.rename");
+      renBtn.append(createIcon("pencil", "xs"), renSr);
       renBtn.addEventListener("click", (ev) => {
         ev.stopPropagation();
-        const nextName = window.prompt("New buffer name:", buf.name);
+        const nextName = window.prompt(t("buffer.renamePrompt"), buf.name);
         if (nextName && nextName.trim()) {
           void this.api.renameBuffer(buf.id, nextName.trim()).then((updated) => {
             this.buffers = this.buffers.map((b) => (b.id === updated.id ? updated : b));
             this.renderBuffers();
-            this.openBufferModal();
+            this.renderBufferModalList();
           });
         }
       });
       right.appendChild(renBtn);
-      row.append(name, right);
+      row.append(leftGroup, right);
+      row.addEventListener("mouseenter", () => {
+        if (this.bufferActiveIndex !== idx) {
+          this.bufferActiveIndex = idx;
+          this.syncBufferModalHighlight();
+        }
+      });
       row.addEventListener("click", () => {
         this.closeBufferModal();
         void this.switchBuffer(buf.id);
       });
       this.modalListEl.appendChild(row);
-    }
+    });
+  }
+
+  private syncBufferModalHighlight(): void {
+    const rows = Array.from(this.modalListEl.querySelectorAll<HTMLElement>(".modal-row"));
+    rows.forEach((row, i) => {
+      const active = i === this.bufferActiveIndex;
+      row.classList.toggle("is-highlighted", active);
+      row.setAttribute("aria-selected", String(active));
+      if (active) row.scrollIntoView?.({ block: "nearest" });
+    });
+  }
+
+  private openBufferModal(): void {
+    this.bufferFilterQuery = "";
+    this.bufferFilterInputEl.value = "";
+    const curIdx = this.buffers.findIndex((b) => b.id === this.activeBufferId);
+    this.bufferActiveIndex = curIdx >= 0 ? curIdx : 0;
+    this.renderBufferModalList();
     this.modalBackdropEl.classList.remove("hidden");
-    this.newBufInputEl.focus();
+    this.bufferFilterInputEl.focus();
   }
 
   private closeBufferModal(): void {
     this.modalBackdropEl.classList.add("hidden");
   }
 
-  private async createBuffer(): Promise<void> {
-    const name = this.newBufInputEl.value.trim();
+  private async createBufferByName(rawName: string): Promise<void> {
+    const name = rawName.trim();
     if (!name) return;
     try {
       const created = await this.api.createBuffer({ name });
       this.buffers.push(created);
-      this.newBufInputEl.value = "";
+      this.bufferFilterQuery = "";
+      this.bufferFilterInputEl.value = "";
       this.closeBufferModal();
       await this.switchBuffer(created.id);
     } catch (e) {
@@ -2630,20 +3168,42 @@ export class MyNoteApp {
     }
   }
 
+  private formatFindCounter(): string {
+    if (!this.findInputEl?.value) return "";
+    if (this.lastFindMatchCount === 0) return "0 / 0";
+    return `${this.findIndex + 1} / ${this.lastFindMatchCount}`;
+  }
+
   private toggleFindBar(show: boolean): void {
     this.findBarEl.classList.toggle("hidden", !show);
     if (show) {
       this.findInputEl.focus();
       this.findInputEl.select();
+      if (this.findInputEl.value) {
+        this.runFind(0);
+      } else {
+        this.lastFindMatchCount = 0;
+        this.findCountEl.textContent = "";
+      }
+    } else {
+      this.stream.setFindHighlights("", null);
     }
   }
 
   private runFind(delta: number): void {
-    const matches = this.stream.findAcrossBlocks(this.findInputEl.value);
-    this.findCountEl.textContent = `${matches.length} matches`;
-    if (matches.length === 0) return;
+    const query = this.findInputEl.value;
+    const matches = this.stream.findAcrossBlocks(query);
+    this.lastFindMatchCount = matches.length;
+    if (matches.length === 0) {
+      this.findIndex = 0;
+      this.findCountEl.textContent = this.formatFindCounter();
+      this.stream.setFindHighlights(query, null);
+      return;
+    }
     this.findIndex = (this.findIndex + delta + matches.length) % matches.length;
+    this.findCountEl.textContent = this.formatFindCounter();
     const hit = matches[this.findIndex];
+    this.stream.setFindHighlights(query, hit);
     this.stream.highlightBlockMatch(hit.blockId, hit.from, hit.to);
   }
 
@@ -2651,7 +3211,7 @@ export class MyNoteApp {
     const q = this.findInputEl.value;
     if (!q) return;
     const count = await this.stream.replaceAllAcrossBlocks(q, this.replaceInputEl.value);
-    this.showToast(`Replaced ${count} occurrence(s)`);
+    this.showToast(t("find.toastReplaced", { count }));
     this.runFind(0);
   }
 
@@ -2660,7 +3220,7 @@ export class MyNoteApp {
       this.syncStatus = await this.api.syncNow();
       this.updateAlertsFromStatus(this.syncStatus);
       this.renderSyncPill();
-      this.showToast(`Sync: ${this.syncStatus.sync_state}`);
+      this.showToast(t("sync.toastStatus", { state: this.syncStatus.sync_state }));
     } catch (e) {
       this.handleErr(e);
     }

@@ -262,6 +262,7 @@ describe("M1 Embedded Desktop Web UI (Candidate A CM6)", () => {
   let root: HTMLElement;
 
   beforeEach(() => {
+    window.localStorage?.clear?.();
     document.body.innerHTML = `<div id="app" class="app-shell"></div>`;
     root = document.getElementById("app")!;
   });
@@ -302,8 +303,9 @@ describe("M1 Embedded Desktop Web UI (Candidate A CM6)", () => {
     expect(resolved.content).toBe("version from macos");
     expect(root.querySelectorAll(".conflict-panel").length).toBe(0);
 
-    // 5. Create new block via "+ New Block"
-    const newBtn = [...root.querySelectorAll("button")].find((b) => b.textContent === "+ New Block")!;
+    // 5. Create new block via "New Block"
+    const newBtn = root.querySelector<HTMLButtonElement>('[data-testid="new-block-btn"]')!;
+    expect(newBtn.textContent).toBe("New Block");
     newBtn.click();
     await new Promise((r) => setTimeout(r, 20));
     expect(root.querySelectorAll(".block-card").length).toBe(3);
@@ -560,7 +562,7 @@ describe("M1 Embedded Desktop Web UI (Candidate A CM6)", () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(app.stream.getBlockDraftContent(blk2)).toBe("version from macos");
 
-    // 3. Find bar typing MUST NOT steal focus from findInputEl
+    // 3. Find bar typing MUST NOT steal focus from findInputEl and shows borderless "1 / 1" active counter
     const findBtn = [...root.querySelectorAll("button")].find((b) => b.textContent === "Find")!;
     findBtn.click();
     const findInput = root.querySelector<HTMLInputElement>(".find-bar input")!;
@@ -568,7 +570,8 @@ describe("M1 Embedded Desktop Web UI (Candidate A CM6)", () => {
     findInput.value = "macos";
     findInput.dispatchEvent(new Event("input"));
     expect(document.activeElement).toBe(findInput);
-    expect(root.querySelector(".find-bar .kbd")?.textContent).toBe("1 matches");
+    expect(root.querySelector(".find-bar .find-count")?.textContent).toBe("1 / 1");
+    expect(root.querySelector(".find-bar .kbd.find-count")).toBeNull();
 
     // 4. Incremental DOM reconciliation: inserting a remote block via WS MUST preserve card1 DOM node & CM6 view instance
     const card1Before = root.querySelector(`[data-block-id="${blk1}"]`);
@@ -768,7 +771,7 @@ describe("M1 Embedded Desktop Web UI (Candidate A CM6)", () => {
 
     // 2. Lock block into Tier 2 Vault
     const card1 = root.querySelector<HTMLElement>(`[data-block-id="${blk1}"]`)!;
-    const lockBtn = [...card1.querySelectorAll("button")].find((b) => b.textContent === "🔒 Lock")!;
+    const lockBtn = [...card1.querySelectorAll("button")].find((b) => b.textContent === "Lock")!;
     lockBtn.click();
     const hintInput = root.querySelector<HTMLInputElement>('[data-testid="lock-hint-input"]')!;
     hintInput.value = "API JSON secret";
@@ -811,6 +814,8 @@ describe("M1 Embedded Desktop Web UI (Candidate A CM6)", () => {
     const openTrash = [...root.querySelectorAll("button")].find((b) => b.textContent?.startsWith("Trash ("))!;
     openTrash.click();
     await new Promise((r) => setTimeout(r, 30));
+    expect(openTrash.getAttribute("aria-pressed")).toBe("true");
+    expect(root.querySelector(".trash-state-pill")).toBeNull();
     const expediteBtn = [...root.querySelectorAll<HTMLButtonElement>(".trash-item button")].find(
       (b) => b.textContent === "Expedite",
     )!;
@@ -1442,18 +1447,24 @@ describe("M1 Embedded Desktop Web UI (Candidate A CM6)", () => {
 
     const drawer = root.querySelector<HTMLElement>('[data-testid="history-drawer"]')!;
     expect(drawer.classList.contains("hidden")).toBe(false);
+    expect(root.querySelector(`[data-block-id="${t1Id}"]`)?.classList.contains("is-history-target")).toBe(true);
     expect(drawer.textContent).toContain("agent:claude-code");
-    expect(drawer.querySelector('[data-testid="history-undo-actor-btn"]')?.textContent).toBe("Undo agent:claude-code batch");
+    expect(drawer.querySelector('.drawer-actions [data-testid="history-undo-actor-btn"]')?.textContent).toBe("Undo agent:claude-code batch");
+    expect(drawer.querySelector('.drawer-header [data-testid="history-undo-actor-btn"]')).toBeNull();
+    // Ordinary human history rows MUST NOT render redundant "You"/"手动" actor pills
+    const humanRow = drawer.querySelector<HTMLElement>('[data-testid="history-select-01OP_HUMAN_1"]')!;
+    expect(humanRow.querySelector(".actor-badge")).toBeNull();
     expect(drawer.querySelector('[data-testid="history-shredded-badge"]')?.textContent).toBe("Shredded / Unavailable");
     expect(drawer.querySelector<HTMLButtonElement>('[data-testid="history-select-01OP_SHRED_0"]')?.disabled).toBe(true);
 
-    // 2. Inspect prior human version -> line diff renders - human-original and + agent-changed
+    // 2. Inspect prior human version -> line diff renders - human-original and + agent-changed + custom chevron summary
     drawer.querySelector<HTMLButtonElement>('[data-testid="history-select-01OP_HUMAN_1"]')!.click();
     await new Promise((r) => setTimeout(r, 30));
     const diffView = drawer.querySelector<HTMLElement>('[data-testid="history-diff-view"]')!;
     expect(diffView).not.toBeNull();
     expect(diffView.querySelector(".diff-del")?.textContent).toContain("human-original");
     expect(diffView.querySelector(".diff-add")?.textContent).toContain("agent-changed");
+    expect(drawer.querySelector(".history-raw-chevron")).not.toBeNull();
 
     // 3. One-click Revert calls revertBlock({ to_op_id, expected_heads }) and updates block
     drawer.querySelector<HTMLButtonElement>('[data-testid="history-revert-btn"]')!.click();
@@ -1478,7 +1489,7 @@ describe("M1 Embedded Desktop Web UI (Candidate A CM6)", () => {
     expect(app.isVaultUnlocked()).toBe(true);
 
     const t2Card = root.querySelector<HTMLElement>(`[data-block-id="${t2Id}"]`)!;
-    const lockBtn = [...t2Card.querySelectorAll("button")].find((b) => b.textContent === "🔒 Lock")!;
+    const lockBtn = [...t2Card.querySelectorAll("button")].find((b) => b.textContent === "Lock")!;
     lockBtn.click();
     root.querySelector<HTMLInputElement>('[data-testid="lock-hint-input"]')!.value = "Secret MD";
     root.querySelector<HTMLFormElement>(".dialog-form")!.dispatchEvent(new Event("submit", { cancelable: true }));

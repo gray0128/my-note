@@ -1,5 +1,7 @@
 import { Marked, type Tokens } from "marked";
 import createDOMPurify, { type DOMPurify as DOMPurifyInstance } from "dompurify";
+import { getLocale, t, type Locale } from "../i18n";
+import { createIcon, createIconSwap } from "../icons";
 import {
   mountDiagramWidget,
   type DiagramRenderer,
@@ -27,6 +29,7 @@ export interface MountMarkdownOptions {
 
 export interface MountedMarkdownPreview {
   destroy(): void;
+  refreshLocale?(): void;
   getCleanCopyPayload(): { html: string; text: string };
 }
 
@@ -383,12 +386,14 @@ export function renderSafeMarkdown(source: string): SafeMarkdownResult {
         const externalHref = sanitizeExternalImageHref(href);
         const label = escapeHtml(text.trim() || (href ?? "").trim() || "image");
         if (externalHref) {
+          const prefix = escapeHtml(t("md.blockedExtImg"));
           if (insideAnchor) {
-            return `<span class="md-blocked-img">🖼 External image blocked: ${label}</span>`;
+            return `<span class="md-blocked-img">${prefix} ${label}</span>`;
           }
-          return `<span class="md-blocked-img">🖼 External image blocked: <a href="${escapeHtml(externalHref)}" rel="noopener noreferrer" target="_blank">${label}</a></span>`;
+          return `<span class="md-blocked-img">${prefix} <a href="${escapeHtml(externalHref)}" rel="noopener noreferrer" target="_blank">${label}</a></span>`;
         }
-        return `<span class="md-blocked-img">🖼 Image blocked: ${label}</span>`;
+        const prefix = escapeHtml(t("md.blockedImg"));
+        return `<span class="md-blocked-img">${prefix} ${label}</span>`;
       },
 
       link({ href, title, tokens }: Tokens.Link): string {
@@ -674,6 +679,7 @@ function reportCopyFeedback(
 function createCopyControl(label: string, extraClass: string): {
   wrapper: HTMLSpanElement;
   button: HTMLButtonElement;
+  labelEl: HTMLSpanElement;
   tip: HTMLSpanElement;
 } {
   const wrapper = document.createElement("span");
@@ -681,15 +687,18 @@ function createCopyControl(label: string, extraClass: string): {
 
   const button = document.createElement("button");
   button.type = "button";
-  button.className = `btn btn-icon copy-button ${extraClass}`;
-  button.textContent = label;
+  button.className = `btn btn-icon btn-has-icon copy-button ${extraClass}`;
+  const labelEl = document.createElement("span");
+  labelEl.className = "copy-btn-label";
+  labelEl.textContent = label;
+  button.append(createIconSwap("copy", "check", "xs"), labelEl);
 
   const tip = document.createElement("span");
   tip.className = "copy-tip";
   tip.setAttribute("role", "status");
 
   wrapper.append(button, tip);
-  return { wrapper, button, tip };
+  return { wrapper, button, labelEl, tip };
 }
 
 function extractCleanPlainText(root: Element): string {
@@ -751,6 +760,7 @@ export function mountMarkdownPreview(
 ): MountedMarkdownPreview {
   const rendered = renderSafeMarkdown(source);
   let cachedPayloadSource = source;
+  let cachedPayloadLocale: Locale = getLocale();
   let cleanPayload = buildCleanCopyPayload(rendered);
 
   const sanitizedBody = sanitizeHtmlToElement(rendered.html);
@@ -763,6 +773,34 @@ export function mountMarkdownPreview(
   const cleanups: Array<() => void> = [];
   const diagramHandles: DiagramWidgetHandle[] = [];
   const trackedButtons: HTMLButtonElement[] = [];
+  const localeRefreshes: Array<() => void> = [];
+  let destroyed = false;
+
+  // Post-sanitization icon decoration for blocked images (keeps rendered.html 100% <svg>-free for SEC-06).
+  const initialExtPrefix = t("md.blockedExtImg");
+  const initialGenPrefix = t("md.blockedImg");
+  for (const badge of Array.from(previewRoot.querySelectorAll(".md-blocked-img"))) {
+    const firstNode = badge.firstChild;
+    const isExt =
+      badge.querySelector("a") !== null ||
+      (firstNode?.nodeType === 3 && (firstNode.textContent ?? "").startsWith(initialExtPrefix));
+    if (firstNode && firstNode.nodeType === 3) {
+      const currentText = firstNode.textContent ?? "";
+      const prefixUsed = isExt ? initialExtPrefix : initialGenPrefix;
+      const tail = currentText.startsWith(prefixUsed) ? currentText.slice(prefixUsed.length) : currentText;
+      const prefixSpan = document.createElement("span");
+      prefixSpan.className = "md-blocked-img-prefix";
+      prefixSpan.textContent = prefixUsed;
+      firstNode.textContent = tail;
+      badge.insertBefore(prefixSpan, firstNode);
+      badge.insertBefore(createIcon("image-off", "xs"), prefixSpan);
+      localeRefreshes.push(() => {
+        prefixSpan.textContent = isExt ? t("md.blockedExtImg") : t("md.blockedImg");
+      });
+    } else {
+      badge.insertBefore(createIcon("image-off", "xs"), badge.firstChild);
+    }
+  }
 
   let currentSource = source;
   const checkboxes = Array.from(
@@ -770,6 +808,14 @@ export function mountMarkdownPreview(
   ) as HTMLInputElement[];
 
   checkboxes.forEach((cb, idx) => {
+    const li = cb.closest("li");
+    if (li) {
+      li.classList.add("md-task-item");
+      const listEl = li.parentElement;
+      if (listEl && (listEl.localName.toLowerCase() === "ul" || listEl.localName.toLowerCase() === "ol")) {
+        listEl.classList.add("md-task-list");
+      }
+    }
     if (options.readOnly) {
       cb.disabled = true;
       return;
@@ -789,7 +835,8 @@ export function mountMarkdownPreview(
   );
   preNodes.forEach((pre, idx) => {
     const meta = rendered.codeBlocks[idx];
-    const rawCode = meta ? meta.code : pre.querySelector("code")?.textContent ?? "";
+    const codeEl = pre.querySelector("code");
+    const rawCode = meta ? meta.code : codeEl?.textContent ?? "";
 
     const wrap = document.createElement("div");
     wrap.className = "md-code-wrap copyable";
@@ -804,13 +851,36 @@ export function mountMarkdownPreview(
       toolbar.appendChild(langBadge);
     }
 
-    const copyCtrl = createCopyControl("Copy Code", "md-copy-code");
+    const copyCtrl = createCopyControl(t("md.copyCode"), "md-copy-code");
     trackedButtons.push(copyCtrl.button);
+    localeRefreshes.push(() => {
+      copyCtrl.labelEl.textContent = t("md.copyCode");
+    });
     toolbar.appendChild(copyCtrl.wrapper);
 
     pre.setAttribute("tabindex", "0");
     pre.parentNode?.insertBefore(wrap, pre);
     wrap.append(toolbar, pre);
+
+    if (meta?.lang && codeEl) {
+      void import("./highlight")
+        .then(({ highlightCodeSnippet }) => highlightCodeSnippet(rawCode, meta.lang))
+        .then((tokens) => {
+          if (destroyed || !tokens || tokens.length === 0 || !codeEl.isConnected) return;
+          const frag = document.createDocumentFragment();
+          for (const tok of tokens) {
+            if (!tok.cls) {
+              frag.appendChild(document.createTextNode(tok.text));
+            } else {
+              const span = document.createElement("span");
+              span.className = tok.cls;
+              span.textContent = tok.text;
+              frag.appendChild(span);
+            }
+          }
+          codeEl.replaceChildren(frag);
+        });
+    }
 
     const onCopyCode = async (): Promise<void> => {
       try {
@@ -822,8 +892,8 @@ export function mountMarkdownPreview(
           copyCtrl.button,
           copyCtrl.tip,
           true,
-          "Copied",
-          "Copy failed",
+          t("md.copied"),
+          t("md.copyFailed"),
           options.onCopyFeedback,
         );
       } catch {
@@ -831,8 +901,8 @@ export function mountMarkdownPreview(
           copyCtrl.button,
           copyCtrl.tip,
           false,
-          "Copied",
-          "Copy failed",
+          t("md.copied"),
+          t("md.copyFailed"),
           options.onCopyFeedback,
         );
       }
@@ -846,16 +916,26 @@ export function mountMarkdownPreview(
     const wrap = document.createElement("div");
     wrap.className = "md-table-wrap copyable";
 
+    const scroll = document.createElement("div");
+    scroll.className = "md-table-scroll";
+
     const toolbar = document.createElement("div");
     toolbar.className = "md-table-toolbar";
 
-    const tsvCtrl = createCopyControl("Copy TSV", "md-copy-tsv");
-    const mdCtrl = createCopyControl("Copy MD", "md-copy-md");
+    const tsvCtrl = createCopyControl(t("md.copyTsv"), "md-copy-tsv");
+    const mdCtrl = createCopyControl(t("md.copyMd"), "md-copy-md");
+    tsvCtrl.button.title = t("md.copiedTsv");
+    mdCtrl.button.title = t("md.copiedMd");
     trackedButtons.push(tsvCtrl.button, mdCtrl.button);
+    localeRefreshes.push(() => {
+      tsvCtrl.labelEl.textContent = t("md.copyTsv");
+      mdCtrl.labelEl.textContent = t("md.copyMd");
+    });
 
     toolbar.append(tsvCtrl.wrapper, mdCtrl.wrapper);
     table.parentNode?.insertBefore(wrap, table);
-    wrap.append(toolbar, table);
+    scroll.appendChild(table);
+    wrap.append(toolbar, scroll);
 
     const onCopyTsv = async (): Promise<void> => {
       try {
@@ -867,8 +947,8 @@ export function mountMarkdownPreview(
           tsvCtrl.button,
           tsvCtrl.tip,
           true,
-          "Copied TSV",
-          "Copy failed",
+          t("md.copiedTsv"),
+          t("md.copyFailed"),
           options.onCopyFeedback,
         );
       } catch {
@@ -876,8 +956,8 @@ export function mountMarkdownPreview(
           tsvCtrl.button,
           tsvCtrl.tip,
           false,
-          "Copied TSV",
-          "Copy failed",
+          t("md.copiedTsv"),
+          t("md.copyFailed"),
           options.onCopyFeedback,
         );
       }
@@ -893,8 +973,8 @@ export function mountMarkdownPreview(
           mdCtrl.button,
           mdCtrl.tip,
           true,
-          "Copied MD",
-          "Copy failed",
+          t("md.copiedMd"),
+          t("md.copyFailed"),
           options.onCopyFeedback,
         );
       } catch {
@@ -902,8 +982,8 @@ export function mountMarkdownPreview(
           mdCtrl.button,
           mdCtrl.tip,
           false,
-          "Copied MD",
-          "Copy failed",
+          t("md.copiedMd"),
+          t("md.copyFailed"),
           options.onCopyFeedback,
         );
       }
@@ -935,6 +1015,7 @@ export function mountMarkdownPreview(
 
   return {
     destroy() {
+      destroyed = true;
       for (const cleanup of cleanups) {
         cleanup();
       }
@@ -949,9 +1030,19 @@ export function mountMarkdownPreview(
         }
       }
     },
+    refreshLocale() {
+      for (const fn of localeRefreshes) {
+        fn();
+      }
+      for (const handle of diagramHandles) {
+        handle.refreshLocale?.();
+      }
+    },
     getCleanCopyPayload() {
-      if (currentSource !== cachedPayloadSource) {
+      const loc = getLocale();
+      if (currentSource !== cachedPayloadSource || loc !== cachedPayloadLocale) {
         cachedPayloadSource = currentSource;
+        cachedPayloadLocale = loc;
         cleanPayload = buildCleanCopyPayload(renderSafeMarkdown(currentSource));
       }
       return {

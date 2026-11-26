@@ -2,8 +2,8 @@
 // SEC-08 HARD INVARIANT: Cache ONLY static app shell assets (HTML/JS/CSS/WASM/icons).
 // NEVER cache `/v1/*` API calls, snapshots, keys, or auth responses!
 
-const CACHE_NAME = "mynote-pwa-shell-v3";
-const SHELL_PATHS = ["/", "/manifest.webmanifest", "/icon.svg"];
+const CACHE_NAME = "mynote-pwa-shell-v4";
+const SHELL_PATHS = ["/", "/theme-init.js", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(SHELL_PATHS)));
@@ -35,6 +35,7 @@ self.addEventListener("fetch", (event) => {
   const isShellPath =
     url.pathname === "/" ||
     url.pathname === "/index.html" ||
+    url.pathname === "/theme-init.js" ||
     url.pathname === "/manifest.webmanifest" ||
     url.pathname === "/icon.svg";
   if (!isHashedAsset && !isShellPath) return;
