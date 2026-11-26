@@ -231,16 +231,18 @@ flowchart TB
 
 ## 9. CI 编排、仓库布局与执行纪律
 
-### 9.1 GitHub Actions 编排
+### 9.1 GitHub Actions 编排与统一三层入口
 
-- **平台矩阵**：`macos-latest`（aarch64）与 `ubuntu-latest` 同时运行；Worker 契约测试与 Playwright WebKit 测试至少在 Linux 上运行。
-- **静态检查**：`cargo fmt --check`、`cargo clippy -- -D warnings`、Rust 与 npm 依赖审计（如 `cargo deny` / `cargo audit`）、TypeScript 类型检查。
+- **不可变验证器前置阻断**：`immutable-verifier-guard` 作为所有构建与测试任务的 `needs` 前置依赖运行。非 `[eval-only]` PR 触碰 `evals/` 直接阻断后续任务，且各执行任务在运行前强制执行 `rm -rf evals/ && git checkout <base-sha> -- evals/`；`[eval-only]` PR 仅允许修改 `evals/` 与 `docs/eval-framework.md`。
+- **平台矩阵**：`macos-latest`（aarch64）与 `ubuntu-latest` 同时运行；Worker 契约测试与 Playwright Chromium / WebKit 运行时审计在 Linux 上必跑。
+- **静态与架构守卫**：`scripts/check-architecture.py`（含 `--selftest` 变异自检，强制校验 `mynote-core` Sans-I/O 零平台依赖、`spikes/` 物理隔离、`cloud-cf/src/` `<= 700` 行与 `mynote-core` 同步核心 `< 3,000` 行预算 [目标]、同步客户端防 `302` 重定向配置、HTML 零内联脚本与三包版本号一致）、`cargo fmt --check`、`cargo clippy -- -D warnings`、TypeScript 类型检查。
+- **真实浏览器 CDP 几何与状态等价门禁**：除 `SEC-03`、`SEC-06`、`SEC-08` 外，`tests/e2e/test_ui_cdp_equivalence.py` 在真实 `mynote daemon` 与无头 Chromium / WebKit 下断言零 `console.error` / `pageerror`、桌面（`1440x900`、`900x700`）与移动（`390x844`）视口 `scrollWidth <= innerWidth`、`.sr-only` 包含块隔离、实时 WebSocket 并发新建 Buffer 零重复标签，以及前端 DOM 排序与 SQLite 快照等价。
 
-| 层级 | 触发时机 | 耗时 | 内容 | 失败策略 |
-| --- | --- | :---: | --- | --- |
-| **本地** | `pre-commit` | < 10 s [目标] | 单元测试、回归种子集、黄金测试快照校验 | 阻断提交 |
-| **PR** | 每个 PR | < 10 min [目标] | 静态检查；属性测试；DST（约 500 个随机种子 [目标] + 全部回归种子）；真实 Worker 契约测试；INV-RECOVERY；SEC 取证；格式化幂等与导入差分；CLI 黄金测试 | 任一失败阻断合并 |
-| **夜间** | 定时 | 30–60 min [目标] | DST 长浸泡（约 100,000 个种子 [目标]）；可选 fuzz | 失败种子自动开 Issue 并缩减入库；里程碑准出前必须清零 |
+| 层级 | 标准入口命令 | 触发时机 | 耗时 | 内容 | 失败策略 |
+| --- | --- | --- | :---: | --- | --- |
+| **Tier 0（自检与快检）** | `make eval-selftest` / `make eval-fast` | 每次编辑后 / `pre-commit` | < 15 s [目标] | 架构守卫与黄金判分器植错自检（`MG-01`–`MG-07`）；`fmt`；回归种子库回放 | 阻断提交 |
+| **Tier 1（契约与 UI）** | `make eval-contract` / `make eval-ui` | 每个 PR | < 10 min [目标] | 属性测试；M1 + M2 随机种子 DST（`MYNOTE_DST_SEEDS=500` [目标] + 全部回归种子，输出 `INV-SYNC-6` 行写统计）；真实 `workerd` 差分契约测试（含 `keys_confirm` 与 `N=20` 批量门限）；INV-RECOVERY；SEC 取证；CLI 黄金测试 `G01`–`G11`；Chromium + WebKit CDP 安全与状态等价审计 | 任一失败阻断合并 |
+| **夜间浸泡** | `nightly.yml` | 定时 / 手动 | 30–60 min [目标] | M1 + M2 DST 长浸泡（`MYNOTE_DST_SEEDS=100000` [目标]）；可选 fuzz | 失败种子缩减后经 `[eval-only]` PR 入库；里程碑准出前必须清零 |
 
 ### 9.2 仓库布局
 
