@@ -263,9 +263,37 @@ export const myNoteHighlightStyle: HighlightStyle = HighlightStyle.define([
   },
 ]);
 
+/**
+ * Avoid Chromium Blink's `ReplaceSelectionCommand` copying highlighted `<span>`
+ * computed color onto `<div class="cm-line" style="color: ...">` when typing
+ * directly over a non-collapsed selection, which violates strict `style-src-attr` CSP.
+ * IME composition (`isComposing` / `insertCompositionText`) passes through untouched.
+ */
+const cspSafeReplaceSelection: Extension = EditorView.domEventHandlers({
+  beforeinput(event, view) {
+    if (
+      event.isComposing ||
+      event.inputType !== "insertText" ||
+      typeof event.data !== "string" ||
+      !view.state.facet(EditorView.editable) ||
+      view.state.readOnly ||
+      view.state.selection.ranges.every((r) => r.empty)
+    ) {
+      return false;
+    }
+    event.preventDefault();
+    view.dispatch(view.state.replaceSelection(event.data), {
+      userEvent: "input.type",
+      scrollIntoView: true,
+    });
+    return true;
+  },
+});
+
 export const myNoteCmExtensions: readonly Extension[] = [
   myNoteEditorTheme,
   EditorView.lineWrapping,
   syntaxHighlighting(myNoteHighlightStyle),
   markdownCodeDecorationsPlugin,
+  cspSafeReplaceSelection,
 ];
