@@ -1,0 +1,177 @@
+name: Release Desktop Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing git tag to build and publish (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-web:
+    name: Build Embedded Desktop Web UI (WASM + web/dist)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      tag: ${{ steps.resolve-tag.outputs.tag }}
+    steps:
+      - name: Resolve release tag
+        id: resolve-tag
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if ! printf '%s\n' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$'; then
+            echo "ERROR: release tag must match vX.Y.Z (got '$TAG')"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve-tag.outputs.tag }}
+      - name: Verify Cargo.toml version matches release tag
+        shell: bash
+        env:
+          TAG: ${{ steps.resolve-tag.outputs.tag }}
+        run: |
+          CARGO_VER=$(grep -m1 '^version = "' Cargo.toml | sed -E 's/^version = "([^"]+)"/\1/')
+          TAG_VER="${TAG#v}"
+          if [ "$TAG_VER" != "$CARGO_VER" ]; then
+            echo "ERROR: tag $TAG does not match Cargo.toml workspace version $CARGO_VER"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.130
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Build Desktop WASM & embedded web/dist
+        run: |
+          ./scripts/build-wasm.sh
+          pnpm --dir web install --frozen-lockfile
+          pnpm --dir web typecheck
+          pnpm --dir web test
+          pnpm --dir web build
+          test -s web/dist/index.html
+      - name: Upload web-dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 1
+
+  build-release:
+    name: Build & Verify (${{ matrix.target }})
+    needs: [build-web]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build-web.outputs.tag }}
+      - name: Download embedded Desktop Web UI assets
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build stripped release binary (mynote)
+        run: cargo build --release --locked --bin mynote
+      - name: Verify release binary against frozen CLI golden suite (G01-G11)
+        run: |
+          ./target/release/mynote --version
+          ./evals/golden/run_golden.sh --bin ./target/release/mynote
+      - name: Package self-contained desktop bundle
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          STAGE="dist/mynote-${TARGET}"
+          mkdir -p "$STAGE/skill" "$STAGE/deploy/launchd" "$STAGE/deploy/systemd" "$STAGE/deploy/hyprland"
+          install -m 755 target/release/mynote "$STAGE/mynote"
+          install -m 644 skill/SKILL.md "$STAGE/skill/SKILL.md"
+          install -m 644 deploy/launchd/com.mynote.daemon.plist "$STAGE/deploy/launchd/com.mynote.daemon.plist"
+          install -m 644 deploy/systemd/mynote-daemon.service "$STAGE/deploy/systemd/mynote-daemon.service"
+          install -m 644 deploy/hyprland/mynote.conf "$STAGE/deploy/hyprland/mynote.conf"
+          install -m 644 README.md "$STAGE/README.md"
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/mynote-${TARGET}.tar.gz" "mynote-${TARGET}"
+          ls -lh "dist/mynote-${TARGET}.tar.gz"
+      - name: Upload release tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.target }}
+          path: dist/mynote-${{ matrix.target }}.tar.gz
+          retention-days: 1
+
+  publish-release:
+    name: Publish GitHub Release & SHA256SUMS
+    needs: [build-web, build-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download built release tarballs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-*
+          merge-multiple: true
+          path: release-assets
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          cd release-assets
+          ls -lh mynote-*.tar.gz
+          sha256sum mynote-*.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.build-web.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$TAG" release-assets/* \
+              --repo "${{ github.repository }}" \
+              --title "my-note ${TAG}" \
+              --generate-notes
+          fi
