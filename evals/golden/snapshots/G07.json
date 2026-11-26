@@ -1,0 +1,80 @@
+{
+  "scenario": "G07",
+  "steps": [
+    {
+      "exit_code": 6,
+      "json": {
+        "data": null,
+        "error": {
+          "code": "SYNC_OFFLINE",
+          "hint": "<HINT>",
+          "message": "<MESSAGE>",
+          "retryable": true
+        },
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 2,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": false
+      },
+      "name": "sync_push_offline"
+    },
+    {
+      "exit_code": 6,
+      "json": {
+        "data": null,
+        "error": {
+          "code": "SYNC_OFFLINE",
+          "hint": "<HINT>",
+          "message": "<MESSAGE>",
+          "retryable": true
+        },
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 2,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": false
+      },
+      "name": "sync_pull_offline"
+    },
+    {
+      "exit_code": 0,
+      "json": {
+        "data": {
+          "blocked_ops": 0,
+          "clock_skew_ms": 0,
+          "epoch": null,
+          "key_self_check": {
+            "blocks_missing_key": 0,
+            "last_run_ms": "<MS>",
+            "ok": true
+          },
+          "last_local_backup_ms": null,
+          "last_recovery_drill_ms": null,
+          "last_seq": 0,
+          "pending_ops": 2,
+          "recovery_drill_due": false,
+          "sync_state": "pending_offline",
+          "trash": {
+            "count": 0,
+            "next_shred_ms": null,
+            "pending_confirm_count": 0
+          }
+        },
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 2,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": true
+      },
+      "name": "sync_status"
+    }
+  ]
+}

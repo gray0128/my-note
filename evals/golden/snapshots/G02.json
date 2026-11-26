@@ -1,0 +1,210 @@
+{
+  "scenario": "G02",
+  "steps": [
+    {
+      "exit_code": 0,
+      "json": {
+        "data": [
+          {
+            "actor": "human",
+            "buffer_id": "<ULID>",
+            "buffer_name": "scratch",
+            "byte_size": 22,
+            "display_op_id": "<ULID>",
+            "has_conflict": false,
+            "head_op_ids": [
+              "<ULID>"
+            ],
+            "id": "<ULID>",
+            "is_locked": false,
+            "lang": "text",
+            "position": "<POSITION>",
+            "preview": "searchable alpha token",
+            "public_hint": null,
+            "redacted": false,
+            "updated_at_ms": "<MS>"
+          },
+          {
+            "actor": "human",
+            "buffer_id": "<ULID>",
+            "buffer_name": "scratch",
+            "byte_size": 12,
+            "display_op_id": "<ULID>",
+            "has_conflict": false,
+            "head_op_ids": [
+              "<ULID>"
+            ],
+            "id": "<ULID>",
+            "is_locked": false,
+            "lang": "json",
+            "position": "<POSITION>",
+            "preview": "{\"alpha\": 1}",
+            "public_hint": null,
+            "redacted": false,
+            "updated_at_ms": "<MS>"
+          },
+          {
+            "actor": "human",
+            "buffer_id": "<ULID>",
+            "buffer_name": "scratch",
+            "byte_size": null,
+            "display_op_id": "<ULID>",
+            "has_conflict": false,
+            "head_op_ids": [
+              "<ULID>"
+            ],
+            "id": "<ULID>",
+            "is_locked": true,
+            "lang": "text",
+            "position": "<POSITION>",
+            "preview": null,
+            "public_hint": "g02 secret",
+            "redacted": true,
+            "updated_at_ms": "<MS>"
+          }
+        ],
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 5,
+          "redacted_locked_count": 1,
+          "sync_state": "pending_offline"
+        },
+        "ok": true
+      },
+      "name": "ls_json"
+    },
+    {
+      "exit_code": 0,
+      "name": "ls_jsonl",
+      "rows": [
+        {
+          "actor": "human",
+          "buffer_id": "<ULID>",
+          "buffer_name": "scratch",
+          "byte_size": 22,
+          "display_op_id": "<ULID>",
+          "has_conflict": false,
+          "head_op_ids": [
+            "<ULID>"
+          ],
+          "id": "<ULID>",
+          "is_locked": false,
+          "lang": "text",
+          "position": "<POSITION>",
+          "preview": "searchable alpha token",
+          "public_hint": null,
+          "redacted": false,
+          "updated_at_ms": "<MS>"
+        },
+        {
+          "actor": "human",
+          "buffer_id": "<ULID>",
+          "buffer_name": "scratch",
+          "byte_size": 12,
+          "display_op_id": "<ULID>",
+          "has_conflict": false,
+          "head_op_ids": [
+            "<ULID>"
+          ],
+          "id": "<ULID>",
+          "is_locked": false,
+          "lang": "json",
+          "position": "<POSITION>",
+          "preview": "{\"alpha\": 1}",
+          "public_hint": null,
+          "redacted": false,
+          "updated_at_ms": "<MS>"
+        },
+        {
+          "actor": "human",
+          "buffer_id": "<ULID>",
+          "buffer_name": "scratch",
+          "byte_size": null,
+          "display_op_id": "<ULID>",
+          "has_conflict": false,
+          "head_op_ids": [
+            "<ULID>"
+          ],
+          "id": "<ULID>",
+          "is_locked": true,
+          "lang": "text",
+          "position": "<POSITION>",
+          "preview": null,
+          "public_hint": "g02 secret",
+          "redacted": true,
+          "updated_at_ms": "<MS>"
+        }
+      ]
+    },
+    {
+      "exit_code": 0,
+      "json": {
+        "data": [
+          {
+            "actor": "human",
+            "buffer_id": "<ULID>",
+            "buffer_name": "scratch",
+            "byte_size": 12,
+            "display_op_id": "<ULID>",
+            "has_conflict": false,
+            "head_op_ids": [
+              "<ULID>"
+            ],
+            "id": "<ULID>",
+            "is_locked": false,
+            "lang": "json",
+            "position": "<POSITION>",
+            "preview": "{\"alpha\": 1}",
+            "public_hint": null,
+            "redacted": false,
+            "updated_at_ms": "<MS>"
+          },
+          {
+            "actor": "human",
+            "buffer_id": "<ULID>",
+            "buffer_name": "scratch",
+            "byte_size": 22,
+            "display_op_id": "<ULID>",
+            "has_conflict": false,
+            "head_op_ids": [
+              "<ULID>"
+            ],
+            "id": "<ULID>",
+            "is_locked": false,
+            "lang": "text",
+            "position": "<POSITION>",
+            "preview": "searchable alpha token",
+            "public_hint": null,
+            "redacted": false,
+            "updated_at_ms": "<MS>"
+          }
+        ],
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 5,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": true
+      },
+      "name": "search_alpha"
+    },
+    {
+      "exit_code": 0,
+      "json": {
+        "data": [],
+        "error": null,
+        "meta": {
+          "duration_ms": "<MS>",
+          "local_op_count_pending": 5,
+          "redacted_locked_count": 0,
+          "sync_state": "pending_offline"
+        },
+        "ok": true
+      },
+      "name": "search_locked_canary"
+    }
+  ]
+}
