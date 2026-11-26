@@ -332,11 +332,15 @@ describe("GFM tables, code copy, and Dual-Format clean copy payload", () => {
       readOnly: true,
       onCopyFeedback: (msg, isError) => feedback.push({ msg, isError }),
     });
-    // Wait for async Lezer syntax highlighting to decorate <code> with CSP-safe .tok-* spans
-    await new Promise((r) => setTimeout(r, 40));
+    // Wait deterministically for lazy Lezer syntax highlighting to decorate <code> with CSP-safe .tok-* spans
     const codeEl = host.querySelector(".md-code-wrap pre code")!;
+    await vi.waitFor(
+      () => {
+        expect(codeEl.querySelector(".tok-kw")?.textContent).toBe("fn");
+      },
+      { timeout: 5000 },
+    );
     expect(codeEl.textContent).toBe("fn main() {}");
-    expect(codeEl.querySelector(".tok-kw")?.textContent).toBe("fn");
     assertDomTreeCleanOfXss(host);
 
     const btn = host.querySelector(".md-copy-code") as HTMLButtonElement;
