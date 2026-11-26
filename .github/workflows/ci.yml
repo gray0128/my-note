@@ -165,6 +165,10 @@ jobs:
         env:
           MYNOTE_DST_SEEDS: "500"
         run: cargo test --workspace
+      - name: Run frozen CLI golden tests (evals/golden/ G01-G11 + static checks)
+        run: |
+          cargo build --bin mynote
+          ./evals/golden/run_golden.sh
       - name: Verify wasm32-unknown-unknown compilation (core + desktop & pwa WASM features)
         run: |
           cargo check -p mynote-core --target wasm32-unknown-unknown
