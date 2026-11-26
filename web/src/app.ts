@@ -1,8 +1,12 @@
 import { LocalApiError, type LocalApiClient, type Tier2WritePayload } from "./api";
 import { BlockStreamController, type SaveContentResult } from "./editor";
+import { computeLineDiff } from "./render/diff";
+import { copyDualFormat } from "./render/markdown";
 import type {
   AlertFrame,
   BlockDto,
+  BlockHistoryContentDto,
+  BlockHistoryEntryDto,
   BufferDto,
   LocalWsFrame,
   SyncStateLabel,
@@ -46,6 +50,18 @@ export class MyNoteApp {
   private alerts = new Map<string, AlertFrame>();
   private trashItems: TrashItemDto[] = [];
   private trashOpen = false;
+  private historyOpen = false;
+  private historyBlockId: string | null = null;
+  private historyBlockLocked = false;
+  private historyEntries: BlockHistoryEntryDto[] = [];
+  private historySelectedOpId: string | null = null;
+  private historySelectedContent: string | null = null;
+  private historySelectedDto: BlockHistoryContentDto | null = null;
+  private historyLoading = false;
+  private historyOpLoading = false;
+  private historyError: string | null = null;
+  private historyLoadSeq = 0;
+  private historyOpSeq = 0;
   private vimEnabled = false;
   private findIndex = 0;
   private disconnectWs: (() => void) | null = null;
@@ -63,6 +79,11 @@ export class MyNoteApp {
   private trashDrawerEl!: HTMLElement;
   private trashActionsEl!: HTMLElement;
   private trashListEl!: HTMLElement;
+  private historyDrawerEl!: HTMLElement;
+  private historyTitleEl!: HTMLElement;
+  private historyActionsEl!: HTMLElement;
+  private historyListEl!: HTMLElement;
+  private historyDiffEl!: HTMLElement;
   private modalBackdropEl!: HTMLElement;
   private modalListEl!: HTMLElement;
   private newBufInputEl!: HTMLInputElement;
@@ -145,6 +166,9 @@ export class MyNoteApp {
       this.vaultSession = null;
     }
     this.stream.clearUnlockedVaultPlaintext();
+    if (this.hasLockedHistoryOpen()) {
+      this.closeHistoryDrawer();
+    }
     this.renderVaultBtn();
     if (!opts.silent) {
       this.showToast("Vault locked — keys & plaintext wiped from RAM");
@@ -302,6 +326,9 @@ export class MyNoteApp {
       onLockBlock: (blk) => this.promptLockBlock(blk),
       onUnlockBlockToTier1: (blk) => this.promptUnlockBlockToTier1(blk),
       onPurgeHistory: (blk) => this.openTrashConfirmModal("purge_history", [blk.id], T_GRACE_MIN_MS, blk),
+      onOpenHistory: (blk) => void this.openHistoryDrawer(blk),
+      onCopyRich: (blk, html, text) => this.copyBlockRich(blk, html, text),
+      onFeedback: (msg, isError) => this.showToast(msg, isError),
       onSecretPasted: (blk, secretType) => {
         this.secretNudge = { blockId: blk.id, secretType };
         this.renderAlerts();
@@ -330,7 +357,31 @@ export class MyNoteApp {
     this.trashListEl = document.createElement("div");
     this.trashListEl.className = "drawer-list";
     this.trashDrawerEl.append(drawerHdr, this.trashActionsEl, this.trashListEl);
-    workspace.append(streamEl, this.trashDrawerEl);
+
+    // Block History (Time Travel) drawer
+    this.historyDrawerEl = document.createElement("aside");
+    this.historyDrawerEl.className = "drawer history-drawer hidden";
+    this.historyDrawerEl.dataset.testid = "history-drawer";
+    const histHdr = document.createElement("div");
+    histHdr.className = "drawer-header";
+    this.historyTitleEl = document.createElement("span");
+    this.historyTitleEl.textContent = "Block History";
+    const closeHist = document.createElement("button");
+    closeHist.type = "button";
+    closeHist.className = "btn btn-icon";
+    closeHist.dataset.testid = "history-close-btn";
+    closeHist.textContent = "✕";
+    closeHist.addEventListener("click", () => this.closeHistoryDrawer());
+    histHdr.append(this.historyTitleEl, closeHist);
+    this.historyActionsEl = document.createElement("div");
+    this.historyActionsEl.className = "drawer-actions";
+    this.historyListEl = document.createElement("div");
+    this.historyListEl.className = "drawer-list history-list";
+    this.historyDiffEl = document.createElement("div");
+    this.historyDiffEl.className = "history-diff-pane";
+    this.historyDrawerEl.append(histHdr, this.historyActionsEl, this.historyListEl, this.historyDiffEl);
+
+    workspace.append(streamEl, this.trashDrawerEl, this.historyDrawerEl);
 
     // Buffer Switcher modal
     this.modalBackdropEl = document.createElement("div");
@@ -403,6 +454,8 @@ export class MyNoteApp {
       }
       if (this.vaultSession) {
         this.lockVaultNow({ skipFlush: true, silent: true });
+      } else if (this.hasLockedHistoryOpen()) {
+        this.closeHistoryDrawer();
       }
     }
   };
@@ -416,6 +469,8 @@ export class MyNoteApp {
     }
     if (this.vaultSession) {
       this.lockVaultNow({ skipFlush: true, silent: true });
+    } else if (this.hasLockedHistoryOpen()) {
+      this.closeHistoryDrawer();
     }
   };
 
@@ -435,6 +490,7 @@ export class MyNoteApp {
         this.closeBufferModal();
         this.closeDialog();
         this.toggleFindBar(false);
+        this.closeHistoryDrawer();
       }
       return;
     }
@@ -442,6 +498,11 @@ export class MyNoteApp {
     if (key === "p") {
       ev.preventDefault();
       this.openBufferModal();
+    } else if (key === "e" && !ev.shiftKey) {
+      const targetId = this.stream.getActiveBlockId() ?? this.stream.getBlocks()[0]?.id ?? null;
+      if (targetId && this.stream.toggleBlockSourcePreview(targetId)) {
+        ev.preventDefault();
+      }
     } else if (key === "l" && ev.shiftKey) {
       ev.preventDefault();
       const id = this.stream.getActiveBlockId();
@@ -706,6 +767,13 @@ export class MyNoteApp {
       if (this.isVaultUnlocked()) {
         this.decryptVisibleLockedBlocks();
       }
+      if (this.historyOpen && this.historyBlockId) {
+        if (frame.deleted_ids.includes(this.historyBlockId)) {
+          this.closeHistoryDrawer();
+        } else if (frame.upserted.some((b) => b.id === this.historyBlockId)) {
+          this.renderHistoryDrawer();
+        }
+      }
     } else if (frame.type === "buffers_changed") {
       const del = new Set(frame.deleted_ids);
       let next = this.buffers.filter((b) => !del.has(b.id));
@@ -766,6 +834,7 @@ export class MyNoteApp {
       const blocks = await this.api.listBlocks(bufferId);
       if (reqSeq !== this.switchSeq) return;
       this.activeBufferId = bufferId;
+      this.closeHistoryDrawer();
       this.renderBuffers();
       this.stream.setBlocks(blocks);
       if (this.isVaultUnlocked()) {
@@ -1100,7 +1169,7 @@ export class MyNoteApp {
         return;
       }
 
-      const { formatted } = await this.api.formatSnippet({ content, lang: cur.lang });
+      const { formatted } = await this.api.formatSnippet({ content, lang: cur.lang, block_id: cur.id });
       const updated = await this.api.patchBlock(cur.id, {
         expected_heads: expectedHeads,
         content: formatted,
@@ -1118,6 +1187,16 @@ export class MyNoteApp {
       await navigator.clipboard.writeText(content);
       this.showToast("Copied block to clipboard");
     } catch {
+      this.showToast("Clipboard permission unavailable", true);
+    }
+  }
+
+  private async copyBlockRich(block: BlockDto, html: string, text: string): Promise<void> {
+    const ok = await copyDualFormat(html, text);
+    if (ok) {
+      if (block.is_locked) this.resetVaultIdleTimer();
+      this.showToast("Copied rich HTML + plain text");
+    } else {
       this.showToast("Clipboard permission unavailable", true);
     }
   }
@@ -1140,6 +1219,9 @@ export class MyNoteApp {
       await this.stream.waitForSaveIdle(block.id);
       const cur = this.stream.getBlocks().find((b) => b.id === block.id) ?? block;
       await this.api.deleteBlock(cur.id, cur.head_op_ids);
+      if (this.historyOpen && this.historyBlockId === cur.id) {
+        this.closeHistoryDrawer();
+      }
       this.stream.upsertBlocks([], [cur.id], this.activeBufferId);
       this.showToast("Moved block to Recycle Bin");
       await this.refreshTrash();
@@ -1700,10 +1782,512 @@ export class MyNoteApp {
     this.dialogBackdropEl.classList.remove("hidden");
   }
 
+  // ---------- M3 Block History (Time Travel) Drawer ----------
+
+  private hasLockedHistoryOpen(): boolean {
+    if (!this.historyOpen) return false;
+    if (this.historyBlockLocked || this.historySelectedDto?.is_locked) return true;
+    if (this.historyEntries.some((e) => e.is_locked)) return true;
+    return this.stream.getBlocks().some((b) => b.id === this.historyBlockId && b.is_locked);
+  }
+
+  closeHistoryDrawer(): void {
+    this.historyLoadSeq++;
+    this.historyOpSeq++;
+    this.historyOpen = false;
+    this.historyBlockId = null;
+    this.historyBlockLocked = false;
+    this.historyEntries = [];
+    this.historySelectedOpId = null;
+    this.historySelectedContent = null;
+    this.historySelectedDto = null;
+    this.historyLoading = false;
+    this.historyOpLoading = false;
+    this.historyError = null;
+    this.historyDrawerEl.classList.add("hidden");
+    this.historyTitleEl.textContent = "Block History";
+    this.historyActionsEl.replaceChildren();
+    this.historyListEl.replaceChildren();
+    this.historyDiffEl.replaceChildren();
+  }
+
+  private async openHistoryDrawer(block: BlockDto): Promise<void> {
+    if (!this.api.getBlockHistory) {
+      this.showToast("Block history API unavailable", true);
+      return;
+    }
+    const cur = this.stream.getBlocks().find((b) => b.id === block.id) ?? block;
+    if (cur.is_locked && !this.isVaultUnlocked()) {
+      this.pendingAfterUnlock = () => this.openHistoryDrawer(cur);
+      this.openVaultModal();
+      return;
+    }
+    if (this.trashOpen) {
+      this.trashOpen = false;
+      this.trashDrawerEl.classList.add("hidden");
+    }
+
+    const reqSeq = ++this.historyLoadSeq;
+    const lockEpoch = this.stream.getVaultLockEpoch();
+    this.historyOpSeq++;
+    this.historyOpen = true;
+    this.historyBlockId = cur.id;
+    this.historyBlockLocked = cur.is_locked;
+    this.historyEntries = [];
+    this.historySelectedOpId = null;
+    this.historySelectedContent = null;
+    this.historySelectedDto = null;
+    this.historyLoading = true;
+    this.historyOpLoading = false;
+    this.historyError = null;
+    this.historyDrawerEl.classList.remove("hidden");
+    this.renderHistoryDrawer();
+
+    try {
+      const entries = await this.api.getBlockHistory(cur.id, 100);
+      if (reqSeq !== this.historyLoadSeq || !this.historyOpen || this.historyBlockId !== cur.id) {
+        return;
+      }
+      const hasLockedEntries = cur.is_locked || entries.some((e) => e.is_locked);
+      if (hasLockedEntries && cur.is_locked && (!this.isVaultUnlocked() || isPageHidden() || this.stream.getVaultLockEpoch() !== lockEpoch)) {
+        this.closeHistoryDrawer();
+        return;
+      }
+      this.historyEntries = entries;
+      this.historyLoading = false;
+      this.renderHistoryDrawer();
+    } catch (e) {
+      if (reqSeq !== this.historyLoadSeq || !this.historyOpen) return;
+      this.historyLoading = false;
+      this.historyError = e instanceof Error ? e.message : "Failed to load block history";
+      this.renderHistoryDrawer();
+      this.handleErr(e);
+    }
+  }
+
+  private async selectHistoryEntry(entry: BlockHistoryEntryDto): Promise<void> {
+    if (!this.historyOpen || !this.historyBlockId || !this.api.getBlockHistoryOp) return;
+    if (!entry.has_content || entry.shredded || !entry.content_available) return;
+    const blockId = this.historyBlockId;
+    if (entry.is_locked && !this.isVaultUnlocked()) {
+      this.openVaultModal();
+      return;
+    }
+
+    const reqSeq = ++this.historyOpSeq;
+    const lockEpoch = this.stream.getVaultLockEpoch();
+    this.historySelectedOpId = entry.op_id;
+    this.historySelectedContent = null;
+    this.historySelectedDto = null;
+    this.historyOpLoading = true;
+    this.historyError = null;
+    this.renderHistoryDrawer();
+
+    try {
+      const dto = await this.api.getBlockHistoryOp(blockId, entry.op_id);
+      if (reqSeq !== this.historyOpSeq || !this.historyOpen || this.historyBlockId !== blockId) {
+        return;
+      }
+      let plain: string;
+      if (dto.is_locked) {
+        const session = this.vaultSession;
+        if (!session || session.isLocked() || isPageHidden() || this.stream.getVaultLockEpoch() !== lockEpoch) {
+          this.closeHistoryDrawer();
+          return;
+        }
+        if (!dto.mnb1_b64 || !dto.mnw1_b64) {
+          throw new Error("Missing Tier 2 ciphertext or key wrap for historical version");
+        }
+        const dec = session.decryptBlock(
+          dto.block_id,
+          dto.op_id,
+          dto.key_id,
+          b64ToBytes(dto.mnb1_b64),
+          b64ToBytes(dto.mnw1_b64),
+        );
+        plain = dec.content;
+        dec.free();
+        this.resetVaultIdleTimer();
+      } else {
+        plain = dto.content ?? "";
+      }
+      this.historySelectedDto = dto;
+      this.historySelectedContent = plain;
+      this.historyOpLoading = false;
+      this.renderHistoryDrawer();
+    } catch (e) {
+      if (reqSeq !== this.historyOpSeq || !this.historyOpen) return;
+      this.historyOpLoading = false;
+      this.historyError = e instanceof Error ? e.message : "Failed to load historical content";
+      this.renderHistoryDrawer();
+      this.handleErr(e);
+    }
+  }
+
+  private encryptTier2RevertPayload(
+    block: BlockDto,
+    plaintext: string,
+    session: WasmVaultSession,
+  ): { op_id: string; key_id: string; mnb1_b64: string; mnw1_b64?: string } {
+    const mat = this.findTier2KeyMaterial(block);
+    if (mat) {
+      const enc = session.encryptUpdate(
+        JSON.stringify({ block_id: block.id }),
+        mat.keyId,
+        b64ToBytes(mat.mnw1B64),
+        plaintext,
+        block.lang,
+      );
+      const payload = { op_id: enc.opId, key_id: enc.keyId, mnb1_b64: bytesToB64(enc.mnb1) };
+      enc.free();
+      return payload;
+    }
+    const enc = session.rekeyToVault(JSON.stringify({ block_id: block.id }), plaintext, block.lang);
+    const payload = {
+      op_id: enc.opId,
+      key_id: enc.keyId,
+      mnb1_b64: bytesToB64(enc.mnb1),
+      mnw1_b64: enc.mnw1 ? bytesToB64(enc.mnw1) : undefined,
+    };
+    enc.free();
+    return payload;
+  }
+
+  private async revertToSelectedHistory(): Promise<void> {
+    if (!this.historyOpen || !this.historyBlockId || !this.historySelectedOpId || !this.api.revertBlock) return;
+    const blockId = this.historyBlockId;
+    const targetOpId = this.historySelectedOpId;
+    const targetPlaintext = this.historySelectedContent;
+    const lockEpoch = this.stream.getVaultLockEpoch();
+
+    await this.stream.waitForSaveIdle(blockId);
+    const cur = this.stream.getBlocks().find((b) => b.id === blockId);
+    if (!cur) return;
+    if (cur.has_conflict) {
+      this.showToast("Resolve concurrent versions before reverting", true);
+      return;
+    }
+    const expectedHeads = this.stream.getExpectedHeadsForBlock(cur.id);
+    try {
+      let updated: BlockDto;
+      if (cur.is_locked) {
+        const session = this.vaultSession;
+        if (!session || session.isLocked() || isPageHidden() || this.stream.getVaultLockEpoch() !== lockEpoch) {
+          this.openVaultModal();
+          return;
+        }
+        if (targetPlaintext === null) {
+          this.showToast("Selected version content is unavailable", true);
+          return;
+        }
+        const payload = this.encryptTier2RevertPayload(cur, targetPlaintext, session);
+        this.resetVaultIdleTimer();
+        updated = await this.api.revertBlock(cur.id, {
+          expected_heads: expectedHeads,
+          ...payload,
+        });
+        const keepUnlocked =
+          this.isVaultUnlocked() && !isPageHidden() && this.stream.getVaultLockEpoch() === lockEpoch;
+        this.stream.applyAuthoritativeBlock(updated, this.activeBufferId, keepUnlocked ? targetPlaintext : undefined);
+      } else {
+        updated = await this.api.revertBlock(cur.id, {
+          to_op_id: targetOpId,
+          expected_heads: expectedHeads,
+        });
+        this.stream.applyAuthoritativeBlock(updated, this.activeBufferId);
+      }
+      this.showToast("Reverted block to selected version");
+      if (this.historyOpen && this.historyBlockId === cur.id) {
+        await this.openHistoryDrawer(updated);
+      }
+    } catch (e) {
+      this.handleErr(e);
+    }
+  }
+
+  private async undoActorBatch(actor: string, predecessor: BlockHistoryEntryDto): Promise<void> {
+    if (!this.historyOpen || !this.historyBlockId || !this.api.revertBlock) return;
+    const blockId = this.historyBlockId;
+    const lockEpoch = this.stream.getVaultLockEpoch();
+
+    await this.stream.waitForSaveIdle(blockId);
+    const cur = this.stream.getBlocks().find((b) => b.id === blockId);
+    if (!cur) return;
+    if (cur.has_conflict) {
+      this.showToast("Resolve concurrent versions before reverting", true);
+      return;
+    }
+    const expectedHeads = this.stream.getExpectedHeadsForBlock(cur.id);
+    try {
+      let updated: BlockDto;
+      if (cur.is_locked) {
+        const session = this.vaultSession;
+        if (
+          !session ||
+          session.isLocked() ||
+          isPageHidden() ||
+          this.stream.getVaultLockEpoch() !== lockEpoch ||
+          !this.api.getBlockHistoryOp
+        ) {
+          this.openVaultModal();
+          return;
+        }
+        const dto = await this.api.getBlockHistoryOp(cur.id, predecessor.op_id);
+        if (!this.isVaultUnlocked() || this.vaultSession !== session || isPageHidden() || this.stream.getVaultLockEpoch() !== lockEpoch) {
+          this.closeHistoryDrawer();
+          return;
+        }
+        let plain: string;
+        if (dto.is_locked) {
+          if (!dto.mnb1_b64 || !dto.mnw1_b64) {
+            throw new Error("Missing Tier 2 ciphertext or key wrap for predecessor version");
+          }
+          const dec = session.decryptBlock(
+            dto.block_id,
+            dto.op_id,
+            dto.key_id,
+            b64ToBytes(dto.mnb1_b64),
+            b64ToBytes(dto.mnw1_b64),
+          );
+          plain = dec.content;
+          dec.free();
+        } else {
+          plain = dto.content ?? "";
+        }
+        const payload = this.encryptTier2RevertPayload(cur, plain, session);
+        this.resetVaultIdleTimer();
+        updated = await this.api.revertBlock(cur.id, {
+          expected_heads: expectedHeads,
+          ...payload,
+        });
+        const keepUnlocked =
+          this.isVaultUnlocked() && !isPageHidden() && this.stream.getVaultLockEpoch() === lockEpoch;
+        this.stream.applyAuthoritativeBlock(updated, this.activeBufferId, keepUnlocked ? plain : undefined);
+      } else {
+        updated = await this.api.revertBlock(cur.id, {
+          undo_actor: actor,
+          expected_heads: expectedHeads,
+        });
+        this.stream.applyAuthoritativeBlock(updated, this.activeBufferId);
+      }
+      this.showToast(`Undid ${actor} batch`);
+      if (this.historyOpen && this.historyBlockId === cur.id) {
+        await this.openHistoryDrawer(updated);
+      }
+    } catch (e) {
+      this.handleErr(e);
+    }
+  }
+
+  private formatHistoryTime(ms: number): string {
+    if (!Number.isFinite(ms) || ms <= 0) return "";
+    return new Date(ms).toISOString().slice(0, 19).replace("T", " ") + "Z";
+  }
+
+  private renderHistoryDrawer(): void {
+    if (!this.historyOpen || !this.historyBlockId) return;
+    const cur = this.stream.getBlocks().find((b) => b.id === this.historyBlockId) ?? null;
+    this.historyTitleEl.textContent = cur
+      ? `History · ${cur.lang} · ${cur.id.slice(0, 8)}`
+      : `History · ${this.historyBlockId.slice(0, 8)}`;
+
+    this.historyActionsEl.replaceChildren();
+    this.historyListEl.replaceChildren();
+    this.historyDiffEl.replaceChildren();
+
+    if (this.historyLoading) {
+      const loading = document.createElement("div");
+      loading.className = "empty-state";
+      loading.textContent = "Loading history…";
+      this.historyListEl.appendChild(loading);
+      return;
+    }
+
+    // Undo <actor> batch button when the most recent content-bearing op(s) came from a non-human actor
+    const contentEntries = this.historyEntries.filter((e) => e.has_content);
+    const latestContent = contentEntries[0];
+    if (latestContent && latestContent.actor && latestContent.actor !== "human") {
+      const badActor = latestContent.actor;
+      const predecessor = contentEntries.find((e) => e.actor !== badActor) ?? null;
+      const undoBtn = document.createElement("button");
+      undoBtn.type = "button";
+      undoBtn.className = "btn btn-amber btn-icon";
+      undoBtn.dataset.testid = "history-undo-actor-btn";
+      undoBtn.textContent = `Undo ${badActor} batch`;
+      if (!predecessor) {
+        undoBtn.disabled = true;
+        undoBtn.title = `No earlier version outside actor '${badActor}'`;
+      } else if (predecessor.shredded || !predecessor.content_available) {
+        undoBtn.disabled = true;
+        undoBtn.title = "Predecessor version is shredded or unavailable";
+      } else {
+        undoBtn.addEventListener("click", () => void this.undoActorBatch(badActor, predecessor));
+      }
+      this.historyActionsEl.appendChild(undoBtn);
+    }
+
+    if (cur?.has_conflict) {
+      const conflictHint = document.createElement("div");
+      conflictHint.className = "history-conflict-note";
+      conflictHint.textContent = "Conflict present — resolve concurrent versions before reverting.";
+      this.historyActionsEl.appendChild(conflictHint);
+    }
+
+    if (this.historyEntries.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "empty-state";
+      empty.textContent = this.historyError ? `Error: ${this.historyError}` : "No history entries found.";
+      this.historyListEl.appendChild(empty);
+      return;
+    }
+
+    for (const entry of this.historyEntries) {
+      const row = document.createElement("div");
+      const isSelected = entry.op_id === this.historySelectedOpId;
+      const unavailable = entry.shredded || (entry.has_content && !entry.content_available);
+      const selectable = entry.has_content && !unavailable;
+      row.className = `history-item${isSelected ? " selected" : ""}${unavailable ? " unavailable" : ""}`;
+      row.dataset.opId = entry.op_id;
+
+      const topRow = document.createElement("div");
+      topRow.className = "history-item-top";
+
+      const opBadge = document.createElement("span");
+      opBadge.className = "kbd";
+      opBadge.textContent = entry.op_type;
+      topRow.appendChild(opBadge);
+
+      const actorBadge = document.createElement("span");
+      actorBadge.className = entry.actor !== "human" ? "actor-badge actor-badge-agent" : "actor-badge actor-badge-human";
+      actorBadge.textContent = entry.actor;
+      topRow.appendChild(actorBadge);
+
+      if (entry.is_locked) {
+        const lockBadge = document.createElement("span");
+        lockBadge.className = "vault-badge";
+        lockBadge.textContent = "🔒";
+        lockBadge.title = "Tier 2 Vault version";
+        topRow.appendChild(lockBadge);
+      }
+
+      if (cur && cur.display_op_id === entry.op_id) {
+        const curBadge = document.createElement("span");
+        curBadge.className = "history-current-badge";
+        curBadge.textContent = "Current";
+        topRow.appendChild(curBadge);
+      }
+
+      if (unavailable) {
+        const shredBadge = document.createElement("span");
+        shredBadge.className = "history-badge-shredded";
+        shredBadge.dataset.testid = "history-shredded-badge";
+        shredBadge.textContent = "Shredded / Unavailable";
+        topRow.appendChild(shredBadge);
+      } else if (!entry.has_content) {
+        const metaBadge = document.createElement("span");
+        metaBadge.className = "kbd";
+        metaBadge.textContent = "meta";
+        topRow.appendChild(metaBadge);
+      }
+
+      const metaRow = document.createElement("div");
+      metaRow.className = "history-item-meta";
+      metaRow.textContent = `${this.formatHistoryTime(entry.created_at_ms)} · ${entry.device_id}`;
+
+      const btnRow = document.createElement("div");
+      btnRow.className = "history-item-actions";
+      const viewBtn = document.createElement("button");
+      viewBtn.type = "button";
+      viewBtn.className = `btn btn-icon${isSelected ? " btn-primary" : ""}`;
+      viewBtn.dataset.testid = `history-select-${entry.op_id}`;
+      viewBtn.textContent = isSelected ? "Inspecting" : "Diff & Inspect";
+      viewBtn.disabled = !selectable;
+      if (selectable) {
+        viewBtn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          void this.selectHistoryEntry(entry);
+        });
+        row.addEventListener("click", () => void this.selectHistoryEntry(entry));
+      }
+      btnRow.appendChild(viewBtn);
+
+      row.append(topRow, metaRow, btnRow);
+      this.historyListEl.appendChild(row);
+    }
+
+    // Selected entry diff & revert panel
+    if (this.historyOpLoading) {
+      const loading = document.createElement("div");
+      loading.className = "history-diff-empty";
+      loading.textContent = "Loading version content…";
+      this.historyDiffEl.appendChild(loading);
+    } else if (this.historyError) {
+      const errEl = document.createElement("div");
+      errEl.className = "history-diff-error";
+      errEl.textContent = this.historyError;
+      this.historyDiffEl.appendChild(errEl);
+    } else if (this.historySelectedOpId && this.historySelectedContent !== null) {
+      const diffHdr = document.createElement("div");
+      diffHdr.className = "history-diff-header";
+      const titleSpan = document.createElement("span");
+      titleSpan.textContent = `Selected (${this.historySelectedOpId.slice(0, 8)}) → Current`;
+
+      const revertBtn = document.createElement("button");
+      revertBtn.type = "button";
+      revertBtn.className = "btn btn-primary btn-icon";
+      revertBtn.dataset.testid = "history-revert-btn";
+      revertBtn.textContent = "Revert to this version";
+      revertBtn.addEventListener("click", () => void this.revertToSelectedHistory());
+      diffHdr.append(titleSpan, revertBtn);
+
+      const currentContent = cur ? this.stream.getBlockDraftContent(cur.id) : "";
+      const diffLines = computeLineDiff(this.historySelectedContent, currentContent);
+
+      const diffView = document.createElement("div");
+      diffView.className = "diff-view";
+      diffView.dataset.testid = "history-diff-view";
+      if (diffLines.length === 0) {
+        const emptyLine = document.createElement("div");
+        emptyLine.className = "diff-line diff-ctx";
+        emptyLine.textContent = "(empty)";
+        diffView.appendChild(emptyLine);
+      } else {
+        for (const line of diffLines) {
+          const lineEl = document.createElement("div");
+          const cls = line.kind === "add" ? "diff-add" : line.kind === "del" ? "diff-del" : "diff-ctx";
+          lineEl.className = `diff-line ${cls}`;
+
+          const sign = document.createElement("span");
+          sign.className = "diff-sign";
+          sign.textContent = line.kind === "add" ? "+" : line.kind === "del" ? "-" : " ";
+
+          const text = document.createElement("span");
+          text.className = "diff-text";
+          text.textContent = line.text;
+
+          lineEl.append(sign, text);
+          diffView.appendChild(lineEl);
+        }
+      }
+
+      const rawDetails = document.createElement("details");
+      rawDetails.className = "history-raw-details";
+      const rawSummary = document.createElement("summary");
+      rawSummary.textContent = "Raw historical content";
+      const rawPre = document.createElement("pre");
+      rawPre.className = "history-raw-pre";
+      rawPre.textContent = this.historySelectedContent;
+      rawDetails.append(rawSummary, rawPre);
+
+      this.historyDiffEl.append(diffHdr, diffView, rawDetails);
+    }
+  }
+
   // ---------- M2 Recycle Bin & Controlled Shred Confirmation ----------
 
   private async toggleTrash(): Promise<void> {
     this.trashOpen = !this.trashOpen;
+    if (this.trashOpen) this.closeHistoryDrawer();
     this.trashDrawerEl.classList.toggle("hidden", !this.trashOpen);
     if (this.trashOpen) await this.refreshTrash();
   }

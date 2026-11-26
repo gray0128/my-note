@@ -5,6 +5,8 @@ import {
   WasmSyncEngine,
   WasmVaultSession,
 } from "../wasm/pwa";
+import { mountDiagramWidget } from "../render/diagram";
+import { copyDualFormat, mountMarkdownPreview } from "../render/markdown";
 import {
   claimPairing,
   CloudApiError,
@@ -24,8 +26,21 @@ import {
 } from "./idb";
 
 const MOBILE_VAULT_IDLE_MS = 5 * 60 * 1000;
-const PWA_BUILD_VERSION = "M2-0.2.0";
+const PWA_BUILD_VERSION = "M3-0.3.0";
 const isPageHidden = (): boolean => document.visibilityState === "hidden";
+
+function isPwaMarkdownLang(lang: string): boolean {
+  const norm = lang.toLowerCase();
+  return norm === "markdown" || norm === "md";
+}
+
+function isPwaMermaidLang(lang: string): boolean {
+  return lang.toLowerCase() === "mermaid";
+}
+
+function isPwaRenderableLang(lang: string): boolean {
+  return isPwaMarkdownLang(lang) || isPwaMermaidLang(lang);
+}
 
 interface MobileLeafView {
   op_id: string;
@@ -113,6 +128,8 @@ export class MobilePwaApp {
   private blocks: MobileBlockView[] = [];
   private activeBufferId: string | null = null;
   private selectedVersionByBlock = new Map<string, string>();
+  private viewModeByBlock = new Map<string, "preview" | "source">();
+  private activePreviewCleanups: Array<() => void> = [];
   private searchQuery = "";
   private syncInFlight = false;
   private syncQueued = false;
@@ -178,6 +195,7 @@ export class MobilePwaApp {
     this.syncAbort?.abort();
     this.stopCamera();
     this.closeModal();
+    this.cleanupMountedPreviews();
     this.lockVaultNow(true);
     this.disconnectWs?.();
     this.disconnectWs = null;
@@ -519,7 +537,19 @@ export class MobilePwaApp {
     }
   }
 
+  private cleanupMountedPreviews(): void {
+    for (const cleanup of this.activePreviewCleanups) {
+      try {
+        cleanup();
+      } catch {
+        // ignore cleanup error
+      }
+    }
+    this.activePreviewCleanups = [];
+  }
+
   private lockVaultNow(silent = false): void {
+    this.cleanupMountedPreviews();
     if (this.vaultIdleTimer !== null) {
       window.clearTimeout(this.vaultIdleTimer);
       this.vaultIdleTimer = null;
@@ -861,6 +891,8 @@ export class MobilePwaApp {
     this.blocks = [];
     this.activeBufferId = null;
     this.selectedVersionByBlock.clear();
+    this.viewModeByBlock.clear();
+    this.cleanupMountedPreviews();
     this.syncTruncatedBanner = null;
   }
 
@@ -924,6 +956,7 @@ export class MobilePwaApp {
   }
 
   private renderMain(): void {
+    this.cleanupMountedPreviews();
     this.mainEl.innerHTML = "";
     if (!this.creds) {
       this.renderOnboarding();
@@ -1100,15 +1133,63 @@ export class MobilePwaApp {
       meta.appendChild(hint);
     }
 
+    const isRenderable = effectiveText !== null && isPwaRenderableLang(blk.lang);
+    const viewMode: "preview" | "source" = isRenderable
+      ? (this.viewModeByBlock.get(blk.id) ?? "preview")
+      : "source";
+    card.dataset.viewMode = viewMode;
+
     head.appendChild(meta);
+    let getRichCopyPayload: (() => { html: string; text: string }) | null = null;
     if (effectiveText !== null) {
+      const actions = document.createElement("div");
+      actions.className = "ro-block-actions";
+
+      if (isRenderable) {
+        const modeBtn = document.createElement("button");
+        modeBtn.type = "button";
+        modeBtn.className = "btn btn-sm";
+        modeBtn.dataset.testid = `pwa-toggle-mode-${blk.id}`;
+        modeBtn.setAttribute("aria-pressed", String(viewMode === "preview"));
+        modeBtn.textContent = viewMode === "preview" ? "Source" : "Preview";
+        modeBtn.addEventListener("click", () => {
+          this.viewModeByBlock.set(blk.id, viewMode === "preview" ? "source" : "preview");
+          this.renderMain();
+        });
+        actions.appendChild(modeBtn);
+      }
+
+      if (isPwaMarkdownLang(blk.lang) && viewMode === "preview") {
+        const copyRichBtn = document.createElement("button");
+        copyRichBtn.type = "button";
+        copyRichBtn.className = "btn btn-sm";
+        copyRichBtn.dataset.testid = `pwa-copy-rich-${blk.id}`;
+        copyRichBtn.textContent = "Copy Rich";
+        copyRichBtn.addEventListener("click", () => {
+          const payload = getRichCopyPayload?.();
+          if (!payload) return;
+          void copyDualFormat(payload.html, payload.text).then((ok) => {
+            if (!ok) {
+              this.showToast("Clipboard unavailable — tap & hold text to copy", true);
+            } else if (blk.is_locked) {
+              this.resetVaultIdleTimer();
+              this.showToast("Copied rich Vault secret (Note: iOS/Universal Clipboard cannot be auto-cleared)");
+            } else {
+              this.showToast("Copied rich HTML + plain text");
+            }
+          });
+        });
+        actions.appendChild(copyRichBtn);
+      }
+
       const copyBtn = document.createElement("button");
       copyBtn.type = "button";
       copyBtn.className = "btn btn-sm";
       copyBtn.dataset.testid = `copy-${blk.id}`;
       copyBtn.textContent = "Copy";
       copyBtn.addEventListener("click", () => this.copyTextGesture(effectiveText, blk.is_locked));
-      head.appendChild(copyBtn);
+      actions.appendChild(copyBtn);
+      head.appendChild(actions);
     }
     card.appendChild(head);
 
@@ -1151,6 +1232,41 @@ export class MobilePwaApp {
       locked.className = "ro-locked-body";
       locked.textContent = "⚠ Content unavailable (missing key or awaiting key refresh).";
       card.appendChild(locked);
+    } else if (viewMode === "preview" && isPwaMarkdownLang(blk.lang)) {
+      const previewHost = document.createElement("div");
+      previewHost.className = "ro-preview-host";
+      const mounted = mountMarkdownPreview(previewHost, effectiveText, {
+        readOnly: true,
+        isTier2: blk.is_locked,
+        onCopyFeedback: (msg, isError) => {
+          if (!isError && blk.is_locked) {
+            this.resetVaultIdleTimer();
+            this.showToast(`${msg} (Vault secret — iOS/Universal Clipboard cannot be auto-cleared)`);
+          } else {
+            this.showToast(msg, isError);
+          }
+        },
+      });
+      getRichCopyPayload = () => mounted.getCleanCopyPayload();
+      this.activePreviewCleanups.push(() => mounted.destroy());
+      card.appendChild(previewHost);
+    } else if (viewMode === "preview" && isPwaMermaidLang(blk.lang)) {
+      const previewHost = document.createElement("div");
+      previewHost.className = "ro-preview-host";
+      const handle = mountDiagramWidget(previewHost, effectiveText, {
+        readOnly: true,
+        isTier2: blk.is_locked,
+        onFeedback: (msg, isError) => {
+          if (!isError && blk.is_locked) {
+            this.resetVaultIdleTimer();
+            this.showToast(`${msg} (Vault secret — iOS/Universal Clipboard cannot be auto-cleared)`);
+          } else {
+            this.showToast(msg, isError);
+          }
+        },
+      });
+      this.activePreviewCleanups.push(() => handle.destroy());
+      card.appendChild(previewHost);
     } else {
       // Strictly read-only <pre> — NO <textarea>, NO contenteditable, NO soft keyboard!
       const pre = document.createElement("pre");

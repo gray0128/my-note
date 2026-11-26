@@ -26,7 +26,10 @@
     "@codemirror/state": "^6.5.2",
     "@codemirror/view": "^6.36.5",
     "@lezer/highlight": "^1.2.1",
-    "@replit/codemirror-vim": "^6.2.1"
+    "@replit/codemirror-vim": "^6.2.1",
+    "dompurify": "^3.5.0",
+    "marked": "^18.3.0",
+    "pele": "^1.13.0"
   },
   "devDependencies": {
     "happy-dom": "^17.4.4",

@@ -71,6 +71,7 @@ EXAMPLES:
   mynote block get <id> --json
   mynote block get <id> --raw | jq .
   mynote block update <id> --expected-head <op_id> --json < new.txt
+  mynote block revert <id> --undo-actor agent:claude-code --dry-run --json
   mynote block delete <id> --expected-head <op_id> --json";
 
 pub const TRASH_AFTER_HELP: &str = "\
@@ -146,6 +147,8 @@ const TOPIC_AGENT: &str = "\
 3. `block delete` moves blocks to trash only (`shred_state: \"unscheduled\"` in M1).
    `trash empty` / `trash expedite` / `trash confirm` ALWAYS exit 2 (`UI_CONFIRMATION_REQUIRED`).
 4. Locked blocks (`is_locked: true`, `redacted: true`) never expose plaintext to CLI/FTS5/mirror.
+5. Time travel & rollback: inspect `mynote block history <id> --json`, preview with
+   `mynote block revert <id> --undo-actor <actor> --dry-run --json`, then execute without `--dry-run`.
 ";
 
 const TOPIC_FORMATTING: &str = "\
@@ -162,7 +165,11 @@ const TOPIC_FORMATTING: &str = "\
   - `ts-to-iso`, `iso-to-ts`
 
 ## Layer 2 (Optional External CLI Pipeline: ~/.config/mynote/formatters.toml)
-Example configuration:
+Example configuration (array `cmd` or string `cmd` + `args` are both supported):
+  [formatters.typescript]
+  cmd = [\"biome\", \"format\", \"--stdin-file-path=scratch.ts\"]
+  timeout_ms = 2000
+
   [formatters.python]
   cmd = \"ruff\"
   args = [\"format\", \"-\"]
@@ -171,6 +178,7 @@ Example configuration:
 Safety Fuse:
 - Non-zero exit code, timeout kill, non-UTF-8 stdout, or 0-byte stdout for non-empty input
   ALWAYS returns `FORMAT_SYNTAX_ERROR` (exit 7) and leaves the target block unmodified.
+- Child process runs with cleared environment (`PATH` and `LC_ALL=C.UTF-8` only).
 - Unlocked Tier 2 blocks are NEVER sent to external Layer 2 subprocesses.
 ";
 

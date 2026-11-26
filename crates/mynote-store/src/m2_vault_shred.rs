@@ -19,6 +19,23 @@ pub struct VaultHeaderDto {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlockHistoryContentDto {
+    pub block_id: String,
+    pub op_id: String,
+    pub op_type: String,
+    pub hlc: String,
+    pub device_id: String,
+    pub actor: String,
+    pub created_at_ms: i64,
+    pub is_locked: bool,
+    pub key_id: String,
+    pub lang: Option<String>,
+    pub content: Option<String>,
+    pub mnb1_b64: Option<String>,
+    pub mnw1_b64: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockedTier2OpDto {
     pub op_id: String,
     pub block_id: String,
@@ -298,6 +315,125 @@ impl LocalStore {
             "leaf op does not contain Tier 1 content",
             "Refresh block state",
         ))
+    }
+
+    /// Fetch a single historical `BlockContent` op for Desktop Daemon Time Travel (`GET /v1/local/blocks/{id}/history/{op_id}`).
+    /// - Tier 1: unwraps BDEK with SMK, decrypts `MNB1` -> `content: Some(pt)`, `is_locked: false`.
+    /// - Tier 2 (`SEC-03` HARD INVARIANT): unwraps outer `MNR1` with SMK to extract `mnw1` ONLY ->
+    ///   `content: None`, `is_locked: true`, `mnb1_b64: Some(...)`, `mnw1_b64: Some(...)`.
+    pub fn get_block_history_op_for_daemon(
+        &self,
+        block_id_str: &str,
+        op_id_str: &str,
+    ) -> Result<BlockHistoryContentDto, CoreError> {
+        let blk_id = BlockId::parse(block_id_str)?;
+        let target_op_id = OpId::parse(op_id_str)?;
+        let decoded = self.load_entity_decoded_ops(EntityType::Block, &blk_id.to_string())?;
+        if decoded.is_empty() {
+            return Err(CoreError::new(
+                ErrorCode::NotFound,
+                format!("block '{block_id_str}' not found"),
+                "Check block ID",
+            ));
+        }
+        let target = decoded.iter().find(|d| d.op_id == target_op_id).ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::NotFound,
+                format!("op '{op_id_str}' not found in block '{block_id_str}'"),
+                format!("Run 'mynote block history {block_id_str} --json'"),
+            )
+        })?;
+        let (op_lang, tier, key_id, mnb1) = match &target.inner.body {
+            OpBodyV1::BlockContent {
+                lang,
+                tier,
+                key_id,
+                mnb1,
+                ..
+            } => (lang.clone(), *tier, *key_id, mnb1.as_slice()),
+            _ => {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "op '{op_id_str}' has no block content (op_type={})",
+                        op_type_str(target.inner.op_type)
+                    ),
+                    "Select a content-bearing history op",
+                ));
+            }
+        };
+
+        if self.is_key_executed(&key_id) {
+            return Err(CoreError::new(
+                ErrorCode::KeyShredded,
+                format!("key {key_id} for op '{op_id_str}' has been permanently shredded"),
+                "Shredded historical versions cannot be recovered",
+            ));
+        }
+
+        let effective_lang = op_lang.or_else(|| {
+            self.conn
+                .query_row(
+                    "SELECT lang FROM blocks WHERE id = ?1",
+                    [blk_id.to_string()],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+        });
+
+        match tier {
+            1 => {
+                let bdek = self.unwrap_tier1_bdek(key_id)?;
+                let pt = decrypt_mnb1(blk_id.as_bytes(), target.op_id, key_id, &bdek, mnb1)?;
+                Ok(BlockHistoryContentDto {
+                    block_id: blk_id.to_string(),
+                    op_id: target.op_id.to_string(),
+                    op_type: op_type_str(target.inner.op_type).to_string(),
+                    hlc: target.inner.hlc.canonical_string(),
+                    device_id: target.device_id.to_string(),
+                    actor: target.inner.actor.clone(),
+                    created_at_ms: target.created_at_ms,
+                    is_locked: false,
+                    key_id: key_id.to_string(),
+                    lang: effective_lang,
+                    content: Some(pt),
+                    mnb1_b64: None,
+                    mnw1_b64: None,
+                })
+            }
+            2 => {
+                let rec = self.unwrap_key_record_full(key_id)?;
+                if rec.tier != 2 || rec.bdek.len() != 93 || rec.block_id != blk_id.0 {
+                    return Err(CoreError::new(
+                        ErrorCode::IntegrityError,
+                        format!("invalid Tier 2 key record for key {key_id} on block {blk_id}"),
+                        "Verify key integrity or restore from backup",
+                    ));
+                }
+                Ok(BlockHistoryContentDto {
+                    block_id: blk_id.to_string(),
+                    op_id: target.op_id.to_string(),
+                    op_type: op_type_str(target.inner.op_type).to_string(),
+                    hlc: target.inner.hlc.canonical_string(),
+                    device_id: target.device_id.to_string(),
+                    actor: target.inner.actor.clone(),
+                    created_at_ms: target.created_at_ms,
+                    is_locked: true,
+                    key_id: key_id.to_string(),
+                    lang: effective_lang,
+                    content: None,
+                    mnb1_b64: Some(B64.encode(mnb1)),
+                    mnw1_b64: Some(B64.encode(&rec.bdek)),
+                })
+            }
+            _ => Err(CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("unsupported block content tier {tier} in op '{op_id_str}'"),
+                "Inspect block history or restore from backup",
+            )),
+        }
     }
 
     pub fn list_blocks_for_daemon(&self, buffer_selector: &str) -> Result<Vec<BlockDetailDto>, CoreError> {

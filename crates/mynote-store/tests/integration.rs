@@ -160,3 +160,365 @@ fn schema_too_new_refuses_open_without_writing() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn time_travel_history_undo_actor_shred_and_tier2_daemon_contracts() {
+    use base64::Engine;
+    use mynote_core::crypto::{decrypt_mnb1, encrypt_mnb1, encrypt_mnr1, KeyRecordV1};
+    use mynote_core::hlc::Hlc;
+    use mynote_core::ids::{BlockId, DeviceId, KeyId, MonotonicUlidGen, OpId, SmkKid, Ulid, VkekKid};
+    use mynote_core::model::OpType;
+    use mynote_core::sync::StoreMutation;
+    use mynote_core::vault::{create_vault_header, unlock_vault_with_passphrase, T_GRACE_DEFAULT_MS};
+    use mynote_store::store::RemoteBlockOpParams;
+    use mynote_store::Tier2OpInput;
+    use zeroize::Zeroizing;
+
+    let dir = temp_dir("time_travel_m3");
+    let mut store = LocalStore::open(&dir).unwrap();
+
+    // 1. Interleaved human edits, SET_META, and agent edits
+    let r1 = store
+        .add_block(
+            "scratch",
+            "v1 human original",
+            Some("markdown"),
+            None,
+            "human",
+            None,
+        )
+        .unwrap();
+    let blk_id = r1.block_id.clone();
+    let op1 = r1.op_id.clone();
+
+    let meta1 = store
+        .move_block(&blk_id, None, None, None, Some("text"), "human")
+        .unwrap();
+    let r2 = store
+        .update_block(
+            &blk_id,
+            "v2 agent draft",
+            &r1.head_op_ids,
+            false,
+            "agent:claude-code",
+        )
+        .unwrap();
+    let r3 = store
+        .update_block(
+            &blk_id,
+            "v3 agent bad edit",
+            &r2.head_op_ids,
+            false,
+            "agent:claude-code",
+        )
+        .unwrap();
+    // Intervening SET_META by human AFTER agent edits MUST NOT hijack --undo-actor!
+    let _meta2 = store
+        .move_block(&blk_id, None, None, None, Some("markdown"), "human")
+        .unwrap();
+
+    let hist = store.block_history(&blk_id, 50).unwrap();
+    assert_eq!(hist.len(), 5);
+    let meta_entry = hist.iter().find(|e| e.op_id == meta1.op_id).unwrap();
+    assert_eq!(meta_entry.op_type, "SET_META");
+    assert!(!meta_entry.has_content);
+    assert!(!meta_entry.content_available);
+    assert!(!meta_entry.shredded);
+    assert!(!meta_entry.is_locked);
+    assert!(meta_entry.key_id.is_none());
+
+    let content_entry = hist.iter().find(|e| e.op_id == op1).unwrap();
+    assert!(content_entry.has_content);
+    assert!(content_entry.content_available);
+    assert!(!content_entry.shredded);
+    assert!(!content_entry.is_locked);
+    assert!(content_entry.key_id.is_some());
+
+    // Non-content op -> InvalidArgument (400); missing op -> NotFound (404)
+    let meta_err = store
+        .get_block_history_op_for_daemon(&blk_id, &meta1.op_id)
+        .unwrap_err();
+    assert_eq!(meta_err.code(), ErrorCode::InvalidArgument);
+    let missing_op = OpId::from_ulid(Ulid::from_parts(1_720_000_000_999, [0xEE; 10])).to_string();
+    assert_eq!(
+        store
+            .get_block_history_op_for_daemon(&blk_id, &missing_op)
+            .unwrap_err()
+            .code(),
+        ErrorCode::NotFound
+    );
+
+    // Tier 1 historical op fetch
+    let op1_dto = store.get_block_history_op_for_daemon(&blk_id, &op1).unwrap();
+    assert_eq!(op1_dto.content.as_deref(), Some("v1 human original"));
+    assert!(!op1_dto.is_locked);
+    assert!(op1_dto.mnb1_b64.is_none());
+    assert!(op1_dto.mnw1_b64.is_none());
+    assert_eq!(op1_dto.lang.as_deref(), Some("markdown"));
+
+    // Preview --undo-actor skips SET_META and skips 2 agent ops with ZERO DB writes
+    let preview = store
+        .preview_revert_block(&blk_id, None, Some("agent:claude-code"))
+        .unwrap();
+    assert!(preview.dry_run);
+    assert_eq!(preview.current_head_op_id.as_deref(), Some(r3.op_id.as_str()));
+    assert_eq!(preview.target_op_id, op1);
+    assert_eq!(preview.target_actor, "human");
+    assert_eq!(preview.skipped_actor_ops, 2);
+    assert!(!preview.is_locked);
+    assert_eq!(preview.preview.as_deref(), Some("v1 human original"));
+    // Verify zero writes
+    assert_eq!(store.block_history(&blk_id, 50).unwrap().len(), 5);
+    assert_eq!(
+        store.get_block(&blk_id).unwrap().content.as_deref(),
+        Some("v3 agent bad edit")
+    );
+
+    // Execute revert -> writes a fresh UPDATE without mutating history
+    let resolved = store
+        .resolve_revert_target(&blk_id, None, Some("agent:claude-code"))
+        .unwrap();
+    let rev_receipt = store
+        .revert_block(&blk_id, &resolved.target.op_id, "human")
+        .unwrap();
+    assert_ne!(rev_receipt.op_id, op1);
+    assert_eq!(
+        store.get_block(&blk_id).unwrap().content.as_deref(),
+        Some("v1 human original")
+    );
+    assert_eq!(store.block_history(&blk_id, 50).unwrap().len(), 6);
+
+    // 2. Purge history + ExecuteShred -> shredded ops report shredded=true, content_available=false,
+    //    and both get_block_history_op_for_daemon & revert_block return KeyShredded!
+    let (_purge_rec, old_keys) = store
+        .purge_block_history(&blk_id, None, None, T_GRACE_DEFAULT_MS, "agent:claude-code")
+        .unwrap();
+    assert!(!old_keys.is_empty());
+    let muts: Vec<StoreMutation> = old_keys
+        .iter()
+        .copied()
+        .map(|key_id| StoreMutation::ExecuteShred { key_id })
+        .collect();
+    store.apply_store_mutations(&muts).unwrap();
+
+    let hist_after_shred = store.block_history(&blk_id, 50).unwrap();
+    let op1_after = hist_after_shred.iter().find(|e| e.op_id == op1).unwrap();
+    assert!(op1_after.has_content);
+    assert!(op1_after.shredded);
+    assert!(!op1_after.content_available);
+
+    assert_eq!(
+        store
+            .get_block_history_op_for_daemon(&blk_id, &op1)
+            .unwrap_err()
+            .code(),
+        ErrorCode::KeyShredded
+    );
+    assert_eq!(
+        store.revert_block(&blk_id, &op1, "human").unwrap_err().code(),
+        ErrorCode::KeyShredded
+    );
+    // CRITICAL: undo_actor MUST fail closed with KeyShredded when the immediate predecessor
+    // outside bad_actor was shredded (NEVER silently skip past it!)
+    assert_eq!(
+        store
+            .resolve_revert_target(&blk_id, None, Some("agent:claude-code"))
+            .unwrap_err()
+            .code(),
+        ErrorCode::KeyShredded
+    );
+
+    // 3. Multi-leaf conflict block -> ConflictPresent (exit 4 / HTTP 409)
+    let c1 = store
+        .add_block("scratch", "conflict base", Some("text"), None, "human", None)
+        .unwrap();
+    let _c2 = store
+        .update_block(&c1.block_id, "local branch", &c1.head_op_ids, false, "human")
+        .unwrap();
+    let kr_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("smk_keyring.local.json")).unwrap()).unwrap();
+    let smk_kid_s = kr_json["current_smk_kid"].as_str().unwrap();
+    let smk_hex = kr_json["generations"][smk_kid_s].as_str().unwrap();
+    let mut smk = [0u8; 32];
+    for i in 0..32 {
+        smk[i] = u8::from_str_radix(&smk_hex[i * 2..i * 2 + 2], 16).unwrap();
+    }
+    let smk_kid = SmkKid::parse(smk_kid_s).unwrap();
+    let mut ugen = MonotonicUlidGen::new();
+    let remote_dev = DeviceId::parse("dev_remote_tt01").unwrap();
+    let c_bid = BlockId::parse(&c1.block_id).unwrap();
+    let r_op = OpId::from_ulid(ugen.next(1_795_600_000_000, [1u8; 10]));
+    let r_kid = KeyId::from_ulid(ugen.next(1_795_600_000_001, [2u8; 10]));
+    let r_bdek = [0x33u8; 32];
+    let r_mnb1 = encrypt_mnb1(c_bid.as_bytes(), r_op, r_kid, &r_bdek, "remote branch", [3u8; 24]).unwrap();
+    let r_mnr1 = encrypt_mnr1(
+        smk_kid,
+        &smk,
+        1,
+        &KeyRecordV1 {
+            v: 1,
+            key_id: r_kid,
+            block_id: c_bid.0,
+            tier: 1,
+            created_hlc: Hlc::new(1_795_600_000_000, 0, remote_dev.clone()).canonical_string(),
+            created_by: remote_dev.clone(),
+            bdek: r_bdek.to_vec(),
+        },
+        [4u8; 24],
+    )
+    .unwrap();
+    store
+        .apply_remote_block_op_for_sync(RemoteBlockOpParams {
+            remote_device: remote_dev.clone(),
+            block_id: c_bid,
+            op_id: r_op,
+            parents: vec![OpId::parse(&c1.op_id).unwrap()],
+            op_type: OpType::Update,
+            hlc: Hlc::new(1_795_600_000_000, 0, remote_dev),
+            tier: 1,
+            key_id: r_kid,
+            new_key_record: Some((1, r_mnr1)),
+            mnb1: r_mnb1,
+            public_hint: None,
+        })
+        .unwrap();
+    store.set_local_meta("bootstrap_completed", "1").unwrap();
+
+    assert_eq!(
+        store
+            .resolve_revert_target(&c1.block_id, Some(&c1.op_id), None)
+            .unwrap_err()
+            .code(),
+        ErrorCode::ConflictPresent
+    );
+    assert_eq!(
+        store
+            .preview_revert_block(&c1.block_id, Some(&c1.op_id), None)
+            .unwrap_err()
+            .code(),
+        ErrorCode::ConflictPresent
+    );
+    assert_eq!(
+        store
+            .revert_block(&c1.block_id, &c1.op_id, "human")
+            .unwrap_err()
+            .code(),
+        ErrorCode::ConflictPresent
+    );
+
+    // 4. Tier 2 Vault history op -> SEC-03 zero plaintext in Daemon, returns mnb1_b64 + mnw1_b64
+    let rpk = store.recovery_pk().unwrap();
+    let vkid = VkekKid::from_ulid(Ulid::from_parts(1_720_000_000_000, [0x11; 10]));
+    let vh = create_vault_header(
+        b"tt-vault-pass",
+        &rpk,
+        vkid,
+        &[0x77; 32],
+        [0x12; 16],
+        [0x13; 24],
+        [0x14; 32],
+        [0x15; 24],
+        1_720_000_000_000,
+    )
+    .unwrap();
+    let unlocked = unlock_vault_with_passphrase(b"tt-vault-pass", &vh).unwrap();
+    store
+        .put_vault_header(vh.updated_at_ms, &rmp_serde::to_vec_named(&vh).unwrap())
+        .unwrap();
+
+    let t2_blk = BlockId::from_ulid(ugen.next(1_795_600_100_000, [0x21; 10]));
+    let t2_op1 = OpId::from_ulid(ugen.next(1_795_600_100_001, [0x22; 10]));
+    let t2_kid = KeyId::from_ulid(ugen.next(1_795_600_100_002, [0x23; 10]));
+    let t2_bdek = Zeroizing::new([0x88; 32]);
+    let t2_mnb1_1 = encrypt_mnb1(
+        t2_blk.as_bytes(),
+        t2_op1,
+        t2_kid,
+        &t2_bdek,
+        "TIER2_HISTORICAL_SECRET_V1",
+        [0x24; 24],
+    )
+    .unwrap();
+    let t2_mnw1 = unlocked.wrap_bdek(t2_kid, t2_blk, &t2_bdek, [0x25; 24]).unwrap();
+    let t2_rec1 = store
+        .add_tier2_block(
+            &t2_blk.to_string(),
+            Tier2OpInput {
+                op_id: &t2_op1.to_string(),
+                key_id: &t2_kid.to_string(),
+                mnb1: &t2_mnb1_1,
+                mnw1: Some(&t2_mnw1),
+            },
+            "scratch",
+            "text",
+            None,
+            Some("secret hint"),
+            "human",
+        )
+        .unwrap();
+
+    let t2_op2 = OpId::from_ulid(ugen.next(1_795_600_100_010, [0x26; 10]));
+    let t2_mnb1_2 = encrypt_mnb1(
+        t2_blk.as_bytes(),
+        t2_op2,
+        t2_kid,
+        &t2_bdek,
+        "TIER2_CURRENT_SECRET_V2",
+        [0x27; 24],
+    )
+    .unwrap();
+    store
+        .update_tier2_block(
+            &t2_blk.to_string(),
+            Tier2OpInput {
+                op_id: &t2_op2.to_string(),
+                key_id: &t2_kid.to_string(),
+                mnb1: &t2_mnb1_2,
+                mnw1: None,
+            },
+            &t2_rec1.head_op_ids,
+            None,
+            None,
+            "human",
+        )
+        .unwrap();
+
+    let t2_hist = store.block_history(&t2_blk.to_string(), 10).unwrap();
+    assert_eq!(t2_hist.len(), 2);
+    assert!(t2_hist
+        .iter()
+        .all(|e| e.is_locked && e.has_content && e.content_available && !e.shredded));
+
+    let t2_op1_dto = store
+        .get_block_history_op_for_daemon(&t2_blk.to_string(), &t2_op1.to_string())
+        .unwrap();
+    assert!(t2_op1_dto.is_locked);
+    assert!(t2_op1_dto.content.is_none());
+    let json_s = serde_json::to_string(&t2_op1_dto).unwrap();
+    assert!(!json_s.contains("TIER2_HISTORICAL_SECRET_V1"));
+    let dec_mnb1 = base64::engine::general_purpose::STANDARD
+        .decode(t2_op1_dto.mnb1_b64.as_deref().unwrap())
+        .unwrap();
+    let dec_mnw1 = base64::engine::general_purpose::STANDARD
+        .decode(t2_op1_dto.mnw1_b64.as_deref().unwrap())
+        .unwrap();
+    let unwrapped_bdek = unlocked.unwrap_bdek(t2_kid, t2_blk, &dec_mnw1).unwrap();
+    let recovered = decrypt_mnb1(t2_blk.as_bytes(), t2_op1, t2_kid, &unwrapped_bdek, &dec_mnb1).unwrap();
+    assert_eq!(recovered, "TIER2_HISTORICAL_SECRET_V1");
+
+    // Preview on locked op returns is_locked=true, preview=None; Tier 1 revert_block returns BlockLocked
+    let t2_prev = store
+        .preview_revert_block(&t2_blk.to_string(), Some(&t2_op1.to_string()), None)
+        .unwrap();
+    assert!(t2_prev.is_locked);
+    assert!(t2_prev.preview.is_none());
+    assert_eq!(
+        store
+            .revert_block(&t2_blk.to_string(), &t2_op1.to_string(), "human")
+            .unwrap_err()
+            .code(),
+        ErrorCode::BlockLocked
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

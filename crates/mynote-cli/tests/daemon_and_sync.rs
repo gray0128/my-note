@@ -1875,3 +1875,558 @@ async fn pr38_cli_daemon_regressions_c1_c8_h16_h17() {
         let _ = Path::new(d).exists().then(|| std::fs::remove_dir_all(d));
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m3_daemon_time_travel_tier2_history_revert_and_format_sec03_isolation() {
+    use mynote_core::crypto::{decrypt_mnb1, encrypt_mnb1, encrypt_mnr1, KeyRecordV1};
+    use mynote_core::hlc::Hlc;
+    use mynote_core::ids::{BlockId, MonotonicUlidGen, SmkKid, Ulid, VkekKid};
+    use mynote_core::model::OpType;
+    use mynote_core::sync::StoreMutation;
+    use mynote_core::vault::{create_vault_header, unlock_vault_with_passphrase, T_GRACE_DEFAULT_MS};
+    use mynote_store::store::RemoteBlockOpParams;
+    use mynote_store::Tier2OpInput;
+    use zeroize::Zeroizing;
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(v) = &self.prev {
+                std::env::set_var(self.key, v);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    let dir = temp_dir("m3_daemon_tt_fmt");
+    let daemon = start_daemon(DaemonConfig {
+        data_dir: dir.clone(),
+        port: 0,
+        enable_cloud_sync: false,
+    })
+    .await
+    .unwrap();
+    let port = daemon.port;
+    let base_ip = format!("http://127.0.0.1:{port}");
+    let base_localhost = format!("http://localhost:{port}");
+    let http = raw_http_client();
+
+    // Acquire authenticated local session cookie
+    let dir_uds = dir.clone();
+    let ticket = tokio::task::spawn_blocking(move || {
+        try_send_uds(&dir_uds, &UdsRequest::OpenTicket, Duration::from_secs(3))
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let ticket_path = ticket
+        .url
+        .unwrap()
+        .strip_prefix(&base_localhost)
+        .unwrap()
+        .to_string();
+    let ex_res = http
+        .get(format!("{base_ip}{ticket_path}"))
+        .header(HOST, format!("localhost:{port}"))
+        .send()
+        .await
+        .unwrap();
+    let cookie = ex_res
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Connect local WebSocket to verify live `blocks_changed` broadcast on revert
+    let mut ws_req = format!("ws://127.0.0.1:{port}/v1/local/ws")
+        .into_client_request()
+        .unwrap();
+    ws_req
+        .headers_mut()
+        .insert(HOST, HeaderValue::from_str(&format!("localhost:{port}")).unwrap());
+    ws_req
+        .headers_mut()
+        .insert(ORIGIN, HeaderValue::from_str(&base_localhost).unwrap());
+    ws_req
+        .headers_mut()
+        .insert(COOKIE, HeaderValue::from_str(&cookie).unwrap());
+    let (mut ws_stream, _) = tokio_tungstenite::connect_async(ws_req).await.unwrap();
+
+    // 1. Create Tier 1 block with human + SET_META + agent:claude-code edits
+    let (blk_id, op1, op2, op3, meta_op) = {
+        let mut g = daemon.state.store.lock().unwrap();
+        let r1 = g
+            .add_block("scratch", "v1 human base", Some("markdown"), None, "human", None)
+            .unwrap();
+        let r2 = g
+            .update_block(&r1.block_id, "v2 human good", &r1.head_op_ids, false, "human")
+            .unwrap();
+        let m1 = g
+            .move_block(&r1.block_id, None, None, None, Some("text"), "human")
+            .unwrap();
+        let r3 = g
+            .update_block(
+                &r1.block_id,
+                "v3 agent oops",
+                &r2.head_op_ids,
+                false,
+                "agent:claude-code",
+            )
+            .unwrap();
+        (r1.block_id, r1.op_id, r2.op_id, r3.op_id, m1.op_id)
+    };
+
+    // GET /v1/local/blocks/{id}/history
+    let h_res = http
+        .get(format!("{base_ip}/v1/local/blocks/{blk_id}/history"))
+        .header(HOST, format!("localhost:{port}"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(h_res.status(), StatusCode::OK);
+    let h_json: Value = h_res.json().await.unwrap();
+    assert_eq!(h_json["data"].as_array().unwrap().len(), 4);
+
+    // GET /v1/local/blocks/{id}/history/{op1} -> Tier 1 plaintext
+    let op1_res = http
+        .get(format!("{base_ip}/v1/local/blocks/{blk_id}/history/{op1}"))
+        .header(HOST, format!("localhost:{port}"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(op1_res.status(), StatusCode::OK);
+    let op1_j: Value = op1_res.json().await.unwrap();
+    assert_eq!(op1_j["data"]["content"], "v1 human base");
+    assert_eq!(op1_j["data"]["is_locked"], false);
+    assert!(op1_j["data"]["mnb1_b64"].is_null());
+    assert!(op1_j["data"]["mnw1_b64"].is_null());
+
+    // GET /v1/local/blocks/{id}/history/{meta_op} -> 400 INVALID_ARGUMENT
+    let meta_res = http
+        .get(format!("{base_ip}/v1/local/blocks/{blk_id}/history/{meta_op}"))
+        .header(HOST, format!("localhost:{port}"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(meta_res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        meta_res.json::<Value>().await.unwrap()["error"]["code"],
+        "INVALID_ARGUMENT"
+    );
+
+    // POST /v1/local/blocks/{id}/revert with stale expected_heads -> 409 HEAD_MISMATCH
+    let stale_rev = http
+        .post(format!("{base_ip}/v1/local/blocks/{blk_id}/revert"))
+        .header(HOST, format!("localhost:{port}"))
+        .header(ORIGIN, &base_localhost)
+        .header(COOKIE, &cookie)
+        .json(&json!({
+            "undo_actor": "agent:claude-code",
+            "expected_heads": [&op1]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale_rev.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        stale_rev.json::<Value>().await.unwrap()["error"]["code"],
+        "HEAD_MISMATCH"
+    );
+
+    // POST /v1/local/blocks/{id}/revert with undo_actor -> 200 OK, restores "v2 human good" + WS broadcast!
+    let ok_rev = http
+        .post(format!("{base_ip}/v1/local/blocks/{blk_id}/revert"))
+        .header(HOST, format!("localhost:{port}"))
+        .header(ORIGIN, &base_localhost)
+        .header(COOKIE, &cookie)
+        .json(&json!({
+            "undo_actor": "agent:claude-code",
+            "expected_heads": [&op3]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_rev.status(), StatusCode::OK);
+    let ok_rev_j: Value = ok_rev.json().await.unwrap();
+    assert_eq!(ok_rev_j["data"]["content"], "v2 human good");
+    assert_ne!(ok_rev_j["data"]["head_op_ids"][0], op2);
+
+    // Expect a live WS `blocks_changed` frame for the reverted block
+    let mut saw_ws_revert = false;
+    let ws_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < ws_deadline {
+        if let Ok(Some(Ok(Message::Text(txt)))) =
+            tokio::time::timeout(Duration::from_millis(500), ws_stream.next()).await
+        {
+            if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+                if v["type"] == "blocks_changed"
+                    && v["upserted"].as_array().is_some_and(|arr| {
+                        arr.iter()
+                            .any(|b| b["id"] == blk_id && b["content"] == "v2 human good")
+                    })
+                {
+                    saw_ws_revert = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(saw_ws_revert, "WS must broadcast blocks_changed on POST /revert");
+
+    // 2. Purge history + ExecuteShred -> HTTP 410 KEY_SHREDDED on history op, REST revert, and UDS revert!
+    {
+        let mut g = daemon.state.store.lock().unwrap();
+        let (_rec, old_keys) = g
+            .purge_block_history(&blk_id, None, None, T_GRACE_DEFAULT_MS, "human")
+            .unwrap();
+        let muts: Vec<StoreMutation> = old_keys
+            .into_iter()
+            .map(|key_id| StoreMutation::ExecuteShred { key_id })
+            .collect();
+        g.apply_store_mutations(&muts).unwrap();
+    }
+
+    let shred_get = http
+        .get(format!("{base_ip}/v1/local/blocks/{blk_id}/history/{op1}"))
+        .header(HOST, format!("localhost:{port}"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shred_get.status(), StatusCode::GONE);
+    assert_eq!(
+        shred_get.json::<Value>().await.unwrap()["error"]["code"],
+        "KEY_SHREDDED"
+    );
+
+    let shred_post = http
+        .post(format!("{base_ip}/v1/local/blocks/{blk_id}/revert"))
+        .header(HOST, format!("localhost:{port}"))
+        .header(ORIGIN, &base_localhost)
+        .header(COOKIE, &cookie)
+        .json(&json!({ "to_op_id": &op1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shred_post.status(), StatusCode::GONE);
+    assert_eq!(
+        shred_post.json::<Value>().await.unwrap()["error"]["code"],
+        "KEY_SHREDDED"
+    );
+
+    // UDS ApplyRequest::RevertBlock shares resolve_revert_target and returns KEY_SHREDDED
+    let dir_uds2 = dir.clone();
+    let blk_for_uds = blk_id.clone();
+    let op1_for_uds = op1.clone();
+    let uds_resp = tokio::task::spawn_blocking(move || {
+        try_send_uds(
+            &dir_uds2,
+            &UdsRequest::Apply {
+                meta: ApplyMeta {
+                    actor: "human".into(),
+                    idempotency_key: None,
+                    allow_empty: true,
+                    force: false,
+                },
+                request: ApplyRequest::RevertBlock {
+                    id: blk_for_uds,
+                    to_op: Some(op1_for_uds),
+                    undo_actor: None,
+                },
+            },
+            Duration::from_secs(3),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert!(!uds_resp.ok);
+    assert_eq!(uds_resp.error.as_ref().unwrap().code, "KEY_SHREDDED");
+
+    // 3. Conflict block -> POST /revert returns 409 CONFLICT_PRESENT
+    let (conflict_id, conflict_op1) = {
+        let mut g = daemon.state.store.lock().unwrap();
+        let c1 = g
+            .add_block("scratch", "dc-base", Some("text"), None, "human", None)
+            .unwrap();
+        let _c2 = g
+            .update_block(&c1.block_id, "dc-local", &c1.head_op_ids, false, "human")
+            .unwrap();
+        let kr_json: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("smk_keyring.local.json")).unwrap()).unwrap();
+        let smk_kid_s = kr_json["current_smk_kid"].as_str().unwrap();
+        let smk_hex = kr_json["generations"][smk_kid_s].as_str().unwrap();
+        let mut smk = [0u8; 32];
+        for i in 0..32 {
+            smk[i] = u8::from_str_radix(&smk_hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        let smk_kid = SmkKid::parse(smk_kid_s).unwrap();
+        let mut gen = MonotonicUlidGen::new();
+        let remote_dev = DeviceId::parse("dev_dconf_tt1").unwrap();
+        let c_bid = BlockId::parse(&c1.block_id).unwrap();
+        let r_op = OpId::from_ulid(gen.next(1_795_800_000_000, [1u8; 10]));
+        let r_kid = KeyId::from_ulid(gen.next(1_795_800_000_001, [2u8; 10]));
+        let r_bdek = [0x55u8; 32];
+        let r_mnb1 = encrypt_mnb1(c_bid.as_bytes(), r_op, r_kid, &r_bdek, "dc-remote", [3u8; 24]).unwrap();
+        let r_mnr1 = encrypt_mnr1(
+            smk_kid,
+            &smk,
+            1,
+            &KeyRecordV1 {
+                v: 1,
+                key_id: r_kid,
+                block_id: c_bid.0,
+                tier: 1,
+                created_hlc: Hlc::new(1_795_800_000_000, 0, remote_dev.clone()).canonical_string(),
+                created_by: remote_dev.clone(),
+                bdek: r_bdek.to_vec(),
+            },
+            [4u8; 24],
+        )
+        .unwrap();
+        g.apply_remote_block_op_for_sync(RemoteBlockOpParams {
+            remote_device: remote_dev.clone(),
+            block_id: c_bid,
+            op_id: r_op,
+            parents: vec![OpId::parse(&c1.op_id).unwrap()],
+            op_type: OpType::Update,
+            hlc: Hlc::new(1_795_800_000_000, 0, remote_dev),
+            tier: 1,
+            key_id: r_kid,
+            new_key_record: Some((1, r_mnr1)),
+            mnb1: r_mnb1,
+            public_hint: None,
+        })
+        .unwrap();
+        g.set_local_meta("bootstrap_completed", "1").unwrap();
+        (c1.block_id, c1.op_id)
+    };
+    let conf_rev = http
+        .post(format!("{base_ip}/v1/local/blocks/{conflict_id}/revert"))
+        .header(HOST, format!("localhost:{port}"))
+        .header(ORIGIN, &base_localhost)
+        .header(COOKIE, &cookie)
+        .json(&json!({ "to_op_id": &conflict_op1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conf_rev.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        conf_rev.json::<Value>().await.unwrap()["error"]["code"],
+        "CONFLICT_PRESENT"
+    );
+
+    // 4. Tier 2 historical op via Daemon GET /history/{op_id} & Tier 2 WASM-encrypted POST /revert (SEC-03!)
+    let (t2_blk, t2_kid, t2_op1, t2_op2, unlocked) = {
+        let mut g = daemon.state.store.lock().unwrap();
+        let rpk = g.recovery_pk().unwrap();
+        let vkid = VkekKid::from_ulid(Ulid::from_parts(1_720_000_100_000, [0x31; 10]));
+        let vh = create_vault_header(
+            b"daemon-m3-pass",
+            &rpk,
+            vkid,
+            &[0x61; 32],
+            [0x32; 16],
+            [0x33; 24],
+            [0x34; 32],
+            [0x35; 24],
+            1_720_000_100_000,
+        )
+        .unwrap();
+        let unlocked = unlock_vault_with_passphrase(b"daemon-m3-pass", &vh).unwrap();
+        g.put_vault_header(vh.updated_at_ms, &rmp_serde::to_vec_named(&vh).unwrap())
+            .unwrap();
+
+        let mut ugen = MonotonicUlidGen::new();
+        let t2_blk = BlockId::from_ulid(ugen.next(1_795_810_000_000, [0x41; 10]));
+        let t2_op1 = OpId::from_ulid(ugen.next(1_795_810_000_001, [0x42; 10]));
+        let t2_kid = KeyId::from_ulid(ugen.next(1_795_810_000_002, [0x43; 10]));
+        let t2_bdek = Zeroizing::new([0x66; 32]);
+        let mnb1_1 = encrypt_mnb1(
+            t2_blk.as_bytes(),
+            t2_op1,
+            t2_kid,
+            &t2_bdek,
+            "DAEMON_T2_HIST_CANARY_V1",
+            [0x44; 24],
+        )
+        .unwrap();
+        let mnw1 = unlocked.wrap_bdek(t2_kid, t2_blk, &t2_bdek, [0x45; 24]).unwrap();
+        let r1 = g
+            .add_tier2_block(
+                &t2_blk.to_string(),
+                Tier2OpInput {
+                    op_id: &t2_op1.to_string(),
+                    key_id: &t2_kid.to_string(),
+                    mnb1: &mnb1_1,
+                    mnw1: Some(&mnw1),
+                },
+                "scratch",
+                "spy_daemon_sec03",
+                None,
+                Some("t2 hint"),
+                "human",
+            )
+            .unwrap();
+        let t2_op2 = OpId::from_ulid(ugen.next(1_795_810_000_010, [0x46; 10]));
+        let mnb1_2 = encrypt_mnb1(
+            t2_blk.as_bytes(),
+            t2_op2,
+            t2_kid,
+            &t2_bdek,
+            "DAEMON_T2_CURR_CANARY_V2",
+            [0x47; 24],
+        )
+        .unwrap();
+        g.update_tier2_block(
+            &t2_blk.to_string(),
+            Tier2OpInput {
+                op_id: &t2_op2.to_string(),
+                key_id: &t2_kid.to_string(),
+                mnb1: &mnb1_2,
+                mnw1: None,
+            },
+            &r1.head_op_ids,
+            None,
+            None,
+            "human",
+        )
+        .unwrap();
+        (t2_blk, t2_kid, t2_op1, t2_op2, unlocked)
+    };
+
+    let t2_hist_res = http
+        .get(format!("{base_ip}/v1/local/blocks/{t2_blk}/history/{t2_op1}"))
+        .header(HOST, format!("localhost:{port}"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(t2_hist_res.status(), StatusCode::OK);
+    let t2_hist_txt = t2_hist_res.text().await.unwrap();
+    assert!(
+        !t2_hist_txt.contains("DAEMON_T2_HIST_CANARY_V1"),
+        "SEC-03 VIOLATION: Daemon history op response must contain ZERO Tier 2 plaintext"
+    );
+    let t2_hist_j: Value = serde_json::from_str(&t2_hist_txt).unwrap();
+    assert_eq!(t2_hist_j["data"]["is_locked"], true);
+    assert!(t2_hist_j["data"]["content"].is_null());
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mnb1_bytes = b64
+        .decode(t2_hist_j["data"]["mnb1_b64"].as_str().unwrap())
+        .unwrap();
+    let mnw1_bytes = b64
+        .decode(t2_hist_j["data"]["mnw1_b64"].as_str().unwrap())
+        .unwrap();
+    let dec_bdek = unlocked.unwrap_bdek(t2_kid, t2_blk, &mnw1_bytes).unwrap();
+    let pt_v1 = decrypt_mnb1(t2_blk.as_bytes(), t2_op1, t2_kid, &dec_bdek, &mnb1_bytes).unwrap();
+    assert_eq!(pt_v1, "DAEMON_T2_HIST_CANARY_V1");
+
+    // Re-encrypt client-side (simulating WasmVaultSession) and POST /v1/local/blocks/{id}/revert
+    let t2_op3 = OpId::from_ulid(Ulid::from_parts(1_795_810_000_020, [0x48; 10]));
+    let mnb1_3 = encrypt_mnb1(t2_blk.as_bytes(), t2_op3, t2_kid, &dec_bdek, &pt_v1, [0x49; 24]).unwrap();
+    let t2_rev = http
+        .post(format!("{base_ip}/v1/local/blocks/{t2_blk}/revert"))
+        .header(HOST, format!("localhost:{port}"))
+        .header(ORIGIN, &base_localhost)
+        .header(COOKIE, &cookie)
+        .json(&json!({
+            "expected_heads": [t2_op2.to_string()],
+            "op_id": t2_op3.to_string(),
+            "key_id": t2_kid.to_string(),
+            "mnb1_b64": b64.encode(&mnb1_3),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(t2_rev.status(), StatusCode::OK);
+    let t2_rev_txt = t2_rev.text().await.unwrap();
+    assert!(!t2_rev_txt.contains("DAEMON_T2_HIST_CANARY_V1"));
+    let t2_rev_j: Value = serde_json::from_str(&t2_rev_txt).unwrap();
+    assert_eq!(t2_rev_j["data"]["is_locked"], true);
+    assert_eq!(t2_rev_j["data"]["head_op_ids"][0], t2_op3.to_string());
+
+    // 5. Daemon POST /v1/local/format SEC-03 locked-block zero-subprocess guarantee!
+    let marker = dir.join("daemon_locked_fmt_spy.marker");
+    let cfg_path = dir.join("daemon_formatters.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[formatters.spy_daemon_sec03]
+cmd = ["sh", "-c", "touch '{}'; printf 'FMT:%s' \"$(cat)\""]
+timeout_ms = 500
+"#,
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let _env_guard = EnvGuard {
+        key: "MYNOTE_FORMATTERS_CONFIG",
+        prev: std::env::var("MYNOTE_FORMATTERS_CONFIG").ok(),
+    };
+    std::env::set_var("MYNOTE_FORMATTERS_CONFIG", &cfg_path);
+
+    // Locked block -> 423 BLOCK_LOCKED, spy subprocess MUST NOT run!
+    let fmt_locked = http
+        .post(format!("{base_ip}/v1/local/format"))
+        .header(HOST, format!("localhost:{port}"))
+        .header(ORIGIN, &base_localhost)
+        .header(COOKIE, &cookie)
+        .json(&json!({
+            "block_id": t2_blk.to_string(),
+            "lang": "spy_daemon_sec03",
+            "content": "NEVER_PASS_TO_SUBPROCESS"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fmt_locked.status(), StatusCode::LOCKED);
+    assert_eq!(
+        fmt_locked.json::<Value>().await.unwrap()["error"]["code"],
+        "BLOCK_LOCKED"
+    );
+    assert!(
+        !marker.exists(),
+        "SEC-03 VIOLATION: Daemon /v1/local/format MUST NOT spawn subprocess for locked block_id"
+    );
+
+    // Unlocked block -> 200 OK via spawn_blocking external array-cmd formatter!
+    let fmt_ok = http
+        .post(format!("{base_ip}/v1/local/format"))
+        .header(HOST, format!("localhost:{port}"))
+        .header(ORIGIN, &base_localhost)
+        .header(COOKIE, &cookie)
+        .json(&json!({
+            "block_id": blk_id,
+            "lang": "spy_daemon_sec03",
+            "content": "hello_t1"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fmt_ok.status(), StatusCode::OK);
+    assert_eq!(
+        fmt_ok.json::<Value>().await.unwrap()["data"]["formatted"],
+        "FMT:hello_t1"
+    );
+    assert!(marker.exists());
+
+    drop(_env_guard);
+    daemon.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

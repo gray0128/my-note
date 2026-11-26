@@ -1,7 +1,17 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { MyNoteApp } from "../src/app";
+import { MobilePwaApp } from "../src/pwa/pwaApp";
 import type { LocalApiClient } from "../src/api";
-import type { BlockDto, BootstrapResponse, BufferDto, LocalWsFrame, SyncStatusDto, TrashItemDto } from "../src/types";
+import type {
+  BlockDto,
+  BlockHistoryContentDto,
+  BlockHistoryEntryDto,
+  BootstrapResponse,
+  BufferDto,
+  LocalWsFrame,
+  SyncStatusDto,
+  TrashItemDto,
+} from "../src/types";
 
 function makeMockApi() {
   const buffers: BufferDto[] = [{ id: "01BUF000000000000000000001", name: "scratch", position: "a0", updated_at_ms: 1000 }];
@@ -1005,5 +1015,683 @@ describe("M1 Embedded Desktop Web UI (Candidate A CM6)", () => {
     Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
 
     app.destroy();
+  });
+
+  it("M3 Desktop Markdown dual-mode: Source/Preview/Split, Cmd/Ctrl+E toggle, interactive task checkbox atomic patch, Copy Rich Dual-Format, and lang switch reset", async () => {
+    const { api } = makeMockApi();
+    const mdBlkId = "01M3MD00000000000000000001";
+    const mdInitial = "# Sprint Tasks\n\n- [ ] write docs\n- [x] ship core\n\n![beacon](https://evil.example/a.png)\n";
+    const mdBlock: BlockDto = {
+      id: mdBlkId,
+      buffer_id: "01BUF000000000000000000001",
+      position: "a0",
+      lang: "markdown",
+      is_locked: false,
+      has_unlocked_concurrent_version: false,
+      public_hint: null,
+      head_op_ids: ["01M3OP_MD_1"],
+      display_op_id: "01M3OP_MD_1",
+      has_conflict: false,
+      content: mdInitial,
+      versions: [
+        {
+          op_id: "01M3OP_MD_1",
+          hlc: "000000000001000-00000-dev_mac0000000001",
+          device_id: "dev_mac0000000001",
+          actor: "human",
+          is_display: true,
+          is_locked: false,
+          key_id: "01M3KEY_MD_1",
+          content: mdInitial,
+        },
+      ],
+      updated_at_ms: 1000,
+    };
+
+    const patchCalls: Array<{ id: string; content?: string; expected_heads?: string[]; lang?: string }> = [];
+    const origBootstrap = api.bootstrap.bind(api);
+    api.bootstrap = async () => {
+      const b = await origBootstrap();
+      return { ...b, blocks: [mdBlock] };
+    };
+    api.listBlocks = async () => [mdBlock];
+    api.patchBlock = async (id, input) => {
+      patchCalls.push({ id, content: input.content, expected_heads: input.expected_heads, lang: input.lang });
+      if (input.content !== undefined) {
+        mdBlock.content = input.content;
+        mdBlock.head_op_ids = [`01M3OP_MD_${patchCalls.length + 1}`];
+        mdBlock.display_op_id = mdBlock.head_op_ids[0];
+        mdBlock.versions[0].op_id = mdBlock.head_op_ids[0];
+        mdBlock.versions[0].content = input.content;
+      }
+      if (input.lang !== undefined) {
+        mdBlock.lang = input.lang;
+      }
+      return { ...mdBlock, head_op_ids: [...mdBlock.head_op_ids], versions: [{ ...mdBlock.versions[0] }] };
+    };
+
+    const clipboardWrite = vi.fn().mockResolvedValue(undefined);
+    const clipboardWriteText = vi.fn().mockResolvedValue(undefined);
+    class FakeClipboardItem {
+      constructor(public readonly items: Record<string, Blob>) {}
+    }
+    vi.stubGlobal("ClipboardItem", FakeClipboardItem);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { write: clipboardWrite, writeText: clipboardWriteText },
+    });
+
+    const app = new MyNoteApp(root, api);
+    await app.start();
+
+    const card = root.querySelector<HTMLElement>(`[data-block-id="${mdBlkId}"]`)!;
+    // Default mode is source with CM6 mounted
+    expect(app.stream.getBlockViewMode(mdBlkId)).toBe("source");
+    expect(card.querySelector(".cm-editor")).not.toBeNull();
+    expect(card.querySelector(`[data-testid="mode-source-${mdBlkId}"]`)?.getAttribute("aria-pressed")).toBe("true");
+
+    // Switch to Preview via header button -> unmounts CM6, renders .md-preview, shows Copy Rich, blocks external img
+    card.querySelector<HTMLButtonElement>(`[data-testid="mode-preview-${mdBlkId}"]`)!.click();
+    expect(app.stream.getBlockViewMode(mdBlkId)).toBe("preview");
+    expect(card.querySelector(".cm-editor")).toBeNull();
+    expect(card.querySelector(".block-preview-host .md-preview h1")?.textContent).toBe("Sprint Tasks");
+    expect(card.querySelectorAll(".block-preview-host img").length).toBe(0);
+    expect(card.querySelector(".block-preview-host .md-blocked-img")).not.toBeNull();
+
+    // Interactive task checkbox click atomically writes updated Markdown via patchBlock with expected_heads
+    const boxes = card.querySelectorAll<HTMLInputElement>('.block-preview-host input[type="checkbox"]');
+    expect(boxes.length).toBe(2);
+    expect(boxes[0].disabled).toBe(false);
+    boxes[0].checked = true;
+    boxes[0].dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(patchCalls.length).toBe(1);
+    expect(patchCalls[0].expected_heads).toEqual(["01M3OP_MD_1"]);
+    expect(patchCalls[0].content).toContain("- [x] write docs");
+    expect(patchCalls[0].content).toContain("- [x] ship core");
+
+    // Copy Rich invokes Dual-Format ClipboardItem (text/html + text/plain)
+    const copyRichBtn = card.querySelector<HTMLButtonElement>(`[data-testid="copy-rich-${mdBlkId}"]`)!;
+    expect(copyRichBtn).not.toBeNull();
+    copyRichBtn.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(clipboardWrite).toHaveBeenCalledTimes(1);
+    const copiedItem = (clipboardWrite.mock.calls[0][0] as FakeClipboardItem[])[0];
+    expect(Object.keys(copiedItem.items)).toEqual(["text/html", "text/plain"]);
+
+    // Cmd/Ctrl+E toggles Preview -> Source -> Preview
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "e", ctrlKey: true, cancelable: true }));
+    expect(app.stream.getBlockViewMode(mdBlkId)).toBe("source");
+    expect(card.querySelector(".cm-editor")).not.toBeNull();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "e", ctrlKey: true, cancelable: true }));
+    expect(app.stream.getBlockViewMode(mdBlkId)).toBe("preview");
+    expect(card.querySelector(".cm-editor")).toBeNull();
+
+    // Split mode mounts BOTH CM6 and live .md-preview, debouncing edits into preview
+    card.querySelector<HTMLButtonElement>(`[data-testid="mode-split-${mdBlkId}"]`)!.click();
+    expect(app.stream.getBlockViewMode(mdBlkId)).toBe("split");
+    expect(card.querySelector(".block-split-body")).not.toBeNull();
+    expect(card.querySelector(".cm-editor")).not.toBeNull();
+    expect(card.querySelector(".block-preview-host .md-preview")).not.toBeNull();
+
+    const mounted = (app.stream as unknown as { mounted: Map<string, { view: import("@codemirror/view").EditorView }> }).mounted.get(mdBlkId)!;
+    mounted.view.dispatch({ changes: { from: 0, to: mounted.view.state.doc.length, insert: "## Live Split Updated" } });
+    await new Promise((r) => setTimeout(r, 200));
+    expect(card.querySelector(".block-preview-host .md-preview h2")?.textContent).toBe("Live Split Updated");
+
+    // Switching language away from markdown resets cleanly to source & mounts CM6
+    const langSel = card.querySelector<HTMLSelectElement>(".lang-select")!;
+    langSel.value = "yaml";
+    langSel.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(app.stream.getBlockViewMode(mdBlkId)).toBe("source");
+    expect(card.querySelector(".block-split-body")).toBeNull();
+    expect(card.querySelector(".block-preview-host .md-preview")).toBeNull();
+    expect(card.querySelector(".cm-editor")).not.toBeNull();
+
+    vi.unstubAllGlobals();
+    app.destroy();
+  });
+
+  it("M3 Desktop Mermaid Split/Preview lazy Pele rendering, last-valid-frame preservation, and Tier 1 formatSnippet block_id forwarding", async () => {
+    const { api } = makeMockApi();
+    const mmdId = "01M3MMD0000000000000000001";
+    const mmdBlock: BlockDto = {
+      id: mmdId,
+      buffer_id: "01BUF000000000000000000001",
+      position: "a0",
+      lang: "mermaid",
+      is_locked: false,
+      has_unlocked_concurrent_version: false,
+      public_hint: null,
+      head_op_ids: ["01M3OP_MMD_1"],
+      display_op_id: "01M3OP_MMD_1",
+      has_conflict: false,
+      content: "flowchart LR\n  A[Alpha] --> B[Beta]",
+      versions: [
+        {
+          op_id: "01M3OP_MMD_1",
+          hlc: "000000000001000-00000-dev_mac0000000001",
+          device_id: "dev_mac0000000001",
+          actor: "human",
+          is_display: true,
+          is_locked: false,
+          key_id: "01M3KEY_MMD_1",
+          content: "flowchart LR\n  A[Alpha] --> B[Beta]",
+        },
+      ],
+      updated_at_ms: 1000,
+    };
+
+    const formatInputs: Array<{ content: string; lang: string; block_id?: string }> = [];
+    const origBootstrap = api.bootstrap.bind(api);
+    api.bootstrap = async () => {
+      const b = await origBootstrap();
+      return { ...b, blocks: [mmdBlock, b.blocks[0]] };
+    };
+    api.formatSnippet = async (input) => {
+      formatInputs.push(input);
+      return { formatted: input.content };
+    };
+
+    const app = new MyNoteApp(root, api);
+    await app.start();
+
+    // Format unlocked Tier 1 JSON block -> forwards block_id to /v1/local/format
+    const jsonCard = root.querySelector<HTMLElement>('[data-block-id="01BLK000000000000000000001"]')!;
+    const fmtBtn = [...jsonCard.querySelectorAll("button")].find((b) => b.textContent === "Format")!;
+    fmtBtn.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(formatInputs.length).toBe(1);
+    expect(formatInputs[0].block_id).toBe("01BLK000000000000000000001");
+
+    // Mermaid Split mode: lazy Pele renders pure SVG with zero inline style
+    const card = root.querySelector<HTMLElement>(`[data-block-id="${mmdId}"]`)!;
+    card.querySelector<HTMLButtonElement>(`[data-testid="mode-split-${mmdId}"]`)!.click();
+    await new Promise((r) => setTimeout(r, 80));
+
+    const svgBefore = card.querySelector(".diagram-viewport svg");
+    expect(svgBefore).not.toBeNull();
+    expect(svgBefore?.getAttribute("style")).toBeNull();
+    expect(card.querySelector(".diagram-viewport")?.textContent).toContain("Alpha");
+
+    // Introduce invalid syntax mid-edit -> preserves last valid SVG and displays syntax hint
+    const mounted = (app.stream as unknown as { mounted: Map<string, { view: import("@codemirror/view").EditorView }> }).mounted.get(mmdId)!;
+    mounted.view.dispatch({
+      changes: { from: 0, to: mounted.view.state.doc.length, insert: "flowchart LR\n  A --> --> ??? BROKEN %%%" },
+    });
+    await new Promise((r) => setTimeout(r, 240));
+
+    const hint = card.querySelector<HTMLElement>(".diagram-syntax-hint")!;
+    expect(hint.hidden).toBe(false);
+    expect(hint.textContent).toContain("Diagram syntax error");
+    expect(card.querySelector(".diagram-viewport svg")).toBe(svgBefore);
+    expect(card.querySelector(".diagram-viewport")?.textContent).toContain("Alpha");
+
+    app.destroy();
+  });
+
+  it("M3 Desktop History Drawer & SEC-03: agent badge, shredded badge, line diff, revert, undo actor batch, and Vault lock wiping Preview & History DOM", async () => {
+    const fsMod = (await import(/* @vite-ignore */ "node:" + "fs")) as { readFileSync(p: string): Uint8Array };
+    const wasmBytes = fsMod.readFileSync("src/wasm/pkg/mynote_wasm_bg.wasm");
+    const { bytesToB64, initDesktopWasmSync } = await import("../src/wasm/desktop");
+    initDesktopWasmSync(new Uint8Array(wasmBytes));
+
+    const { api } = makeMockApi();
+    const t1Id = "01BLK000000000000000000001";
+    const t2Id = "01JH5T20000000000000000001";
+    let storedHeader: { gen: number; blob_b64: string; updated_at_ms: number } | null = null;
+    const recoveryPkB64 = bytesToB64(new Uint8Array(32).fill(5));
+
+    const t2Block: BlockDto = {
+      id: t2Id,
+      buffer_id: "01BUF000000000000000000001",
+      position: "a5",
+      lang: "markdown",
+      is_locked: false,
+      has_unlocked_concurrent_version: false,
+      public_hint: null,
+      head_op_ids: ["01JH5T20000000000000000011"],
+      display_op_id: "01JH5T20000000000000000011",
+      has_conflict: false,
+      content: "# Secret Note\n\nTOP_SECRET_MARKDOWN_TOKEN",
+      versions: [
+        {
+          op_id: "01JH5T20000000000000000011",
+          hlc: "000000000001000-00000-dev_mac0000000001",
+          device_id: "dev_mac0000000001",
+          actor: "human",
+          is_display: true,
+          is_locked: false,
+          key_id: "01JH5T20000000000000000021",
+          content: "# Secret Note\n\nTOP_SECRET_MARKDOWN_TOKEN",
+        },
+      ],
+      updated_at_ms: 1000,
+    };
+
+    const t1History: BlockHistoryEntryDto[] = [
+      {
+        op_id: "01OP_AGENT_2",
+        op_type: "UPDATE",
+        hlc: "000000000003000-00000-dev_mac0000000001",
+        device_id: "dev_mac0000000001",
+        actor: "agent:claude-code",
+        content_available: true,
+        has_content: true,
+        is_locked: false,
+        shredded: false,
+        key_id: "01KEY_1",
+        created_at_ms: 1700000003000,
+      },
+      {
+        op_id: "01OP_HUMAN_1",
+        op_type: "UPDATE",
+        hlc: "000000000002000-00000-dev_mac0000000001",
+        device_id: "dev_mac0000000001",
+        actor: "human",
+        content_available: true,
+        has_content: true,
+        is_locked: false,
+        shredded: false,
+        key_id: "01KEY_1",
+        created_at_ms: 1700000002000,
+      },
+      {
+        op_id: "01OP_SHRED_0",
+        op_type: "CREATE",
+        hlc: "000000000001000-00000-dev_mac0000000001",
+        device_id: "dev_mac0000000001",
+        actor: "human",
+        content_available: false,
+        has_content: true,
+        is_locked: false,
+        shredded: true,
+        key_id: "01KEY_OLD",
+        created_at_ms: 1700000001000,
+      },
+    ];
+
+    const revertCalls: Array<{ id: string; input: Record<string, unknown> }> = [];
+    let lockedT2Snapshot: BlockDto = t2Block;
+    let t2HistContent: BlockHistoryContentDto | null = null;
+
+    const origBootstrap = api.bootstrap.bind(api);
+    api.bootstrap = async () => {
+      const b = await origBootstrap();
+      b.blocks[0].content = "line1\nagent-changed";
+      b.blocks[0].head_op_ids = ["01OP_AGENT_2"];
+      b.blocks[0].display_op_id = "01OP_AGENT_2";
+      return {
+        ...b,
+        blocks: [b.blocks[0], lockedT2Snapshot],
+        vault_header: storedHeader,
+        recovery_pk_b64: recoveryPkB64,
+      };
+    };
+    api.putVaultHeader = async (gen, blob_b64) => {
+      storedHeader = { gen, blob_b64, updated_at_ms: Date.now() };
+      return storedHeader;
+    };
+    api.listBlockedOps = async () => [];
+    api.lockBlock = async (_id, input) => {
+      lockedT2Snapshot = {
+        ...t2Block,
+        is_locked: true,
+        public_hint: input.public_hint ?? null,
+        head_op_ids: [input.op_id],
+        display_op_id: input.op_id,
+        content: null,
+        versions: [
+          {
+            op_id: input.op_id,
+            hlc: "000000000009000-00000-dev_mac0000000001",
+            device_id: "dev_mac0000000001",
+            actor: "human",
+            is_display: true,
+            is_locked: true,
+            key_id: input.key_id,
+            content: null,
+            mnb1_b64: input.mnb1_b64,
+            mnw1_b64: input.mnw1_b64,
+          },
+        ],
+      };
+      t2HistContent = {
+        block_id: t2Id,
+        op_id: input.op_id,
+        op_type: "LOCK",
+        hlc: "000000000009000-00000-dev_mac0000000001",
+        device_id: "dev_mac0000000001",
+        actor: "human",
+        created_at_ms: 1700000009000,
+        is_locked: true,
+        key_id: input.key_id,
+        lang: "markdown",
+        content: null,
+        mnb1_b64: input.mnb1_b64,
+        mnw1_b64: input.mnw1_b64,
+      };
+      return lockedT2Snapshot;
+    };
+    api.getBlockHistory = async (id) => {
+      if (id === t2Id && t2HistContent) {
+        return [
+          {
+            op_id: t2HistContent.op_id,
+            op_type: "LOCK",
+            hlc: t2HistContent.hlc,
+            device_id: t2HistContent.device_id,
+            actor: "human",
+            content_available: true,
+            has_content: true,
+            is_locked: true,
+            shredded: false,
+            key_id: t2HistContent.key_id,
+            created_at_ms: t2HistContent.created_at_ms,
+          },
+        ];
+      }
+      return t1History;
+    };
+    api.getBlockHistoryOp = async (id, opId) => {
+      if (id === t2Id && t2HistContent) {
+        return t2HistContent;
+      }
+      return {
+        block_id: id,
+        op_id: opId,
+        op_type: "UPDATE",
+        hlc: "000000000002000-00000-dev_mac0000000001",
+        device_id: "dev_mac0000000001",
+        actor: "human",
+        created_at_ms: 1700000002000,
+        is_locked: false,
+        key_id: "01KEY_1",
+        lang: "json",
+        content: "line1\nhuman-original",
+        mnb1_b64: null,
+        mnw1_b64: null,
+      };
+    };
+    api.revertBlock = async (id, input) => {
+      revertCalls.push({ id, input: { ...input } });
+      const cur = app.stream.getBlocks().find((b) => b.id === id)!;
+      return {
+        ...cur,
+        head_op_ids: [`01OP_REVERT_${revertCalls.length}`],
+        display_op_id: `01OP_REVERT_${revertCalls.length}`,
+        content: "line1\nhuman-original",
+        versions: [
+          {
+            ...cur.versions[0],
+            op_id: `01OP_REVERT_${revertCalls.length}`,
+            actor: "human",
+            content: "line1\nhuman-original",
+          },
+        ],
+      };
+    };
+
+    const app = new MyNoteApp(root, api);
+    await app.start();
+
+    // 1. Open History Drawer on Tier 1 block
+    root.querySelector<HTMLButtonElement>(`[data-testid="history-btn-${t1Id}"]`)!.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    const drawer = root.querySelector<HTMLElement>('[data-testid="history-drawer"]')!;
+    expect(drawer.classList.contains("hidden")).toBe(false);
+    expect(drawer.textContent).toContain("agent:claude-code");
+    expect(drawer.querySelector('[data-testid="history-undo-actor-btn"]')?.textContent).toBe("Undo agent:claude-code batch");
+    expect(drawer.querySelector('[data-testid="history-shredded-badge"]')?.textContent).toBe("Shredded / Unavailable");
+    expect(drawer.querySelector<HTMLButtonElement>('[data-testid="history-select-01OP_SHRED_0"]')?.disabled).toBe(true);
+
+    // 2. Inspect prior human version -> line diff renders - human-original and + agent-changed
+    drawer.querySelector<HTMLButtonElement>('[data-testid="history-select-01OP_HUMAN_1"]')!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    const diffView = drawer.querySelector<HTMLElement>('[data-testid="history-diff-view"]')!;
+    expect(diffView).not.toBeNull();
+    expect(diffView.querySelector(".diff-del")?.textContent).toContain("human-original");
+    expect(diffView.querySelector(".diff-add")?.textContent).toContain("agent-changed");
+
+    // 3. One-click Revert calls revertBlock({ to_op_id, expected_heads }) and updates block
+    drawer.querySelector<HTMLButtonElement>('[data-testid="history-revert-btn"]')!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(revertCalls.length).toBe(1);
+    expect(revertCalls[0].input.to_op_id).toBe("01OP_HUMAN_1");
+    expect(revertCalls[0].input.expected_heads).toEqual(["01OP_AGENT_2"]);
+    expect(app.stream.getBlockDraftContent(t1Id)).toBe("line1\nhuman-original");
+
+    // 4. Undo actor batch button calls revertBlock({ undo_actor: "agent:claude-code", expected_heads })
+    drawer.querySelector<HTMLButtonElement>('[data-testid="history-undo-actor-btn"]')!.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(revertCalls.length).toBe(2);
+    expect(revertCalls[1].input.undo_actor).toBe("agent:claude-code");
+
+    // 5. SEC-03: Setup Vault, lock Markdown block into Tier 2, open Preview AND open Tier 2 History Drawer, then lockVaultNow()
+    root.querySelector<HTMLButtonElement>('[data-testid="vault-btn"]')!.click();
+    root.querySelector<HTMLInputElement>('[data-testid="vault-passphrase-input"]')!.value = "m3-vault-passphrase";
+    root.querySelector<HTMLInputElement>('[data-testid="vault-passphrase-confirm"]')!.value = "m3-vault-passphrase";
+    root.querySelector<HTMLFormElement>(".dialog-form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await new Promise((r) => setTimeout(r, 150));
+    expect(app.isVaultUnlocked()).toBe(true);
+
+    const t2Card = root.querySelector<HTMLElement>(`[data-block-id="${t2Id}"]`)!;
+    const lockBtn = [...t2Card.querySelectorAll("button")].find((b) => b.textContent === "🔒 Lock")!;
+    lockBtn.click();
+    root.querySelector<HTMLInputElement>('[data-testid="lock-hint-input"]')!.value = "Secret MD";
+    root.querySelector<HTMLFormElement>(".dialog-form")!.dispatchEvent(new Event("submit", { cancelable: true }));
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Switch locked Markdown block to Preview mode -> renders secret heading in .block-preview-host
+    const t2LockedCard = root.querySelector<HTMLElement>(`[data-block-id="${t2Id}"]`)!;
+    t2LockedCard.querySelector<HTMLButtonElement>(`[data-testid="mode-preview-${t2Id}"]`)!.click();
+    expect(t2LockedCard.querySelector(".block-preview-host .md-preview")?.textContent).toContain("TOP_SECRET_MARKDOWN_TOKEN");
+
+    // Open Tier 2 History Drawer & decrypt historical version strictly in browser WASM RAM
+    t2LockedCard.querySelector<HTMLButtonElement>(`[data-testid="history-btn-${t2Id}"]`)!.click();
+    await new Promise((r) => setTimeout(r, 40));
+    const t2SelectBtn = drawer.querySelector<HTMLButtonElement>(`[data-testid="history-select-${t2HistContent!.op_id}"]`)!;
+    t2SelectBtn.click();
+    await new Promise((r) => setTimeout(r, 40));
+    expect(drawer.classList.contains("hidden")).toBe(false);
+    expect(drawer.textContent).toContain("TOP_SECRET_MARKDOWN_TOKEN");
+
+    // Lock Vault -> MUST immediately wipe locked Preview DOM AND close & clear History Drawer!
+    app.lockVaultNow();
+    expect(app.isVaultUnlocked()).toBe(false);
+    expect(drawer.classList.contains("hidden")).toBe(true);
+    expect(drawer.textContent).not.toContain("TOP_SECRET_MARKDOWN_TOKEN");
+    expect(root.textContent).not.toContain("TOP_SECRET_MARKDOWN_TOKEN");
+    expect(root.querySelector(`[data-block-id="${t2Id}"] .block-preview-host`)).toBeNull();
+    expect(root.querySelector(`[data-block-id="${t2Id}"] .locked-card`)).not.toBeNull();
+
+    app.destroy();
+  });
+
+  it("M3 Mobile Read-Only PWA: Markdown & Mermaid default to Preview, toggle to Source, disabled checkboxes, external img blocked, and SEC-08 wipe on hide", async () => {
+    const pwaRoot = document.createElement("div");
+    pwaRoot.className = "pwa-shell";
+    document.body.appendChild(pwaRoot);
+
+    const pwa = new MobilePwaApp(pwaRoot);
+    const internals = pwa as unknown as {
+      creds: { device_id: string; device_token: string; sync_url: string; smks: Array<{ smk_kid: string; smk_b64: string }> };
+      buffers: Array<{ id: string; name: string; position: string; state: string; updated_at_ms: number }>;
+      blocks: Array<{
+        id: string;
+        buffer_id: string;
+        position: string;
+        lang: string;
+        public_hint: string | null;
+        state: string;
+        is_locked: boolean;
+        has_unlocked_concurrent_version: boolean;
+        display_op_id: string | null;
+        updated_at_ms: number;
+        versions: Array<{
+          op_id: string;
+          hlc: string;
+          device_id: string;
+          actor: string;
+          is_display: boolean;
+          is_locked: boolean;
+          key_id: string | null;
+          content: string | null;
+          mnb1_b64: string | null;
+          mnw1_b64: string | null;
+          body_state: string;
+        }>;
+      }>;
+      activeBufferId: string;
+      vaultSession: { isLocked(): boolean; lockAndZeroize(): void; free(): void } | null;
+      unlockedPlaintext: Map<string, Map<string, string>>;
+      render(): void;
+    };
+
+    const mdId = "01PWA_MD_1";
+    const mmdId = "01PWA_MMD_1";
+    const lockedMdId = "01PWA_T2_MD_1";
+    internals.creds = {
+      device_id: "dev_iphone000001",
+      device_token: "tok",
+      sync_url: "https://sync.example.com",
+      smks: [],
+    };
+    internals.buffers = [{ id: "01BUF1", name: "mobile", position: "a0", state: "active", updated_at_ms: 1000 }];
+    internals.activeBufferId = "01BUF1";
+    internals.blocks = [
+      {
+        id: mdId,
+        buffer_id: "01BUF1",
+        position: "a0",
+        lang: "markdown",
+        public_hint: null,
+        state: "active",
+        is_locked: false,
+        has_unlocked_concurrent_version: false,
+        display_op_id: "01OP_MD",
+        updated_at_ms: 1000,
+        versions: [
+          {
+            op_id: "01OP_MD",
+            hlc: "000000000001000-00000-dev_mac",
+            device_id: "dev_mac",
+            actor: "human",
+            is_display: true,
+            is_locked: false,
+            key_id: "01K1",
+            content: "# Mobile Read\n\n- [ ] readonly task\n- [x] done task\n\n![track](https://evil.example/track.gif)\n",
+            mnb1_b64: null,
+            mnw1_b64: null,
+            body_state: "ok",
+          },
+        ],
+      },
+      {
+        id: mmdId,
+        buffer_id: "01BUF1",
+        position: "b0",
+        lang: "mermaid",
+        public_hint: null,
+        state: "active",
+        is_locked: false,
+        has_unlocked_concurrent_version: false,
+        display_op_id: "01OP_MMD",
+        updated_at_ms: 1000,
+        versions: [
+          {
+            op_id: "01OP_MMD",
+            hlc: "000000000002000-00000-dev_mac",
+            device_id: "dev_mac",
+            actor: "human",
+            is_display: true,
+            is_locked: false,
+            key_id: "01K2",
+            content: "flowchart LR\n  Phone[iPhone] --> Safe[SVG]",
+            mnb1_b64: null,
+            mnw1_b64: null,
+            body_state: "ok",
+          },
+        ],
+      },
+      {
+        id: lockedMdId,
+        buffer_id: "01BUF1",
+        position: "c0",
+        lang: "markdown",
+        public_hint: "Vault MD",
+        state: "active",
+        is_locked: true,
+        has_unlocked_concurrent_version: false,
+        display_op_id: "01OP_T2",
+        updated_at_ms: 1000,
+        versions: [
+          {
+            op_id: "01OP_T2",
+            hlc: "000000000003000-00000-dev_mac",
+            device_id: "dev_mac",
+            actor: "human",
+            is_display: true,
+            is_locked: true,
+            key_id: "01K3",
+            content: null,
+            mnb1_b64: "AAA",
+            mnw1_b64: "BBB",
+            body_state: "locked",
+          },
+        ],
+      },
+    ];
+    let fakeLocked = false;
+    internals.vaultSession = {
+      isLocked: () => fakeLocked,
+      lockAndZeroize: () => {
+        fakeLocked = true;
+      },
+      free: () => {},
+    };
+    internals.unlockedPlaintext.set(lockedMdId, new Map([["01OP_T2", "# Vault Secret\n\nPWA_TIER2_SECRET_BODY"]]));
+    internals.render();
+    await new Promise((r) => setTimeout(r, 80));
+
+    // Markdown & Mermaid default to Preview mode
+    const mdCard = pwaRoot.querySelector<HTMLElement>(`[data-block-id="${mdId}"]`)!;
+    expect(mdCard.dataset.viewMode).toBe("preview");
+    expect(mdCard.querySelector(".md-preview h1")?.textContent).toBe("Mobile Read");
+    expect(mdCard.querySelectorAll("img").length).toBe(0);
+    expect(mdCard.querySelectorAll("textarea, [contenteditable]").length).toBe(0);
+    expect(mdCard.querySelector(`[data-testid="pwa-copy-rich-${mdId}"]`)).not.toBeNull();
+    const pwaBoxes = Array.from(mdCard.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'));
+    expect(pwaBoxes.length).toBe(2);
+    expect(pwaBoxes.every((cb) => cb.disabled)).toBe(true);
+
+    const mmdCard = pwaRoot.querySelector<HTMLElement>(`[data-block-id="${mmdId}"]`)!;
+    expect(mmdCard.dataset.viewMode).toBe("preview");
+    const pwaSvg = mmdCard.querySelector(".diagram-viewport svg");
+    expect(pwaSvg).not.toBeNull();
+    expect(pwaSvg?.getAttribute("style")).toBeNull();
+    expect(mmdCard.querySelector(".diagram-viewport")?.textContent).toContain("iPhone");
+
+    // Toggle Markdown block from Preview -> Source -> Preview
+    const toggleBtn = mdCard.querySelector<HTMLButtonElement>(`[data-testid="pwa-toggle-mode-${mdId}"]`)!;
+    expect(toggleBtn.textContent).toBe("Source");
+    toggleBtn.click();
+    const mdCardSource = pwaRoot.querySelector<HTMLElement>(`[data-block-id="${mdId}"]`)!;
+    expect(mdCardSource.dataset.viewMode).toBe("source");
+    expect(mdCardSource.querySelector(".ro-pre")?.textContent).toContain("# Mobile Read");
+    expect(mdCardSource.querySelector<HTMLButtonElement>(`[data-testid="pwa-toggle-mode-${mdId}"]`)?.textContent).toBe("Preview");
+
+    // SEC-08: Unlocked Tier 2 Markdown preview is wiped immediately on visibilitychange: hidden
+    expect(pwaRoot.textContent).toContain("PWA_TIER2_SECRET_BODY");
+    Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(pwaRoot.textContent).not.toContain("PWA_TIER2_SECRET_BODY");
+    expect(pwaRoot.querySelector(`[data-block-id="${lockedMdId}"] .ro-locked-body`)).not.toBeNull();
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+
+    pwa.destroy();
+    pwaRoot.remove();
   });
 });

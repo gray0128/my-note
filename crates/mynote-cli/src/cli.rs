@@ -315,6 +315,10 @@ pub enum BlockCommand {
         /// Revert to the latest version not authored by this actor
         #[arg(long, value_name = "ACTOR")]
         undo_actor: Option<String>,
+
+        /// Validate and preview the revert target without modifying the database
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Move a block into the recycle bin (soft delete only; recoverable via 'trash restore')

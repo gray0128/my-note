@@ -1026,6 +1026,11 @@ fn build_router(state: Arc<DaemonState>) -> Router {
         .route("/v1/local/blocks/{id}/resolve", post(handle_resolve_block))
         .route("/v1/local/blocks/{id}/history", get(handle_block_history))
         .route(
+            "/v1/local/blocks/{id}/history/{op_id}",
+            get(handle_block_history_op),
+        )
+        .route("/v1/local/blocks/{id}/revert", post(handle_revert_block))
+        .route(
             "/v1/local/blocks/{id}/tier1-leaf/{op_id}",
             get(handle_get_tier1_leaf_plaintext),
         )
@@ -1969,6 +1974,129 @@ async fn handle_block_history(
     }
 }
 
+async fn handle_block_history_op(
+    State(state): State<Arc<DaemonState>>,
+    AxumPath((id, op_id)): AxumPath<(String, String)>,
+) -> Response {
+    let res = state
+        .store
+        .lock()
+        .unwrap()
+        .get_block_history_op_for_daemon(&id, &op_id);
+    match res {
+        Ok(dto) => ok_json(dto),
+        Err(e) => core_err_to_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct RevertBlockBody {
+    to_op_id: Option<String>,
+    undo_actor: Option<String>,
+    expected_heads: Option<Vec<String>>,
+    // Tier 2 WASM-encrypted revert fields (Daemon NEVER sees plaintext or VKEK)
+    op_id: Option<String>,
+    key_id: Option<String>,
+    mnb1_b64: Option<String>,
+    mnw1_b64: Option<String>,
+}
+
+async fn handle_revert_block(
+    State(state): State<Arc<DaemonState>>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<RevertBlockBody>,
+) -> Response {
+    let res = {
+        let mut store = state.store.lock().unwrap();
+        let write = if let Some(mnb1_b64) = body.mnb1_b64.as_deref() {
+            (|| -> Result<mynote_store::WriteReceipt, CoreError> {
+                let heads = match &body.expected_heads {
+                    Some(h) if !h.is_empty() => h,
+                    _ => {
+                        return Err(CoreError::new(
+                            ErrorCode::InvalidArgument,
+                            "expected_heads is required for Tier 2 revert",
+                            "Pass current head_op_ids in expected_heads",
+                        ));
+                    }
+                };
+                let detail = store.get_block(&id)?;
+                if detail.has_conflict {
+                    return Err(CoreError::new(
+                        ErrorCode::ConflictPresent,
+                        format!("block '{id}' has multiple leaves; merge before reverting"),
+                        "Resolve concurrent versions before reverting",
+                    ));
+                }
+                let op_id = body.op_id.as_deref().ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::InvalidArgument,
+                        "op_id is required for Tier 2 revert",
+                        "Encrypt reverted plaintext via WasmVaultSession.encryptUpdate",
+                    )
+                })?;
+                let key_id = body.key_id.as_deref().ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::InvalidArgument,
+                        "key_id is required for Tier 2 revert",
+                        "Encrypt reverted plaintext via WasmVaultSession.encryptUpdate",
+                    )
+                })?;
+                let mnb1 = decode_b64_arg("mnb1_b64", mnb1_b64)?;
+                let mnw1 = body
+                    .mnw1_b64
+                    .as_deref()
+                    .map(|s| decode_b64_arg("mnw1_b64", s))
+                    .transpose()?;
+                store.update_tier2_block(
+                    &id,
+                    Tier2OpInput {
+                        op_id,
+                        key_id,
+                        mnb1: &mnb1,
+                        mnw1: mnw1.as_deref(),
+                    },
+                    heads,
+                    None,
+                    None,
+                    "human",
+                )
+            })()
+        } else {
+            (|| -> Result<mynote_store::WriteReceipt, CoreError> {
+                let resolved =
+                    store.resolve_revert_target(&id, body.to_op_id.as_deref(), body.undo_actor.as_deref())?;
+                if let Some(exp) = body.expected_heads.as_deref() {
+                    let exp_set: std::collections::BTreeSet<&String> = exp.iter().collect();
+                    let act_set: std::collections::BTreeSet<&String> =
+                        resolved.detail.head_op_ids.iter().collect();
+                    if exp_set != act_set {
+                        return Err(CoreError::new(
+                            ErrorCode::HeadMismatch,
+                            format!("block {id} heads changed concurrently"),
+                            "Refresh block state and retry revert",
+                        )
+                        .with_details(serde_json::json!({
+                            "expected_heads": exp,
+                            "actual_heads": resolved.detail.head_op_ids,
+                        })));
+                    }
+                }
+                store.revert_block(&id, &resolved.target.op_id, "human")
+            })()
+        };
+        write.and_then(|_| store.get_block_for_daemon(&id))
+    };
+    match res {
+        Ok(blk) => {
+            state.broadcast_block_upserted(&blk.id);
+            state.sync_notify.notify_one();
+            ok_json(blk)
+        }
+        Err(e) => core_err_to_response(e),
+    }
+}
+
 async fn handle_list_trash(State(state): State<Arc<DaemonState>>) -> Response {
     let res = state.store.lock().unwrap().list_trash();
     match res {
@@ -2441,10 +2569,42 @@ struct FormatBody {
     content: String,
     lang: String,
     action: Option<String>,
+    #[serde(default)]
+    block_id: Option<String>,
 }
 
-async fn handle_format(Json(body): Json<FormatBody>) -> Response {
-    match format_content(&body.content, &body.lang, body.action.as_deref()) {
+async fn handle_format(State(state): State<Arc<DaemonState>>, Json(body): Json<FormatBody>) -> Response {
+    if let Some(bid) = body.block_id.as_deref() {
+        let check = {
+            let store = state.store.lock().unwrap();
+            store.get_block_for_daemon(bid)
+        };
+        match check {
+            Ok(blk) if blk.is_locked => {
+                return core_err_to_response(CoreError::new(
+                    ErrorCode::BlockLocked,
+                    format!("block '{bid}' is locked; unlocked Tier 2 blocks must be formatted in WASM only"),
+                    "Format locked blocks via in-browser WASM Layer 1 formatter without invoking Daemon/Layer 2",
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => return core_err_to_response(e),
+        }
+    }
+    let content = body.content;
+    let lang = body.lang;
+    let action = body.action;
+    let formatted = tokio::task::spawn_blocking(move || format_content(&content, &lang, action.as_deref()))
+        .await
+        .map_err(|e| {
+            CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("formatter worker join error: {e}"),
+                "Retry formatting",
+            )
+        })
+        .and_then(|res| res);
+    match formatted {
         Ok(formatted) => ok_json(serde_json::json!({ "formatted": formatted })),
         Err(e) => core_err_to_response(e),
     }
@@ -2858,38 +3018,15 @@ fn execute_uds_apply(state: &Arc<DaemonState>, meta: ApplyMeta, req: ApplyReques
                 id,
                 to_op,
                 undo_actor,
-            } => {
-                let target_op = if let Some(op_s) = to_op {
-                    Ok(op_s)
-                } else if let Some(uactor) = undo_actor {
-                    store.block_history(&id, 500).and_then(|hist| {
-                        hist.into_iter()
-                            .find(|h| h.actor != uactor && h.content_available)
-                            .map(|h| h.op_id)
-                            .ok_or_else(|| {
-                                CoreError::new(
-                                    ErrorCode::NotFound,
-                                    format!("no prior version authored by someone other than '{uactor}'"),
-                                    "Inspect 'mynote block history <id> --json'",
-                                )
-                            })
+            } => store
+                .resolve_revert_target(&id, to_op.as_deref(), undo_actor.as_deref())
+                .and_then(|resolved| store.revert_block(&id, &resolved.target.op_id, &meta.actor))
+                .and_then(|r| {
+                    broadcast_block_up = Some(r.block_id.clone());
+                    serde_json::to_value(r).map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "encode receipt")
                     })
-                } else {
-                    Err(CoreError::new(
-                        ErrorCode::InvalidArgument,
-                        "provide either --to-op or --undo-actor",
-                        "Run 'mynote block revert --help'",
-                    ))
-                };
-                target_op
-                    .and_then(|op_s| store.revert_block(&id, &op_s, &meta.actor))
-                    .and_then(|r| {
-                        broadcast_block_up = Some(r.block_id.clone());
-                        serde_json::to_value(r).map_err(|e| {
-                            CoreError::new(ErrorCode::IntegrityError, e.to_string(), "encode receipt")
-                        })
-                    })
-            }
+                }),
             ApplyRequest::DeleteBlock {
                 id,
                 expected_heads,

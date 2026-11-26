@@ -136,7 +136,7 @@ pub struct BlockSummaryDto {
 
 #[path = "m2_vault_shred.rs"]
 mod m2_vault_shred;
-pub use m2_vault_shred::{BlockedTier2OpDto, Tier2OpInput, VaultHeaderDto};
+pub use m2_vault_shred::{BlockHistoryContentDto, BlockedTier2OpDto, Tier2OpInput, VaultHeaderDto};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockVersionDto {
@@ -203,7 +203,32 @@ pub struct HistoryEntryDto {
     pub device_id: String,
     pub actor: String,
     pub content_available: bool,
+    pub has_content: bool,
+    pub is_locked: bool,
+    pub shredded: bool,
+    pub key_id: Option<String>,
     pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedRevertTarget {
+    pub detail: BlockDetailDto,
+    pub target: HistoryEntryDto,
+    pub skipped_actor_ops: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RevertPreviewDto {
+    pub dry_run: bool,
+    pub block_id: String,
+    pub current_head_op_id: Option<String>,
+    pub target_op_id: String,
+    pub target_actor: String,
+    pub target_hlc: String,
+    pub target_op_type: String,
+    pub skipped_actor_ops: usize,
+    pub is_locked: bool,
+    pub preview: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -278,6 +303,18 @@ pub struct LocalStore {
     smks: BTreeMap<SmkKid, Zeroizing<[u8; 32]>>,
     /// Present ONLY on the very first initialization call so CLI/UI can show it once.
     pub initial_recovery_words: Option<String>,
+}
+
+pub(super) fn op_type_str(op_type: OpType) -> &'static str {
+    match op_type {
+        OpType::Create => "CREATE",
+        OpType::Update => "UPDATE",
+        OpType::SetMeta => "SET_META",
+        OpType::Lock => "LOCK",
+        OpType::Unlock => "UNLOCK",
+        OpType::Resolve => "RESOLVE",
+        OpType::Delete => "DELETE",
+    }
 }
 
 fn now_ms() -> u64 {
@@ -2886,7 +2923,7 @@ impl LocalStore {
 
     pub fn block_history(&self, block_id_str: &str, limit: usize) -> Result<Vec<HistoryEntryDto>, CoreError> {
         let blk_id = BlockId::parse(block_id_str)?;
-        let decoded = self.load_entity_decoded_ops(EntityType::Block, &blk_id.to_string())?;
+        let mut decoded = self.load_entity_decoded_ops(EntityType::Block, &blk_id.to_string())?;
         if decoded.is_empty() {
             return Err(CoreError::new(
                 ErrorCode::NotFound,
@@ -2894,26 +2931,192 @@ impl LocalStore {
                 "Check block ID",
             ));
         }
+        decoded.sort_by(|a, b| {
+            (b.inner.hlc.canonical_string(), b.op_id).cmp(&(a.inner.hlc.canonical_string(), a.op_id))
+        });
         let kt = self.load_key_table()?;
-        let mut out: Vec<HistoryEntryDto> = decoded
+        let out: Vec<HistoryEntryDto> = decoded
             .into_iter()
-            .rev()
             .take(limit)
             .map(|d| {
-                let avail = d.inner.key_id().is_none_or(|k| kt.is_key_available(&k));
+                let (has_content, is_locked, key_id_opt) = match &d.inner.body {
+                    OpBodyV1::BlockContent { tier, key_id, .. } => (true, *tier == 2, Some(*key_id)),
+                    _ => (false, false, d.inner.key_id()),
+                };
+                let shredded = key_id_opt.is_some_and(|k| kt.is_shredded(&k) || self.is_key_executed(&k));
+                let content_available =
+                    has_content && !shredded && key_id_opt.is_some_and(|k| kt.is_key_available(&k));
                 HistoryEntryDto {
                     op_id: d.op_id.to_string(),
-                    op_type: format!("{:?}", d.inner.op_type).to_uppercase(),
+                    op_type: op_type_str(d.inner.op_type).to_string(),
                     hlc: d.inner.hlc.canonical_string(),
                     device_id: d.device_id.to_string(),
                     actor: d.inner.actor,
-                    content_available: avail,
+                    content_available,
+                    has_content,
+                    is_locked,
+                    shredded,
+                    key_id: key_id_opt.map(|k| k.to_string()),
                     created_at_ms: d.created_at_ms,
                 }
             })
             .collect();
-        out.sort_by(|a, b| (&b.hlc, &b.op_id).cmp(&(&a.hlc, &a.op_id)));
         Ok(out)
+    }
+
+    /// Resolve a revert target op (by explicit `to_op` or `undo_actor`) while enforcing single-leaf
+    /// conflict refusal (`CONFLICT_PRESENT`) and strict fail-closed handling of shredded targets
+    /// (`KEY_SHREDDED` — never skipping past a shredded predecessor).
+    pub fn resolve_revert_target(
+        &self,
+        block_id_str: &str,
+        to_op: Option<&str>,
+        undo_actor: Option<&str>,
+    ) -> Result<ResolvedRevertTarget, CoreError> {
+        if to_op.is_none() && undo_actor.is_none() {
+            return Err(CoreError::new(
+                ErrorCode::InvalidArgument,
+                "specify either --to-op <op_id> or --undo-actor <actor>",
+                format!("Run 'mynote block history {block_id_str} --json' to list historical ops"),
+            ));
+        }
+        if to_op.is_some() && undo_actor.is_some() {
+            return Err(CoreError::new(
+                ErrorCode::InvalidArgument,
+                "specify either --to-op or --undo-actor, not both",
+                "Pass only one revert selector",
+            ));
+        }
+        let detail = self.get_block(block_id_str)?;
+        if detail.has_conflict {
+            return Err(CoreError::new(
+                ErrorCode::ConflictPresent,
+                format!("block '{block_id_str}' has multiple leaves; merge before reverting"),
+                format!("Run 'mynote block get {block_id_str} --json' first"),
+            ));
+        }
+        let history = self.block_history(block_id_str, usize::MAX)?;
+        let (target, skipped_actor_ops) = if let Some(op_s) = to_op {
+            let target_op_id = OpId::parse(op_s)?;
+            let target_str = target_op_id.to_string();
+            let entry = history
+                .into_iter()
+                .find(|e| e.op_id == target_str)
+                .ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::NotFound,
+                        format!("op '{op_s}' not found in block '{block_id_str}'"),
+                        format!("Run 'mynote block history {block_id_str} --json'"),
+                    )
+                })?;
+            if !entry.has_content {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("op '{op_s}' has no block content (op_type={})", entry.op_type),
+                    "Choose a CREATE, UPDATE, LOCK, UNLOCK, or RESOLVE op_id",
+                ));
+            }
+            if entry.shredded {
+                return Err(CoreError::new(
+                    ErrorCode::KeyShredded,
+                    format!("op '{op_s}' cannot be restored because its key was permanently shredded"),
+                    "Shredded historical versions cannot be recovered",
+                ));
+            }
+            if !entry.content_available {
+                return Err(CoreError::new(
+                    ErrorCode::KeyMissing,
+                    format!("key for op '{op_s}' is not available locally"),
+                    "Run 'mynote sync pull' or 'mynote keyring unlock'",
+                ));
+            }
+            (entry, 0usize)
+        } else {
+            let bad_actor = undo_actor.expect("checked above");
+            let mut skipped_actor_ops = 0usize;
+            let mut found: Option<HistoryEntryDto> = None;
+            for entry in history {
+                if !entry.has_content {
+                    continue;
+                }
+                if entry.actor == bad_actor {
+                    skipped_actor_ops += 1;
+                    continue;
+                }
+                found = Some(entry);
+                break;
+            }
+            let entry = found.ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::NotFound,
+                    format!("no earlier version authored outside actor '{bad_actor}'"),
+                    format!("Run 'mynote block history {block_id_str} --json' to pick an op_id explicitly"),
+                )
+            })?;
+            if entry.shredded {
+                return Err(CoreError::new(
+                    ErrorCode::KeyShredded,
+                    format!(
+                        "target version '{}' (actor '{}') cannot be restored because its key was permanently shredded",
+                        entry.op_id, entry.actor
+                    ),
+                    "Shredded historical versions cannot be recovered",
+                ));
+            }
+            if !entry.content_available {
+                return Err(CoreError::new(
+                    ErrorCode::KeyMissing,
+                    format!(
+                        "key for target version '{}' is not available locally",
+                        entry.op_id
+                    ),
+                    "Run 'mynote sync pull' or 'mynote keyring unlock'",
+                ));
+            }
+            (entry, skipped_actor_ops)
+        };
+
+        Ok(ResolvedRevertTarget {
+            detail,
+            target,
+            skipped_actor_ops,
+        })
+    }
+
+    /// Preview a revert operation without mutating SQLite (`--dry-run`).
+    /// Never exposes plaintext for locked blocks or Tier 2 historical versions (`SEC-03`).
+    pub fn preview_revert_block(
+        &self,
+        block_id_str: &str,
+        to_op: Option<&str>,
+        undo_actor: Option<&str>,
+    ) -> Result<RevertPreviewDto, CoreError> {
+        let resolved = self.resolve_revert_target(block_id_str, to_op, undo_actor)?;
+        let is_locked = resolved.target.is_locked || resolved.detail.is_locked;
+        let preview = if is_locked {
+            None
+        } else {
+            let hist_op = self.get_block_history_op_for_daemon(block_id_str, &resolved.target.op_id)?;
+            hist_op.content.map(|pt| truncate_preview(&pt, 240))
+        };
+        let current_head_op_id = resolved
+            .detail
+            .display_op_id
+            .clone()
+            .or_else(|| resolved.detail.head_op_ids.first().cloned());
+
+        Ok(RevertPreviewDto {
+            dry_run: true,
+            block_id: resolved.detail.id,
+            current_head_op_id,
+            target_op_id: resolved.target.op_id,
+            target_actor: resolved.target.actor,
+            target_hlc: resolved.target.hlc,
+            target_op_type: resolved.target.op_type,
+            skipped_actor_ops: resolved.skipped_actor_ops,
+            is_locked,
+            preview,
+        })
     }
 
     pub fn revert_block(
@@ -2941,20 +3144,10 @@ impl LocalStore {
                 format!("Run 'mynote block history {block_id_str} --json'"),
             )
         })?;
-        let (key_id, mnb1) = match &target.inner.body {
+        let (tier, key_id, mnb1) = match &target.inner.body {
             OpBodyV1::BlockContent {
-                key_id,
-                mnb1,
-                tier: 1,
-                ..
-            } => (*key_id, mnb1.as_slice()),
-            OpBodyV1::BlockContent { tier: 2, .. } => {
-                return Err(CoreError::new(
-                    ErrorCode::BlockLocked,
-                    "cannot revert locked op without Vault unlock",
-                    "Unlock in UI",
-                ));
-            }
+                tier, key_id, mnb1, ..
+            } => (*tier, *key_id, mnb1.as_slice()),
             _ => {
                 return Err(CoreError::new(
                     ErrorCode::InvalidArgument,
@@ -2963,6 +3156,27 @@ impl LocalStore {
                 ));
             }
         };
+        if self.is_key_executed(&key_id) {
+            return Err(CoreError::new(
+                ErrorCode::KeyShredded,
+                format!("key {key_id} for op '{to_op_id_str}' has been permanently shredded"),
+                "Shredded historical versions cannot be recovered",
+            ));
+        }
+        if tier == 2 {
+            return Err(CoreError::new(
+                ErrorCode::BlockLocked,
+                "cannot revert locked op without Vault unlock",
+                "Unlock in UI",
+            ));
+        }
+        if tier != 1 {
+            return Err(CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("unsupported block content tier {tier} in op '{to_op_id_str}'"),
+                "Inspect block history or restore from backup",
+            ));
+        }
         let bdek = self.unwrap_tier1_bdek(key_id)?;
         let pt = decrypt_mnb1(blk_id.as_bytes(), target_op_id, key_id, &bdek, mnb1)?;
         self.update_block(block_id_str, &pt, &detail.head_op_ids, false, actor)

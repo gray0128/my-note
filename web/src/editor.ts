@@ -3,12 +3,30 @@ import { EditorView, keymap } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { loadLangExtension, loadVimExtension, SUPPORTED_LANGS } from "./langs";
+import { mountDiagramWidget, type DiagramWidgetHandle } from "./render/diagram";
+import { mountMarkdownPreview, type MountedMarkdownPreview } from "./render/markdown";
 import type { BlockDto } from "./types";
 import { detectSecretPatternFast } from "./wasm/desktop";
 
 const REMOTE_SYNC_ANN = Annotation.define<boolean>();
 const INITIAL_MOUNT_WINDOW = 20;
 const LARGE_BLOCK_BYTES = 64 * 1024;
+const SPLIT_PREVIEW_DEBOUNCE_MS = 150;
+
+export type BlockViewMode = "source" | "preview" | "split";
+
+function isMarkdownLang(lang: string): boolean {
+  const norm = lang.toLowerCase();
+  return norm === "markdown" || norm === "md";
+}
+
+function isMermaidLang(lang: string): boolean {
+  return lang.toLowerCase() === "mermaid";
+}
+
+function isRenderableLang(lang: string): boolean {
+  return isMarkdownLang(lang) || isMermaidLang(lang);
+}
 
 export type SaveContentResult =
   | { status: "ok"; updated: BlockDto }
@@ -34,9 +52,16 @@ export interface BlockEditorCallbacks {
   onLockBlock?(block: BlockDto): Promise<void>;
   onUnlockBlockToTier1?(block: BlockDto): Promise<void>;
   onPurgeHistory?(block: BlockDto): Promise<void>;
+  onOpenHistory?(block: BlockDto): void;
+  onCopyRich?(block: BlockDto, html: string, text: string): Promise<void>;
+  onFeedback?(msg: string, isError?: boolean): void;
   onSecretPasted?(block: BlockDto, secretType: string): void;
   onVaultActivity?(): void;
 }
+
+type MountedPreview =
+  | { kind: "markdown"; handle: MountedMarkdownPreview; lastSource: string }
+  | { kind: "mermaid"; handle: DiagramWidgetHandle; lastSource: string };
 
 interface MountedEditor {
   view: EditorView;
@@ -69,6 +94,9 @@ export class BlockStreamController {
   private savingPromises = new Map<string, Promise<void>>();
   private pendingResave = new Map<string, { fastSync: boolean; isMerge: boolean; keepalive?: boolean }>();
   private saveTimers = new Map<string, number>();
+  private viewModes = new Map<string, BlockViewMode>();
+  private previewMounts = new Map<string, MountedPreview>();
+  private splitPreviewTimers = new Map<string, number>();
   private unlockedPlaintext = new Map<string, string>();
   private unlockedLeafPlaintext = new Map<string, Map<string, string>>();
   private vaultLockEpoch = 0;
@@ -87,7 +115,7 @@ export class BlockStreamController {
             const blk = this.blocks.find((b) => b.id === id);
             if (!blk) continue;
             if (entry.isIntersecting) {
-              if (this.isEditable(blk) && !this.mounted.has(id)) {
+              if (this.isEditable(blk) && !this.mounted.has(id) && this.getBlockViewMode(id) !== "preview") {
                 this.mountEditorForBlock(blk);
               }
             } else if (
@@ -150,12 +178,14 @@ export class BlockStreamController {
     }
   }
 
-  /** Immediately wipe all transient Tier 2 plaintext from RAM, destroy Tier 2 CM6 views, and restore locked cards (`SEC-03`). */
+  /** Immediately wipe all transient Tier 2 plaintext from RAM, destroy Tier 2 CM6 views & previews, and restore locked cards (`SEC-03`). */
   clearUnlockedVaultPlaintext(): void {
     this.vaultLockEpoch++;
     const lockedIds = new Set(this.blocks.filter((b) => b.is_locked).map((b) => b.id));
     for (const id of [...this.unlockedPlaintext.keys(), ...lockedIds]) {
       this.clearTimer(id);
+      this.clearSplitPreviewTimer(id);
+      this.destroyPreviewForBlock(id);
       this.dirty.delete(id);
       this.pendingResave.delete(id);
       const m = this.mounted.get(id);
@@ -166,12 +196,65 @@ export class BlockStreamController {
       const card = this.cards.get(id);
       if (card) {
         const host = card.querySelector<HTMLElement>(".block-editor-host");
-        if (host) host.textContent = "";
+        if (host) host.replaceChildren();
+        const previewHost = card.querySelector<HTMLElement>(".block-preview-host");
+        if (previewHost) previewHost.replaceChildren();
       }
     }
     this.unlockedPlaintext.clear();
     this.unlockedLeafPlaintext.clear();
     this.syncDomAndEditors();
+  }
+
+  getBlockViewMode(id: string): BlockViewMode {
+    const blk = this.blocks.find((b) => b.id === id);
+    if (!blk || !isRenderableLang(blk.lang) || !this.isEditable(blk)) {
+      return "source";
+    }
+    return this.viewModes.get(id) ?? "source";
+  }
+
+  canTogglePreview(id: string): boolean {
+    const blk = this.blocks.find((b) => b.id === id);
+    return Boolean(blk && this.isEditable(blk) && isRenderableLang(blk.lang));
+  }
+
+  setBlockViewMode(id: string, mode: BlockViewMode, opts: { focusEditor?: boolean } = {}): void {
+    const blk = this.blocks.find((b) => b.id === id);
+    if (!blk || !this.isEditable(blk) || !isRenderableLang(blk.lang)) {
+      this.viewModes.delete(id);
+      return;
+    }
+    const prevMode = this.getBlockViewMode(id);
+    if (mode === "source") {
+      this.viewModes.delete(id);
+    } else {
+      this.viewModes.set(id, mode);
+    }
+    if (prevMode !== "preview" && mode === "preview") {
+      const entry = this.dirty.get(id);
+      if (entry && !entry.mismatch && !blk.has_conflict) {
+        void this.flushDirtyBlock(id, { fastSync: true, isMerge: false });
+      }
+    }
+    this.setActive(id);
+    const card = this.cards.get(id);
+    if (card) {
+      this.applyViewModeLayout(card, blk);
+      this.syncCardHeaderControls(card, blk);
+    }
+    if (opts.focusEditor && mode !== "preview") {
+      const m = this.mounted.get(id);
+      m?.view.focus();
+    }
+  }
+
+  toggleBlockSourcePreview(id: string): boolean {
+    if (!this.canTogglePreview(id)) return false;
+    const curMode = this.getBlockViewMode(id);
+    const nextMode: BlockViewMode = curMode === "source" ? "preview" : "source";
+    this.setBlockViewMode(id, nextMode, { focusEditor: nextMode === "source" });
+    return true;
   }
 
   getBlocks(): BlockDto[] {
@@ -244,6 +327,15 @@ export class BlockStreamController {
     for (const id of [...this.saveTimers.keys()]) {
       if (!nextIds.has(id)) this.clearTimer(id);
     }
+    for (const id of [...this.splitPreviewTimers.keys()]) {
+      if (!nextIds.has(id)) this.clearSplitPreviewTimer(id);
+    }
+    for (const id of [...this.previewMounts.keys()]) {
+      if (!nextIds.has(id)) this.destroyPreviewForBlock(id);
+    }
+    for (const id of [...this.viewModes.keys()]) {
+      if (!nextIds.has(id)) this.viewModes.delete(id);
+    }
     for (const id of [...this.dirty.keys()]) {
       if (!nextIds.has(id)) this.dirty.delete(id);
     }
@@ -280,6 +372,9 @@ export class BlockStreamController {
     }
     for (const id of delSet) {
       this.clearTimer(id);
+      this.clearSplitPreviewTimer(id);
+      this.destroyPreviewForBlock(id);
+      this.viewModes.delete(id);
       this.dirty.delete(id);
       this.pendingResave.delete(id);
       if (this.activeBlockId === id) this.activeBlockId = null;
@@ -292,6 +387,9 @@ export class BlockStreamController {
   focusBlock(id: string, pos = 0): void {
     const blk = this.blocks.find((b) => b.id === id);
     if (!blk || !this.isEditable(blk)) return;
+    if (this.getBlockViewMode(id) === "preview") {
+      this.setBlockViewMode(id, "source");
+    }
     if (!this.mounted.has(id)) this.mountEditorForBlock(blk);
     const m = this.mounted.get(id);
     if (!m) return;
@@ -305,6 +403,9 @@ export class BlockStreamController {
   highlightBlockMatch(id: string, from: number, to: number): void {
     const blk = this.blocks.find((b) => b.id === id);
     if (!blk || !this.isEditable(blk)) return;
+    if (this.getBlockViewMode(id) === "preview") {
+      this.setBlockViewMode(id, "source");
+    }
     if (!this.mounted.has(id)) this.mountEditorForBlock(blk);
     const m = this.mounted.get(id);
     if (!m) return;
@@ -499,8 +600,12 @@ export class BlockStreamController {
   destroy(): void {
     this.observer?.disconnect();
     for (const id of [...this.saveTimers.keys()]) this.clearTimer(id);
+    for (const id of [...this.splitPreviewTimers.keys()]) this.clearSplitPreviewTimer(id);
+    for (const id of [...this.previewMounts.keys()]) this.destroyPreviewForBlock(id);
     for (const m of this.mounted.values()) m.view.destroy();
     this.mounted.clear();
+    this.previewMounts.clear();
+    this.viewModes.clear();
     this.cards.clear();
     this.dirty.clear();
     this.saving.clear();
@@ -513,6 +618,44 @@ export class BlockStreamController {
       window.clearTimeout(t);
       this.saveTimers.delete(id);
     }
+  }
+
+  private clearSplitPreviewTimer(id: string): void {
+    const t = this.splitPreviewTimers.get(id);
+    if (t !== undefined) {
+      window.clearTimeout(t);
+      this.splitPreviewTimers.delete(id);
+    }
+  }
+
+  private destroyPreviewForBlock(id: string): void {
+    this.clearSplitPreviewTimer(id);
+    const prev = this.previewMounts.get(id);
+    if (prev) {
+      prev.handle.destroy();
+      this.previewMounts.delete(id);
+    }
+    const card = this.cards.get(id);
+    const previewHost = card?.querySelector<HTMLElement>(".block-preview-host");
+    if (previewHost) {
+      previewHost.replaceChildren();
+    }
+  }
+
+  private scheduleSplitPreviewUpdate(id: string): void {
+    this.clearSplitPreviewTimer(id);
+    this.splitPreviewTimers.set(
+      id,
+      window.setTimeout(() => {
+        this.splitPreviewTimers.delete(id);
+        const blk = this.blocks.find((b) => b.id === id);
+        const card = this.cards.get(id);
+        if (!blk || !card) return;
+        if (this.getBlockViewMode(id) === "split") {
+          this.syncPreviewForBlock(card, blk);
+        }
+      }, SPLIT_PREVIEW_DEBOUNCE_MS),
+    );
   }
 
   private setActive(id: string | null): void {
@@ -596,6 +739,7 @@ export class BlockStreamController {
 
   private renderStream(): void {
     this.observer?.disconnect();
+    for (const id of [...this.previewMounts.keys()]) this.destroyPreviewForBlock(id);
     for (const m of this.mounted.values()) m.view.destroy();
     this.mounted.clear();
     this.cards.clear();
@@ -610,13 +754,21 @@ export class BlockStreamController {
     }
 
     this.blocks.forEach((block, index) => {
+      if (!isRenderableLang(block.lang)) {
+        this.viewModes.delete(block.id);
+      }
       const card = this.buildCard(block);
       this.cards.set(block.id, card);
       this.container.appendChild(card);
       this.observer?.observe(card);
 
-      if (this.isEditable(block) && (index < INITIAL_MOUNT_WINDOW || block.id === this.activeBlockId || this.dirty.has(block.id))) {
-        this.mountEditorForBlock(block);
+      const mode = this.getBlockViewMode(block.id);
+      if (this.isEditable(block)) {
+        if (mode === "preview" || mode === "split") {
+          this.applyViewModeLayout(card, block);
+        } else if (index < INITIAL_MOUNT_WINDOW || block.id === this.activeBlockId || this.dirty.has(block.id)) {
+          this.mountEditorForBlock(block);
+        }
       }
       if (this.dirty.get(block.id)?.mismatch) {
         this.renderMismatchNotice(block.id, true);
@@ -640,6 +792,8 @@ export class BlockStreamController {
     for (const [id, card] of [...this.cards.entries()]) {
       if (!desiredIds.has(id)) {
         this.observer?.unobserve(card);
+        this.destroyPreviewForBlock(id);
+        this.viewModes.delete(id);
         const m = this.mounted.get(id);
         if (m) {
           m.view.destroy();
@@ -653,6 +807,9 @@ export class BlockStreamController {
     this.blocks.forEach((b, index) => {
       let card = this.cards.get(b.id);
       const desiredEditable = this.isEditable(b);
+      if (!isRenderableLang(b.lang) && this.viewModes.has(b.id)) {
+        this.viewModes.delete(b.id);
+      }
       const modeChanged =
         !card ||
         card.dataset.locked !== String(b.is_locked) ||
@@ -661,6 +818,7 @@ export class BlockStreamController {
       if (modeChanged) {
         if (card) {
           this.observer?.unobserve(card);
+          this.destroyPreviewForBlock(b.id);
           const oldMounted = this.mounted.get(b.id);
           if (oldMounted) {
             oldMounted.view.destroy();
@@ -678,8 +836,13 @@ export class BlockStreamController {
         this.container.insertBefore(card!, currentChild ?? null);
       }
 
-      if (modeChanged && desiredEditable && (index < INITIAL_MOUNT_WINDOW || b.id === this.activeBlockId || this.dirty.has(b.id))) {
-        this.mountEditorForBlock(b);
+      const viewMode = this.getBlockViewMode(b.id);
+      if (modeChanged && desiredEditable) {
+        if (viewMode === "preview" || viewMode === "split") {
+          this.applyViewModeLayout(card!, b);
+        } else if (index < INITIAL_MOUNT_WINDOW || b.id === this.activeBlockId || this.dirty.has(b.id)) {
+          this.mountEditorForBlock(b);
+        }
       }
 
       card!.classList.toggle("has-conflict", b.has_conflict);
@@ -688,6 +851,8 @@ export class BlockStreamController {
 
       const sel = card!.querySelector<HTMLSelectElement>(".lang-select");
       if (sel && sel.value !== b.lang) sel.value = b.lang;
+
+      this.syncCardHeaderControls(card!, b);
 
       const m = this.mounted.get(b.id);
       const effContent = this.getEffectiveContent(b);
@@ -710,9 +875,13 @@ export class BlockStreamController {
             }
           });
         }
-      } else if (desiredEditable) {
+      } else if (desiredEditable && viewMode === "source") {
         const pre = card!.querySelector<HTMLElement>(".block-placeholder");
         if (pre && !this.dirty.has(b.id) && effContent !== null) pre.textContent = effContent;
+      }
+
+      if (desiredEditable) {
+        this.applyViewModeLayout(card!, b);
       }
 
       this.renderConflictSection(card!, b);
@@ -757,6 +926,12 @@ export class BlockStreamController {
     });
     left.appendChild(select);
 
+    const modeControls = document.createElement("div");
+    modeControls.className = "mode-seg";
+    modeControls.setAttribute("role", "group");
+    modeControls.setAttribute("aria-label", "Block view mode");
+    left.appendChild(modeControls);
+
     if (block.is_locked) {
       const vBadge = document.createElement("span");
       vBadge.className = `vault-badge${editable ? " unlocked" : ""}`;
@@ -791,6 +966,10 @@ export class BlockStreamController {
       btn.addEventListener("click", onClick);
       return btn;
     };
+
+    const copyRichSlot = document.createElement("span");
+    copyRichSlot.className = "copy-rich-slot";
+    right.appendChild(copyRichSlot);
 
     if (editable) {
       right.appendChild(
@@ -828,6 +1007,21 @@ export class BlockStreamController {
           }),
         );
       }
+    }
+    if (this.cb.onOpenHistory) {
+      const histBtn = mkBtn(
+        "History",
+        block.is_locked && !editable
+          ? "Unlock Vault to inspect Tier 2 block history"
+          : "View version history & revert",
+        "",
+        () => {
+          const cur = this.blocks.find((x) => x.id === block.id);
+          if (cur) this.cb.onOpenHistory?.(cur);
+        },
+      );
+      histBtn.dataset.testid = `history-btn-${block.id}`;
+      right.appendChild(histBtn);
     }
     right.appendChild(
       mkBtn("↑", "Move block up", "", () => {
@@ -881,6 +1075,8 @@ export class BlockStreamController {
         "⚠ Block content unavailable (missing encryption key or decryption failed) — read-only until keys sync or keyring is unlocked.";
       card.appendChild(unreadable);
     } else {
+      const body = document.createElement("div");
+      body.className = "block-body";
       const host = document.createElement("div");
       host.className = "block-editor-host";
       const pre = document.createElement("pre");
@@ -894,8 +1090,20 @@ export class BlockStreamController {
         }
       });
       host.appendChild(pre);
-      card.appendChild(host);
+
+      const previewHost = document.createElement("div");
+      previewHost.className = "block-preview-host hidden";
+      previewHost.addEventListener("click", () => {
+        this.setActive(block.id);
+        const cur = this.blocks.find((x) => x.id === block.id);
+        if (cur?.is_locked) this.cb.onVaultActivity?.();
+      });
+
+      body.append(host, previewHost);
+      card.appendChild(body);
     }
+
+    this.syncCardHeaderControls(card, block);
 
     const mismatchSlot = document.createElement("div");
     mismatchSlot.className = "mismatch-slot";
@@ -1043,6 +1251,12 @@ export class BlockStreamController {
           return true;
         },
       },
+      {
+        key: "Mod-e",
+        run: () => {
+          return this.toggleBlockSourcePreview(block.id);
+        },
+      },
     ]);
 
     const cspNonce = document.querySelector<HTMLMetaElement>('meta[name="csp-nonce"]')?.content ?? "";
@@ -1083,6 +1297,9 @@ export class BlockStreamController {
           const mismatch = prevDirty?.mismatch ?? false;
           this.dirty.set(block.id, { text, baseHeads, mismatch });
           this.updateDirtyBadge(block.id, true, mismatch ? "● conflict (unsaved draft)" : "● unsaved");
+          if (this.getBlockViewMode(block.id) === "split") {
+            this.scheduleSplitPreviewUpdate(block.id);
+          }
           const isPaste = u.transactions.some((tr) => tr.isUserEvent("input.paste"));
           if (isPaste && cur && !cur.is_locked && this.cb.onSecretPasted) {
             let pasted = "";
@@ -1129,5 +1346,205 @@ export class BlockStreamController {
         }
       });
     }
+  }
+
+  private syncCardHeaderControls(card: HTMLElement, block: BlockDto): void {
+    const editable = this.isEditable(block);
+    const renderable = editable && isRenderableLang(block.lang);
+    const mode = this.getBlockViewMode(block.id);
+
+    const seg = card.querySelector<HTMLElement>(".mode-seg");
+    if (seg) {
+      if (!renderable) {
+        seg.replaceChildren();
+        seg.classList.add("hidden");
+      } else {
+        seg.classList.remove("hidden");
+        const existingBtns = seg.querySelectorAll<HTMLButtonElement>("button");
+        if (existingBtns.length === 3) {
+          const modes: BlockViewMode[] = ["source", "preview", "split"];
+          existingBtns.forEach((btn, i) => {
+            btn.setAttribute("aria-pressed", String(mode === modes[i]));
+          });
+        } else {
+          seg.replaceChildren();
+          const items: Array<{ key: BlockViewMode; label: string; title: string }> = [
+            { key: "source", label: "Source", title: "Source view (Cmd/Ctrl+E)" },
+            { key: "preview", label: "Preview", title: "Preview view (Cmd/Ctrl+E)" },
+            { key: "split", label: "Split", title: "Split source & live preview" },
+          ];
+          for (const item of items) {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "btn btn-icon mode-seg-btn";
+            btn.textContent = item.label;
+            btn.title = item.title;
+            btn.dataset.testid = `mode-${item.key}-${block.id}`;
+            btn.setAttribute("aria-pressed", String(mode === item.key));
+            btn.addEventListener("mousedown", (ev) => ev.preventDefault());
+            btn.addEventListener("click", () => {
+              this.setBlockViewMode(block.id, item.key, { focusEditor: item.key === "source" });
+            });
+            seg.appendChild(btn);
+          }
+        }
+      }
+    }
+
+    const richSlot = card.querySelector<HTMLElement>(".copy-rich-slot");
+    if (richSlot) {
+      const showCopyRich = editable && isMarkdownLang(block.lang) && mode !== "source";
+      if (!showCopyRich) {
+        richSlot.replaceChildren();
+      } else if (richSlot.childElementCount === 0) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn btn-icon";
+        btn.textContent = "Copy Rich";
+        btn.title = "Copy clean semantic HTML + plain text";
+        btn.dataset.testid = `copy-rich-${block.id}`;
+        btn.addEventListener("mousedown", (ev) => ev.preventDefault());
+        btn.addEventListener("click", () => {
+          const cur = this.blocks.find((x) => x.id === block.id);
+          const mounted = this.previewMounts.get(block.id);
+          if (!cur || !mounted || mounted.kind !== "markdown") return;
+          const { html, text } = mounted.handle.getCleanCopyPayload();
+          void this.cb.onCopyRich?.(cur, html, text);
+        });
+        richSlot.appendChild(btn);
+      }
+    }
+  }
+
+  private applyViewModeLayout(card: HTMLElement, block: BlockDto): void {
+    const body = card.querySelector<HTMLElement>(".block-body");
+    const editorHost = card.querySelector<HTMLElement>(".block-editor-host");
+    const previewHost = card.querySelector<HTMLElement>(".block-preview-host");
+    if (!body || !editorHost || !previewHost) return;
+
+    const editable = this.isEditable(block);
+    const renderable = editable && isRenderableLang(block.lang);
+    const mode: BlockViewMode = renderable ? this.getBlockViewMode(block.id) : "source";
+    card.dataset.viewMode = mode;
+
+    if (mode === "source") {
+      body.classList.remove("block-split-body");
+      editorHost.classList.remove("hidden");
+      previewHost.classList.add("hidden");
+      this.destroyPreviewForBlock(block.id);
+      if (editable && !this.mounted.has(block.id)) {
+        const idx = this.blocks.findIndex((x) => x.id === block.id);
+        if (idx >= 0 && (idx < INITIAL_MOUNT_WINDOW || block.id === this.activeBlockId || this.dirty.has(block.id))) {
+          this.mountEditorForBlock(block);
+        } else if (editorHost.childElementCount === 0) {
+          const pre = document.createElement("pre");
+          pre.className = "block-placeholder";
+          pre.textContent = this.dirty.get(block.id)?.text ?? this.getEffectiveContent(block) ?? "";
+          pre.addEventListener("click", () => {
+            const cur = this.blocks.find((x) => x.id === block.id);
+            if (cur && this.isEditable(cur)) {
+              this.mountEditorForBlock(cur);
+              this.focusBlock(cur.id);
+            }
+          });
+          editorHost.appendChild(pre);
+        }
+      }
+      return;
+    }
+
+    if (mode === "preview") {
+      body.classList.remove("block-split-body");
+      const m = this.mounted.get(block.id);
+      if (m) {
+        m.view.destroy();
+        this.mounted.delete(block.id);
+      }
+      editorHost.replaceChildren();
+      editorHost.classList.add("hidden");
+      previewHost.classList.remove("hidden");
+      this.syncPreviewForBlock(card, block);
+      return;
+    }
+
+    // mode === "split"
+    body.classList.add("block-split-body");
+    editorHost.classList.remove("hidden");
+    previewHost.classList.remove("hidden");
+    if (editable && !this.mounted.has(block.id)) {
+      this.mountEditorForBlock(block);
+    }
+    this.syncPreviewForBlock(card, block);
+  }
+
+  private syncPreviewForBlock(card: HTMLElement, block: BlockDto, forceRemount = false): void {
+    const previewHost = card.querySelector<HTMLElement>(".block-preview-host");
+    if (!previewHost || !this.isEditable(block) || !isRenderableLang(block.lang)) return;
+
+    const kind: "markdown" | "mermaid" = isMermaidLang(block.lang) ? "mermaid" : "markdown";
+    const text = this.getBlockDraftContent(block.id);
+    const existing = this.previewMounts.get(block.id);
+
+    if (existing && existing.kind === kind && !forceRemount) {
+      if (existing.lastSource === text) return;
+      if (existing.kind === "mermaid") {
+        existing.lastSource = text;
+        void existing.handle.update(text);
+        return;
+      }
+      existing.handle.destroy();
+      this.previewMounts.delete(block.id);
+    } else if (existing) {
+      existing.handle.destroy();
+      this.previewMounts.delete(block.id);
+    }
+
+    if (kind === "mermaid") {
+      const handle = mountDiagramWidget(previewHost, text, {
+        readOnly: false,
+        isTier2: block.is_locked,
+        onFeedback: (msg, isError) => this.cb.onFeedback?.(msg, isError),
+      });
+      this.previewMounts.set(block.id, { kind: "mermaid", handle, lastSource: text });
+    } else {
+      const handle = mountMarkdownPreview(previewHost, text, {
+        readOnly: false,
+        isTier2: block.is_locked,
+        onCopyFeedback: (msg, isError) => this.cb.onFeedback?.(msg, isError),
+        onToggleTask: (nextSource) => this.handleTaskToggle(block.id, nextSource),
+      });
+      this.previewMounts.set(block.id, { kind: "markdown", handle, lastSource: text });
+    }
+  }
+
+  private handleTaskToggle(blockId: string, nextSource: string): void {
+    const cur = this.blocks.find((b) => b.id === blockId);
+    if (!cur || !this.isEditable(cur)) return;
+    if (cur.is_locked) this.cb.onVaultActivity?.();
+    if (cur.has_conflict || this.dirty.get(blockId)?.mismatch) {
+      this.cb.onFeedback?.("Resolve concurrent conflict before toggling tasks", true);
+      const card = this.cards.get(blockId);
+      if (card) this.syncPreviewForBlock(card, cur, true);
+      return;
+    }
+
+    const mountedPreview = this.previewMounts.get(blockId);
+    if (mountedPreview && mountedPreview.kind === "markdown") {
+      mountedPreview.lastSource = nextSource;
+    }
+
+    const expectedHeads = this.getExpectedHeadsForBlock(blockId);
+    this.dirty.set(blockId, { text: nextSource, baseHeads: expectedHeads, mismatch: false });
+    this.updateDirtyBadge(blockId, true);
+
+    const m = this.mounted.get(blockId);
+    if (m) {
+      m.view.dispatch({
+        changes: { from: 0, to: m.view.state.doc.length, insert: nextSource },
+        annotations: REMOTE_SYNC_ANN.of(true),
+      });
+    }
+
+    void this.flushDirtyBlock(blockId, { fastSync: true, isMerge: false });
   }
 }
