@@ -88,6 +88,11 @@ pub trait SystemClipboard: Send + Sync {
     /// Inspect ONLY a mynote-marked clipboard item's raw BLAKE3 digest for safe ephemeral auto-clear.
     /// Returns `None` if the user has overwritten the clipboard with a non-mynote item (without reading user data).
     fn current_mynote_blake3(&self) -> Option<[u8; 32]>;
+    /// Returns `true` only for the live OS pasteboard adapter (`NativeSystemClipboard`).
+    /// Mock/file clipboards return `false` so hermetic tests never attach background watchers to the host OS clipboard.
+    fn is_native(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +296,10 @@ impl EchoGuard {
 
     pub fn last_hash(&self) -> Option<[u8; 32]> {
         self.last_applied_blake3
+    }
+
+    pub fn applied_at_ms(&self) -> u64 {
+        self.applied_at_ms
     }
 }
 
@@ -697,6 +706,14 @@ mod macos_impl {
             None
         })
     }
+    pub fn change_count() -> isize {
+        autoreleasepool(|_| NSPasteboard::generalPasteboard().changeCount())
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn macos_change_count() -> isize {
+    macos_impl::change_count()
 }
 
 #[cfg(target_os = "linux")]
@@ -1139,6 +1156,10 @@ impl SystemClipboard for NativeSystemClipboard {
         {
             None
         }
+    }
+
+    fn is_native(&self) -> bool {
+        true
     }
 }
 

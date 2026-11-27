@@ -127,6 +127,7 @@ EXAMPLES:
   mynote clip history --limit 20 --kind text --json
   mynote clip promote --buf scratch --json
   mynote clip undo --json
+  mynote clip watch --enable --auto-apply inbox-only --json
   mynote clip rotate-key";
 
 pub fn render_topic(topic: &str) -> Option<&'static str> {

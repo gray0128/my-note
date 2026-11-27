@@ -42,5 +42,6 @@ eval-ui:
 	$(E2E_PYTHON) tests/e2e/test_m2_sec08_mobile_webkit.py
 	$(E2E_PYTHON) tests/e2e/test_m3_sec06_pele_history.py
 	$(E2E_PYTHON) tests/e2e/test_ui_cdp_equivalence.py
+	$(E2E_PYTHON) tests/e2e/test_m4_clip_sec08_sec09.py
 
 eval-all: eval-contract eval-ui

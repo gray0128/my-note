@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::cli::ClipCommand;
+use crate::clip_watch::{load_persisted_watch_config, persist_watch_config, validate_auto_apply_mirror};
 use crate::clipboard::{
     default_system_clipboard, detect_image_mime_from_bytes_and_path, inspect_image_dimensions, is_svg_bytes,
     make_thumbnail, ClipboardPayload, ClipboardWriteOpts, ReadClipboardResult,
@@ -856,6 +857,96 @@ pub(super) fn handle_clip(
                 }
                 OutputMode::Human => println!(
                     "rotated ClipKey to {new_kid} (gen={new_gen}); cloud & local clip history cleared"
+                ),
+            }
+            Ok(0)
+        }
+
+        ClipCommand::Watch {
+            enable,
+            disable,
+            pause,
+            resume,
+            auto_apply,
+        } => {
+            if let Some(ref m) = auto_apply {
+                validate_auto_apply_mirror(m)?;
+            }
+            let enabled_opt = if enable {
+                Some(true)
+            } else if disable {
+                Some(false)
+            } else {
+                None
+            };
+            let paused_opt = if pause {
+                Some(true)
+            } else if resume {
+                Some(false)
+            } else {
+                None
+            };
+
+            let (cfg, daemon_notified) = if let Some(resp) = try_send_uds(
+                store.data_dir(),
+                &UdsRequest::ClipWatchSet {
+                    paused: paused_opt,
+                    enabled: enabled_opt,
+                    auto_apply_mirror: auto_apply.clone(),
+                },
+                Duration::from_secs(3),
+            )? {
+                if !resp.ok {
+                    return Err(resp.into_core_error());
+                }
+                let data = resp.data.unwrap_or_default();
+                let cfg = crate::daemon::ClipWatchConfig {
+                    watch_enabled: data
+                        .get("watch_enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    watch_paused: data
+                        .get("watch_paused")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    auto_apply_mirror: data
+                        .get("auto_apply_mirror")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("inbox-only")
+                        .to_string(),
+                };
+                (cfg, true)
+            } else {
+                let mut cfg = load_persisted_watch_config(store);
+                let persist_needed = enabled_opt.is_some() || auto_apply.is_some();
+                if let Some(e) = enabled_opt {
+                    cfg.watch_enabled = e;
+                }
+                if let Some(m) = auto_apply {
+                    cfg.auto_apply_mirror = m;
+                }
+                if let Some(p) = paused_opt {
+                    cfg.watch_paused = p;
+                }
+                if persist_needed {
+                    persist_watch_config(store, &cfg)?;
+                }
+                (cfg, false)
+            };
+
+            let out = serde_json::json!({
+                "watch_enabled": cfg.watch_enabled,
+                "watch_paused": cfg.watch_paused,
+                "auto_apply_mirror": cfg.auto_apply_mirror,
+                "daemon_notified": daemon_notified,
+            });
+            match mode {
+                OutputMode::Json | OutputMode::Jsonl => {
+                    emit_json(out, store_meta(store, started, None));
+                }
+                OutputMode::Human => println!(
+                    "clip watch: enabled={} paused={} auto_apply_mirror={} (daemon_notified={})",
+                    cfg.watch_enabled, cfg.watch_paused, cfg.auto_apply_mirror, daemon_notified
                 ),
             }
             Ok(0)

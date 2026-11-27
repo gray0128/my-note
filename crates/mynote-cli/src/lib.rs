@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod clip_watch;
 pub mod clipboard;
 pub mod daemon;
 pub mod formatters;
