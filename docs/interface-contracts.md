@@ -471,8 +471,8 @@ export class WasmClipCodec {
   constructor(deviceId: string, clipKid: string, clipKeyBytes: Uint8Array);
   /** 封装 ClipMetaV1（小文本内联或图片元数据+缩略图，pad256 + XChaCha20-Poly1305） */
   encryptMeta(clipId: string, metaJson: string, ephemeral: boolean): Uint8Array;
-  /** 解密并校验 AAD，返回 ClipMetaV1 JSON */
-  decryptMeta(clipId: string, authorDeviceId: string, envelope: Uint8Array): string;
+  /** 解密并校验 AAD（含 ephemeral 位防跨通道重放），返回 ClipMetaV1 JSON */
+  decryptMeta(clipId: string, authorDeviceId: string, ephemeral: boolean, envelope: Uint8Array): string;
   /** 封装图片或长文本原始二进制流为 MNC1 (payload_type=1)，零 Base64 膨胀 */
   encryptBlob(clipId: string, rawBytes: Uint8Array): Uint8Array;
   /** 解密并校验 AAD，返回原始位图或 UTF-8 字节 */

@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>S-Clip-2: PWA WASM MNC1 &amp; Safari ClipboardItem PNG Benchmark</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 780px; margin: 24px auto; padding: 0 16px; }
+    button { font-size: 16px; padding: 10px 16px; margin: 6px 8px 6px 0; cursor: pointer; }
+    pre { background: #111827; color: #e5e7eb; padding: 12px; border-radius: 8px; overflow-x: auto; font-size: 12px; }
+    .meta { color: #4b5563; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>S-Clip-2: <code>WasmClipCodec</code> &amp; Sync-Promise PNG Clipboard</h1>
+  <p class="meta">
+    Automated by <code>bench_webkit_clip.py</code> and also usable directly on a physical iPhone Standalone PWA
+    (add to Home Screen over HTTPS/Tailscale, tap <strong>Copy Encrypted JPEG as PNG</strong>, then paste into WeChat / Notes).
+  </p>
+  <div>
+    <button id="btn-run-wasm">Run 1 / 5 / 10 MiB WASM Bench</button>
+    <button id="btn-copy-png">Copy Encrypted JPEG as PNG (Sync Promise)</button>
+    <button id="btn-check-item">Verify ClipboardItem Promise Resolution Only</button>
+  </div>
+  <pre id="log">Initializing...</pre>
+
+  <script type="module">
+    import init, { WasmClipCodec } from "./pkg/mynote_wasm.js";
+
+    const logEl = document.getElementById("log");
+    const log = (msg) => {
+      logEl.textContent += "\n" + msg;
+    };
+
+    const DEVICE_ID = "dev_sclip2bench01";
+    const CLIP_KID = "01JDF8Z9X4K7M2N5P8Q1R3S6T9";
+    const CLIP_KEY = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) CLIP_KEY[i] = (i * 7 + 0x13) & 0xff;
+
+    let wasmExports = null;
+    let codec = null;
+    let preparedJpegMeta = null;
+
+    function median(nums) {
+      const sorted = [...nums].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+    }
+
+    function makePatternBytes(sizeBytes, seed) {
+      const buf = new Uint8Array(sizeBytes);
+      // Fast deterministic non-trivial pattern (xorshift32 per 4 bytes)
+      let x = (seed | 1) >>> 0;
+      const u32 = new Uint32Array(buf.buffer, buf.byteOffset, Math.floor(sizeBytes / 4));
+      for (let i = 0; i < u32.length; i++) {
+        x ^= x << 13;
+        x ^= x >>> 17;
+        x ^= x << 5;
+        u32[i] = x >>> 0;
+      }
+      for (let i = u32.length * 4; i < sizeBytes; i++) {
+        buf[i] = (i ^ seed) & 0xff;
+      }
+      return buf;
+    }
+
+    function bytesEqual(a, b) {
+      if (a.length !== b.length) return false;
+      const len4 = a.length - (a.length % 4);
+      const a32 = new Uint32Array(a.buffer, a.byteOffset, len4 / 4);
+      const b32 = new Uint32Array(b.buffer, b.byteOffset, len4 / 4);
+      for (let i = 0; i < a32.length; i++) {
+        if (a32[i] !== b32[i]) return false;
+      }
+      for (let i = len4; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+      }
+      return true;
+    }
+
+    async function ensureReady() {
+      if (!wasmExports) {
+        wasmExports = await init({ module_or_path: "./pkg/mynote_wasm_bg.wasm" });
+        codec = new WasmClipCodec(DEVICE_ID, CLIP_KID, CLIP_KEY);
+      }
+      return { wasmExports, codec };
+    }
+
+    function getWasmMemBytes() {
+      return wasmExports?.memory?.buffer?.byteLength ?? 0;
+    }
+
+    /**
+     * Synthesize a realistic 1920x1080 JPEG via offscreen <canvas>, encrypt it with
+     * WasmClipCodec.encryptBlob, and upload ciphertext to /blob.mnc1 on the local server
+     * so the click handler executes the full real fetch -> WASM decrypt -> JPEG->PNG path.
+     */
+    async function prepareEncryptedJpegFixture(width = 1920, height = 1080) {
+      await ensureReady();
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      const grad = ctx.createLinearGradient(0, 0, width, height);
+      grad.addColorStop(0, "#0f172a");
+      grad.addColorStop(0.5, "#1d4ed8");
+      grad.addColorStop(1, "#10b981");
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, width, height);
+
+      // Add high-frequency shapes & text so JPEG size is realistic (not a flat solid color)
+      for (let y = 40; y < height - 40; y += 64) {
+        for (let x = 40; x < width - 40; x += 96) {
+          ctx.fillStyle = `rgb(${(x * 3) % 255}, ${(y * 5) % 255}, ${((x + y) * 7) % 255})`;
+          ctx.fillRect(x, y, 48, 32);
+        }
+      }
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 72px sans-serif";
+      ctx.fillText("my-note S-Clip-2 PNG Copy Check", 120, 540);
+
+      const jpegBlob = await new Promise((resolve, reject) => {
+        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("JPEG toBlob returned null"))), "image/jpeg", 0.85);
+      });
+      const jpegBytes = new Uint8Array(await jpegBlob.arrayBuffer());
+      if (jpegBytes[0] !== 0xff || jpegBytes[1] !== 0xd8 || jpegBytes[2] !== 0xff) {
+        throw new Error(`Invalid JPEG magic: ${Array.from(jpegBytes.slice(0, 4))}`);
+      }
+
+      const clipId = "01JDF8Z9X4K7M2N5P8Q1R3S6TB";
+      const encStart = performance.now();
+      const ciphertext = codec.encryptBlob(clipId, jpegBytes);
+      const encMs = performance.now() - encStart;
+
+      const putResp = await fetch("/upload-blob", {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: ciphertext,
+      });
+      if (!putResp.ok) throw new Error(`Failed uploading fixture ciphertext: HTTP ${putResp.status}`);
+
+      preparedJpegMeta = {
+        clipId,
+        width,
+        height,
+        jpegBytes: jpegBytes.length,
+        ciphertextBytes: ciphertext.length,
+        encryptMs: Number(encMs.toFixed(2)),
+      };
+      return preparedJpegMeta;
+    }
+
+    /**
+     * Build the async PNG Blob Promise for synchronous handoff to
+     * `new ClipboardItem({ 'image/png': pngBlobPromise })`.
+     */
+    function buildPngBlobPromise(metricsOut) {
+      const { clipId } = preparedJpegMeta;
+      const t0 = performance.now();
+      return (async () => {
+        const resp = await fetch("/blob.mnc1", { redirect: "manual" });
+        if (resp.status !== 200) throw new Error(`fetch /blob.mnc1 returned HTTP ${resp.status}`);
+        const ct = new Uint8Array(await resp.arrayBuffer());
+        const tFetch = performance.now();
+
+        const jpegBytes = codec.decryptBlob(clipId, DEVICE_ID, ct);
+        const tDec = performance.now();
+        if (jpegBytes[0] !== 0xff || jpegBytes[1] !== 0xd8 || jpegBytes[2] !== 0xff) {
+          throw new Error("Decrypted blob is not a valid JPEG");
+        }
+
+        const jpegBlob = new Blob([jpegBytes], { type: "image/jpeg" });
+        let width = 0;
+        let height = 0;
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d");
+
+        if (typeof createImageBitmap === "function") {
+          const bmp = await createImageBitmap(jpegBlob);
+          width = bmp.width;
+          height = bmp.height;
+          canvas.width = width;
+          canvas.height = height;
+          ctx.drawImage(bmp, 0, 0);
+          bmp.close();
+        } else {
+          const url = URL.createObjectURL(jpegBlob);
+          try {
+            const img = new Image();
+            await new Promise((resolve, reject) => {
+              img.onload = resolve;
+              img.onerror = () => reject(new Error("Image decode failed"));
+              img.src = url;
+            });
+            width = img.naturalWidth;
+            height = img.naturalHeight;
+            canvas.width = width;
+            canvas.height = height;
+            ctx.drawImage(img, 0, 0);
+          } finally {
+            URL.revokeObjectURL(url);
+          }
+        }
+
+        const pngBlob = await new Promise((resolve, reject) => {
+          canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("PNG toBlob returned null"))), "image/png");
+        });
+        const tConv = performance.now();
+
+        const pngHead = new Uint8Array(await pngBlob.slice(0, 8).arrayBuffer());
+        metricsOut.fetchMs = Number((tFetch - t0).toFixed(2));
+        metricsOut.decryptMs = Number((tDec - tFetch).toFixed(2));
+        metricsOut.jpegToPngCanvasMs = Number((tConv - tDec).toFixed(2));
+        metricsOut.totalPromiseMs = Number((tConv - t0).toFixed(2));
+        metricsOut.pngBytes = pngBlob.size;
+        metricsOut.pngMagicHex = Array.from(pngHead)
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join(" ");
+        metricsOut.width = width;
+        metricsOut.height = height;
+        metricsOut.wasmMemBytesAfter = getWasmMemBytes();
+        return pngBlob;
+      })();
+    }
+
+    async function runWasmBench(runs = 3) {
+      await ensureReady();
+      const memBefore = getWasmMemBytes();
+
+      // 1. Metadata + security invariants check
+      const metaClipId = "01JDF8Z9X4K7M2N5P8Q1R3S6TC";
+      const metaJson = JSON.stringify({
+        v: 1,
+        kind: "text",
+        mime: "text/plain",
+        source_mode: "explicit",
+        created_at_ms: 1795600000001,
+        text: "my-note S-Clip-2 metadata test",
+        blob: null,
+      });
+      const metaCt = codec.encryptMeta(metaClipId, metaJson, false);
+      const metaDec = codec.decryptMeta(metaClipId, DEVICE_ID, metaCt, false);
+      if (metaDec !== metaJson) throw new Error("encryptMeta/decryptMeta roundtrip mismatch");
+
+      // SVG MIME rejection check
+      let svgRejected = false;
+      try {
+        codec.encryptMeta(
+          metaClipId,
+          JSON.stringify({
+            v: 1,
+            kind: "image",
+            mime: "image/svg+xml",
+            source_mode: "explicit",
+            created_at_ms: 1795600000001,
+            text: null,
+            blob: null,
+          }),
+          false
+        );
+      } catch {
+        svgRejected = true;
+      }
+
+      // Cross-channel AAD isolation check (regular vs ephemeral)
+      const ephCt = codec.encryptMeta(metaClipId, metaJson, true);
+      let crossChannelRejected = false;
+      try {
+        codec.decryptMeta(metaClipId, DEVICE_ID, ephCt, false);
+      } catch {
+        crossChannelRejected = true;
+      }
+
+      // 2. Blob encryption / decryption benchmarks: 1 MiB, 5 MiB, 10 MiB
+      const sizesMiB = [1, 5, 10];
+      const results = [];
+      let peakWasmMemBytes = memBefore;
+
+      for (let idx = 0; idx < sizesMiB.length; idx++) {
+        const mib = sizesMiB[idx];
+        const sizeTag = ["A", "B", "C"][idx];
+        const byteLen = mib * 1024 * 1024;
+        const input = makePatternBytes(byteLen, mib * 97);
+        const encSamples = [];
+        const decSamples = [];
+        let exactMatchAll = true;
+        let tamperRejected = false;
+
+        // Record all `runs` raw samples honestly, plus report median
+        for (let r = 0; r < runs; r++) {
+          const cid = `01JDF8Z9X4K7M2N5P8Q1R3S6${sizeTag}${r}`;
+          const t0 = performance.now();
+          const ct = codec.encryptBlob(cid, input);
+          const t1 = performance.now();
+          peakWasmMemBytes = Math.max(peakWasmMemBytes, getWasmMemBytes());
+
+          const pt = codec.decryptBlob(cid, DEVICE_ID, ct);
+          const t2 = performance.now();
+          peakWasmMemBytes = Math.max(peakWasmMemBytes, getWasmMemBytes());
+
+          encSamples.push(Number((t1 - t0).toFixed(2)));
+          decSamples.push(Number((t2 - t1).toFixed(2)));
+
+          if (ct.length !== 45 + byteLen + 16 || !bytesEqual(pt, input)) {
+            exactMatchAll = false;
+          }
+          if (r === 0) {
+            ct[45] ^= 0x80;
+            try {
+              codec.decryptBlob(cid, DEVICE_ID, ct);
+            } catch {
+              tamperRejected = true;
+            }
+          }
+        }
+
+        const encMed = Number(median(encSamples).toFixed(2));
+        const decMed = Number(median(decSamples).toFixed(2));
+        results.push({
+          sizeMiB: mib,
+          sizeBytes: byteLen,
+          ciphertextBytes: 45 + byteLen + 16,
+          encryptMsSamples: encSamples,
+          encryptMedianMs: encMed,
+          encryptThroughputMiBs: Number((mib / (encMed / 1000)).toFixed(1)),
+          decryptMsSamples: decSamples,
+          decryptMedianMs: decMed,
+          decryptThroughputMiBs: Number((mib / (decMed / 1000)).toFixed(1)),
+          roundTripExactMatch: exactMatchAll,
+          tamperRejected,
+          wasmMemBytesAfter: getWasmMemBytes(),
+        });
+      }
+
+      return {
+        userAgent: navigator.userAgent,
+        isSecureContext: window.isSecureContext,
+        hasClipboardApi: Boolean(navigator.clipboard && typeof ClipboardItem === "function"),
+        metaRoundTripOk: metaDec === metaJson,
+        svgRejected,
+        crossChannelRejected,
+        wasmMemBeforeBytes: memBefore,
+        peakWasmMemBytes,
+        peakWasmMemMiB: Number((peakWasmMemBytes / (1024 * 1024)).toFixed(2)),
+        benchmarks: results,
+      };
+    }
+
+    // State captured by trusted click handlers
+    window.__lastClipboardWriteResult = null;
+    window.__lastClipboardItemResult = null;
+
+    // Button 1: Real synchronous-Promise navigator.clipboard.write([new ClipboardItem({ 'image/png': pngBlobPromise })])
+    document.getElementById("btn-copy-png").addEventListener("click", () => {
+      const metrics = {};
+      let writePromise;
+      try {
+        if (!preparedJpegMeta) throw new Error("prepareEncryptedJpegFixture not called");
+        // CRITICAL SAFARI RULE: construct Promise & ClipboardItem & call navigator.clipboard.write SYNCHRONOUSLY inside click handler!
+        const pngBlobPromise = buildPngBlobPromise(metrics);
+        const item = new ClipboardItem({ "image/png": pngBlobPromise });
+        writePromise = navigator.clipboard.write([item]);
+      } catch (err) {
+        window.__lastClipboardWriteResult = {
+          ok: false,
+          phase: "sync_call",
+          errorName: err?.name || "Error",
+          errorMessage: String(err?.message || err),
+          metrics,
+        };
+        log("Copy PNG sync error: " + JSON.stringify(window.__lastClipboardWriteResult));
+        return;
+      }
+
+      writePromise
+        .then(() => {
+          window.__lastClipboardWriteResult = { ok: true, errorName: null, errorMessage: null, metrics };
+          log("Copy PNG PASS: " + JSON.stringify(window.__lastClipboardWriteResult));
+        })
+        .catch((err) => {
+          window.__lastClipboardWriteResult = {
+            ok: false,
+            phase: "async_write",
+            errorName: err?.name || "Error",
+            errorMessage: String(err?.message || err),
+            metrics,
+          };
+          log("Copy PNG async error: " + JSON.stringify(window.__lastClipboardWriteResult));
+        });
+    });
+
+    // Button 2: Verify ClipboardItem({ 'image/png': pngBlobPromise }) construction + getType('image/png') directly
+    document.getElementById("btn-check-item").addEventListener("click", () => {
+      const metrics = {};
+      try {
+        if (!preparedJpegMeta) throw new Error("prepareEncryptedJpegFixture not called");
+        const pngBlobPromise = buildPngBlobPromise(metrics);
+        const item = new ClipboardItem({ "image/png": pngBlobPromise });
+        const hasPngType = item.types.includes("image/png");
+        item
+          .getType("image/png")
+          .then(async (blob) => {
+            const bytes = new Uint8Array(await blob.arrayBuffer());
+            const head = Array.from(bytes.slice(0, 8))
+              .map((b) => b.toString(16).padStart(2, "0"))
+              .join(" ");
+            window.__lastClipboardItemResult = {
+              ok: head === "89 50 4e 47 0d 0a 1a 0a" && bytes.length > 1000,
+              hasPngType,
+              itemTypes: Array.from(item.types),
+              resolvedType: blob.type,
+              resolvedBytes: bytes.length,
+              pngMagicHex: head,
+              metrics,
+            };
+            log("ClipboardItem.getType PASS: " + JSON.stringify(window.__lastClipboardItemResult));
+          })
+          .catch((err) => {
+            window.__lastClipboardItemResult = {
+              ok: false,
+              errorName: err?.name || "Error",
+              errorMessage: String(err?.message || err),
+              metrics,
+            };
+          });
+      } catch (err) {
+        window.__lastClipboardItemResult = {
+          ok: false,
+          errorName: err?.name || "Error",
+          errorMessage: String(err?.message || err),
+          metrics,
+        };
+      }
+    });
+
+    document.getElementById("btn-run-wasm").addEventListener("click", async () => {
+      log("Running WASM benchmark...");
+      const res = await runWasmBench(3);
+      log(JSON.stringify(res, null, 2));
+    });
+
+    // Expose hooks for Playwright
+    window.__sClip2 = {
+      ensureReady,
+      runWasmBench,
+      prepareEncryptedJpegFixture,
+      async readClipboardPng() {
+        const items = await navigator.clipboard.read();
+        for (const item of items) {
+          if (item.types.includes("image/png")) {
+            const blob = await item.getType("image/png");
+            const bytes = new Uint8Array(await blob.arrayBuffer());
+            const head = Array.from(bytes.slice(0, 8))
+              .map((b) => b.toString(16).padStart(2, "0"))
+              .join(" ");
+            return {
+              found: true,
+              types: Array.from(item.types),
+              byteLength: bytes.length,
+              pngMagicHex: head,
+            };
+          }
+        }
+        return { found: false, types: items.flatMap((i) => Array.from(i.types)) };
+      },
+    };
+
+    ensureReady()
+      .then(() => prepareEncryptedJpegFixture(1920, 1080))
+      .then((fixture) => {
+        window.__sClip2Ready = true;
+        logEl.textContent = "Ready. Fixture prepared: " + JSON.stringify(fixture);
+      })
+      .catch((err) => {
+        window.__sClip2Error = String(err?.stack || err);
+        logEl.textContent = "INIT ERROR: " + window.__sClip2Error;
+      });
+  </script>
+</body>
+</html>

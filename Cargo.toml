@@ -9,6 +9,9 @@ members = [
 exclude = [
     "spikes/s0-2-macos-tauri-spike/shell-app",
     "spikes/s0-3-wasm-argon2",
+    "spikes/s-clip-1-ios-shortcuts/rust-interop",
+    "spikes/s-clip-3-macos-pasteboard",
+    "spikes/s-clip-4-hyprland-wayland",
 ]
 
 [workspace.package]
