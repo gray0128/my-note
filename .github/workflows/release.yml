@@ -124,12 +124,14 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           STAGE="dist/mynote-${TARGET}"
-          mkdir -p "$STAGE/skill" "$STAGE/deploy/launchd" "$STAGE/deploy/systemd" "$STAGE/deploy/hyprland"
+          mkdir -p "$STAGE/skill" "$STAGE/deploy/launchd" "$STAGE/deploy/systemd" "$STAGE/deploy/hyprland" "$STAGE/deploy/ios-shortcuts"
           install -m 755 target/release/mynote "$STAGE/mynote"
           install -m 644 skill/SKILL.md "$STAGE/skill/SKILL.md"
           install -m 644 deploy/launchd/com.mynote.daemon.plist "$STAGE/deploy/launchd/com.mynote.daemon.plist"
           install -m 644 deploy/systemd/mynote-daemon.service "$STAGE/deploy/systemd/mynote-daemon.service"
           install -m 644 deploy/hyprland/mynote.conf "$STAGE/deploy/hyprland/mynote.conf"
+          install -m 644 deploy/ios-shortcuts/mynote-clip-push.js "$STAGE/deploy/ios-shortcuts/mynote-clip-push.js"
+          install -m 644 deploy/ios-shortcuts/README.md "$STAGE/deploy/ios-shortcuts/README.md"
           install -m 644 README.md "$STAGE/README.md"
           COPYFILE_DISABLE=1 tar -C dist -czf "dist/mynote-${TARGET}.tar.gz" "mynote-${TARGET}"
           ls -lh "dist/mynote-${TARGET}.tar.gz"
