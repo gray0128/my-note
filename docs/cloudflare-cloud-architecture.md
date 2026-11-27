@@ -1,6 +1,6 @@
 # 基于 Cloudflare 技术栈的自部署云端架构：深度评估与设计方案
 
-> 2026-11-24 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D7 更新。
+> 2026-11-27 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D8（含 2026-11-27 剪贴板同步拍板 D8 / D1′）更新。
 
 > 本文档是 [总架构设计方案 (`architecture-proposal.md`)](./architecture-proposal.md) 的云端专项设计，并与 [数据结构规范 (`data-structures.md`)](./data-structures.md)、[全链路接口契约 (`interface-contracts.md`)](./interface-contracts.md)、[同步协议规范 (`sync-protocol.md`)](./sync-protocol.md)、[安全与威胁模型规范 (`threat-model.md`)](./threat-model.md) 配套执行。结合已确定的核心取舍——**云端自部署在 Cloudflare 技术栈，且不考虑云端 MCP 与本地 MCP（Agent 统一走本地 CLI + Skill）**——本方案聚焦于构建一个**存储层零知识端到端加密（E2EE，服务端不持有任何解密密钥）、零运维、桌面间亚秒级唤醒、个人成本约 \$5/月（Workers Paid）**的极薄同步中继与只读 PWA 托管架构。
 >
@@ -20,7 +20,7 @@
 8. [逃生舱设计（反厂商锁定）](#8-逃生舱设计反厂商锁定)
 9. [测试：真实 Worker 契约测试与 DST 共用场景](#9-测试真实-worker-契约测试与-dst-共用场景)
 10. [分阶段落地路线（云端切片）](#10-分阶段落地路线云端切片)
-11. [已移除 / 推迟的机制（2026-11-24）](#11-已移除--推迟的机制2026-11-24)
+11. [已移除 / 推迟的机制（2026-11-24 / 2026-11-27 修订）](#11-已移除--推迟的机制2026-11-24--2026-11-27-修订)
 
 ---
 
@@ -61,40 +61,42 @@
 
 ## 3. 基于 Cloudflare 的推荐云端架构蓝图与极薄服务端职责
 
-整个云端只需部署 **1 个 Cloudflare Worker（M1 预算 `< 500` 行 TypeScript [目标]，M2 含碎纸状态机后约 `500–700` 行 [估算]，单仓库 `wrangler.jsonc`，只由 CI 发布）**，承载全部云端职责：
+整个云端只需部署 **1 个 Cloudflare Worker（M1 预算 `< 500` 行 TypeScript [目标]，M2 实测 `690` 行 `[已测]` <= `700` 行，M4 含 100 条图文剪贴板与流式 R2 后约 `870–930` 行 `[估算]`，单仓库 `wrangler.jsonc`，只由 CI 发布）**，承载全部云端职责：
 
 ```mermaid
 flowchart TD
     subgraph Clients["客户端 (持有本地明文与密钥)"]
         Mac["macOS: mynote Rust Daemon + CLI + Skill + 浏览器/WebApp (read-write 令牌)"]
         Linux["Omarchy: mynote Rust Daemon + CLI + Skill + Chromium webapp (read-write 令牌)"]
-        Phone["iOS / Android: 只读 PWA (WASM 解密 + 复制 + Vault 解锁, read 令牌)"]
+        Phone["iOS / Android: PWA (笔记只读 + Vault + M4 剪贴板, read / read+clip 令牌)"]
+        SC["iOS Shortcuts + Scriptable (M4 不切屏快传, clip-write 单向令牌)"]
         Agent["本地 AI Agent (Claude Code / Codex / OpenCode)"]
         Agent -->|"CLI + SKILL.md"| Mac
         Agent -->|"CLI + SKILL.md"| Linux
     end
 
     subgraph CF["Cloudflare 个人单租户云端 (自定义域名: note.yourdomain.com)"]
-        Edge["Worker 入口 (设备令牌鉴权 + 范围校验 / 限流 / 路由)"]
-        Assets["Workers Static Assets (只读 PWA 静态资源, 仅 CI 发布)"]
+        Edge["Worker 入口 (设备令牌鉴权 + 四态范围校验 / 流式 R2 转发 / 限流 / 路由)"]
+        Assets["Workers Static Assets (PWA 静态资源, 仅 CI 发布)"]
 
         subgraph DO_Box["单实例 SQLite Durable Object: SyncJournalDO"]
-            WS["WebSocket Hibernation Hub (只发唤醒通知, 不携带 op)"]
-            SQL[("内嵌 SQLite: 盲 ops + block_keys + key_material + shred_marks + devices + pairing_tickets")]
-            Alarm["单一 Alarm 复用 (每日归档 / 密钥快照 + M2 碎纸到期置空 + 配对超时清理)"]
+            WS["WebSocket Hibernation Hub (笔记 wake + M4 clip_wake / clip_ephemeral)"]
+            SQL[("内嵌 SQLite: 盲 ops + block_keys + key_material + shred_marks + devices + pairing_tickets + M4 100 条 clip_items 索引")]
+            Alarm["单一 Alarm 复用 (每日归档 / 密钥快照 + M2 碎纸到期置空 + 配对超时清理 + M4 剪贴板到期清理)"]
         end
 
-        R2[("Cloudflare R2: op 密文归档 (永久) + 密钥快照 (latest + 30 天历史) + 手机状态快照 (2 份)")]
+        R2[("Cloudflare R2: op 密文归档 (永久) + 密钥快照 + 手机快照 2 份 + M4 clip/blobs/ (8 天生命周期, 0 DO PITR)")]
 
         Edge -->|"/, /assets/*"| Assets
-        Edge -->|"/v1/sync/*, /v1/keys*, /v1/devices*, /v1/sync/ws"| DO_Box
-        Edge -->|"/v1/snapshots/state"| R2
-        Alarm -->|"追加归档 op 密文 & 写密钥快照"| R2
+        Edge -->|"/v1/sync/*, /v1/keys*, /v1/devices*, /v1/clip*, /v1/sync/ws"| DO_Box
+        Edge -->|"/v1/snapshots/state, /v1/clip/blob*"| R2
+        Alarm -->|"追加归档 op 密文 / 写密钥快照 / 清理过期 clip/blobs"| R2
     end
 
-    Mac <-->|"HTTPS push/pull + WSS 唤醒"| Edge
-    Linux <-->|"HTTPS push/pull + WSS 唤醒"| Edge
-    Phone <-->|"HTTPS pull / 状态快照 + WSS 唤醒 (只读)"| Edge
+    Mac <-->|"HTTPS push/pull + /v1/clip* + WSS 唤醒"| Edge
+    Linux <-->|"HTTPS push/pull + /v1/clip* + WSS 唤醒"| Edge
+    Phone <-->|"笔记只读拉取 + /v1/clip* 双向 + WSS"| Edge
+    SC -->|"仅 POST/PUT /v1/clip* (clip-write)"| Edge
 ```
 
 ### 3.1 极薄服务端职责清单（F-12）
@@ -103,7 +105,7 @@ flowchart TD
 
 | # | 职责 | 服务端行为要点 |
 | --- | --- | --- |
-| 1 | **令牌与范围校验** | 每台设备独立令牌，DO 只存 `SHA-256(device_token)`（未完成 `pair-claim` 的预注册行不激活）；令牌范围 `read` / `read-write`（D1）。`read` 令牌对 `push`、密钥记录与 `key_material` 写入、碎纸请求 / 撤销 / 确认、状态快照发布、发起配对一律返回 **403**；可读 `pull`、`/v1/keys`、状态快照、WS 唤醒。吊销后立即拒绝一切 HTTP/WS 请求。 |
+| 1 | **令牌与四态范围校验** | 每台设备独立令牌，DO 只存 `SHA-256(device_token)`（未完成 `pair-claim` 的预注册行不激活）；四态范围 `read` / `read+clip` / `clip-write` / `read-write`（D1′、D8）。所有非 `read-write` 令牌对笔记 `push`、密钥与 `key_material` 写入、碎纸、状态快照上传、设备管理一律返回 **`403`**；`clip-write` 仅允许 `POST /v1/clip` 与 `PUT /v1/clip/blob`，一切 `GET`（含 `GET /v1/clip*`）均返回 **`403`**。吊销后立即拒绝一切 HTTP/WS 请求。 |
 | 2 | **幂等追加** | `push` 在 `ctx.storage.transactionSync` 内逐条插入；以 `op_id` 去重，重复提交返回原 `seq`；只有事务提交后才返回明确 JSON ack（[§6 #1](#6-cloudflare-专属工程暗坑与防御清单必看)）。op 一旦写入**永不修改、永不删除**。 |
 | 3 | **分配 `seq`** | 单 DO 单线程，`seq` 在当前 `epoch` 内严格单调递增。 |
 | 4 | **按 `seq` 分页** | `pull?since=<seq>&limit=<n>` 返回 `(since, since+n]` 区间与 `head_seq`；因为不做 GC，任意 `since` 都可直接拉取，无「超保留窗口」分支。 |
@@ -117,13 +119,14 @@ flowchart TD
 | 11 | **每日归档** | 同一 alarm 每日把新增 op 密文追加归档到 R2，并写密钥表快照（`latest.mnks` + `history/<yyyy-mm-dd>.mnks`，见 [§3.3](#33-r2-布局归档快照与生命周期)）。 |
 | 12 | **手机状态快照存储（M2）** | 接收桌面发布的状态快照，在同一 `journal_epoch` 内按 `covers_seq` 单调接受，保留最近 2 份（[§3.3](#33-r2-布局归档快照与生命周期)）。 |
 | 13 | **首台引导与一次性领取配对 / 刷新** | `POST /v1/devices/bootstrap` 凭部署环境变量 `BOOTSTRAP_TOKEN` 注册首台桌面（或全设备丢失后重新接入）；`POST /v1/devices`（`read-write`）与 `POST /v1/devices/:id/refresh` 暂存桌面用 `K_pair` 加密的密文（**服务端不接触明文 `device_token` 或 `K_pair`**，TTL 10 分钟）；`POST /v1/devices/pair-claim` 凭 128 位 `pair_id` **首次领取即删除**，超时未领由 alarm 删除票据并清理未激活的预注册设备。形状见 [`interface-contracts.md`](./interface-contracts.md) §4.2 (5)。 |
+| 14 | **独立 100 条图文剪贴板与流式 R2（M4，D8）** | 维护物理隔离的 `clip_items` 环形索引（保留最近 **100 条** / 默认 **7 天 TTL**，绝不进入每日 op 归档与手机快照）：`POST /v1/clip` 存 `≤ 64 KiB` 小文本，或对 `ephemeral: true`（`≤ 256 KiB`）执行**零 SQLite / 零 R2 写入**直接广播给在线 `read-write` 桌面 WS（无在线桌面返 `409 NO_ONLINE_DESKTOP`）；`PUT /v1/clip/blob` 流式写 R2 `clip/blobs/<clip_id>.mnc1`（上限 `10.5 MiB`，DO 登记失败立即清孤儿对象）；`GET /v1/clip/:clip_id/blob` 流式直出；超 100 条淘汰、用户删除与 alarm 到期同步 `R2.delete`。 |
 
-**参数**（Q7–Q9 已按默认拍板）：`T_grace` = 7 天（客户端默认值）；`T_grace_min` = 24 小时；`N` = 20 块/天。`T_grace_min`、`N` 与 `BOOTSTRAP_TOKEN` 以 Worker 环境变量 / Secret 配置，**只能经 CI 或控制台修改**，持有设备令牌的攻击者无法调低。
+**参数**（Q7–Q9 已按默认拍板）：`T_grace` = 7 天（客户端默认值）；`T_grace_min` = 24 小时；`N` = 20 块/天；M4 剪贴板 `CLIP_MAX_ITEMS` = 100、`CLIP_TTL_DAYS` = 7、`CLIP_MAX_BLOB_BYTES` = `10 MiB`（密文含信封头上限 `10.5 MiB`）。`T_grace_min`、`N` 与 `BOOTSTRAP_TOKEN` 以 Worker 环境变量 / Secret 配置，**只能经 CI 或控制台修改**，持有设备令牌的攻击者无法调低。
 
 > [!NOTE]
 > 服务端看不到内容，**也区分不了请求来自 UI 还是 CLI**（二者用同一台设备的令牌）。「CLI 只能删进回收站、缩短宽限期 / 清空回收站只能在 UI 交互确认」由本地 Daemon 强制（见 [`interface-contracts.md`](./interface-contracts.md)）；服务端能构造性保证的是：任何碎纸请求都至少有 `T_grace_min` 的可撤销窗口，且超出批量阈值的部分在确认前不会计时。
 
-**alarm 复用**：每个 DO 只有一个 alarm。每次处理完毕后重新设定为 `min(下一次每日任务时刻, 最早一个待到期 not_before_ms, 最早一个配对票据过期时刻)`；DO 启动（含 PITR 回滚后）时也重算一次，保证到期任务不会被漏掉。
+**alarm 复用**：每个 DO 只有一个 alarm。每次处理完毕后重新设定为 `min(下一次每日任务时刻, 最早一个待到期 not_before_ms, 最早一个配对票据过期时刻, 最早一个 clip_items.expires_at_ms)`；DO 启动（含 PITR 回滚后）时也重算一次，保证到期任务不会被漏掉。
 
 ### 3.2 同步链路的核心设计哲学：「HTTP 为可靠真相，WebSocket 为零成本唤醒」
 
@@ -151,6 +154,7 @@ flowchart TD
 | `archives/keys/latest.mnks` | 最新全量密钥表 + `key_material` 快照（已置空的密钥不含 `key_record`） | DO alarm | **每日覆写、不挂生命周期删除**：碎纸执行次日即被覆盖移除，不延长约 37 天上界；即使停写超过 30 天也永不归零 |
 | `archives/keys/history/` | 按日归档的密钥表快照（`<yyyy-mm-dd>.mnks`） | DO alarm | **R2 生命周期规则：创建 30 天（`T_snap`）后自动删除** |
 | `snapshots/state/` | 手机引导用「当前状态快照」（非 `Shredded` 块的全部叶子版本 + 字段 LWW 结果 + `covers_seq`；正文仍用各自 BDEK 加密） | 任一桌面（`read-write` 令牌） | 同一 `journal_epoch` 内按 `covers_seq` **单调接受**（不大于当前最新则拒绝，无 CAS 链）；**只保留最近 2 份**，由 Worker 在接受新快照后删除更旧的 |
+| `clip/blobs/`（M4，D8） | 独立剪贴板图片（PNG/JPEG/WebP/GIF）与 `> 64 KiB` 长文本原始二进制 `MNC1` 密文（键名 `clip/blobs/<clip_id>.mnc1`，上限 `10.5 MiB`） | 桌面 / 手机 PWA / 快捷指令（`read-write` / `read+clip` / `clip-write`）经 Worker 流式直写 | **不受 `archives/ops/` Bucket Lock 影响，物理 0 进入 DO 30 天 PITR**；超 100 条淘汰、用户删除与 7 天到期时由 DO 主动 `R2.delete`，另配置 **R2 8 天前缀生命周期规则**清理极端异常孤儿对象 |
 
 - 状态快照的发布时机（每日或尾部 op 超过阈值）与手机应用尾部 op 的规则由 [`sync-protocol.md`](./sync-protocol.md) 定义；状态快照**只给手机读**，不参与桌面因果判定，出错的后果只是手机显示不对、重新拉取即可。
 - 历史密钥快照的删除依赖 R2 生命周期规则的异步执行，实际删除可能比 30 天略晚 [待 S0 验证]；彻底删除的时间上界（`T_grace + max(PITR 30 天, T_snap)` ≈ 37 天）的承诺措辞以 [`threat-model.md`](./threat-model.md) 为准。
@@ -196,12 +200,12 @@ INV-RECOVERY（零设备 + 恢复包 + 本地导出的 R2 归档目录 → 恢�
 | 资源项 | 个人用量 | Workers Paid (\$5/月) 套餐内含 / 上限 | 落点评估 |
 | --- | --- | --- | --- |
 | **Workers Static Assets (PWA)** | 每日几十次页面加载 | 静态资源请求不计费 | **\$0** |
-| **DO Requests** | ~1,000 次/日 ≈ 3 万次/月 [估算]（WS 消息按 20:1 折算） | 100 万次/月 | 约 3% |
+| **DO Requests** | 笔记 ~1,000 次/日 + M4 剪贴板（按日均 50 文本 + 50 图片）约 300 次/日 ≈ 3.9 万次/月 [估算]（WS 消息按 20:1 折算） | 100 万次/月 | 约 3.9% |
 | **DO Duration** | 开启 Hibernation，~30–50 GB-s/日 [估算] | 400,000 GB-s/月 | < 0.4% |
-| **DO SQLite 行写** | 约 1,000–1,500 行/日 ≈ 3–4.5 万行/月 [估算]（每 op 2–3 行，INV-SYNC-6 已放宽） | 5,000 万行/月 | 约 0.06–0.09% |
-| **DO SQLite 行读** | pull 约 1 万行/日；密钥表全量比对：5,000 块 × 300 次同步/日 ≈ 150 万行/日 [估算]；合计约 4,500 万行/月 | 250 亿行/月 | 约 0.2% |
-| **DO SQLite 存储** | op 日志约 **220 MB/年**；密钥表约「块数 × 250 B」（5,000 块 ≈ 1.25 MB）[估算] | 单 DO **10 GB**、账户不限；含 5 GB-月，超出按量计费 | **不做 GC 约可用 45 年** [估算]；约 20 年后才超出 5 GB-月内含额度 [估算] |
-| **R2 存储** | op 归档约 220 MB/年；密钥快照（`latest` + 30 份历史）× ~1.25 MB；状态快照 2 份 × 数 MB–数十 MB [估算] | 10 GB-月免费（以官方定价页为准） | 10 年内约 2.5 GB [估算]，**\$0** |
+| **DO SQLite 行写** | 笔记约 3–4.5 万行/月 + M4 剪贴板约 0.6 万行/月 [估算]（每 op 2–3 行，INV-SYNC-6 已放宽） | 5,000 万行/月 | 约 0.1% |
+| **DO SQLite 行读** | pull 约 1 万行/日；密钥表全量比对约 150 万行/日；M4 剪贴板约 1 万行/日 [估算]；合计约 4,600 万行/月 | 250 亿行/月 | 约 0.2% |
+| **DO SQLite 存储** | op 日志约 **220 MB/年**；密钥表约 `1.25 MB`；M4 100 条 `clip_items` 轻索引 + 缩略图 `< 2 MiB` [估算] | 单 DO **10 GB**、账户不限；含 5 GB-月，超出按量计费 | **不做 GC 约可用 45 年** [估算]；约 20 年后才超出 5 GB-月内含额度 [估算] |
+| **R2 存储与请求** | op 归档约 220 MB/年；密钥快照与状态快照数 MB；M4 100 条活跃图片均值 1–3 MiB ≈ **`100–300 MiB`**（极端全图 `1 GiB` [保证]）；月 Class A ~1,500 次（0.15%）、Class B ~5,000 次（0.05%）、出口流量 **\$0** [估算] | 10 GB-月存储 + 100 万 Class A + 1,000 万 Class B 免费 | 10 年内约 2.8–3.5 GB [估算]，**\$0** |
 
 **结论**：
 - 固定成本约 **\$5/月**（Workers Paid）+ 自定义域名约 \$10/年；正常使用下不会产生超额费用 [估算]。
@@ -265,6 +269,9 @@ Cloudflare 于 2026-11-13 推出 Spend Management（beta），可分别为 Worke
 
 8. **【防同步停摆 #8】Spend Management 拦截会同时停掉 alarm**：
    - 拦截触发后 DO SQL 写入、stub、alarm 全部被拒，归档与碎纸都会推迟。因此只开告警或设宽松上限（[§5.2](#52-spend-management支出告警配置建议)）。
+9. **【防 128 MB Worker OOM 与大对象污染 #9（M4，D8）】大剪贴板图片必须流式直写 R2，严禁 Base64 进 DO SQLite**：
+   - Cloudflare Worker 单实例内存硬上限为 **128 MB**，SQLite DO 单行上限为 **8 MB**；若把 100 条图片放进 DO SQLite 并经 JSON Base64 返回，单次列表响应可达 `200–300 MiB` 直接打穿 Worker 与手机 Safari 内存，且污染 30 天 DO PITR；
+   - *强制防御*：`PUT /v1/clip/blob` 必须在校验 `Content-Length ≤ 10.5 MiB` 后直接把 `req.body`（`ReadableStream`）流式写入 R2 `clip/blobs/<clip_id>.mnc1`，`GET /v1/clip/:clip_id/blob` 直接返回 `new Response(obj.body)`，严禁调用 `req.arrayBuffer()` 或把原图 Base64 拼进 JSON；DO `clip_items` 仅存轻元数据、≤ `64 KiB` 小文本与 ≤ `16 KiB` 缩略图。
 
 ---
 
@@ -297,6 +304,7 @@ Cloudflare 于 2026-11-13 推出 Spend Management（beta），可分别为 Worke
 | `POST /v1/devices/bootstrap` | `BOOTSTRAP_TOKEN` | 凭部署环境变量注册首台 `read-write` 桌面（或全桌面丢失后重新接入并可选吊销旧设备） |
 | `POST / GET /v1/devices`、`POST /v1/devices/:id/refresh`、`DELETE /v1/devices/:id` | `read-write` | 发起一次性领取配对或密钥刷新（桌面用 `K_pair` 加密，TTL 10 分钟）/ 列出 / 吊销设备 |
 | `POST /v1/devices/pair-claim` | 无需令牌（凭 `pair_id`） | 一次性领取：首次领取即激活设备并删除暂存记录，再次领取或过期返回 404 |
+| `POST /v1/clip`、`PUT /v1/clip/blob`、`GET /v1/clip`、`GET /v1/clip/:id/blob`、`DELETE /v1/clip[/:id]` | 写：`read-write` / `read+clip` / `clip-write`；读：`read-write` / `read+clip` / `read`；删：`read-write` / `read+clip` | （M4，D8）独立 100 条图文剪贴板通道：小文本写 DO、图片/长文本流式读写 R2 `clip/blobs/`、`ephemeral: true` 零写库纯内存 WS 直推 |
 
 **随时脱离 Cloudflare 的 3 步逃生路径**：
 1. Mac 和 Omarchy 本机始终存着完整的本地 SQLite 数据库（全量 op 历史、密钥表与物化状态）；
@@ -341,17 +349,21 @@ Cloudflare 于 2026-11-13 推出 Spend Management（beta），可分别为 Worke
   - `read` 令牌范围手机接入、手机状态快照接口（同一 `epoch` 内 `covers_seq` 单调、保留 2 份）、PWA 静态资源经 CI 发布（Service Worker 固定版本 + 版本号）；
   - `shred_marks`：`T_grace_min` 校验、批量阈值与确认、撤销、`#9a` 竞态校验、DO alarm 到期置空（对 M1 期间删进回收站的存量块一次性豁免阈值补建标记）；INV-GRACE 进契约测试门禁。
 - **M3 — 渲染与打磨**：云端无新增职责。
+- **S-Clip & M4 — 独立 100 条图文剪贴板通道（D8，`cloud-cf/src/` 增量 `+180–240` 行，总计约 `870–930` 行 TS `[估算]`）**：
+  - `S-Clip-5`：在 `workerd` 与真实 CF 账号验证 `PUT /v1/clip/blob` 流式写 `10 MiB` 密文至 R2 `clip/blobs/` 不触发内存超限，并配置 `clip/blobs/` 8 天前缀生命周期规则（确认与 `archives/ops/` Bucket Lock 互不干扰）；
+  - `M4a`：扩展 `devices.scope`（四态）与 `key_material.kind`（新增 `'clip_key'`），新增 `clip_items` 100 条/7 天 TTL 环形索引表、`/v1/clip*` 常规与流式 R2 路由、`≤ 256 KiB` 零写库 `ephemeral` WS 广播、超 100 条淘汰与 alarm 到期同步清理 R2 `clip/blobs/*`、`INV-CLIP-ISOLATION` 与 `SEC-09` `workerd` 契约测试；
+  - `M4b`：云端无新增职责（纯桌面客户端后台监听）。
 
 ---
 
-## 11. 已移除 / 推迟的机制（2026-11-24）
+## 11. 已移除 / 推迟的机制（2026-11-24 / 2026-11-27 修订）
 
 依据 [第一性原理审查](../review/2026-11-24-first-principles-review.md)：
 
 - **DO 活跃水位滑动窗口 GC、700 MB 警戒线**：已移除。Paid 单 DO 10 GB，约 45 年无需 GC [估算]（§9.5、§9.7，D4）。
 - **R2 `K=5` 多代快照 + `prev_snapshot_id` CAS、`snapshot_meta`**：已移除，改为只给手机读的状态快照（无 CAS、保留 2 份）（§9.2、§9.7，D1）。
 - **`purge_op_ids` 原地墓碑擦除**：已移除。op 密文永不删除，删除只通过加密碎纸作用于密钥（§9.3，D2′）。
-- **瞬态加密剪贴板（`ephemeral_clips`、`/v1/sync/ephemeral-clip`）**：已移除，由手机「复制」按钮取代（§9.2，D1）。
+- **旧版写入 DO SQLite 且声称零 PITR 的 `ephemeral_clips`（`/v1/sync/ephemeral-clip`）**：已永久废弃（F-06）；2026-11-27 拍板 **D8** 改为独立 100 条图文通道（DO 轻索引 + R2 流式大对象 0 DO PITR + 可轮换 `ClipKey` + 零写库 `--ephemeral` WS 直推，见 §3.1 #14、§3.3、§10）。
 - **`vault_keys` / `vault_key_slots` 同步端点、`MNK1`、`key_seq`**：已移除，由独立密钥表 `block_keys` + `shred_marks`（2P-Set）取代（§9.3，D2′）。
 - **云端 `/v1/archive/*` 下载接口**：已移除。仅设备全失而 DO 健在时直接凭 `BOOTSTRAP_TOKEN` + 24 词从 DO 拉回；极端双重灾难直接从 CF R2 下载目录走纯离线 `restore --from-archive <local-dir>`，不为极端场景增加云端鉴权复杂度。
 - **加密图片附件（`blobs/`、`/v1/blobs/:sha256`）**：推迟至按数据触发的待办（届时每附件独立随机 `BlobKey` 存入块正文结构，避免块换钥时损坏存活附件）。

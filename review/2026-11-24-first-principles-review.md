@@ -499,8 +499,9 @@ flowchart LR
 | D2′ | **删除优先，但不牺牲可靠性**：明确意图 + 服务端强制宽限期 + 加密碎纸；密文永久保留、密钥可删 | Q2、F-04、F-05、F-06 | 每块一把数据密钥 + 独立密钥表（M1 线格式）；彻底删除有约 37 天的上界（§9.3） |
 | D3 | 同块离线并发编辑以「**两个版本并列 + 手动合并**」呈现 | Q3、F-09 | 采用路径 γ：全量载荷 + 多叶子，不做 `SPAN_PATCH`，不引入 Loro |
 | D4 | 使用 **Cloudflare Workers Paid**（\$5/月） | C2、F-15、附录 B | 单 DO 10 GB 存储，配额不再是设计约束；不做 GC |
+| D8 | **独立 100 条图文跨端剪贴板通道**（2026-11-27 增补，局部修订 D1 → D1′） | [`clipboard-sync-proposal.md`](../docs/clipboard-sync-proposal.md) Q1–Q6 | 手机仍严格禁写笔记与密钥（保住 D1 边界），新增 `read+clip` 与 `clip-write` 令牌范围；剪贴板与 `ops` 物理隔离，采用「DO 100 条轻索引（7 天 TTL）+ R2 流式加密原图（`10 MiB` 上限，0 DO PITR）+ 独立可轮换 `ClipKey`（`MNC1`）+ 可选 `≤ 256 KiB` 零写库 `--ephemeral` WS 直推」；移动端 → 桌面由 PWA（Android `share_target` + iOS 无损大图 `mynote-wasm`）与 iOS Shortcuts/Scriptable（文本及前置缩放 `≤ 1.5 MiB` 截图）分流；路线图纳入 `S-Clip → M4a（显式）→ M4b（桌面后台自动镜像 opt-in）` |
 
-目标函数相应修订：**G3** 改为「桌面之间实时同步；手机能读、能复制，并能解锁 Vault（D7）」；**C2** 改为「约 \$5/月（Workers Paid），并配置支出告警」。
+目标函数相应修订：**G3** 改为「桌面之间实时同步；手机能读、能复制、能解锁 Vault（D7），并可通过物理隔离的剪贴板通道与桌面双向同步图文剪贴板（D8）」；**C2** 改为「约 \$5/月（Workers Paid），并配置支出告警」。
 
 ### 9.2 D1「手机只读 + 复制」的推论
 
@@ -758,6 +759,14 @@ DO GC、R2 多代快照、瞬态剪贴板、自动爬山已从待办中移除；
 6. **2026-11-25 真机实测补充拍板（D5′ 与 S0-3）**：
    - **D5′（双桌面形态统一）**：在真实 macOS 试用 Tauri v2 脚手架后明确移除 macOS Tauri 薄壳（`shell-macos/` 与 `spikes/s0-2-macos-tauri-spike/`），macOS 与 Omarchy 彻底统一为纯 `mynote` 单二进制（CLI + Daemon + 内嵌 HTML），统一走 `http://localhost:<port>`（详见 [`docs/spikes/s0-2-macos-tauri-shell.md`](../docs/spikes/s0-2-macos-tauri-shell.md)）。
    - **S0-3（iPhone 真机 Argon2id 定值）**：真机 iPhone（iOS 18.7 / Safari 27.2，添加到主屏幕的 Standalone PWA）实测 7 组参数全部零 OOM，原暂定 `(65536, 3, 1)` 实测 `4812 ms` 否决；拍板 `VaultHeaderV1` 唯一默认 KDF 为 **`(m_kib=32768, t=2, p=1)`**（实测中位 `1553 ms` [已测]，详见 [`docs/spikes/s0-3-wasm-argon2.md`](../docs/spikes/s0-3-wasm-argon2.md)）。结合 S0-2 与 S0-3 闭环，`ADR-06` 升级为 `Accepted`。
+7. **2026-11-27 剪贴板同步增补拍板（D8，局部修订 D1 → D1′）**：
+   - 在 M1–M3 全部落地并上线 `v0.2.0` 后，针对 [`docs/clipboard-sync-proposal.md`](../docs/clipboard-sync-proposal.md) 中的 Q1–Q6 全部按推荐默认值拍板为 **D8**：
+     - **Q1（权限最小化）**：批准局部修订 D1 为 D1′，保持手机对笔记 `ops`、`block_keys`、`shred_marks`、`phone_snapshots` 与设备管理严格只读（写请求一律 `403`），仅针对物理隔离的 `/v1/clip*` 通道新增 `read+clip`（手机 PWA）与 `clip-write`（快捷指令单向只写，连剪贴板历史也不可读）两种令牌范围；
+     - **Q2（容量、TTL 与存储分层）**：环形上限扩展至 **100 条**、默认 **7 天 TTL**、单条硬上限 **`10 MiB`**，采用「DO SQLite `clip_items` 存轻索引、≤ `64 KiB` 小文本与 ≤ `16 KiB` 缩略图 + R2 `clip/blobs/` 流式存加密原图/大文本（8 天前缀生命周期，不受 `archives/ops/` Bucket Lock 影响，物理 0 进入 DO 30 天 PITR）」分离架构；
+     - **Q3（移动端 → 桌面图文分流）**：Android 走 PWA `share_target`（文本 + 图片文件）；iOS 采用 PWA `mynote-wasm`（最高 `10 MiB` 无损原图 + 原生输入框粘贴）+ iOS Shortcuts/Scriptable（Keychain 存密钥、不切屏发文本及前置缩放 `≤ 1.5 MiB` 压缩图，以 `S-Clip-1` 真机实测为准），不立项原生 Swift App；
+     - **Q4（线格式与密钥隔离）**：全端统一对称 `MNC1`（独立可轮换 `ClipKey`，与 `SMK`/`VKEK` 物理隔离、不入恢复包，轮换即刻令 DO PITR 旧剪贴板密文不可解；另提供 `≤ 256 KiB` 零写库 `--ephemeral` 纯内存 WS 直推，彻底规避旧 `ephemeral_clips` 的 F-06 缺陷）；
+     - **Q5（桌面落地策略）**：手机与 CLI 显式发送项默认自动写入桌面系统剪贴板（覆盖前保留可撤销槽 `mynote clip undo` 并弹轻通知）；桌面后台自动镜像默认仅入收件箱可配置；
+     - **Q6（分期节奏）**：纳入路线图 `S-Clip（3–4 天真机 Spike）→ M4a（100 条图文显式同步 + 移动端 → 桌面）→ M4b（桌面 ↔ 桌面后台自动镜像，默认关闭 opt-in）→ M4c`，各正式规范文档已同步更新（对应新增 `ADR-11`，保持 `Proposed` 直至 S-Clip 产出真机实测证据）。
 
 ---
 

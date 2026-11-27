@@ -1,6 +1,6 @@
 # 安全架构与威胁模型规范 (`threat-model.md`)
 
-> 2026-11-24 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D7 更新。
+> 2026-11-27 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D8（含 2026-11-27 剪贴板同步拍板 D8 / D1′）更新。
 
 > 本文档是 [总架构设计方案 (`architecture-proposal.md`)](./architecture-proposal.md) 的安全与密码学专项规范，也是本项目**安全承诺的单一事实来源**。它与 [数据结构规范 (`data-structures.md`)](./data-structures.md)、[同步协议 (`sync-protocol.md`)](./sync-protocol.md)、[全链路接口契约 (`interface-contracts.md`)](./interface-contracts.md) 配套执行，界定 `my-note` 在桌面多端同步、块级保险库（Vault）、只读手机 PWA、本地守护进程及同用户 AI Agent 交互场景下的**真实信任边界、密钥存放、删除语义与攻击面防护**。每条承诺都写明「防什么、不防什么」。
 >
@@ -18,7 +18,8 @@
 6. [渲染层防 XSS / 防外带通道与严格 CSP 策略](#6-渲染层防-xss--防外带通道与严格-csp-策略)
 7. [设备配对、令牌范围、吊销与密钥环轮换](#7-设备配对令牌范围吊销与密钥环轮换)
 8. [手机端 Vault 解锁：仅内存会话、剪贴板与代码下发信任边界](#8-手机端-vault-解锁仅内存会话剪贴板与代码下发信任边界)
-9. [已移除 / 推迟的机制（2026-11-24）](#9-已移除--推迟的机制2026-11-24)
+9. [独立 100 条图文剪贴板同步安全边界（D8，M4）](#9-独立-100-条图文剪贴板同步安全边界d8m4)
+10. [已移除 / 推迟的机制（2026-11-24 / 2026-11-27 修订）](#10-已移除--推迟的机制2026-11-24--2026-11-27-修订)
 
 ---
 
@@ -31,9 +32,9 @@
 | **T1：云端被动存储泄露**（DO SQLite 磁盘与 PITR、R2 归档 / 快照外泄、网络抓包） | **✅ 内容零知识**（元数据可见，见 §1.2） | **✅ 内容零知识** | 每个块的全部版本都由该块独立的数据密钥 **BDEK** 经 `XChaCha20-Poly1305` 加密并填充后出站；BDEK 本身只以被 `SMK`（Tier 1）或 `VKEK`（Tier 2）包裹的形式存入密钥表。信封与密钥记录格式见 [`data-structures.md`](./data-structures.md)。 |
 | **T2：Cloudflare 账户或部署流水线被攻破**（主动篡改 Worker 代码、PWA 静态资源，删除或扣留云端数据） | **✅ 桌面端机密性不受影响**<br>**⚠️ 手机端不防** | **✅ 桌面端机密性不受影响**<br>**⚠️ 手机端不防**（D7） | 桌面 UI 只加载本地 `mynote` 二进制内嵌的前端资源，**不执行云端下发的代码**。手机 PWA 的代码由 Cloudflare 下发：被篡改的 JS 可读取手机已持有的 `SMK`，并在你下一次输入 Vault 口令时截获它（§8.4）。可用性：攻击者可删除 DO 与 R2 中的数据，此时依赖各桌面的本地库与本地备份（§3.5）。缓解：CF 账户强 2FA（建议硬件 FIDO2）、只从 CI 用最小权限 Token 部署、Service Worker 固定版本并在 UI 显示版本号。 |
 | **T3：浏览器中打开的外部恶意网页**（CSRF / DNS Rebinding / 跨源 WebSocket 探测本地端口） | **✅ 阻断** | **✅ 阻断** | 本地 Daemon 只接受统一入口 `http://localhost:<port>`：校验 `Host` 精确匹配、`Origin` 严格白名单，以及一次性票据换取的 `HttpOnly; SameSite=Strict` 256-bit 随机 Session Cookie（HTTP 与 WS 握手同等校验），见 §5.1。 |
-| **T4：外部粘贴或模型生成的恶意 Markdown / Mermaid 内容**（Stored XSS / 外链图片信标泄密） | **✅ 阻断** | **✅ 阻断** | Markdown 禁原始 HTML + `DOMPurify` 白名单净化；Mermaid 默认使用纯 SVG 输出的 `Pele` 渲染器；全端启用锁死 `style-src` 与 `img-src` 的严格 CSP，见 §6。 |
+| **T4：外部粘贴或模型生成的恶意 Markdown / Mermaid / 剪贴板图片内容**（Stored XSS / SVG 注入 / 外链图片信标泄密） | **✅ 阻断** | **✅ 阻断** | Markdown 禁原始 HTML + `DOMPurify` 白名单净化；Mermaid 默认使用纯 SVG 输出的 `Pele` 渲染器；全端启用锁死 `style-src` 与 `img-src` 的严格 CSP（§6）；M4 剪贴板图片严格限定位图白名单（`image/png`、`image/jpeg`、`image/webp`、`image/gif`），**严禁 `image/svg+xml` 走图片渲染**，预览使用 `Blob` + `URL.createObjectURL` 不放宽 CSP（§9）。 |
 | **T5：被 Prompt Injection 劫持的本地同 UID AI Agent（读取）** | **⚠️ 可读取普通块**（符合设计预期） | **⚠️ 防被动读取；不防持久化篡改** | 同 UID 进程可读本地文件、可读 Daemon 凭据与 Secret Service 中的 `SMK`、可用 `script` / `expect` 伪造 PTY——因此 **`isatty` 与 `MYNOTE_ACTOR` 只是体验与审计护栏，不是安全边界**。Tier 2 保证的是「**某一时刻的被动读取**」拿不到明文：常驻 Daemon、本地 SQLite、WAL、FTS、备份与镜像中只有密文。**不防**能持久化篡改执行环境的攻击者（替换用户可写的二进制、shell alias、`formatters.toml`、浏览器 profile / 扩展），它可以等你下一次输入口令。缓解：二进制由包管理器安装到用户不可写的位置；Agent 跑在沙箱 / 容器 / 独立 UID 下（§5.2）。 |
-| **T6：手机 / 笔记本丢失，或退役硬盘被物理取证** | **⚠️ 设备缓存中未碎纸的内容可被读取**；后续内容靠吊销 + 密钥环轮换保护 | **✅ 静态密文；`VKEK` 不落盘**（⚠️ Vault 头部可被离线暴力破解口令） | 手机只持有 `read` 范围的令牌：**丢失后攻击者写不进、也删不掉任何东西**。处置 = 吊销令牌 + 密钥环轮换（§7.3）。已离线的失窃设备上的缓存，吊销与碎纸都管不到。Vault 的 KDF 参数按 iPhone 定（§2.1），离线暴力破解成本由口令强度决定。SSD 磨损均衡层的物理残留依赖全盘加密（macOS `FileVault` / Linux `LUKS`）与 iOS 数据保护。 |
+| **T6：手机 / 笔记本丢失，或退役硬盘被物理取证** | **⚠️ 设备缓存中未碎纸的内容可被读取**；后续内容靠吊销 + 密钥环轮换保护 | **✅ 静态密文；`VKEK` 不落盘**（⚠️ Vault 头部可被离线暴力破解口令） | 手机仅持有 `read` 或（M4 起）`read+clip` 令牌：**丢失后攻击者仍写不进、删不掉任何笔记或密钥**（D1′）；快捷指令发送器仅持单向 `clip-write` 令牌，连历史剪贴板与笔记都不可读（§7.1）。处置 = 吊销令牌 + 密钥环轮换（或对 `clip-write` 执行 `mynote clip rotate-key`，§7.3 / §9）。已离线的失窃设备上的缓存，吊销与碎纸都管不到。Vault 的 KDF 参数按 iPhone 定（§2.1），离线暴力破解成本由口令强度决定。SSD 磨损均衡层的物理残留依赖全盘加密（macOS `FileVault` / Linux `LUKS`）与 iOS 数据保护。 |
 | **T7：二进制供应链**（包管理器分发） | **⚠️ 信任包管理器与维护者发布账号** | **⚠️ 同左** | 不再有自升级通道（`mynote update` 已删除）。分发交给 Homebrew tap / AUR / `cargo install`，完整性校验与回滚由包管理器负责；维护者 GitHub / 包仓库账号开启 2FA，发布产物只由 CI 构建。被篡改的二进制可以读取一切，这是所有本地软件的共同前提（§7.4）。 |
 | **T8：被注入的 Agent 或有 bug 的客户端（破坏）**（批量删除、提交垃圾版本、发起碎纸） | **⚠️ 能删进回收站、能写新版本、能请求碎纸；做不到「立即抹除」** | **⚠️ 同左** | op 日志只追加、密文永不删除，垃圾版本可回退；唯一能让数据不可恢复的路径是加密碎纸，而它受**服务端强制的最短宽限期 `T_grace_min` = 24 小时**约束；另有批量阈值、CLI 只能删进回收站、只读令牌不能碎纸、每日密钥自检；所有待删项在宽限期内对全部桌面可见、可撤销；碎纸执行后的最后补救是 R2 中保留 `T_snap` 的历史密钥表快照。**诚实边界**：直接持有令牌与 `SMK` 的代码可绕过 CLI，并伪造「UI 确认」，服务端无法区分——**硬保证只有服务端强制的宽限期**（§3.6）。 |
 | **T9：丢钥匙（自我丢数）**（密钥环、恢复包或密钥表丢失 / 被 bug 删除） | **⚠️ 依赖恢复包与密钥表的可靠性** | **⚠️ 同左，另需 Vault 口令或恢复包** | E2EE 引入了一种新的丢数方式。缓解：**一份统一恢复包**包裹整个密钥环（§2.2）；密钥表按 2P-Set 合并，合并本身不会丢失密钥；每日自检 + INV-KEY-LIVENESS；INV-RECOVERY 演练「零设备 + 恢复包 → 恢复全部未删除数据」；轮换后运行恢复演练验证恢复包有效。 |
@@ -42,9 +43,10 @@
 
 盲服务端看不到内容，但能看到以下信息。本系统**不承诺**隐藏「何时写入、加锁或删除、哪些 op 编辑同一实体、一共有多少块」：
 
-- 设备数量、每台设备的令牌范围（`read` / `read-write`）、连接与推送时间；
+- 设备数量、每台设备的令牌范围（`read` / `read+clip` / `clip-write` / `read-write`）、连接与推送时间；
 - op 的数量、填充后的体积档位、时间、来源设备，以及外层明文 `key_id`（用于服务端密钥竞态校验——由此可看出哪些 op 共用同一把数据密钥，大致对应同一块或同一 Buffer 在未换钥期间的编辑序列；不涉及 BDEK 的 `SET_META` / `DELETE` 为 `null`）；
-- 密钥表的记录数与每条记录的上传时间，以及碎纸标记的 `key_id`、`not_before`、状态与发起设备——由此可推断块的大致数量和删除 / 换钥 / 加锁活动的时间（例如「新建一把密钥的同时碎纸另一把」暗示发生了一次换钥）。
+- 密钥表的记录数与每条记录的上传时间，以及碎纸标记的 `key_id`、`not_before`、状态与发起设备——由此可推断块的大致数量和删除 / 换钥 / 加锁活动的时间（例如「新建一把密钥的同时碎纸另一把」暗示发生了一次换钥）；
+- **（M4，D8）独立剪贴板通道元数据**：`clip_id`、`clip_kid`、来源 `device_id`、`kind`（`text` / `image`）、创建时间、过期时间、密文体积档位及是否走 R2 `clip/blobs/`——服务端**看不到**剪贴板明文正文、缩略图、图片内容、宽高或 MIME 细类。
 - 服务端**看不到**：密钥记录对应哪个具体块 ID、属于 Tier 1 还是 Tier 2——`block_id` 与 `tier` 位于加密记录内部，服务端只见随机 `key_id`（格式见 [`data-structures.md`](./data-structures.md)）。因此服务端无法分辨哪把密钥属于 Vault 块。
 
 ---
@@ -93,7 +95,8 @@ flowchart TD
 | **`SMK`（`smk_vN`）**<br>Sync Master Key | 包裹 Tier 1 BDEK；加密 op 外层与状态快照 | OS Keychain（macOS） / Secret Service（Linux，如 GNOME Keyring / KeePassXC） | 由 IndexedDB 中 `extractable: false` 的 WebCrypto `AES-GCM` `CryptoKey` 包裹存储；运行时解包进 WASM 线性内存 | 持有（后台同步与物化 Tier 1 明文） | **❌ 永不接触明文** |
 | **`VKEK`**<br>Vault Key-Encrypting Key | 包裹 Tier 2 BDEK | **不落盘明文**：只以「口令包裹（Vault 头部）」与「恢复公钥封装（恢复密钥环）」两种密文存在；仅在 UI WASM 会话或单次 CLI 进程解锁期间驻留内存，空闲 5 分钟 / 失焦即 `zeroize` | **仅内存**：永不写 IndexedDB / Cache Storage；`visibilitychange` 或闲置 N 分钟自动上锁（§8） | **❌ 永不接触** | 仅存上述两种包裹密文 |
 | **`BDEK`（`key_id`）**<br>Block Data Encryption Key | 每块（及每 Buffer）一把，加密该实体全部版本 | 被 `SMK` 或 `VKEK` 包裹后存于本地密钥表 `block_keys` | 缓存密钥表副本（仍为包裹形式） | 只能解开 Tier 1 的 BDEK；Tier 2 的只透传包裹密文 | 存包裹密文与碎纸标记；到期由 DO alarm 置空（DO PITR 仍保留 30 天，见 §3.4） |
-| **`device_token`** | 云端接入鉴权（每设备独立，范围 `read` / `read-write`） | OS Keychain / `0600` 凭据文件；`read-write` | IndexedDB（同包裹保护）；**固定为 `read`** | 持有 | 仅存 `SHA-256(token)` 与范围；`read` 令牌的一切写请求（push、碎纸、撤销碎纸）返回 403 |
+| **`ClipKey`（`clip_kid`）**<br>独立剪贴板对称密钥（M4，D8） | 加密独立剪贴板通道 `MNC1`（100 条索引、R2 原图与 `--ephemeral` 帧）；与 `SMK`/`VKEK` 物理隔离，**不入 24 词恢复包** | 由 `SMK` 封装存于 `key_material(kind='clip_key')`，运行时在内存解包；轮换即丢弃旧钥 | PWA：同 `SMK` 由不可导出 WebCrypto `CryptoKey` 包裹存入 IndexedDB；iOS Shortcuts：存于 **Scriptable 原生 Keychain** | 持有（解包与加解密独立剪贴板） | 仅存被 `SMK` 封装的 `key_material` 密文；**❌ 永不接触明文** |
+| **`device_token`** | 云端接入鉴权（每设备独立，四态范围：`read` / `read+clip` / `clip-write` / `read-write`） | OS Keychain / `0600` 凭据文件；`read-write` | PWA：IndexedDB 包裹保护（`read` 或 `read+clip`）；iOS Shortcuts：Scriptable Keychain（`clip-write`） | 持有 | 仅存 `SHA-256(token)` 与范围；所有非 `read-write` 令牌对笔记/密钥/碎纸写请求返回 `403`；`clip-write` 对全部 `GET` 返回 `403` |
 
 > [!NOTE]
 > **关于 PWA 中 WebCrypto `extractable: false` 包裹密钥的诚实边界说明**：
@@ -274,14 +277,16 @@ $$
 
 ## 7. 设备配对、令牌范围、吊销与密钥环轮换
 
-### 7.1 设备令牌范围（D1）
+### 7.1 设备令牌范围（D1′、D8）
 
-| 范围 | 签发对象 | 允许 | 拒绝（403） |
+| 范围 | 签发对象 | 允许 | 拒绝（`403`） |
 | --- | --- | --- | --- |
-| `read` | 手机 PWA | 拉取 op、密钥表、状态快照、密钥环密文、Vault 头部 | push、碎纸、撤销碎纸及任何写请求 |
-| `read-write` | 桌面（Mac / Omarchy） | 全部同步操作；碎纸受 §3.6 的服务端校验约束 | — |
+| `read` | 纯只读手机 PWA（向后兼容） | 拉取 op、密钥表、状态快照、密钥环密文、Vault 头部、读剪贴板 | 笔记 push、密钥/碎纸写、状态快照上传、设备管理、写剪贴板 |
+| `read+clip` | **手机 PWA（M4 启用剪贴板时）** | 同 `read`，外加读写 `/v1/clip*` 独立剪贴板通道 | **笔记 push、密钥/碎纸写、状态快照上传、设备管理仍全部 `403`**（保住 D1 手机零破坏笔记边界） |
+| `clip-write` | **iOS Shortcuts / Scriptable / Android 快捷发送器（M4）** | 仅允许单向 `POST /v1/clip` 与 `PUT /v1/clip/blob` | **一切 `GET`（含 `GET /v1/clip*`、笔记、密钥、快照）与全部笔记/设备路由均 `403`** |
+| `read-write` | 桌面（Mac / Omarchy） | 全部同步、剪贴板与设备管理操作；碎纸受 §3.6 的服务端校验约束 | — |
 
-服务端只存 `SHA-256(token)` 与范围；手机的 Vault 解锁不需要写权限。
+服务端只存 `SHA-256(token)` 与范围；手机的 Vault 解锁不需要笔记写权限。`clip-write` 配对票据仅封装 `{ device_token, device_id, sync_url, clip_kid, clip_key }`，**绝不包含 `SMK`**。
 
 ### 7.2 首台设备引导与新设备配对
 
@@ -356,14 +361,39 @@ $$
 
 ---
 
-## 9. 已移除 / 推迟的机制（2026-11-24）
+## 9. 独立 100 条图文剪贴板同步安全边界（D8，M4）
+
+2026-11-27 拍板的独立剪贴板通道（D8）严格遵循「零虚假承诺、密钥隔离、与笔记主库物理解耦」原则：
+
+### 9.1 DO 30 天 PITR 诚实边界与两种销毁机制（化解旧 F-06）
+
+1. **图片与 `> 64 KiB` 长文本本体（存 R2 `clip/blobs/`）**：不进入 DO SQLite，因此**物理 0 进入 DO 30 天 PITR**，且不受 `archives/ops/` 的 R2 Bucket Lock 约束；超 100 条淘汰、用户删除或 7 天到期执行 `R2.delete` 即从服务端消失（另挂 8 天前缀生命周期清扫异常孤儿对象）。
+2. **100 条轻元数据与 `≤ 64 KiB` 小文本（存 DO SQLite `clip_items`）**：未轮换 `ClipKey` 前，已删除的条目仍受 Cloudflare 平台 30 天 DO PITR 覆盖；但因使用与 `SMK`/`VKEK` 物理隔离且**轮换不保留旧钥**的 `ClipKey`，一旦执行 `mynote clip rotate-key`，旧 `ClipKey` 在全端销毁，DO PITR 中的历史剪贴板密文立即可证明无法解密。
+3. **纯内存瞬态直推（`--ephemeral`，限 `≤ 256 KiB` 敏感短串）**：服务端零 SQLite 写入、零 R2 写入，仅向在线 `read-write` 桌面 WS 转发；无在线桌面直接返回 `409 NO_ONLINE_DESKTOP`，绝不降级写库，做到真正的物理零 PITR。
+
+### 9.2 桌面隐私与防泄露硬防线
+
+- **密码管理器标记硬过滤（不可关闭）**：macOS 读取 `NSPasteboard` 类型列表，凡命中 `org.nspasteboard.ConcealedType`、`TransientType`、`AutoGeneratedType`、`com.agilebits.onepassword`、`dev.mynote.vault-secret` 及默认忽略的 `com.apple.is-remote-clipboard` 一律跳过且不读取正文；Omarchy / Wayland 检查 offer MIME 列表，命中 `x-kde-passwordManagerHint`、`application/x-mynote-vault-secret` 或 `application/x-mynote-synced` 直接跳过。
+- **高危凭据自动拦截**：M4b 后台自动监听（默认关闭，opt-in）捕获的文本调用 `detect_secret_pattern`，命中高危凭据特征时拒绝自动上传，仅提示用户显式走 `mynote clip push --ephemeral`。
+- **位图 MIME 白名单防 XSS（守住 T4 / SEC-06）**：图片通道只接受 `image/png`、`image/jpeg`、`image/webp`、`image/gif`，**严禁 `image/svg+xml` 按图片解析或渲染**（SVG 按纯文本同步）；桌面与 PWA 使用 `Blob` + `URL.createObjectURL` 展示图片，不放宽现有严格 CSP。
+- **敏感瞬态写入剪贴板告知**：桌面收到 `ephemeral` 条目写入本机系统剪贴板时，主动附带 `TransientType` + `ConcealedType`（macOS）或 `x-kde-passwordManagerHint=secret`（Wayland）并支持可配定时清空（默认 60 秒）；与 §8.3 同口径，定时清空仅属体验优化而非绝对安全保证。
+
+### 9.3 移动端快捷指令与 PWA 剪贴板信任边界
+
+- **iOS Shortcuts + Scriptable（`clip-write` 单向通道）**：令牌与独立 `ClipKey` 存于 **Scriptable 原生 iOS Keychain**（避免硬编码在快捷指令文件内因分享泄露）；即使泄露，攻击者既无法调用 `GET /v1/clip*` 读取历史剪贴板，也无法读写任何笔记、密钥或碎纸标记（服务端一律 `403`），吊销设备并执行 `mynote clip rotate-key` 即可完全止损。
+- **Android PWA `share_target` 临时缓存清理**：Service Worker 拦截系统分享的 `POST /clip-share` 后仅短暂暂存至专用 Cache，主页面读取并由 `mynote-wasm` 加密后**立即删除该明文缓存条目**，确保 `SEC-08` 稳态零明文落盘。
+- **PWA 代码下发边界不变**：同 §8.4，手机 PWA 静态资源由 Cloudflare 下发，因此手机剪贴板同样不防 CF 账户 / 部署流水线被攻破（桌面本地二进制不受影响）。
+
+---
+
+## 10. 已移除 / 推迟的机制（2026-11-24 / 2026-11-27 修订）
 
 依据 [第一性原理审查](../review/2026-11-24-first-principles-review.md)：
 
 - **`purge_op_ids` 云端历史置空**：已移除——op 密文永不删除，删除只作用于密钥（§9.3、F-04）。
 - **「云端 PITR 与历史冷备将在保留期满后自然淘汰」的表述**：已移除——与永久 op 归档矛盾，改为 §3.4 的明确上界（§9.3、F-06）。
 - **可变密钥表 `vault_keys` + `MNK1` 外层信封 + `key_seq` 水位 + INV-SYNC-4**：已移除，由只创建不修改的独立密钥表 `block_keys`（2P-Set）+ 碎纸标记取代（§9.3、§9.7）。
-- **瞬态加密剪贴板**（`mynote clip push --ephemeral`、`/v1/sync/ephemeral-clip`、`ephemeral_clips`）：已移除——手机「复制」按钮取代，且它进入了 DO PITR，承诺本身不成立（§9.2、F-06）。
+- **旧版写入 DO SQLite 且声称零 PITR 的 `ephemeral_clips`（`/v1/sync/ephemeral-clip`）**：已永久废弃（F-06）；2026-11-27 拍板 **D8** 改为 §9 的独立 100 条图文通道（R2 原图 0 PITR + 可轮换 `ClipKey` + 零写库 `--ephemeral` WS 直推）。
 - **`vault_key_slots` 多槽位包裹（LUKS 模型）与按设备自适应 KDF 参数**：已移除——单套 KDF 参数按 iPhone 定（§9.10）。
 - **WebAuthn PRF 解锁**：推迟，触发条件见审查 §9.11（§9.10）。
 - **Vault 独立的 24 词恢复码**：已并入统一恢复包（F-05、§9.10）。

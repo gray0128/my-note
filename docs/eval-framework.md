@@ -1,6 +1,6 @@
 # 质量门禁与测试规范 (`eval-framework.md`)
 
-> 2026-11-24 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D7 更新。
+> 2026-11-27 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D8（含 2026-11-27 剪贴板同步拍板 D8 / D1′）更新。
 
 > 本文档是 `my-note` **测试门禁的单一事实来源**。评测与自动爬山不是本项目的研究目标（D6），所以这里只保留**确定性、可在 CI 中零方差复现**的质量手段，用来守护两件不可逆的事：**G1 永不静默丢数**、**G4 安全承诺不被破坏**。所有手段都要在一个人的维护预算内可持续。线格式、同步协议、安全承诺、云端实现与 CLI 契约分别以 [data-structures.md](./data-structures.md)、[sync-protocol.md](./sync-protocol.md)、[threat-model.md](./threat-model.md)、[cloudflare-cloud-architecture.md](./cloudflare-cloud-architecture.md)、[interface-contracts.md](./interface-contracts.md) 为准，本文只定义「怎么测、测到什么程度算过」。
 
@@ -17,8 +17,8 @@
 7. [CLI 黄金测试](#7-cli-黄金测试)
 8. [可选：线格式解析 fuzz](#8-可选线格式解析-fuzz)
 9. [CI 编排、仓库布局与执行纪律](#9-ci-编排仓库布局与执行纪律)
-10. [里程碑门禁矩阵（S0 → M3）](#10-里程碑门禁矩阵s0--m3)
-11. [已移除 / 推迟的机制（2026-11-24）](#11-已移除--推迟的机制2026-11-24)
+10. [里程碑门禁矩阵（S0 → M4）](#10-里程碑门禁矩阵s0--m4)
+11. [已移除 / 推迟的机制（2026-11-24 / 2026-11-27 修订）](#11-已移除--推迟的机制2026-11-24--2026-11-27-修订)
 
 ---
 
@@ -147,6 +147,13 @@ flowchart TB
 
 参数取值（`T_grace`、`T_grace_min`、N 等）以 [threat-model.md](./threat-model.md) 为准；测试按参数符号编写，并在默认取值下运行。
 
+**`INV-CLIP-ISOLATION`（M4，独立剪贴板物理隔离与流式 R2 契约测试）**：
+
+- 写入 100+ 条文本与图片剪贴板（含 `POST /v1/clip` 与 `PUT /v1/clip/blob`）后，断言 DO `ops`、`block_keys`、`shred_marks`、`phone_snapshots`、R2 `archives/ops/` 与 `archives/keys/` 均为 **0 变更**，桌面 FTS5 与只读 Markdown 镜像为 **0 变更**；
+- 连续写入第 101 条剪贴板或推进虚拟时钟越过 7 天 TTL 并触发 DO alarm 后，最旧条目从 `clip_items` 删除，且其对应的 R2 `clip/blobs/<clip_id>.mnc1` 对象被同步清理（0 孤儿大对象）；
+- `PUT /v1/clip/blob` 模拟 DO 登记失败时，刚写入的 R2 临时对象被同步回滚删除；超过 `10.5 MiB` 的上传被拒绝；
+- `ephemeral: true` 在 `workerd` 中实测 **0 次 DO SQLite 写入、0 次 R2 写入**；存在在线 `read-write` 桌面 WS 时收到 `clip_ephemeral` 帧，无在线桌面时返回 `409 NO_ONLINE_DESKTOP`。
+
 ---
 
 ## 4. INV-RECOVERY：零设备端到端恢复
@@ -176,7 +183,8 @@ flowchart TB
 | **`SEC-04`** | 填充往返无损 | `proptest` 遍历 `0 B` 至 `512 KiB` 随机长度（含全 `0x00`、全 `0x80` 边界）往返填充 / 去填充（填充规则以 [data-structures.md](./data-structures.md) 为准） | 精确还原原始字节，密文负载长度符合填充粒度 | M1 |
 | **`SEC-05`** | 本地 Daemon 跨源与票据重放防御 | 构造 `Host: attacker.com`（DNS Rebinding）、缺失 / 伪造 `Origin` 的写请求与本地 WebSocket 握手、重放已消费的一次性票据 | 全部返回 `401` 或 `403`，零状态变更 | M1 |
 | **`SEC-06`** | Markdown / `Pele` 零 XSS、零外带 | 输入 OWASP XSS 向量库、恶意外链图片、含伪造 `<foreignObject>` 与 `<script>` 的 Mermaid 文本，经渲染管线在无头浏览器 CSP 沙盒中加载 | 渲染 DOM 中 `<script>`、`<iframe>`、`<foreignObject>`、`on*` 属性数为 `0`；外部网络请求数为 `0` | M3 |
-| **`SEC-08`** | 手机 PWA 不落盘秘密 | Playwright WebKit 中运行只读 PWA：浏览含加锁块的库、解锁 Vault、复制，然后切后台 / 闲置；导出 IndexedDB 与 Cache Storage 全部内容扫描 | IndexedDB / Cache Storage 中零 Tier 2 明文、零 VKEK；`visibilitychange` 与闲置超时后自动上锁，内存会话被清除 | M2 |
+| **`SEC-08`** | 手机 PWA 不落盘秘密 | Playwright WebKit 中运行只读 PWA：浏览含加锁块的库、解锁 Vault、复制，然后切后台 / 闲置；导出 IndexedDB 与 Cache Storage 全部内容扫描 | IndexedDB / Cache Storage 中零 Tier 2 明文、零 VKEK；`visibilitychange` 与闲置超时后自动上锁，内存会话被清除；M4 `clip_items` 仅存 `MNC1` 密文，Android `share_target` 临时交接缓存消费后立即删除 | M2（M4 扩展） |
+| **`SEC-09`** | 独立剪贴板四态越权、防 XSS、密钥轮换与防泄露 | ① `clip-write` 访问全部 `GET`（含 `GET /v1/clip*`）与笔记路由，`read+clip` 访问笔记写/碎纸/设备路由；② 上传伪造 `image/svg+xml` 图片；③ `ClipKey` 轮换后尝试用新密钥解旧元数据与旧 R2 大对象；④ 桌面模拟收到含 `ConcealedType`、`x-kde-passwordManagerHint`、`com.apple.is-remote-clipboard` 与密钥正则特征的剪贴板事件；⑤ 双桌面含 JPEG → PNG 转码写入的互推测试 | ① 越权请求 100% 返回 `403`；② SVG 图片被拒绝（`400 INVALID_ARGUMENT`）；③ 旧密文解密失败（`INTEGRITY_ERROR`）；④ 敏感事件 0 次网络出站；⑤ 100 轮互推网络消息数恒为 1（零回环放大） | M4a（监听过滤与回环随 M4b） |
 
 补充说明：
 
@@ -235,7 +243,7 @@ flowchart TB
 
 - **不可变验证器前置阻断**：`immutable-verifier-guard` 作为所有构建与测试任务的 `needs` 前置依赖运行。非 `[eval-only]` PR 触碰 `evals/` 直接阻断后续任务，且各执行任务在运行前强制执行 `rm -rf evals/ && git checkout <base-sha> -- evals/`；`[eval-only]` PR 仅允许修改 `evals/` 与 `docs/eval-framework.md`。
 - **平台矩阵**：`macos-latest`（aarch64）与 `ubuntu-latest` 同时运行；Worker 契约测试与 Playwright Chromium / WebKit 运行时审计在 Linux 上必跑。
-- **静态与架构守卫**：`scripts/check-architecture.py`（含 `--selftest` 变异自检，强制校验 `mynote-core` Sans-I/O 零平台依赖、`spikes/` 物理隔离、`cloud-cf/src/` `<= 700` 行与 `mynote-core` 同步核心 `< 3,000` 行预算 [目标]、同步客户端防 `302` 重定向配置、HTML 零内联脚本与三包版本号一致）、`cargo fmt --check`、`cargo clippy -- -D warnings`、TypeScript 类型检查。
+- **静态与架构守卫**：`scripts/check-architecture.py`（含 `--selftest` 变异自检，强制校验 `mynote-core` Sans-I/O 零平台依赖、`spikes/` 物理隔离、`cloud-cf/src/` M2 `<= 700` 行 / M4 `<= 950` 行与 `mynote-core` 同步核心 `< 3,000` 行预算 [目标]、同步客户端防 `302` 重定向配置、HTML 零内联脚本与三包版本号一致）、`cargo fmt --check`、`cargo clippy -- -D warnings`、TypeScript 类型检查。
 - **真实浏览器 CDP 几何与状态等价门禁**：除 `SEC-03`、`SEC-06`、`SEC-08` 外，`tests/e2e/test_ui_cdp_equivalence.py` 在真实 `mynote daemon` 与无头 Chromium / WebKit 下断言零 `console.error` / `pageerror`、桌面（`1440x900`、`900x700`）与移动（`390x844`）视口 `scrollWidth <= innerWidth`、`.sr-only` 包含块隔离、实时 WebSocket 并发新建 Buffer 零重复标签，以及前端 DOM 排序与 SQLite 快照等价。
 
 | 层级 | 标准入口命令 | 触发时机 | 耗时 | 内容 | 失败策略 |
@@ -273,9 +281,9 @@ my-note/
 
 ---
 
-## 10. 里程碑门禁矩阵（S0 → M3）
+## 10. 里程碑门禁矩阵（S0 → M4）
 
-路线图以 [architecture-proposal.md](./architecture-proposal.md) 为准（审查 §9.11）。
+路线图以 [architecture-proposal.md](./architecture-proposal.md) 为准（审查 §9.11、§9.12）。
 
 | 里程碑 | 必须绿灯的门禁 | 非 CI 的准出条件 |
 | --- | --- | --- |
@@ -283,6 +291,9 @@ my-note/
 | **M1 替换 Heynote + iCloud** | 属性测试；DST（INV-SYNC-1/2/3/5、INV-KEY-LIVENESS）；真实 Worker 契约测试（push / pull / epoch / 令牌范围 / WS 唤醒 / 密钥表 / 归档）；INV-RECOVERY；`SEC-04`、`SEC-05`；Layer 1 格式化幂等与 Heynote 导入差分；CLI 黄金测试；双平台 CI | 双桌面纯 CLI + Daemon + HTML（`http://localhost:<port>`）日常流畅可用（D5′）；Mac 与 Omarchy 日常使用 4 周零丢数；Heynote 卸载 |
 | **M2 手机只读 + Vault + 碎纸** | 新增：INV-GRACE；INV-SHRED-BOUND；`SEC-01`（换钥语义）；`SEC-03`；`SEC-08`（手机 IndexedDB / Cache Storage）；INV-SYNC-7；DST 加入碎纸 / 撤销 / 到期与离线编辑交错 | iPhone 真机 Vault 解锁约 1–2 s（S0-3 已测 `(32768, 2, 1)` = `1553 ms` [已测]）；手机自动上锁人工验证 |
 | **M3 渲染与打磨** | 新增：`SEC-06`；Layer 2 外部格式化熔断 | — |
+| **S-Clip 技术 spike** | 无门禁；隔离于 `spikes/`。完成 `S-Clip-1`–`S-Clip-5` 真机实测（iPhone Scriptable JS 互通与压缩图稳定性、PWA WASM 体积与 Safari Promise 写图、macOS `NSPasteboard`、Hyprland `cliphist` 共存、Worker 流式写 `10 MiB` 到 R2） | 5 项实测报告入库后 `ADR-11` 升为 `Accepted` |
+| **M4a 100 条图文显式剪贴板** | 新增：`INV-CLIP-ISOLATION`；`SEC-09`（越权 `403`、拒 SVG、`ClipKey` 轮换、`ephemeral` 零写库）；`SEC-08` 扩展（PWA `clip_items` 密文与 `share_target` 缓存清零） | 真实 iPhone（PWA 无损原图 + Shortcuts 文本/压缩图）→ Mac / Omarchy 端到端实测通过 |
+| **M4b 桌面后台自动镜像（opt-in）** | 新增：`SEC-09` 桌面监听过滤（敏感 UTI/MIME 与 `detect_secret_pattern` 0 出站）与含 JPEG → PNG 转码的 Echo Loop 免疫测试 | Mac ↔ Omarchy 连续 2 周日常使用零回环、零密码管理器泄露、与 `cliphist` 零冲突 |
 
 ### 10.1 观测指标（不阻断）
 
@@ -298,7 +309,7 @@ my-note/
 
 ---
 
-## 11. 已移除 / 推迟的机制（2026-11-24）
+## 11. 已移除 / 推迟的机制（2026-11-24 / 2026-11-27 修订）
 
 依据 [第一性原理审查](../review/2026-11-24-first-principles-review.md)：
 
@@ -312,7 +323,7 @@ my-note/
 - **`SEC-01` 中的 `purge_op_ids` 擦除与「DO `ops` 表零明文」断言**：改为「换钥 + 碎纸旧钥」语义，op 密文永不删除（§9.3）。
 - **`SEC-02`（可变 `vault_keys` 的 `vault shred`）**：由 INV-SHRED-BOUND 与 INV-GRACE 取代（§9.3）。
 - **`SEC-07`（`mynote update` 自升级验签 / 防降级 / 回滚）**：删除，分发交给包管理器（F-14）。
-- **瞬态加密剪贴板（`ephemeral_clips`、`clip push --ephemeral`）相关测试**：删除，手机复制按钮取代（§9.2、D1）。
+- **旧版写入 DO SQLite 的 `ephemeral_clips` 相关测试**：已永久废弃（F-06）；2026-11-27 拍板 **D8** 改为 M4 的 `INV-CLIP-ISOLATION` 与 `SEC-09`（独立 100 条图文通道 + R2 原图 0 DO PITR + 零写库 `--ephemeral` 直推，见 §3、§5、§10）。
 - **Passkey PRF 槽位测试**：推迟，WebAuthn PRF 仍未进入路线图（§9.10）。
 - **Suite A4 FTS 检索评测集（100 组用例、`Recall@5` / `MRR@5` 阈值）**：推迟，不在 §9.9 门禁清单内；加锁块零召回由 `SEC-01` 覆盖；触发条件：日常使用中搜索漏召回成为明显痛点。
 - **Suite A5 体积 / 内存 / 延迟硬红线**：降为 §10.1 的不阻断观测指标，S0 实测前这些数字都未经测量（F-16）。
