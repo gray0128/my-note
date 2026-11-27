@@ -5,8 +5,8 @@ use mynote_core::error::{CoreError, ErrorCode};
 use rusqlite::Connection;
 use std::path::Path;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
-pub const MIN_READER_SCHEMA_VERSION: i64 = 1;
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const MIN_READER_SCHEMA_VERSION: i64 = 2;
 
 pub const INIT_PRAGMAS: &str = "
 PRAGMA busy_timeout = 5000;
@@ -15,7 +15,7 @@ PRAGMA foreign_keys = ON;
 PRAGMA secure_delete = ON;
 ";
 
-pub const SCHEMA_V1_DDL: &str = r#"
+pub const SCHEMA_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS local_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -146,7 +146,7 @@ CREATE TABLE IF NOT EXISTS shred_marks (
 CREATE INDEX IF NOT EXISTS idx_shred_marks_key ON shred_marks (key_id);
 
 CREATE TABLE IF NOT EXISTS key_material (
-    kind           TEXT PRIMARY KEY CHECK (kind IN ('keyring', 'vault_header')),
+    kind           TEXT PRIMARY KEY CHECK (kind IN ('keyring', 'vault_header', 'clip_key')),
     gen            INTEGER NOT NULL,
     blob           BLOB NOT NULL,
     updated_at_ms  INTEGER NOT NULL
@@ -159,7 +159,80 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     op_id          TEXT NOT NULL,
     created_at_ms  INTEGER NOT NULL
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS clip_items (
+    clip_id         TEXT PRIMARY KEY,
+    clip_kid        TEXT NOT NULL,
+    device_id       TEXT NOT NULL,
+    kind            TEXT NOT NULL CHECK (kind IN ('text', 'image')),
+    mime            TEXT NOT NULL,
+    source_mode     TEXT NOT NULL CHECK (source_mode IN ('explicit', 'auto')),
+    created_at_ms   INTEGER NOT NULL,
+    expires_at_ms   INTEGER NOT NULL,
+    text_preview    TEXT,
+    has_blob        INTEGER NOT NULL DEFAULT 0 CHECK (has_blob IN (0, 1)),
+    blob_bytes      INTEGER,
+    blob_sha256     TEXT,
+    width           INTEGER,
+    height          INTEGER,
+    thumb_mime      TEXT,
+    thumb_blob      BLOB,
+    local_blob_path TEXT
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_local_clip_created
+    ON clip_items (created_at_ms DESC, clip_id DESC);
 "#;
+
+pub const SCHEMA_V1_DDL: &str = SCHEMA_DDL;
+
+fn migrate_v1_to_v2(conn: &Connection) -> Result<(), CoreError> {
+    let km_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'key_material'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    let needs_km_rebuild = km_sql.as_deref().is_some_and(|sql| !sql.contains("'clip_key'"));
+    if needs_km_rebuild {
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").map_err(|e| {
+            CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("failed disabling foreign_keys for v1->v2 migration: {e}"),
+                "Verify SQLite database file integrity",
+            )
+        })?;
+        let rebuild_res = conn.execute_batch(
+            "
+            BEGIN IMMEDIATE;
+            CREATE TABLE key_material_v2 (
+                kind           TEXT PRIMARY KEY CHECK (kind IN ('keyring', 'vault_header', 'clip_key')),
+                gen            INTEGER NOT NULL,
+                blob           BLOB NOT NULL,
+                updated_at_ms  INTEGER NOT NULL
+            ) STRICT;
+            INSERT INTO key_material_v2 (kind, gen, blob, updated_at_ms)
+                SELECT kind, gen, blob, updated_at_ms FROM key_material;
+            DROP TABLE key_material;
+            ALTER TABLE key_material_v2 RENAME TO key_material;
+            COMMIT;
+            ",
+        );
+        if rebuild_res.is_err() {
+            let _ = conn.execute_batch("ROLLBACK;");
+        }
+        let _ = conn.execute_batch("PRAGMA foreign_keys = ON;");
+        rebuild_res.map_err(|e| {
+            CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("key_material v1->v2 rebuild failed: {e}"),
+                "Restore pre-migration backup from backups/mynote-pre-schema-v1.db",
+            )
+        })?;
+    }
+    Ok(())
+}
 
 pub fn init_connection(conn: &Connection, backups_dir: Option<&Path>) -> Result<(), CoreError> {
     // busy_timeout MUST be set BEFORE inspecting or enabling WAL so concurrent opens wait instead of SQLITE_BUSY.
@@ -215,7 +288,7 @@ pub fn init_connection(conn: &Connection, backups_dir: Option<&Path>) -> Result<
             }
         }
         // Already at current schema version: avoid acquiring SQLite write locks on read-only opens.
-        if existing_ver == CURRENT_SCHEMA_VERSION {
+        if existing_ver >= CURRENT_SCHEMA_VERSION {
             return Ok(());
         }
         // Pre-migration VACUUM INTO consistency snapshot
@@ -232,10 +305,13 @@ pub fn init_connection(conn: &Connection, backups_dir: Option<&Path>) -> Result<
                 vacuum_into(conn, &snap)?;
                 prune_pre_schema_backups(dir, 2);
             }
+            if existing_ver < 2 {
+                migrate_v1_to_v2(conn)?;
+            }
         }
     }
 
-    conn.execute_batch(SCHEMA_V1_DDL).map_err(|e| {
+    conn.execute_batch(SCHEMA_DDL).map_err(|e| {
         CoreError::new(
             ErrorCode::IntegrityError,
             format!("SQLite schema migration failed: {e}"),
@@ -244,12 +320,12 @@ pub fn init_connection(conn: &Connection, backups_dir: Option<&Path>) -> Result<
     })?;
 
     conn.execute(
-        "INSERT OR IGNORE INTO local_meta (key, value) VALUES ('schema_version', ?1)",
+        "INSERT OR REPLACE INTO local_meta (key, value) VALUES ('schema_version', ?1)",
         [CURRENT_SCHEMA_VERSION.to_string()],
     )
     .ok();
     conn.execute(
-        "INSERT OR IGNORE INTO local_meta (key, value) VALUES ('min_reader_schema_version', ?1)",
+        "INSERT OR REPLACE INTO local_meta (key, value) VALUES ('min_reader_schema_version', ?1)",
         [MIN_READER_SCHEMA_VERSION.to_string()],
     )
     .ok();

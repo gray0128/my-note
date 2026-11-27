@@ -9,8 +9,11 @@ use crate::daemon::{run_daemon_foreground, DaemonConfig};
 use crate::formatters::format_content;
 use crate::help::render_topic;
 use crate::output::{emit_error, emit_json, emit_jsonl, CliMeta, OutputMode};
-use crate::sync_client::{render_terminal_qr, RelayClient};
+use crate::sync_client::{ensure_clip_key, render_terminal_qr, RelayClient};
 use crate::uds::{try_send_uds, ApplyMeta, ApplyRequest, UdsRequest, UdsResponse};
+
+#[path = "runner_clip.rs"]
+mod runner_clip;
 use base64::Engine;
 use clap::Parser;
 use mynote_core::crypto::{decrypt_mnb1, encrypt_mnb1, RecoveryKeypair, VaultHeaderV1};
@@ -411,6 +414,15 @@ fn execute(cli: Cli, mode: OutputMode, started: Instant) -> i32 {
         } => {
             return handle_device_claim(&data_dir, non_interactive, mode, started, quiet);
         }
+        #[cfg(target_os = "linux")]
+        Commands::Clip {
+            action: crate::cli::ClipCommand::ServeWayland,
+        } => {
+            return match crate::clipboard::run_serve_wayland_helper() {
+                Ok(()) => 0,
+                Err(err) => emit_error(&err, mode, empty_meta(started), quiet),
+            };
+        }
         Commands::Device {
             action: DeviceCommand::Bootstrap { url, revoke_existing },
         } => {
@@ -458,6 +470,9 @@ fn execute(cli: Cli, mode: OutputMode, started: Instant) -> i32 {
         Commands::Device { action } => handle_device(&mut store, action, non_interactive, mode, started),
         Commands::Keyring { action } => handle_keyring(&mut store, action, non_interactive, mode, started),
         Commands::Recovery { action } => handle_recovery(&store, action, non_interactive, mode, started),
+        Commands::Clip { action } => {
+            runner_clip::handle_clip(&mut store, action, &actor, non_interactive, mode, started, quiet)
+        }
         Commands::Help { .. }
         | Commands::Restore(_)
         | Commands::Vault { .. }
@@ -722,7 +737,7 @@ fn handle_device_claim(
     if let Ok(mut store) = LocalStore::open(data_dir) {
         if let Ok(Some(creds)) = store.load_credentials() {
             if let Ok(client) = RelayClient::from_credentials(&creds) {
-                let _ = run_async(client.run_sync_round(&mut store, creds.scope == "read"));
+                let _ = run_async(client.run_sync_round(&mut store, creds.scope != "read-write"));
             }
         }
     }
@@ -1981,7 +1996,7 @@ fn handle_sync(
                 ));
             };
             let client = RelayClient::from_credentials(&creds)?;
-            let read_only = creds.scope == "read" || matches!(action, SyncCommand::Pull);
+            let read_only = creds.scope != "read-write" || matches!(action, SyncCommand::Pull);
             let report = run_async(client.run_sync_round(store, read_only))?;
             match mode {
                 OutputMode::Json | OutputMode::Jsonl => {
@@ -2425,6 +2440,7 @@ fn handle_device(
                     "Run 'mynote device add' in an interactive terminal without --json",
                 ));
             }
+            let parsed_scope = scope.parse::<mynote_core::model::DeviceScope>()?;
             let Some(creds) = store.load_credentials()? else {
                 return Err(CoreError::new(
                     ErrorCode::SyncOffline,
@@ -2433,15 +2449,41 @@ fn handle_device(
                 ));
             };
             let client = RelayClient::from_credentials(&creds)?;
-            let smks = store.current_smks_for_pairing();
-            let ticket = run_async(client.create_pairing_ticket(&name, &scope, smks))?;
+            let clip_key_opt = match parsed_scope {
+                mynote_core::model::DeviceScope::ClipWrite | mynote_core::model::DeviceScope::ReadClip => {
+                    let (ck, key, _gen) = run_async(ensure_clip_key(store, &client))?;
+                    Some((ck, key))
+                }
+                mynote_core::model::DeviceScope::ReadWrite => {
+                    store.unwrap_local_clip_key()?.map(|(ck, key, _)| (ck, key))
+                }
+                mynote_core::model::DeviceScope::Read => None,
+            };
+            let smks = match parsed_scope {
+                mynote_core::model::DeviceScope::ClipWrite => Vec::new(),
+                _ => store.current_smks_for_pairing(),
+            };
+            let ticket =
+                run_async(client.create_pairing_ticket(&name, parsed_scope.as_str(), smks, clip_key_opt))?;
             println!(
                 "One-time pairing ticket created for device {} (scope={}, valid 10 min):",
                 ticket.device_id, ticket.scope
             );
             println!("\n{}\n", render_terminal_qr(&ticket.pairing_code));
             println!("Pairing code:\n  {}\n", ticket.pairing_code);
-            println!("Run 'mynote device claim' on the target device and paste the code above.");
+            match parsed_scope {
+                mynote_core::model::DeviceScope::ClipWrite => {
+                    println!("Paste or scan the code in your iOS Shortcuts / Scriptable clip-only helper (no SMK included).");
+                }
+                mynote_core::model::DeviceScope::ReadClip => {
+                    println!(
+                        "Scan or paste the code in the mobile PWA to pair read-only notes + clipboard sync."
+                    );
+                }
+                _ => {
+                    println!("Run 'mynote device claim' on the target device and paste the code above.");
+                }
+            }
             Ok(0)
         }
         DeviceCommand::Refresh { device_id } => {
@@ -2514,11 +2556,24 @@ fn handle_device(
                 ));
             };
             let client = RelayClient::from_credentials(&creds)?;
+            let revoked_scope = run_async(client.list_devices())
+                .ok()
+                .and_then(|devs| devs.into_iter().find(|d| d.device_id == device_id))
+                .map(|d| d.scope);
             let revoked_at_ms = run_async(client.revoke_device(&device_id))?;
+            let hint = match revoked_scope.as_deref() {
+                Some("clip-write") => {
+                    "Run 'mynote clip rotate-key' to rotate ClipKey and wipe cloud clipboard history"
+                }
+                Some("read+clip") => {
+                    "Run 'mynote keyring rotate' and 'mynote clip rotate-key' to rotate SMK and ClipKey"
+                }
+                _ => "Run 'mynote keyring rotate' to prevent the revoked device from decrypting future notes",
+            };
             let data = serde_json::json!({
                 "device_id": device_id,
                 "revoked_at_ms": revoked_at_ms,
-                "hint": "Run 'mynote keyring rotate' to prevent the revoked device from decrypting future notes",
+                "hint": hint,
             });
             match mode {
                 OutputMode::Json | OutputMode::Jsonl => {
@@ -2526,7 +2581,7 @@ fn handle_device(
                 }
                 OutputMode::Human => {
                     println!("revoked device {device_id} at {revoked_at_ms}");
-                    println!("hint: run 'mynote keyring rotate' to rotate SMK for future notes");
+                    println!("hint: {hint}");
                 }
             }
             Ok(0)
@@ -2606,7 +2661,7 @@ fn handle_keyring(
             let gens = store.unlock_keyring_with_words(&words)?;
             if let Some(creds) = &maybe_creds {
                 if let Ok(client) = RelayClient::from_credentials(creds) {
-                    let _ = run_async(client.run_sync_round(store, creds.scope == "read"));
+                    let _ = run_async(client.run_sync_round(store, creds.scope != "read-write"));
                 }
             }
             let _ = try_send_uds(

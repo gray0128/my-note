@@ -1,6 +1,8 @@
 //! Clap CLI command tree (`docs/interface-contracts.md` §2.3, `docs/architecture-proposal.md` §5.5).
 
-use crate::help::{ADD_AFTER_HELP, BLOCK_AFTER_HELP, FORMAT_AFTER_HELP, TOP_LEVEL_HELP, TRASH_AFTER_HELP};
+use crate::help::{
+    ADD_AFTER_HELP, BLOCK_AFTER_HELP, CLIP_AFTER_HELP, FORMAT_AFTER_HELP, TOP_LEVEL_HELP, TRASH_AFTER_HELP,
+};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -116,6 +118,13 @@ pub enum Commands {
 
     /// Pure offline disaster recovery from local R2 archive directory (--from-archive)
     Restore(RestoreArgs),
+
+    /// Independent 100-item encrypted text & bitmap clipboard channel (M4)
+    #[command(after_help = CLIP_AFTER_HELP)]
+    Clip {
+        #[command(subcommand)]
+        action: ClipCommand,
+    },
 
     /// Run the local desktop HTTP/WS/UDS daemon with embedded Web UI and background sync
     Daemon(DaemonArgs),
@@ -485,6 +494,7 @@ pub enum DeviceCommand {
     Add {
         #[arg(long)]
         name: String,
+        /// Token scope: read, read+clip, clip-write, or read-write
         #[arg(long, default_value = "read-write")]
         scope: String,
     },
@@ -512,6 +522,86 @@ pub enum RecoveryCommand {
     Show,
     /// Offline read-only verification that 24 words unseal all SMK generations (TTY required)
     Drill,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ClipCommand {
+    /// Push text or bitmap image (from system clipboard, --stdin, --text, or --file)
+    Push {
+        /// Read UTF-8 text from stdin
+        #[arg(long)]
+        stdin: bool,
+
+        /// Explicit UTF-8 text to push
+        #[arg(long, value_name = "STR")]
+        text: Option<String>,
+
+        /// Bitmap image file (png/jpeg/webp/gif <= 10 MiB; SVG rejected)
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+
+        /// Zero-DB pure-memory WS direct push to online desktop (<= 256 KiB text; exits 6 NO_ONLINE_DESKTOP if none online)
+        #[arg(long)]
+        ephemeral: bool,
+
+        /// Explicitly wait for cloud relay acknowledgment (exits 6 if offline)
+        #[arg(long)]
+        wait_sync: bool,
+    },
+
+    /// Pull the latest or specified clip item from the encrypted clipboard channel
+    Pull {
+        /// Target clip ULID (defaults to latest item)
+        clip_id: Option<String>,
+
+        /// Apply pulled payload to the local system clipboard (captures undo slot & sets echo-guard marker)
+        #[arg(long)]
+        apply: bool,
+
+        /// Emit exact raw payload bytes to stdout with no trailing decorations
+        #[arg(long)]
+        raw: bool,
+
+        /// Write pulled payload bytes to a local file path
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+
+    /// List recent clipboard history summaries (token-budget safe)
+    History {
+        /// Maximum items to return (1..=100)
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+
+        /// Filter by kind: text or image
+        #[arg(long, value_name = "KIND")]
+        kind: Option<String>,
+    },
+
+    /// Promote a text clip item into a standard note block
+    Promote {
+        /// Target clip ULID (defaults to latest item)
+        clip_id: Option<String>,
+
+        /// Target buffer name or ULID (default: "scratch")
+        #[arg(long, default_value = "scratch")]
+        buf: String,
+
+        /// Language tag (auto-detected when omitted)
+        #[arg(long)]
+        lang: Option<String>,
+    },
+
+    /// Restore the desktop clipboard to its state prior to the last overwrite
+    Undo,
+
+    /// Rotate ClipKey and wipe cloud + local clip history (TTY required)
+    RotateKey,
+
+    /// Internal detached Wayland clipboard owner helper
+    #[cfg(target_os = "linux")]
+    #[command(name = "__serve-wayland", hide = true)]
+    ServeWayland,
 }
 
 #[derive(Debug, Args)]

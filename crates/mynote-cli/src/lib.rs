@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod clipboard;
 pub mod daemon;
 pub mod formatters;
 pub mod help;

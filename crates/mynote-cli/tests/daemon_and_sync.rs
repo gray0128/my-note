@@ -1026,7 +1026,7 @@ async fn full_dual_desktop_sync_conflict_rotation_refresh_revoke_and_pitr_e2e() 
 
     // 2. Desktop A creates one-time pairing ticket -> Desktop B claims -> pulls identical note
     let pair = client_a
-        .create_pairing_ticket("omarchy", "read-write", store_a.current_smks_for_pairing())
+        .create_pairing_ticket("omarchy", "read-write", store_a.current_smks_for_pairing(), None)
         .await
         .unwrap();
     let claimed = RelayClient::claim_pairing_code(&pair.pairing_code, &dir_b)
@@ -1339,7 +1339,12 @@ async fn regression_recovery_bootstrap_key_table_diff_large_batch_and_daemon_smk
 
     // === 2. HIGH #2: sync_key_table GET-before-POST when peer holds older keyring_gen ===
     let pair = client_rec
-        .create_pairing_ticket("peer-desktop", "read-write", store_rec.current_smks_for_pairing())
+        .create_pairing_ticket(
+            "peer-desktop",
+            "read-write",
+            store_rec.current_smks_for_pairing(),
+            None,
+        )
         .await
         .unwrap();
     RelayClient::claim_pairing_code(&pair.pairing_code, &dir_peer)
@@ -1418,6 +1423,7 @@ async fn regression_recovery_bootstrap_key_table_diff_large_batch_and_daemon_smk
             "daemon-desktop",
             "read-write",
             store_rec.current_smks_for_pairing(),
+            None,
         )
         .await
         .unwrap();

@@ -187,9 +187,29 @@ pub enum ApplyRequest {
 pub enum UdsRequest {
     Ping,
     OpenTicket,
-    Poke { fast_flush: bool },
-    SyncNow { wait: bool },
-    Apply { meta: ApplyMeta, request: ApplyRequest },
+    Poke {
+        fast_flush: bool,
+    },
+    SyncNow {
+        wait: bool,
+    },
+    Apply {
+        meta: ApplyMeta,
+        request: ApplyRequest,
+    },
+    ClipUndo,
+    ClipApply {
+        clip_id: String,
+    },
+    ClipPoke {
+        clip_id: Option<String>,
+        cleared: bool,
+    },
+    ClipWatchSet {
+        paused: Option<bool>,
+        enabled: Option<bool>,
+        auto_apply_mirror: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -269,6 +289,7 @@ impl UdsResponse {
                 "DEVICE_REVOKED" => ErrorCode::DeviceRevoked,
                 "TOKEN_SCOPE_FORBIDDEN" => ErrorCode::TokenScopeForbidden,
                 "SYNC_OFFLINE" => ErrorCode::SyncOffline,
+                "NO_ONLINE_DESKTOP" => ErrorCode::NoOnlineDesktop,
                 "RATE_LIMITED" => ErrorCode::RateLimited,
                 "FORMAT_SYNTAX_ERROR" => ErrorCode::FormatSyntaxError,
                 "KEY_MISSING" => ErrorCode::KeyMissing,
