@@ -444,6 +444,18 @@ impl LocalStore {
             .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "get clip_item"))
     }
 
+    pub fn count_active_clip_items(&self, now_ms: i64) -> Result<usize, CoreError> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM clip_items WHERE expires_at_ms > ?1",
+                [now_ms],
+                |r| r.get(0),
+            )
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "count clip_items"))?;
+        Ok(count.max(0) as usize)
+    }
+
     pub fn latest_clip_item(&self) -> Result<Option<ClipItemRow>, CoreError> {
         let sql = format!(
             "SELECT {CLIP_SELECT_COLS} FROM clip_items \

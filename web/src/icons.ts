@@ -49,7 +49,8 @@ export type IconName =
   | "download"
   | "file-plus"
   | "pause"
-  | "play";
+  | "play"
+  | "keyboard";
 
 type SvgPrimitive =
   | { readonly tag: "path"; readonly attrs: Readonly<Record<string, string>> }
@@ -283,6 +284,14 @@ const ICON_DEFS: Readonly<Record<IconName, readonly SvgPrimitive[]>> = {
   ],
   play: [
     { tag: "path", attrs: { d: "M6 4l14 8-14 8V4z" } },
+  ],
+  keyboard: [
+    { tag: "rect", attrs: { x: "2", y: "5", width: "20", height: "14", rx: "2.5" } },
+    { tag: "line", attrs: { x1: "6", y1: "9.5", x2: "6.01", y2: "9.5" } },
+    { tag: "line", attrs: { x1: "10", y1: "9.5", x2: "10.01", y2: "9.5" } },
+    { tag: "line", attrs: { x1: "14", y1: "9.5", x2: "14.01", y2: "9.5" } },
+    { tag: "line", attrs: { x1: "18", y1: "9.5", x2: "18.01", y2: "9.5" } },
+    { tag: "line", attrs: { x1: "8", y1: "14.5", x2: "16", y2: "14.5" } },
   ],
 };
 

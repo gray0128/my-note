@@ -8,23 +8,25 @@ import { loadLangExtension, loadVimExtension, SUPPORTED_LANGS } from "./langs";
 import { mountDiagramWidget, type DiagramWidgetHandle } from "./render/diagram";
 import { computeInlineWordDiff, type InlineDiffSegment } from "./render/diff";
 import { mountMarkdownPreview, type MountedMarkdownPreview } from "./render/markdown";
-import { createShortcutHint, formatShortcutTitle, type ShortcutKeyToken } from "./shortcuts";
+import {
+  createShortcutHint,
+  formatShortcutTitle,
+  SHORTCUT_CLIPBOARD,
+  SHORTCUT_FIND,
+  SHORTCUT_HELP,
+  SHORTCUT_MOVE_DOWN,
+  SHORTCUT_MOVE_UP,
+  SHORTCUT_NEW_BLOCK,
+  SHORTCUT_SWITCH_BLOCK_PAIR,
+  SHORTCUT_SWITCH_BUFFER,
+  type ShortcutKeyToken,
+} from "./shortcuts";
 import type { BlockDto } from "./types";
 import { detectSecretPatternFast } from "./wasm/desktop";
 
-const MOVE_UP_SHORTCUT: readonly ShortcutKeyToken[] = [
-  { kind: "mod" },
-  { kind: "alt" },
-  { kind: "shift" },
-  { kind: "up" },
-];
-const MOVE_DOWN_SHORTCUT: readonly ShortcutKeyToken[] = [
-  { kind: "mod" },
-  { kind: "alt" },
-  { kind: "shift" },
-  { kind: "down" },
-];
-const NEW_BELOW_SHORTCUT: readonly ShortcutKeyToken[] = [{ kind: "mod" }, { kind: "enter" }];
+const MOVE_UP_SHORTCUT = SHORTCUT_MOVE_UP;
+const MOVE_DOWN_SHORTCUT = SHORTCUT_MOVE_DOWN;
+const NEW_BELOW_SHORTCUT = SHORTCUT_NEW_BLOCK;
 
 const REMOTE_SYNC_ANN = Annotation.define<boolean>();
 const INITIAL_MOUNT_WINDOW = 20;
@@ -127,6 +129,7 @@ export interface BlockEditorCallbacks {
   onFeedback?(msg: string, isError?: boolean): void;
   onSecretPasted?(block: BlockDto, secretType: string): void;
   onVaultActivity?(): void;
+  onOpenShortcuts?(): void;
 }
 
 type MountedPreview =
@@ -202,6 +205,7 @@ export class BlockStreamController {
   private activeFindHit: { blockId: string; from: number; to: number } | null = null;
   private openOverflow: OverflowMenuState | null = null;
   private streamAddBtnEl: HTMLButtonElement | null = null;
+  private streamShortcutHintsEl: HTMLElement | null = null;
 
   constructor(private container: HTMLElement, private cb: BlockEditorCallbacks) {
     if (typeof IntersectionObserver !== "undefined") {
@@ -852,6 +856,7 @@ export class BlockStreamController {
     this.saving.clear();
     this.pendingResave.clear();
     this.streamAddBtnEl = null;
+    this.streamShortcutHintsEl = null;
   }
 
   /**
@@ -859,16 +864,17 @@ export class BlockStreamController {
    * WITHOUT unmounting CodeMirror views or losing drafts/cursor/undo/Vault RAM.
    */
   refreshLocale(): void {
-    if (this.blocks.length === 0) {
-      const emptyEl = this.container.querySelector<HTMLElement>(".empty-state");
-      if (emptyEl) emptyEl.textContent = t("block.emptyStream");
-      return;
-    }
-
     if (this.streamAddBtnEl) {
       const lbl = this.streamAddBtnEl.querySelector<HTMLElement>(".stream-add-label");
       if (lbl) lbl.textContent = t("block.addBelowStream");
       this.streamAddBtnEl.title = t("topbar.newBlockTitle");
+    }
+    this.populateStreamShortcutHints();
+
+    if (this.blocks.length === 0) {
+      const emptyEl = this.container.querySelector<HTMLElement>(".empty-state");
+      if (emptyEl) emptyEl.textContent = t("block.emptyStream");
+      return;
     }
 
     for (const block of this.blocks) {
@@ -1128,6 +1134,38 @@ export class BlockStreamController {
     return true;
   }
 
+  private populateStreamShortcutHints(): void {
+    if (!this.streamShortcutHintsEl) return;
+    this.streamShortcutHintsEl.replaceChildren();
+
+    const mkHintItem = (tokens: readonly ShortcutKeyToken[], label: string): HTMLSpanElement => {
+      const item = document.createElement("span");
+      item.className = "stream-shortcut-item";
+      const lbl = document.createElement("span");
+      lbl.textContent = label;
+      item.append(createShortcutHint(tokens), lbl);
+      return item;
+    };
+
+    const moreBtn = document.createElement("button");
+    moreBtn.type = "button";
+    moreBtn.className = "stream-shortcut-more";
+    moreBtn.dataset.testid = "stream-shortcuts-btn";
+    moreBtn.title = t("topbar.shortcutsTitle", { shortcut: formatShortcutTitle(SHORTCUT_HELP) });
+    const moreLbl = document.createElement("span");
+    moreLbl.textContent = t("shortcuts.more");
+    moreBtn.append(createShortcutHint(SHORTCUT_HELP), moreLbl);
+    moreBtn.addEventListener("click", () => this.cb.onOpenShortcuts?.());
+
+    this.streamShortcutHintsEl.append(
+      mkHintItem(SHORTCUT_SWITCH_BLOCK_PAIR, t("shortcuts.hintSwitchBlock")),
+      mkHintItem(SHORTCUT_CLIPBOARD, t("shortcuts.hintClipboard")),
+      mkHintItem(SHORTCUT_SWITCH_BUFFER, t("shortcuts.hintBuffers")),
+      mkHintItem(SHORTCUT_FIND, t("shortcuts.hintFind")),
+      moreBtn,
+    );
+  }
+
   private ensureStreamAddButton(): void {
     if (!this.streamAddBtnEl) {
       const btn = document.createElement("button");
@@ -1147,6 +1185,15 @@ export class BlockStreamController {
       this.streamAddBtnEl = btn;
     }
     this.container.appendChild(this.streamAddBtnEl);
+
+    if (!this.streamShortcutHintsEl) {
+      const hints = document.createElement("div");
+      hints.className = "stream-shortcut-hints";
+      hints.dataset.testid = "stream-shortcut-hints";
+      this.streamShortcutHintsEl = hints;
+      this.populateStreamShortcutHints();
+    }
+    this.container.appendChild(this.streamShortcutHintsEl);
   }
 
   private renderStream(): void {

@@ -1379,6 +1379,11 @@ async fn handle_bootstrap(State(state): State<Arc<DaemonState>>) -> Response {
             };
             let sync_status = store.sync_status()?;
             let trash_count = sync_status.trash.count;
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(1);
+            let clip_count = store.count_active_clip_items(now_ms).unwrap_or(0);
             let vault_header = store.get_vault_header()?;
             let recovery_pk_b64 = store
                 .recovery_pk()
@@ -1394,6 +1399,8 @@ async fn handle_bootstrap(State(state): State<Arc<DaemonState>>) -> Response {
                 "recovery_pk_b64": recovery_pk_b64,
                 "blocked_tier2_ops": blocked_tier2_ops,
                 "trash_count": trash_count,
+                "clip_count": clip_count,
+                "daemon_version": env!("CARGO_PKG_VERSION"),
                 "device_id": store.device_id().as_str(),
                 "last_hlc": store.last_hlc_string(),
             }))

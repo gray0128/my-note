@@ -11,6 +11,7 @@ import {
 } from "../clipUtils";
 import { formatDeviceName, formatHistoryTimestamp, t } from "../i18n";
 import { createIcon } from "../icons";
+import { formatShortcutTitle, SHORTCUT_NEW_BLOCK } from "../shortcuts";
 import type { BlockDto, ClipAutoApplyMirrorMode, ClipItemDto, ClipKind } from "../types";
 
 export interface ClipDrawerCallbacks {
@@ -26,7 +27,9 @@ export interface ClipWsChangeFrame {
   upserted: ClipItemDto[];
   deleted_ids: string[];
   cleared: boolean;
+  watch_enabled?: boolean;
   watch_paused: boolean;
+  auto_apply_mirror?: ClipAutoApplyMirrorMode;
 }
 
 function sortClipsDesc(items: readonly ClipItemDto[]): ClipItemDto[] {
@@ -60,6 +63,8 @@ export class ClipDrawerController {
   private undoBtnEl!: HTMLButtonElement;
   private clearBtnEl!: HTMLButtonElement;
   private watchBtnEl!: HTMLButtonElement;
+  private watchPauseBtnEl!: HTMLButtonElement;
+  private watchModeBtnEl!: HTMLButtonElement;
   private composerInputEl!: HTMLTextAreaElement;
   private ephemeralCheckEl!: HTMLInputElement;
   private ephemeralTextEl!: HTMLSpanElement;
@@ -127,10 +132,12 @@ export class ClipDrawerController {
     return this.items;
   }
 
-  async refresh(): Promise<void> {
+  async refresh(opts: { silent?: boolean } = {}): Promise<void> {
     if (!this.api.listClips) {
-      this.setError(t("clip.errApiUnavailable"));
-      this.renderList();
+      if (!opts.silent) {
+        this.setError(t("clip.errApiUnavailable"));
+        this.renderList();
+      }
       return;
     }
     try {
@@ -142,14 +149,24 @@ export class ClipDrawerController {
       this.autoApplyMirror = res.auto_apply_mirror;
       this.cb.onCountChange?.(this.items.length);
       this.renderHeaderState();
-      this.renderList();
+      if (this.openState) {
+        this.renderList();
+      }
     } catch (e) {
-      this.cb.onError(e);
+      if (!opts.silent) {
+        this.cb.onError(e);
+      }
     }
   }
 
   applyWsUpdate(frame: ClipWsChangeFrame): void {
+    if (frame.watch_enabled !== undefined) {
+      this.watchEnabled = frame.watch_enabled;
+    }
     this.watchPaused = frame.watch_paused;
+    if (frame.auto_apply_mirror !== undefined) {
+      this.autoApplyMirror = frame.auto_apply_mirror;
+    }
     const byId = new Map<string, ClipItemDto>();
     if (!frame.cleared) {
       for (const item of this.items) {
@@ -226,7 +243,7 @@ export class ClipDrawerController {
     this.closeBtnEl.addEventListener("click", () => this.close());
     hdr.append(titleGroup, this.closeBtnEl);
 
-    // Header actions row: Undo Overwrite, Clear All, Auto-Watch pause/resume toggle
+    // Header actions row: Undo Overwrite & Clear All
     const actionsRow = document.createElement("div");
     actionsRow.className = "drawer-actions clip-header-actions";
 
@@ -236,19 +253,38 @@ export class ClipDrawerController {
     this.undoBtnEl.dataset.testid = "clip-undo-btn";
     this.undoBtnEl.addEventListener("click", () => void this.handleUndo());
 
-    this.watchBtnEl = document.createElement("button");
-    this.watchBtnEl.type = "button";
-    this.watchBtnEl.className = "btn btn-icon btn-has-icon";
-    this.watchBtnEl.dataset.testid = "clip-watch-toggle";
-    this.watchBtnEl.addEventListener("click", () => void this.handleToggleWatch());
-
     this.clearBtnEl = document.createElement("button");
     this.clearBtnEl.type = "button";
     this.clearBtnEl.className = "btn btn-ghost btn-danger btn-icon";
     this.clearBtnEl.dataset.testid = "clip-clear-btn";
     this.clearBtnEl.addEventListener("click", () => void this.handleClearAll());
 
-    actionsRow.append(this.undoBtnEl, this.watchBtnEl, this.clearBtnEl);
+    actionsRow.append(this.undoBtnEl, this.clearBtnEl);
+
+    // Compact Auto-Watch control strip (honest enabled/paused/receive-mode state)
+    const watchBar = document.createElement("div");
+    watchBar.className = "clip-watch-bar";
+    watchBar.dataset.testid = "clip-watch-bar";
+
+    this.watchBtnEl = document.createElement("button");
+    this.watchBtnEl.type = "button";
+    this.watchBtnEl.className = "btn btn-icon btn-has-icon";
+    this.watchBtnEl.dataset.testid = "clip-watch-toggle";
+    this.watchBtnEl.addEventListener("click", () => void this.handleToggleWatchEnabled());
+
+    this.watchPauseBtnEl = document.createElement("button");
+    this.watchPauseBtnEl.type = "button";
+    this.watchPauseBtnEl.className = "btn btn-ghost btn-icon btn-has-icon hidden";
+    this.watchPauseBtnEl.dataset.testid = "clip-watch-pause";
+    this.watchPauseBtnEl.addEventListener("click", () => void this.handleToggleWatchPaused());
+
+    this.watchModeBtnEl = document.createElement("button");
+    this.watchModeBtnEl.type = "button";
+    this.watchModeBtnEl.className = "btn btn-ghost btn-icon hidden";
+    this.watchModeBtnEl.dataset.testid = "clip-watch-mode";
+    this.watchModeBtnEl.addEventListener("click", () => void this.handleToggleWatchMode());
+
+    watchBar.append(this.watchBtnEl, this.watchPauseBtnEl, this.watchModeBtnEl);
 
     // Composer
     const composer = document.createElement("div");
@@ -337,7 +373,7 @@ export class ClipDrawerController {
     this.listEl.className = "drawer-list clip-list";
     this.listEl.dataset.testid = "clip-list";
 
-    this.element.append(hdr, actionsRow, composer, this.filterBarEl, this.listEl);
+    this.element.append(hdr, actionsRow, watchBar, composer, this.filterBarEl, this.listEl);
 
     // Image Preview Modal
     this.previewModalEl = document.createElement("div");
@@ -413,17 +449,45 @@ export class ClipDrawerController {
     undoLbl.textContent = t("clip.undo");
     this.undoBtnEl.replaceChildren(createIcon("rotate-ccw", "xs"), undoLbl);
 
-    this.watchBtnEl.setAttribute("aria-pressed", String(this.watchPaused));
-    this.watchBtnEl.className = `btn btn-icon btn-has-icon${this.watchPaused ? " btn-amber" : ""}`;
-    this.watchBtnEl.title = `${this.watchPaused ? t("clip.watchPaused") : t("clip.watchActive")} (${this.autoApplyMirror})`;
+    this.watchBtnEl.setAttribute("aria-pressed", String(this.watchEnabled));
+    this.watchBtnEl.className = `btn btn-icon btn-has-icon${
+      !this.watchEnabled ? "" : this.watchPaused ? " btn-amber" : " btn-accent-soft"
+    }`;
+    this.watchBtnEl.title = this.watchEnabled ? t("clip.watchDisableTitle") : t("clip.watchEnableTitle");
     const watchLbl = document.createElement("span");
-    watchLbl.textContent = this.watchPaused ? t("clip.watchResume") : t("clip.watchPause");
-    this.watchBtnEl.replaceChildren(createIcon(this.watchPaused ? "play" : "pause", "xs"), watchLbl);
+    watchLbl.textContent = this.watchEnabled ? t("clip.watchOn") : t("clip.watchOff");
+    this.watchBtnEl.replaceChildren(
+      createIcon(this.watchEnabled ? (this.watchPaused ? "pause" : "check-circle") : "play", "xs"),
+      watchLbl,
+    );
+
+    this.watchPauseBtnEl.classList.toggle("hidden", !this.watchEnabled);
+    this.watchPauseBtnEl.setAttribute("aria-pressed", String(this.watchPaused));
+    this.watchPauseBtnEl.className = `btn btn-icon btn-has-icon${
+      this.watchPaused ? " btn-amber" : " btn-ghost"
+    }${this.watchEnabled ? "" : " hidden"}`;
+    this.watchPauseBtnEl.title = this.watchPaused ? t("clip.watchPaused") : t("clip.watchActive");
+    const pauseLbl = document.createElement("span");
+    pauseLbl.textContent = this.watchPaused ? t("clip.watchResumeShort") : t("clip.watchPauseShort");
+    this.watchPauseBtnEl.replaceChildren(createIcon(this.watchPaused ? "play" : "pause", "xs"), pauseLbl);
+
+    const isAutoApply = this.autoApplyMirror === "auto-apply";
+    this.watchModeBtnEl.className = `btn btn-ghost btn-icon clip-watch-mode-btn${
+      this.watchEnabled ? "" : " hidden"
+    }`;
+    this.watchModeBtnEl.dataset.mode = this.autoApplyMirror;
+    this.watchModeBtnEl.textContent = isAutoApply
+      ? t("clip.watchModeAutoApply")
+      : t("clip.watchModeInbox");
+    this.watchModeBtnEl.title = isAutoApply
+      ? t("clip.watchModeAutoApplyTitle")
+      : t("clip.watchModeInboxTitle");
 
     this.clearBtnEl.disabled = this.items.length === 0;
     this.clearBtnEl.textContent = t("clip.clearAll");
 
     this.sendBtnEl.disabled = this.sending;
+    this.sendBtnEl.title = `${t("clip.send")} (${formatShortcutTitle(SHORTCUT_NEW_BLOCK)})`;
     const sendLbl = document.createElement("span");
     sendLbl.textContent = this.sending ? t("clip.sending") : t("clip.send");
     this.sendBtnEl.replaceChildren(createIcon("send", "xs"), sendLbl);
@@ -841,8 +905,23 @@ export class ClipDrawerController {
     }
   }
 
-  private async handleToggleWatch(): Promise<void> {
+  private async handleToggleWatchEnabled(): Promise<void> {
     if (!this.api.patchClipWatch) return;
+    try {
+      const nextEnabled = !this.watchEnabled;
+      const res = await this.api.patchClipWatch({ enabled: nextEnabled, paused: false });
+      this.watchEnabled = res.watch_enabled;
+      this.watchPaused = res.watch_paused;
+      this.autoApplyMirror = res.auto_apply_mirror;
+      this.renderHeaderState();
+      this.cb.onFeedback(this.watchEnabled ? t("clip.toastWatchEnabled") : t("clip.toastWatchDisabled"));
+    } catch (e) {
+      this.cb.onError(e);
+    }
+  }
+
+  private async handleToggleWatchPaused(): Promise<void> {
+    if (!this.api.patchClipWatch || !this.watchEnabled) return;
     try {
       const nextPaused = !this.watchPaused;
       const res = await this.api.patchClipWatch({ paused: nextPaused });
@@ -851,6 +930,26 @@ export class ClipDrawerController {
       this.autoApplyMirror = res.auto_apply_mirror;
       this.renderHeaderState();
       this.cb.onFeedback(this.watchPaused ? t("clip.toastWatchPaused") : t("clip.toastWatchResumed"));
+    } catch (e) {
+      this.cb.onError(e);
+    }
+  }
+
+  private async handleToggleWatchMode(): Promise<void> {
+    if (!this.api.patchClipWatch || !this.watchEnabled) return;
+    try {
+      const nextMode: ClipAutoApplyMirrorMode =
+        this.autoApplyMirror === "auto-apply" ? "inbox-only" : "auto-apply";
+      const res = await this.api.patchClipWatch({ auto_apply_mirror: nextMode });
+      this.watchEnabled = res.watch_enabled;
+      this.watchPaused = res.watch_paused;
+      this.autoApplyMirror = res.auto_apply_mirror;
+      this.renderHeaderState();
+      this.cb.onFeedback(
+        this.autoApplyMirror === "auto-apply"
+          ? t("clip.toastWatchModeAutoApply")
+          : t("clip.toastWatchModeInbox"),
+      );
     } catch (e) {
       this.cb.onError(e);
     }
