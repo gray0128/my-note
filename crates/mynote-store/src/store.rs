@@ -294,13 +294,13 @@ struct LocalSmkFile {
 }
 
 pub struct LocalStore {
-    data_dir: PathBuf,
-    conn: Connection,
+    pub(crate) data_dir: PathBuf,
+    pub(crate) conn: Connection,
     device_id: DeviceId,
-    ulid_gen: MonotonicUlidGen,
+    pub(crate) ulid_gen: MonotonicUlidGen,
     hlc_clock: HlcClock,
-    current_smk_kid: SmkKid,
-    smks: BTreeMap<SmkKid, Zeroizing<[u8; 32]>>,
+    pub(crate) current_smk_kid: SmkKid,
+    pub(crate) smks: BTreeMap<SmkKid, Zeroizing<[u8; 32]>>,
     /// Present ONLY on the very first initialization call so CLI/UI can show it once.
     pub initial_recovery_words: Option<String>,
 }
@@ -324,7 +324,7 @@ fn now_ms() -> u64 {
         .unwrap_or(1)
 }
 
-fn rand_bytes<const N: usize>() -> Result<[u8; N], CoreError> {
+pub(crate) fn rand_bytes<const N: usize>() -> Result<[u8; N], CoreError> {
     let mut buf = [0u8; N];
     getrandom::fill(&mut buf).map_err(|e| {
         CoreError::new(
@@ -387,7 +387,7 @@ fn sanitize_mirror_name(name: &str) -> String {
     }
 }
 
-fn ensure_private_dir(path: &Path) -> Result<(), CoreError> {
+pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), CoreError> {
     std::fs::create_dir_all(path).map_err(|e| {
         CoreError::new(
             ErrorCode::InvalidArgument,
@@ -861,7 +861,7 @@ impl LocalStore {
         Ok(unsealed.len())
     }
 
-    fn current_smk(&self) -> Result<&Zeroizing<[u8; 32]>, CoreError> {
+    pub(crate) fn current_smk(&self) -> Result<&Zeroizing<[u8; 32]>, CoreError> {
         self.smks.get(&self.current_smk_kid).ok_or_else(|| {
             CoreError::new(
                 ErrorCode::KeyMissing,

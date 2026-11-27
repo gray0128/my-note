@@ -107,6 +107,28 @@ EXAMPLES:
   mynote format --lang json --action unescape-json < raw.txt
   mynote format <id> --expected-head <op_id> --json";
 
+pub const CLIP_AFTER_HELP: &str = "\
+CHANNEL ISOLATION:
+  'mynote clip' uses an independent 100-item / 7-day encrypted channel (ClipKey / MNC1)
+  physically isolated from note ops, FTS5 search, Markdown mirrors, and recovery keyrings.
+  Bitmap images allow png/jpeg/webp/gif (<= 10 MiB); image/svg+xml is rejected as image.
+
+EXIT CODES:
+  0  Success
+  2  INVALID_ARGUMENT (e.g., SVG image, >10 MiB, promote image) | INTERACTION_REQUIRED
+  3  NOT_FOUND (clip_id not found or history empty)
+  6  SYNC_OFFLINE | NO_ONLINE_DESKTOP (for --ephemeral when no desktop is online)
+
+EXAMPLES:
+  mynote clip push --text \"hello\" --json
+  mynote clip push --file screenshot.png --json
+  mynote clip push --text \"one-time-otp\" --ephemeral --json
+  mynote clip pull --apply --json
+  mynote clip history --limit 20 --kind text --json
+  mynote clip promote --buf scratch --json
+  mynote clip undo --json
+  mynote clip rotate-key";
+
 pub fn render_topic(topic: &str) -> Option<&'static str> {
     match topic.to_ascii_lowercase().as_str() {
         "agent" => Some(TOPIC_AGENT),

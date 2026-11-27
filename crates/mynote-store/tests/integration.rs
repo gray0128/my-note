@@ -522,3 +522,346 @@ fn time_travel_history_undo_actor_shred_and_tier2_daemon_contracts() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn sqlite_v1_to_v2_migration_creates_backup_preserves_key_material_and_adds_clip_items() {
+    use mynote_core::ids::{Ulid, VkekKid};
+    use mynote_core::vault::create_vault_header;
+    use mynote_store::{ClipItemRow, CLIP_LOCAL_MAX_ITEMS};
+
+    let dir = temp_dir("v1_to_v2_migration");
+    // 1. Bootstrap a real store, populate a note & vault_header, then downgrade DB on disk to genuine v1 schema.
+    let block_id;
+    let saved_keyring_blob: Vec<u8>;
+    let saved_vault_blob: Vec<u8>;
+    {
+        let mut store = LocalStore::open(&dir).unwrap();
+        let rec = store
+            .add_block(
+                "scratch",
+                "pre-migration note content",
+                Some("text"),
+                None,
+                "human",
+                None,
+            )
+            .unwrap();
+        block_id = rec.block_id;
+        let rpk = store.recovery_pk().unwrap();
+        let vh = create_vault_header(
+            b"mig-pass",
+            &rpk,
+            VkekKid::from_ulid(Ulid::from_parts(1_720_000_000_000, [0x41; 10])),
+            &[0x55; 32],
+            [0x11; 16],
+            [0x12; 24],
+            [0x13; 32],
+            [0x14; 24],
+            1_720_000_000_000,
+        )
+        .unwrap();
+        saved_vault_blob = rmp_serde::to_vec_named(&vh).unwrap();
+        store
+            .put_vault_header(vh.updated_at_ms, &saved_vault_blob)
+            .unwrap();
+    }
+    {
+        let conn = Connection::open(dir.join("mynote.db")).unwrap();
+        saved_keyring_blob = conn
+            .query_row("SELECT blob FROM key_material WHERE kind = 'keyring'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // Rebuild exact v1 DB state: drop clip_items, restore old 2-kind CHECK on key_material, user_version = 1
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE IF EXISTS clip_items;
+             CREATE TABLE key_material_old (
+                 kind TEXT PRIMARY KEY CHECK (kind IN ('keyring', 'vault_header')),
+                 gen INTEGER NOT NULL,
+                 blob BLOB NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             ) STRICT;
+             INSERT INTO key_material_old SELECT kind, gen, blob, updated_at_ms FROM key_material WHERE kind IN ('keyring', 'vault_header');
+             DROP TABLE key_material;
+             ALTER TABLE key_material_old RENAME TO key_material;
+             UPDATE local_meta SET value = '1' WHERE key IN ('schema_version', 'min_reader_schema_version');
+             PRAGMA user_version = 1;
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+        // Verify old v1 CHECK rejects 'clip_key'
+        assert!(conn
+            .execute(
+                "INSERT INTO key_material (kind, gen, blob, updated_at_ms) VALUES ('clip_key', 1, X'01', 1)",
+                [],
+            )
+            .is_err());
+    }
+
+    // 2. Reopen via LocalStore::open -> MUST trigger VACUUM INTO backup + v1->v2 migration!
+    let mut store = LocalStore::open(&dir).unwrap();
+    let backup_path = dir.join("backups/mynote-pre-schema-v1.db");
+    assert!(
+        backup_path.is_file(),
+        "pre-migration VACUUM INTO backup must exist at {}",
+        backup_path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "pre-migration backup must be 0600");
+    }
+
+    // Verify user_version == 2 and existing note + key_material rows are preserved
+    {
+        let conn = Connection::open(dir.join("mynote.db")).unwrap();
+        let ver: u32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, 2);
+        let kr: Vec<u8> = conn
+            .query_row("SELECT blob FROM key_material WHERE kind = 'keyring'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let vh: Vec<u8> = conn
+            .query_row(
+                "SELECT blob FROM key_material WHERE kind = 'vault_header'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kr, saved_keyring_blob);
+        assert_eq!(vh, saved_vault_blob);
+    }
+    assert_eq!(
+        store.get_block(&block_id).unwrap().content.as_deref(),
+        Some("pre-migration note content")
+    );
+
+    // 3. ClipKey storage & destructive rotation (no old key retained)
+    let (ck1, key1, blob1) = store.generate_wrapped_clip_key(1_795_600_000_000).unwrap();
+    store
+        .upsert_clip_key_material(1, &blob1, 1_795_600_000_000)
+        .unwrap();
+    let (unw_kid1, unw_key1, unw_gen1) = store.unwrap_local_clip_key().unwrap().unwrap();
+    assert_eq!(unw_kid1, ck1);
+    assert_eq!(*unw_key1, *key1);
+    assert_eq!(unw_gen1, 1);
+
+    // Rotate to gen 2 -> replaces gen 1 completely; stale gen 1 now fails with CasMismatch
+    let (ck2, key2, blob2) = store.generate_wrapped_clip_key(1_795_600_010_000).unwrap();
+    store
+        .upsert_clip_key_material(2, &blob2, 1_795_600_010_000)
+        .unwrap();
+    let (unw_kid2, unw_key2, unw_gen2) = store.unwrap_local_clip_key().unwrap().unwrap();
+    assert_eq!(unw_kid2, ck2);
+    assert_eq!(*unw_key2, *key2);
+    assert_eq!(unw_gen2, 2);
+    assert_eq!(
+        store
+            .upsert_clip_key_material(1, &blob1, 1_795_600_010_001)
+            .unwrap_err()
+            .code(),
+        ErrorCode::CasMismatch
+    );
+
+    // 4. Insert 105 clip_items -> trim_clip_items(100) keeps 100 newest and returns 5 evicted blob paths
+    for i in 0..105u64 {
+        let cid = store.next_clip_id(1_795_600_100_000 + i).unwrap();
+        let rel = format!("{cid}.png");
+        store
+            .upsert_clip_item(&ClipItemRow {
+                clip_id: cid.to_string(),
+                clip_kid: ck2.to_string(),
+                device_id: store.device_id().as_str().to_string(),
+                kind: "image".to_string(),
+                mime: "image/png".to_string(),
+                source_mode: "explicit".to_string(),
+                created_at_ms: (1_795_600_100_000 + i) as i64,
+                expires_at_ms: (1_795_600_100_000 + i + 604_800_000) as i64,
+                text_preview: None,
+                has_blob: true,
+                blob_bytes: Some(128),
+                blob_sha256: Some("a".repeat(64)),
+                width: Some(16),
+                height: Some(16),
+                thumb_mime: Some("image/jpeg".to_string()),
+                thumb_blob: Some(vec![0xFF, 0xD8, 0xFF]),
+                local_blob_path: Some(rel),
+            })
+            .unwrap();
+    }
+    let evicted = store.trim_clip_items(CLIP_LOCAL_MAX_ITEMS).unwrap();
+    assert_eq!(evicted.len(), 5);
+    assert_eq!(store.list_clip_items(100, None).unwrap().len(), 100);
+
+    // SVG mime must be rejected at store boundary
+    let svg_cid = store.next_clip_id(1_795_600_200_000).unwrap().to_string();
+    let svg_err = store
+        .upsert_clip_item(&ClipItemRow {
+            clip_id: svg_cid,
+            clip_kid: ck2.to_string(),
+            device_id: store.device_id().as_str().to_string(),
+            kind: "image".to_string(),
+            mime: "image/svg+xml".to_string(),
+            source_mode: "explicit".to_string(),
+            created_at_ms: 1_795_600_200_000,
+            expires_at_ms: 1_795_600_800_000,
+            text_preview: None,
+            has_blob: true,
+            blob_bytes: Some(10),
+            blob_sha256: Some("b".repeat(64)),
+            width: None,
+            height: None,
+            thumb_mime: None,
+            thumb_blob: None,
+            local_blob_path: None,
+        })
+        .unwrap_err();
+    assert_eq!(svg_err.code(), ErrorCode::InvalidArgument);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn clip_cache_enforces_lru_file_count_byte_budget_permissions_and_isolation() {
+    use mynote_store::ClipItemRow;
+    use std::time::Duration;
+
+    let dir = temp_dir("clip_cache_lru_isolation");
+    let mut store = LocalStore::open(&dir).unwrap();
+    let note = store
+        .add_block(
+            "scratch",
+            "permanent note needle",
+            Some("text"),
+            None,
+            "human",
+            None,
+        )
+        .unwrap();
+    let mirror_before = std::fs::read_to_string(dir.join("mirror/scratch.md")).unwrap();
+
+    let count_rows = |table: &str| -> i64 {
+        let conn = Connection::open(dir.join("mynote.db")).unwrap();
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    let ops_before = count_rows("sync_ops");
+    let blocks_before = count_rows("blocks");
+    let bufs_before = count_rows("buffers");
+    let keys_before = count_rows("block_keys");
+    let marks_before = count_rows("shred_marks");
+
+    // 1. ClipCache LRU: file count cap + read mtime bump + byte budget cap + path traversal guard
+    let cache = store.clip_cache();
+    assert_eq!(
+        cache.write("../escape.png", b"bad").unwrap_err().code(),
+        ErrorCode::InvalidArgument
+    );
+    assert_eq!(
+        cache.write("sub/file.png", b"bad").unwrap_err().code(),
+        ErrorCode::InvalidArgument
+    );
+    assert_eq!(
+        cache.write(".hidden", b"bad").unwrap_err().code(),
+        ErrorCode::InvalidArgument
+    );
+
+    // Write 3 files with small sleeps so mtimes strictly increase; read "a.png" to bump its mtime;
+    // writing 4th file with max_files=3 must evict "b.png" (not "a.png"!).
+    cache.write_with_limits("a.png", &[1u8; 30], 3, 1000).unwrap();
+    thread::sleep(Duration::from_millis(20));
+    cache.write_with_limits("b.png", &[2u8; 30], 3, 1000).unwrap();
+    thread::sleep(Duration::from_millis(20));
+    cache.write_with_limits("c.png", &[3u8; 30], 3, 1000).unwrap();
+    thread::sleep(Duration::from_millis(20));
+    assert_eq!(cache.read("a.png").unwrap().unwrap(), vec![1u8; 30]);
+    thread::sleep(Duration::from_millis(20));
+    cache.write_with_limits("d.png", &[4u8; 30], 3, 1000).unwrap();
+
+    assert!(
+        cache.exists("a.png"),
+        "read hit must protect a.png from LRU eviction"
+    );
+    assert!(!cache.exists("b.png"), "oldest unread b.png must be evicted");
+    assert!(cache.exists("c.png"));
+    assert!(cache.exists("d.png"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir_mode = std::fs::metadata(cache.root()).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(cache.path_for("a.png").unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+    }
+
+    // Byte budget cap: max_bytes = 65 bytes must evict oldest until total <= 65
+    let evicted = cache.enforce_lru(10, 65).unwrap();
+    assert!(!evicted.is_empty());
+    let (files, total_bytes) = cache.stats();
+    assert!(files <= 2 && total_bytes <= 65);
+
+    // 2. INV-CLIP-ISOLATION: clip writes/deletes/clears NEVER touch notes, FTS5, sync_ops, block_keys, or mirror/
+    let (ck, _, blob) = store.generate_wrapped_clip_key(1_795_600_300_000).unwrap();
+    store
+        .upsert_clip_key_material(1, &blob, 1_795_600_300_000)
+        .unwrap();
+    let cid = store.next_clip_id(1_795_600_300_001).unwrap();
+    store
+        .upsert_clip_item(&ClipItemRow {
+            clip_id: cid.to_string(),
+            clip_kid: ck.to_string(),
+            device_id: store.device_id().as_str().to_string(),
+            kind: "text".to_string(),
+            mime: "text/plain".to_string(),
+            source_mode: "explicit".to_string(),
+            created_at_ms: 1_795_600_300_001,
+            expires_at_ms: 1_795_600_900_001,
+            text_preview: Some("CLIP_ONLY_UNIQUE_TOKEN_999".to_string()),
+            has_blob: false,
+            blob_bytes: None,
+            blob_sha256: None,
+            width: None,
+            height: None,
+            thumb_mime: None,
+            thumb_blob: None,
+            local_blob_path: None,
+        })
+        .unwrap();
+
+    // FTS5 search MUST NOT index clip_items!
+    assert!(store
+        .search_blocks("CLIP_ONLY_UNIQUE_TOKEN_999", None, 20)
+        .unwrap()
+        .is_empty());
+    assert_eq!(count_rows("sync_ops"), ops_before);
+    assert_eq!(count_rows("blocks"), blocks_before);
+    assert_eq!(count_rows("buffers"), bufs_before);
+    assert_eq!(count_rows("block_keys"), keys_before);
+    assert_eq!(count_rows("shred_marks"), marks_before);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("mirror/scratch.md")).unwrap(),
+        mirror_before
+    );
+    assert_eq!(
+        store.get_block(&note.block_id).unwrap().content.as_deref(),
+        Some("permanent note needle")
+    );
+
+    store.clear_clip_items().unwrap();
+    cache.clear().unwrap();
+    assert_eq!(cache.stats(), (0, 0));
+    assert_eq!(count_rows("sync_ops"), ops_before);
+    assert_eq!(count_rows("blocks"), blocks_before);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

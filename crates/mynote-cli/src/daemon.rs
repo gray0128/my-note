@@ -1,11 +1,12 @@
 //! Local desktop Daemon (`#8 [M1-7]`): axum HTTP/WS (`localhost:<port>`), `SEC-05` security
 //! middleware, `rust-embed` Web UI assets, `0600` UDS NDJSON IPC, and Single-Flight cloud sync.
 
+use crate::clipboard::{default_system_clipboard, EchoGuard, SystemClipboard, UndoClipboardSlot};
 use crate::formatters::format_content;
 use crate::sync_client::{hex_encode, run_cloud_ws_loop, PushOutcome, RelayClient};
 use crate::uds::{socket_path_for, ApplyMeta, ApplyRequest, UdsRequest, UdsResponse};
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as AxumPath, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, HOST, LOCATION, ORIGIN, REFERRER_POLICY,
     SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
@@ -13,9 +14,15 @@ use axum::http::header::{
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
+
+#[path = "daemon_clip.rs"]
+mod daemon_clip;
 use base64::Engine;
+pub use daemon_clip::{
+    clip_blob_cache_name, clip_row_to_dto, truncate_clip_preview, ClipItemDto, ClipWatchConfig,
+};
 use fs2::FileExt;
 use futures_util::{SinkExt, StreamExt};
 use mynote_core::error::{CoreError, ErrorCode};
@@ -70,10 +77,15 @@ pub struct DaemonState {
     pub trash_confirm_nonces: Mutex<HashMap<String, PendingTrashAction>>,
     pub ws_tx: broadcast::Sender<String>,
     pub sync_lock: tokio::sync::Mutex<()>,
+    pub clip_sync_lock: tokio::sync::Mutex<()>,
     pub sync_notify: Arc<Notify>,
     pub creds_tx: watch::Sender<Option<mynote_store::DeviceCredentials>>,
     pub enable_cloud_sync: bool,
     pub version: &'static str,
+    pub clipboard: Arc<dyn SystemClipboard>,
+    pub clip_undo: Mutex<UndoClipboardSlot>,
+    pub clip_echo: Mutex<EchoGuard>,
+    pub clip_watch_state: Mutex<ClipWatchConfig>,
 }
 
 impl DaemonState {
@@ -261,7 +273,7 @@ impl DaemonState {
                 "Run 'mynote device bootstrap --url <https://...>' or 'mynote device claim'",
             ));
         };
-        let read_only = creds.scope == "read";
+        let read_only = creds.scope != "read-write";
         let client = RelayClient::from_credentials(&creds)?;
         self.broadcast_json(serde_json::json!({
             "type": "sync_status",
@@ -323,6 +335,16 @@ impl DaemonState {
             }
         }
         self.broadcast_sync_and_trash();
+
+        // Cross-epoch PITR reconciliation (`docs/sync-protocol.md` §11.1 #2):
+        // Reset local clip_last_id cursor and re-pull cloud clips without re-pushing old items.
+        if report.reconciled_epoch_change {
+            {
+                let store = self.store.lock().unwrap();
+                let _ = store.set_clip_cursor(None);
+            }
+            let _ = self.pull_cloud_clips(false).await;
+        }
 
         let (head_seq, sync_state, pending) = {
             let store = self.store.lock().unwrap();
@@ -729,6 +751,14 @@ impl RunningDaemon {
 
 /// Acquire single-instance exclusive lock, bind loopback HTTP/WS (`127.0.0.1` + `[::1]`) & `0600` UDS.
 pub async fn start_daemon(cfg: DaemonConfig) -> Result<RunningDaemon, CoreError> {
+    start_daemon_with_clipboard(cfg, default_system_clipboard()).await
+}
+
+/// Same as `start_daemon`, injecting a custom `SystemClipboard` (used by hermetic integration tests).
+pub async fn start_daemon_with_clipboard(
+    cfg: DaemonConfig,
+    clipboard: Arc<dyn SystemClipboard>,
+) -> Result<RunningDaemon, CoreError> {
     std::fs::create_dir_all(&cfg.data_dir).map_err(|e| {
         CoreError::new(
             ErrorCode::InvalidArgument,
@@ -793,10 +823,15 @@ pub async fn start_daemon(cfg: DaemonConfig) -> Result<RunningDaemon, CoreError>
         trash_confirm_nonces: Mutex::new(HashMap::new()),
         ws_tx,
         sync_lock: tokio::sync::Mutex::new(()),
+        clip_sync_lock: tokio::sync::Mutex::new(()),
         sync_notify: sync_notify.clone(),
         creds_tx,
         enable_cloud_sync: cfg.enable_cloud_sync,
         version: env!("CARGO_PKG_VERSION"),
+        clipboard,
+        clip_undo: Mutex::new(UndoClipboardSlot::default()),
+        clip_echo: Mutex::new(EchoGuard::default()),
+        clip_watch_state: Mutex::new(ClipWatchConfig::default()),
     });
 
     let app = build_router(state.clone());
@@ -904,8 +939,9 @@ pub async fn start_daemon(cfg: DaemonConfig) -> Result<RunningDaemon, CoreError>
         let mut rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut poll = tokio::time::interval(Duration::from_secs(60));
-            // Trigger initial sync immediately on startup
+            // Trigger initial note sync & non-intrusive clip pull on startup
             let _ = sync_state.run_cloud_sync_now().await;
+            let _ = sync_state.pull_cloud_clips(false).await;
             loop {
                 tokio::select! {
                     _ = rx.changed() => break,
@@ -914,12 +950,13 @@ pub async fn start_daemon(cfg: DaemonConfig) -> Result<RunningDaemon, CoreError>
                     }
                     _ = poll.tick() => {
                         let _ = sync_state.run_cloud_sync_now().await;
+                        let _ = sync_state.pull_cloud_clips(false).await;
                     }
                 }
             }
         });
 
-        let notify = sync_notify.clone();
+        let ws_state = state.clone();
         let mut rx = shutdown_rx.clone();
         let mut creds_watch = creds_rx;
         tokio::spawn(async move {
@@ -930,10 +967,10 @@ pub async fn start_daemon(cfg: DaemonConfig) -> Result<RunningDaemon, CoreError>
                 }
                 let current_creds = creds_watch.borrow().clone();
                 if let Some(creds) = current_creds {
-                    let n = notify.clone();
+                    let st = ws_state.clone();
                     ws_task = Some(tokio::spawn(async move {
-                        run_cloud_ws_loop(creds, move |_head_seq| {
-                            n.notify_one();
+                        run_cloud_ws_loop(creds, move |ev| {
+                            st.handle_cloud_ws_event(ev);
                         })
                         .await;
                     }));
@@ -1064,6 +1101,34 @@ fn build_router(state: Arc<DaemonState>) -> Router {
         .route("/v1/local/keys", get(handle_get_keys).post(handle_post_keys))
         .route("/v1/local/sync/status", get(handle_sync_status))
         .route("/v1/local/sync/now", post(handle_sync_now))
+        .route(
+            "/v1/local/clip",
+            get(daemon_clip::handle_list_clips)
+                .post(daemon_clip::handle_post_clip)
+                .delete(daemon_clip::handle_clear_clips)
+                .layer(DefaultBodyLimit::max(20 * 1024 * 1024)),
+        )
+        .route("/v1/local/clip/undo", post(daemon_clip::handle_undo_clip))
+        .route(
+            "/v1/local/clip/watch",
+            patch(daemon_clip::handle_patch_clip_watch),
+        )
+        .route(
+            "/v1/local/clip/{clip_id}",
+            delete(daemon_clip::handle_delete_clip),
+        )
+        .route(
+            "/v1/local/clip/{clip_id}/blob",
+            get(daemon_clip::handle_get_clip_blob),
+        )
+        .route(
+            "/v1/local/clip/{clip_id}/apply",
+            post(daemon_clip::handle_apply_clip),
+        )
+        .route(
+            "/v1/local/clip/{clip_id}/promote",
+            post(daemon_clip::handle_promote_clip),
+        )
         .route("/v1/local/ws", get(handle_local_ws))
         .fallback(get(handle_static_asset))
         .layer(middleware::from_fn_with_state(
@@ -2907,6 +2972,16 @@ async fn dispatch_uds_request(state: &Arc<DaemonState>, req: UdsRequest) -> UdsR
             }
         }
         UdsRequest::Apply { meta, request } => execute_uds_apply(state, meta, request),
+        UdsRequest::ClipUndo => daemon_clip::dispatch_uds_clip_undo(state).await,
+        UdsRequest::ClipApply { clip_id } => daemon_clip::dispatch_uds_clip_apply(state, &clip_id).await,
+        UdsRequest::ClipPoke { clip_id, cleared } => {
+            daemon_clip::dispatch_uds_clip_poke(state, clip_id, cleared).await
+        }
+        UdsRequest::ClipWatchSet {
+            paused,
+            enabled,
+            auto_apply_mirror,
+        } => daemon_clip::dispatch_uds_clip_watch_set(state, paused, enabled, auto_apply_mirror),
     }
 }
 

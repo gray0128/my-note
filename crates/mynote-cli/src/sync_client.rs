@@ -5,21 +5,24 @@
 
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
+use mynote_core::clip::CLIP_BLOB_ENVELOPE_MAX_BYTES;
 use mynote_core::crypto::{
     decrypt_pairing_ticket, encrypt_pairing_ticket, PairingPayloadV1, SmkGenerationBytes,
 };
 use mynote_core::error::{CoreError, ErrorCode};
-use mynote_core::ids::{DeviceId, JournalEpoch, KeyId, MarkId, OpId};
-use mynote_core::model::{KeyRecordRow, ShredMarkRow, ShredMarkState};
+use mynote_core::ids::{ClipKid, DeviceId, JournalEpoch, KeyId, MarkId, OpId};
+use mynote_core::model::{DeviceScope, KeyRecordRow, ShredMarkRow, ShredMarkState};
 use mynote_core::sync::{
     step, AckedOp, KeyTableSyncDto, PushRequestDto, RemoteEnvelopeRow, ShredResultDto, SyncCommand, SyncEvent,
 };
 use mynote_store::store::SyncApplySummary;
 use mynote_store::{DeviceCredentials, LocalStore};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::str::FromStr;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
@@ -392,19 +395,69 @@ impl RelayClient {
 
     /// `POST /v1/devices`: pre-register a new device and upload `K_pair`-encrypted one-time ticket.
     /// Server NEVER sees plaintext `device_token` or `K_pair`.
+    /// Enforces four-state scope isolation (`read`, `read+clip`, `clip-write`, `read-write`):
+    /// `clip-write` tickets ALWAYS carry ZERO SMKs and ONLY `(clip_kid, clip_key)`.
     pub async fn create_pairing_ticket(
         &self,
         device_name: &str,
         scope: &str,
         smks: Vec<SmkGenerationBytes>,
+        clip_key: Option<(ClipKid, Zeroizing<[u8; 32]>)>,
     ) -> Result<PairingTicketReceipt, CoreError> {
-        if scope != "read" && scope != "read-write" {
-            return Err(CoreError::new(
-                ErrorCode::InvalidArgument,
-                format!("invalid scope '{scope}': expected 'read' or 'read-write'"),
-                "Use --scope read (mobile) or --scope read-write (desktop)",
-            ));
-        }
+        let parsed_scope = DeviceScope::from_str(scope)?;
+        let (ticket_smks, ticket_clip_kid, ticket_clip_key) = match parsed_scope {
+            DeviceScope::ClipWrite => {
+                let (ck, key) = clip_key.ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::KeyMissing,
+                        "clip-write pairing ticket requires an initialized ClipKey",
+                        "Initialize ClipKey before creating a clip-write pairing ticket",
+                    )
+                })?;
+                // HARD INVARIANT: clip-write tickets NEVER contain any SMK!
+                (Vec::new(), Some(ck), Some(*key))
+            }
+            DeviceScope::ReadClip => {
+                if smks.is_empty() {
+                    return Err(CoreError::new(
+                        ErrorCode::KeyMissing,
+                        "read+clip pairing ticket requires SMK generations",
+                        "Unlock keyring before pairing",
+                    ));
+                }
+                let (ck, key) = clip_key.ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::KeyMissing,
+                        "read+clip pairing ticket requires an initialized ClipKey",
+                        "Initialize ClipKey before creating a read+clip pairing ticket",
+                    )
+                })?;
+                (smks, Some(ck), Some(*key))
+            }
+            DeviceScope::Read => {
+                if smks.is_empty() {
+                    return Err(CoreError::new(
+                        ErrorCode::KeyMissing,
+                        "read pairing ticket requires SMK generations",
+                        "Unlock keyring before pairing",
+                    ));
+                }
+                (smks, None, None)
+            }
+            DeviceScope::ReadWrite => {
+                if smks.is_empty() {
+                    return Err(CoreError::new(
+                        ErrorCode::KeyMissing,
+                        "read-write pairing ticket requires SMK generations",
+                        "Unlock keyring before pairing",
+                    ));
+                }
+                match clip_key {
+                    Some((ck, key)) => (smks, Some(ck), Some(*key)),
+                    None => (smks, None, None),
+                }
+            }
+        };
         let new_device_id = DeviceId::from_random_bytes(rand_bytes::<10>()?);
         let raw_token = Zeroizing::new(rand_bytes::<32>()?);
         let new_device_token = format!("mnt_{}", hex_encode(raw_token.as_ref()));
@@ -412,12 +465,12 @@ impl RelayClient {
         let pair_id = hex_encode(&rand_bytes::<16>()?);
         let k_pair = Zeroizing::new(rand_bytes::<32>()?);
         let payload = PairingPayloadV1 {
-            smks,
+            smks: ticket_smks,
             device_token: Some(new_device_token),
             device_id: new_device_id.clone(),
             sync_url: self.base_url.clone(),
-            clip_kid: None,
-            clip_key: None,
+            clip_kid: ticket_clip_kid,
+            clip_key: ticket_clip_key,
         };
         let ct = encrypt_pairing_ticket(&pair_id, &k_pair, &payload, rand_bytes::<24>()?)?;
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -425,7 +478,7 @@ impl RelayClient {
             "device_id": new_device_id.as_str(),
             "pair_id": pair_id,
             "device_name": device_name,
-            "scope": scope,
+            "scope": parsed_scope.as_str(),
             "token_sha256_hex": token_hash,
             "ciphertext_b64": b64.encode(&ct),
         });
@@ -446,7 +499,7 @@ impl RelayClient {
         Ok(PairingTicketReceipt {
             device_id: new_device_id.to_string(),
             pair_id,
-            scope: scope.to_string(),
+            scope: parsed_scope.as_str().to_string(),
             expires_at_ms,
             pairing_code,
         })
@@ -1554,13 +1607,72 @@ fn merge_summary(dst: &mut SyncApplySummary, src: SyncApplySummary) {
     dst.rekeyed_tier1_ops += src.rekeyed_tier1_ops;
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RemoteClipItem {
+    pub clip_id: String,
+    pub clip_kid: String,
+    pub device_id: String,
+    pub kind: String,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub meta_envelope_b64: String,
+    pub has_blob: bool,
+    pub blob_bytes: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClipMetaPushReceipt {
+    pub clip_id: String,
+    pub created_at_ms: Option<i64>,
+    pub expires_at_ms: Option<i64>,
+    pub delivered_to: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClipBlobPushReceipt {
+    pub clip_id: String,
+    pub blob_bytes: i64,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteClipBlob {
+    pub clip_id: String,
+    pub clip_kid: String,
+    pub device_id: String,
+    pub envelope: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub enum CloudWsEvent {
+    Wake {
+        head_seq: Option<i64>,
+    },
+    DeviceRevoked,
+    ClipWake {
+        clip_id: String,
+        kind: String,
+        created_at_ms: i64,
+    },
+    ClipEphemeral {
+        clip_id: String,
+        clip_kid: String,
+        device_id: String,
+        envelope_b64: String,
+    },
+    ClipCleared {
+        clip_id: Option<String>,
+    },
+}
+
 /// Long-running WebSocket Hibernation wakeup listener (`GET /v1/sync/ws`).
 /// Sends `"ping"` every 30s (Cloudflare edge auto-responds `"pong"` without waking DO) and notifies
-/// `on_wake` whenever `{ type: "wake" }` arrives; backs off exponentially (`1s -> 60s`) on disconnect,
-/// and stops immediately on HTTP 401 / WS 4401 revocation.
-pub async fn run_cloud_ws_loop<F>(creds: DeviceCredentials, mut on_wake: F)
+/// `on_event` whenever `wake`, `clip_wake`, `clip_ephemeral`, `clip_cleared`, or `device_revoked`
+/// arrives; backs off exponentially (`1s -> 60s`) on disconnect and stops immediately on HTTP 401 / WS 4401.
+pub async fn run_cloud_ws_loop<F>(creds: DeviceCredentials, mut on_event: F)
 where
-    F: FnMut(Option<i64>) + Send + 'static,
+    F: FnMut(CloudWsEvent) + Send + 'static,
 {
     let mut backoff_secs = 1u64;
     loop {
@@ -1605,10 +1717,50 @@ where
                                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
                                         match v["type"].as_str() {
                                             Some("wake") => {
-                                                on_wake(v["head_seq"].as_i64());
+                                                on_event(CloudWsEvent::Wake {
+                                                    head_seq: v["head_seq"].as_i64(),
+                                                });
                                             }
                                             Some("device_revoked") => {
+                                                on_event(CloudWsEvent::DeviceRevoked);
                                                 return;
+                                            }
+                                            Some("clip_wake") => {
+                                                if let (Some(clip_id), Some(kind)) = (
+                                                    v["clip_id"].as_str(),
+                                                    v["kind"].as_str(),
+                                                ) {
+                                                    on_event(CloudWsEvent::ClipWake {
+                                                        clip_id: clip_id.to_string(),
+                                                        kind: kind.to_string(),
+                                                        created_at_ms: v["created_at_ms"].as_i64().unwrap_or(0),
+                                                    });
+                                                }
+                                            }
+                                            Some("clip_ephemeral") => {
+                                                if let (
+                                                    Some(clip_id),
+                                                    Some(clip_kid),
+                                                    Some(device_id),
+                                                    Some(envelope_b64),
+                                                ) = (
+                                                    v["clip_id"].as_str(),
+                                                    v["clip_kid"].as_str(),
+                                                    v["device_id"].as_str(),
+                                                    v["envelope_b64"].as_str(),
+                                                ) {
+                                                    on_event(CloudWsEvent::ClipEphemeral {
+                                                        clip_id: clip_id.to_string(),
+                                                        clip_kid: clip_kid.to_string(),
+                                                        device_id: device_id.to_string(),
+                                                        envelope_b64: envelope_b64.to_string(),
+                                                    });
+                                                }
+                                            }
+                                            Some("clip_cleared") => {
+                                                on_event(CloudWsEvent::ClipCleared {
+                                                    clip_id: v["clip_id"].as_str().map(ToString::to_string),
+                                                });
                                             }
                                             _ => {}
                                         }
@@ -1616,6 +1768,7 @@ where
                                 }
                                 Some(Ok(Message::Close(frame))) => {
                                     if frame.as_ref().is_some_and(|f| u16::from(f.code) == 4401) {
+                                        on_event(CloudWsEvent::DeviceRevoked);
                                         return;
                                     }
                                     break;
@@ -1629,6 +1782,7 @@ where
             }
             Err(tokio_tungstenite::tungstenite::Error::Http(resp)) if resp.status().as_u16() == 401 => {
                 // Device revoked or unauthenticated: stop hammering the relay until credentials update.
+                on_event(CloudWsEvent::DeviceRevoked);
                 return;
             }
             Err(_) => {}
@@ -1637,6 +1791,413 @@ where
         tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(60);
     }
+}
+
+impl RelayClient {
+    /// Fetch remote `key_material.clip_key` (`GET /v1/keys`) if present on relay.
+    pub async fn fetch_remote_clip_key(&self) -> Result<Option<(i64, Vec<u8>)>, CoreError> {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let res = self
+            .add_headers(self.http.get(self.endpoint("/v1/keys")))
+            .send()
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::SyncOffline,
+                    format!("GET /v1/keys failed: {e}"),
+                    "Retry online",
+                )
+            })?;
+        let val = parse_relay_json(res).await?;
+        let Some(o) = val["key_material"]["clip_key"].as_object() else {
+            return Ok(None);
+        };
+        let gen = o.get("gen").and_then(|v| v.as_i64()).ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::IntegrityError,
+                "remote clip_key missing valid 'gen'",
+                "Check relay key_material",
+            )
+        })?;
+        let blob_s = o.get("blob_b64").and_then(|v| v.as_str()).ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::IntegrityError,
+                "remote clip_key missing 'blob_b64'",
+                "Check relay key_material",
+            )
+        })?;
+        let blob = b64.decode(blob_s).map_err(|e| {
+            CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("bad clip_key blob_b64: {e}"),
+                "Check relay key_material",
+            )
+        })?;
+        Ok(Some((gen, blob)))
+    }
+
+    /// Upload `key_material.clip_key` (`POST /v1/keys`) with optional `clear_clips: true`.
+    pub async fn push_clip_key_material(
+        &self,
+        gen: i64,
+        blob: &[u8],
+        clear_clips: bool,
+    ) -> Result<i64, CoreError> {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let body = serde_json::json!({
+            "key_records": [],
+            "key_material": {
+                "clip_key": {
+                    "gen": gen,
+                    "blob_b64": b64.encode(blob),
+                }
+            },
+            "clear_clips": clear_clips,
+        });
+        let res = self
+            .add_headers(self.http.post(self.endpoint("/v1/keys")).json(&body))
+            .send()
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::SyncOffline,
+                    format!("POST /v1/keys (clip_key) failed: {e}"),
+                    "Retry online",
+                )
+            })?;
+        let val = parse_relay_json(res).await?;
+        Ok(val["key_material_gens"]["clip_key"].as_i64().unwrap_or(gen))
+    }
+
+    /// `POST /v1/clip`: push inline text `MNC1` metadata envelope or ephemeral WS direct push.
+    pub async fn clip_push_meta(
+        &self,
+        clip_id: &str,
+        clip_kid: &str,
+        kind: &str,
+        ephemeral: bool,
+        meta_envelope: &[u8],
+    ) -> Result<ClipMetaPushReceipt, CoreError> {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let body = serde_json::json!({
+            "clip_id": clip_id,
+            "clip_kid": clip_kid,
+            "kind": kind,
+            "ephemeral": ephemeral,
+            "meta_envelope_b64": b64.encode(meta_envelope),
+        });
+        let res = self
+            .add_headers(self.http.post(self.endpoint("/v1/clip")).json(&body))
+            .send()
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::SyncOffline,
+                    format!("POST /v1/clip failed: {e}"),
+                    "Check network connectivity and retry",
+                )
+            })?;
+        let val = parse_relay_json(res).await?;
+        Ok(ClipMetaPushReceipt {
+            clip_id: val["clip_id"].as_str().unwrap_or(clip_id).to_string(),
+            created_at_ms: val["created_at_ms"].as_i64(),
+            expires_at_ms: val["expires_at_ms"].as_i64(),
+            delivered_to: val["delivered_to"].as_u64().map(|n| n as usize),
+        })
+    }
+
+    /// `PUT /v1/clip/blob`: stream-upload `MNC1` raw binary blob (`payload_type=1`) with exact
+    /// `Content-Length` and `X-Clip-*` headers directly to R2 via Worker.
+    pub async fn clip_push_blob(
+        &self,
+        clip_id: &str,
+        clip_kid: &str,
+        kind: &str,
+        meta_envelope: &[u8],
+        blob_envelope: &[u8],
+    ) -> Result<ClipBlobPushReceipt, CoreError> {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let res = self
+            .add_headers(
+                self.http
+                    .put(self.endpoint("/v1/clip/blob"))
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .header(CONTENT_LENGTH, blob_envelope.len())
+                    .header("X-Clip-Id", clip_id)
+                    .header("X-Clip-Kid", clip_kid)
+                    .header("X-Clip-Kind", kind)
+                    .header("X-Clip-Meta-B64", b64.encode(meta_envelope))
+                    .body(blob_envelope.to_vec()),
+            )
+            .send()
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::SyncOffline,
+                    format!("PUT /v1/clip/blob failed: {e}"),
+                    "Check network connectivity and retry",
+                )
+            })?;
+        let val = parse_relay_json(res).await?;
+        Ok(ClipBlobPushReceipt {
+            clip_id: val["clip_id"].as_str().unwrap_or(clip_id).to_string(),
+            blob_bytes: val["blob_bytes"].as_i64().unwrap_or(blob_envelope.len() as i64),
+            created_at_ms: val["created_at_ms"].as_i64().unwrap_or(now_ms() as i64),
+            expires_at_ms: val["expires_at_ms"].as_i64().unwrap_or(0),
+        })
+    }
+
+    /// `GET /v1/clip?since_id=&limit=`: fetch encrypted clip metadata envelopes.
+    pub async fn clip_list(
+        &self,
+        since_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RemoteClipItem>, CoreError> {
+        let lim = limit.clamp(1, 100);
+        let url = match since_id.filter(|s| !s.is_empty()) {
+            Some(since) => format!("{}/v1/clip?since_id={since}&limit={lim}", self.base_url),
+            None => format!("{}/v1/clip?limit={lim}", self.base_url),
+        };
+        let res = self.add_headers(self.http.get(url)).send().await.map_err(|e| {
+            CoreError::new(
+                ErrorCode::SyncOffline,
+                format!("GET /v1/clip failed: {e}"),
+                "Check network connectivity and retry",
+            )
+        })?;
+        let val = parse_relay_json(res).await?;
+        serde_json::from_value(val["items"].clone()).map_err(|e| {
+            CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("invalid GET /v1/clip items payload: {e}"),
+                "Verify relay version",
+            )
+        })
+    }
+
+    /// `GET /v1/clip/:clip_id/blob`: fetch raw `MNC1` (`payload_type=1`) blob from R2 via Worker.
+    pub async fn clip_get_blob(&self, clip_id: &str) -> Result<RemoteClipBlob, CoreError> {
+        let path = format!("/v1/clip/{clip_id}/blob");
+        let res = self
+            .add_headers(self.http.get(self.endpoint(&path)))
+            .send()
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::SyncOffline,
+                    format!("GET /v1/clip/{clip_id}/blob failed: {e}"),
+                    "Check network connectivity and retry",
+                )
+            })?;
+        let status = res.status();
+        if status.is_redirection() {
+            return Err(CoreError::new(
+                ErrorCode::SyncOffline,
+                format!("clip blob endpoint returned redirect HTTP {}", status.as_u16()),
+                "Check sync URL",
+            ));
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Err(CoreError::new(
+                ErrorCode::NotFound,
+                format!("clip blob '{clip_id}' not found or expired on relay"),
+                "Refresh clip history with 'mynote clip history'",
+            ));
+        }
+        if status != StatusCode::OK {
+            let _ = parse_relay_json(res).await?;
+            return Err(CoreError::new(
+                ErrorCode::SyncOffline,
+                format!("clip blob request failed with HTTP {}", status.as_u16()),
+                "Retry online",
+            ));
+        }
+        let resp_clip_id = res
+            .headers()
+            .get("X-Clip-Id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(clip_id)
+            .to_string();
+        let resp_clip_kid = res
+            .headers()
+            .get("X-Clip-Kid")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let resp_device_id = res
+            .headers()
+            .get("X-Clip-Device-Id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = res.bytes().await.map_err(|e| {
+            CoreError::new(
+                ErrorCode::SyncOffline,
+                format!("reading clip blob body failed: {e}"),
+                "Retry online",
+            )
+        })?;
+        if bytes.len() > CLIP_BLOB_ENVELOPE_MAX_BYTES {
+            return Err(CoreError::new(
+                ErrorCode::IntegrityError,
+                format!(
+                    "downloaded clip blob ({} bytes) exceeds 10.5 MiB envelope cap",
+                    bytes.len()
+                ),
+                "Refusing oversized blob",
+            ));
+        }
+        Ok(RemoteClipBlob {
+            clip_id: resp_clip_id,
+            clip_kid: resp_clip_kid,
+            device_id: resp_device_id,
+            envelope: bytes.to_vec(),
+        })
+    }
+
+    /// `DELETE /v1/clip` or `DELETE /v1/clip/:clip_id`.
+    pub async fn clip_delete(&self, clip_id: Option<&str>) -> Result<usize, CoreError> {
+        let path = match clip_id {
+            Some(id) => format!("/v1/clip/{id}"),
+            None => "/v1/clip".to_string(),
+        };
+        let res = self
+            .add_headers(self.http.delete(self.endpoint(&path)))
+            .send()
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::SyncOffline,
+                    format!("DELETE {path} failed: {e}"),
+                    "Check network connectivity and retry",
+                )
+            })?;
+        let val = parse_relay_json(res).await?;
+        Ok(val["deleted_count"].as_u64().unwrap_or(0) as usize)
+    }
+}
+
+/// Ensure a valid `(ClipKid, ClipKey, gen)` exists locally and on the relay.
+/// Syncs from remote `GET /v1/keys` if already published by another desktop, otherwise mints
+/// a fresh `gen = 1` `ClipKey`, wraps it with current SMK, pushes to `POST /v1/keys`, and persists locally.
+pub async fn ensure_clip_key(
+    store: &mut LocalStore,
+    client: &RelayClient,
+) -> Result<mynote_store::UnwrappedClipKey, CoreError> {
+    if let Some(local) = store.unwrap_local_clip_key()? {
+        return Ok(local);
+    }
+    if let Some((gen, blob)) = client.fetch_remote_clip_key().await? {
+        store.upsert_clip_key_material(gen, &blob, now_ms() as i64)?;
+        if let Some(local) = store.unwrap_local_clip_key()? {
+            return Ok(local);
+        }
+    }
+    let now = now_ms();
+    let (clip_kid, clip_key, blob) = store.generate_wrapped_clip_key(now)?;
+    match client.push_clip_key_material(1, &blob, false).await {
+        Ok(gen) => {
+            store.upsert_clip_key_material(gen, &blob, now as i64)?;
+            Ok((clip_kid, clip_key, gen))
+        }
+        Err(err) if err.code() == ErrorCode::CasMismatch => {
+            if let Some((gen, r_blob)) = client.fetch_remote_clip_key().await? {
+                store.upsert_clip_key_material(gen, &r_blob, now_ms() as i64)?;
+                if let Some(local) = store.unwrap_local_clip_key()? {
+                    return Ok(local);
+                }
+            }
+            Err(err)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Mutex-safe `ensure_clip_key` for Daemon async handlers (NEVER holds `std::sync::Mutex` across `.await`).
+pub async fn ensure_clip_key_with_mutex(
+    store_mutex: &Mutex<LocalStore>,
+    client: &RelayClient,
+) -> Result<mynote_store::UnwrappedClipKey, CoreError> {
+    if let Some(local) = store_mutex.lock().unwrap().unwrap_local_clip_key()? {
+        return Ok(local);
+    }
+    if let Some((gen, blob)) = client.fetch_remote_clip_key().await? {
+        let store = store_mutex.lock().unwrap();
+        store.upsert_clip_key_material(gen, &blob, now_ms() as i64)?;
+        if let Some(local) = store.unwrap_local_clip_key()? {
+            return Ok(local);
+        }
+    }
+    let now = now_ms();
+    let (clip_kid, clip_key, blob) = store_mutex.lock().unwrap().generate_wrapped_clip_key(now)?;
+    match client.push_clip_key_material(1, &blob, false).await {
+        Ok(gen) => {
+            store_mutex
+                .lock()
+                .unwrap()
+                .upsert_clip_key_material(gen, &blob, now as i64)?;
+            Ok((clip_kid, clip_key, gen))
+        }
+        Err(err) if err.code() == ErrorCode::CasMismatch => {
+            if let Some((gen, r_blob)) = client.fetch_remote_clip_key().await? {
+                let store = store_mutex.lock().unwrap();
+                store.upsert_clip_key_material(gen, &r_blob, now_ms() as i64)?;
+                if let Some(local) = store.unwrap_local_clip_key()? {
+                    return Ok(local);
+                }
+            }
+            Err(err)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Refresh local `ClipKey` from remote `GET /v1/keys` (e.g., after a peer rotated `ClipKey`).
+pub async fn refresh_clip_key_from_remote(
+    store: &mut LocalStore,
+    client: &RelayClient,
+) -> Result<Option<mynote_store::UnwrappedClipKey>, CoreError> {
+    if let Some((gen, blob)) = client.fetch_remote_clip_key().await? {
+        let local_gen = store.get_clip_key_material()?.map(|m| m.gen).unwrap_or(0);
+        if gen > local_gen {
+            store.upsert_clip_key_material(gen, &blob, now_ms() as i64)?;
+        }
+    }
+    store.unwrap_local_clip_key()
+}
+
+/// Mutex-safe `refresh_clip_key_from_remote` for Daemon async handlers.
+pub async fn refresh_clip_key_from_remote_with_mutex(
+    store_mutex: &Mutex<LocalStore>,
+    client: &RelayClient,
+) -> Result<Option<mynote_store::UnwrappedClipKey>, CoreError> {
+    if let Some((gen, blob)) = client.fetch_remote_clip_key().await? {
+        let store = store_mutex.lock().unwrap();
+        let local_gen = store.get_clip_key_material()?.map(|m| m.gen).unwrap_or(0);
+        if gen > local_gen {
+            store.upsert_clip_key_material(gen, &blob, now_ms() as i64)?;
+        }
+    }
+    store_mutex.lock().unwrap().unwrap_local_clip_key()
+}
+
+/// Rotate `ClipKey` to a brand-new generation, instruct the relay to wipe `clip_items` & `clip/blobs/*`
+/// (`clear_clips: true`), destructively overwrite local `key_material(kind='clip_key')`, and clear
+/// local `clip_items` & `clip_cache/`.
+pub async fn rotate_clip_key(
+    store: &mut LocalStore,
+    client: &RelayClient,
+) -> Result<(ClipKid, i64), CoreError> {
+    let remote_gen = client.fetch_remote_clip_key().await?.map(|(g, _)| g).unwrap_or(0);
+    let local_gen = store.get_clip_key_material()?.map(|m| m.gen).unwrap_or(0);
+    let next_gen = remote_gen.max(local_gen) + 1;
+    let now = now_ms();
+    let (new_kid, _new_key, blob) = store.generate_wrapped_clip_key(now)?;
+    let acked_gen = client.push_clip_key_material(next_gen, &blob, true).await?;
+    store.upsert_clip_key_material(acked_gen, &blob, now as i64)?;
+    let _ = store.clear_clip_items()?;
+    let _ = store.clip_cache().clear();
+    Ok((new_kid, acked_gen))
 }
 
 fn build_ws_url(sync_url: &str) -> Result<String, CoreError> {
