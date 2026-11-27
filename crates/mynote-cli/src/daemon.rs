@@ -1,6 +1,7 @@
 //! Local desktop Daemon (`#8 [M1-7]`): axum HTTP/WS (`localhost:<port>`), `SEC-05` security
 //! middleware, `rust-embed` Web UI assets, `0600` UDS NDJSON IPC, and Single-Flight cloud sync.
 
+use crate::clip_watch::{load_persisted_watch_config, spawn_clip_watch_supervisor, ClipWatchFilter};
 use crate::clipboard::{default_system_clipboard, EchoGuard, SystemClipboard, UndoClipboardSlot};
 use crate::formatters::format_content;
 use crate::sync_client::{hex_encode, run_cloud_ws_loop, PushOutcome, RelayClient};
@@ -86,6 +87,8 @@ pub struct DaemonState {
     pub clip_undo: Mutex<UndoClipboardSlot>,
     pub clip_echo: Mutex<EchoGuard>,
     pub clip_watch_state: Mutex<ClipWatchConfig>,
+    pub clip_watch_tx: watch::Sender<ClipWatchConfig>,
+    pub clip_watch_filter: Mutex<ClipWatchFilter>,
 }
 
 impl DaemonState {
@@ -814,7 +817,9 @@ pub async fn start_daemon_with_clipboard(
     let (ws_tx, _) = broadcast::channel::<String>(256);
     let sync_notify = Arc::new(Notify::new());
     let initial_creds = store.load_credentials().ok().flatten();
+    let initial_watch_cfg = load_persisted_watch_config(&store);
     let (creds_tx, creds_rx) = watch::channel(initial_creds);
+    let (clip_watch_tx, _) = watch::channel(initial_watch_cfg.clone());
     let state = Arc::new(DaemonState {
         store: Mutex::new(store),
         port: actual_port,
@@ -831,7 +836,9 @@ pub async fn start_daemon_with_clipboard(
         clipboard,
         clip_undo: Mutex::new(UndoClipboardSlot::default()),
         clip_echo: Mutex::new(EchoGuard::default()),
-        clip_watch_state: Mutex::new(ClipWatchConfig::default()),
+        clip_watch_state: Mutex::new(initial_watch_cfg),
+        clip_watch_tx,
+        clip_watch_filter: Mutex::new(ClipWatchFilter::new()),
     });
 
     let app = build_router(state.clone());
@@ -994,6 +1001,9 @@ pub async fn start_daemon_with_clipboard(
             }
         });
     }
+
+    // Spawn M4b-1 opt-in background desktop clipboard watcher supervisor (strictly idle while watch_enabled=false)
+    spawn_clip_watch_supervisor(state.clone(), shutdown_rx.clone());
 
     // Consume unused mut warning on shutdown_rx
     let _ = shutdown_rx.borrow();

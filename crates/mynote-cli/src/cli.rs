@@ -598,6 +598,29 @@ pub enum ClipCommand {
     /// Rotate ClipKey and wipe cloud + local clip history (TTY required)
     RotateKey,
 
+    /// Configure or inspect background desktop clipboard auto-watch (default OFF, opt-in)
+    Watch {
+        /// Enable background desktop clipboard auto-watch (persisted in local_meta)
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+
+        /// Disable background desktop clipboard auto-watch (persisted in local_meta)
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+
+        /// Temporarily pause background auto-watch in the running daemon
+        #[arg(long, conflicts_with = "resume")]
+        pause: bool,
+
+        /// Resume paused background auto-watch in the running daemon
+        #[arg(long, conflicts_with = "pause")]
+        resume: bool,
+
+        /// Receive mode for auto-mirrored desktop clips: inbox-only (default) or auto-apply
+        #[arg(long = "auto-apply", value_name = "MODE")]
+        auto_apply: Option<String>,
+    },
+
     /// Internal detached Wayland clipboard owner helper
     #[cfg(target_os = "linux")]
     #[command(name = "__serve-wayland", hide = true)]

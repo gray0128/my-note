@@ -3,9 +3,13 @@
 //! and UDS clip IPC helpers (`M4a-3`, `docs/interface-contracts.md` §3.2–§3.3).
 
 use super::*;
+use crate::clip_watch::{
+    persist_watch_config, validate_auto_apply_mirror, WatchCaptureOutcome, WatchDecision,
+    CLIP_SECRET_BLOCKED_HINT,
+};
 use crate::clipboard::{
     detect_image_mime_from_bytes_and_path, inspect_image_dimensions, is_svg_bytes, make_thumbnail,
-    send_clip_notification, ClipboardPayload, ClipboardWriteOpts,
+    send_clip_notification, ClipboardPayload, ClipboardWriteOpts, ReadClipboardResult,
 };
 use crate::sync_client::{
     ensure_clip_key_with_mutex, refresh_clip_key_from_remote_with_mutex, CloudWsEvent, RemoteClipItem,
@@ -165,13 +169,15 @@ impl DaemonState {
         deleted_ids: Vec<String>,
         cleared: bool,
     ) {
-        let watch_paused = self.clip_watch_state.lock().unwrap().watch_paused;
+        let watch = self.clip_watch_snapshot();
         self.broadcast_json(serde_json::json!({
             "type": "clip_changed",
             "upserted": upserted,
             "deleted_ids": deleted_ids,
             "cleared": cleared,
-            "watch_paused": watch_paused,
+            "watch_enabled": watch.watch_enabled,
+            "watch_paused": watch.watch_paused,
+            "auto_apply_mirror": watch.auto_apply_mirror,
         }));
     }
 
@@ -695,14 +701,11 @@ impl DaemonState {
         enabled: Option<bool>,
         auto_apply_mirror: Option<String>,
     ) -> Result<ClipWatchConfig, CoreError> {
+        if paused.is_none() && enabled.is_none() && auto_apply_mirror.is_none() {
+            return Ok(self.clip_watch_snapshot());
+        }
         if let Some(ref mode) = auto_apply_mirror {
-            if mode != "inbox-only" && mode != "auto-apply" {
-                return Err(CoreError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("invalid auto_apply_mirror '{mode}'"),
-                    "Use 'inbox-only' or 'auto-apply'",
-                ));
-            }
+            validate_auto_apply_mirror(mode)?;
         }
         let cfg = {
             let mut g = self.clip_watch_state.lock().unwrap();
@@ -717,8 +720,74 @@ impl DaemonState {
             }
             g.clone()
         };
+        {
+            let store = self.store.lock().unwrap();
+            persist_watch_config(&store, &cfg)?;
+        }
+        let _ = self.clip_watch_tx.send(cfg.clone());
         self.broadcast_clip_changed(Vec::new(), Vec::new(), false);
         Ok(cfg)
+    }
+
+    /// Process a clipboard observation from the M4b-1 background watch engine (or test harness).
+    /// Enforces watch enabled/unpaused state, sensitive/echo/secret/size/rate filters, emits
+    /// `CLIP_SECRET_BLOCKED` WS alert on secret hits (0 outbound network calls), and uploads
+    /// allowed items with `source_mode = ClipSourceMode::Auto`.
+    pub async fn handle_auto_captured_read(
+        self: &Arc<Self>,
+        read_res: ReadClipboardResult,
+        now_ms: u64,
+    ) -> Result<WatchCaptureOutcome, CoreError> {
+        let cfg = self.clip_watch_snapshot();
+        if !cfg.watch_enabled || cfg.watch_paused {
+            return Ok(WatchCaptureOutcome::DisabledOrPaused);
+        }
+        let decision = {
+            let mut filter = self.clip_watch_filter.lock().unwrap();
+            let echo = self.clip_echo.lock().unwrap();
+            filter.evaluate_read(read_res, &echo, now_ms)
+        };
+        match decision {
+            WatchDecision::SecretBlocked(pattern) => {
+                self.broadcast_json(serde_json::json!({
+                    "type": "alert",
+                    "code": "CLIP_SECRET_BLOCKED",
+                    "details": {
+                        "pattern": pattern,
+                        "hint": CLIP_SECRET_BLOCKED_HINT,
+                    }
+                }));
+                Ok(WatchCaptureOutcome::Dropped(WatchDecision::SecretBlocked(
+                    pattern,
+                )))
+            }
+            WatchDecision::Allow(payload) => {
+                let dto = match payload {
+                    ClipboardPayload::Text(text) => {
+                        push_text_clip_persisted(self, text, ClipSourceMode::Auto).await?
+                    }
+                    ClipboardPayload::Image {
+                        mime,
+                        bytes,
+                        width,
+                        height,
+                    } => {
+                        push_image_clip_persisted(
+                            self,
+                            &mime,
+                            bytes,
+                            width,
+                            height,
+                            None,
+                            ClipSourceMode::Auto,
+                        )
+                        .await?
+                    }
+                };
+                Ok(WatchCaptureOutcome::Uploaded(Box::new(dto)))
+            }
+            other => Ok(WatchCaptureOutcome::Dropped(other)),
+        }
     }
 }
 
@@ -793,13 +862,23 @@ pub(super) async fn handle_post_clip(
     }
 }
 
-async fn post_clip_inner(
+async fn push_text_clip_persisted(
     state: &Arc<DaemonState>,
-    body: PostClipBody,
-) -> Result<serde_json::Value, CoreError> {
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let now = now_ms_daemon();
+    text: String,
+    source_mode: ClipSourceMode,
+) -> Result<ClipItemDto, CoreError> {
+    if text.len() > CLIP_BLOB_MAX_BYTES {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "text clip length ({} bytes) exceeds 10 MiB limit ({CLIP_BLOB_MAX_BYTES} bytes)",
+                text.len()
+            ),
+            "Split large text under 10 MiB",
+        ));
+    }
 
+    let now = now_ms_daemon();
     let (creds_opt, device_id, clip_id) = {
         let mut store = state.store.lock().unwrap();
         let creds = store.load_credentials()?;
@@ -808,6 +887,251 @@ async fn post_clip_inner(
         (creds, dev, cid)
     };
 
+    let is_blob = text.len() > CLIP_INLINE_TEXT_MAX_BYTES;
+    let (clip_kid, clip_key) = ensure_local_or_cloud_clip_key(state, creds_opt.as_ref()).await?;
+
+    let (meta, blob_bytes_opt, sha_opt) = if is_blob {
+        let raw = text.as_bytes().to_vec();
+        let sha = clip_sha256_hex(&raw);
+        let preview = truncate_clip_preview(&text);
+        let meta = ClipMetaV1 {
+            v: 1,
+            kind: ClipKind::Text,
+            mime: "text/plain".to_string(),
+            source_mode,
+            created_at_ms: now,
+            text: Some(preview),
+            blob: Some(ClipBlobMetaV1 {
+                byte_size: raw.len() as u64,
+                sha256_hex: sha.clone(),
+                width: None,
+                height: None,
+                thumb_mime: None,
+                thumb_b64: None,
+            }),
+        };
+        (meta, Some(raw), Some(sha))
+    } else {
+        let meta = ClipMetaV1 {
+            v: 1,
+            kind: ClipKind::Text,
+            mime: "text/plain".to_string(),
+            source_mode,
+            created_at_ms: now,
+            text: Some(text),
+            blob: None,
+        };
+        (meta, None, None)
+    };
+
+    let meta_env = encrypt_mnc1_meta(
+        clip_kid,
+        &clip_key,
+        clip_id,
+        &device_id,
+        &meta,
+        false,
+        rand_nonce_24()?,
+    )?;
+    let mut created_at_ms = now;
+    let mut expires_at_ms = now + CLIP_DEFAULT_TTL_MS;
+
+    if let Some(creds) = creds_opt.as_ref() {
+        let client = RelayClient::from_credentials(creds)?;
+        if let Some(ref raw) = blob_bytes_opt {
+            let blob_env =
+                encrypt_mnc1_blob(clip_kid, &clip_key, clip_id, &device_id, raw, rand_nonce_24()?)?;
+            let rec = client
+                .clip_push_blob(
+                    &clip_id.to_string(),
+                    &clip_kid.to_string(),
+                    "text",
+                    &meta_env,
+                    &blob_env,
+                )
+                .await?;
+            created_at_ms = rec.created_at_ms;
+            if rec.expires_at_ms > 0 {
+                expires_at_ms = rec.expires_at_ms;
+            }
+        } else {
+            let rec = client
+                .clip_push_meta(
+                    &clip_id.to_string(),
+                    &clip_kid.to_string(),
+                    "text",
+                    false,
+                    &meta_env,
+                )
+                .await?;
+            if let Some(c) = rec.created_at_ms {
+                created_at_ms = c;
+            }
+            if let Some(e) = rec.expires_at_ms {
+                expires_at_ms = e;
+            }
+        }
+    }
+
+    persist_and_broadcast_local_clip(
+        state,
+        ClipItemRow {
+            clip_id: clip_id.to_string(),
+            clip_kid: clip_kid.to_string(),
+            device_id: device_id.as_str().to_string(),
+            kind: "text".to_string(),
+            mime: "text/plain".to_string(),
+            source_mode: source_mode.as_str().to_string(),
+            created_at_ms,
+            expires_at_ms,
+            text_preview: meta.text,
+            has_blob: blob_bytes_opt.is_some(),
+            blob_bytes: blob_bytes_opt.as_ref().map(|b| b.len() as i64),
+            blob_sha256: sha_opt,
+            width: None,
+            height: None,
+            thumb_mime: None,
+            thumb_blob: None,
+            local_blob_path: None,
+        },
+        blob_bytes_opt.as_deref(),
+    )
+}
+
+async fn push_image_clip_persisted(
+    state: &Arc<DaemonState>,
+    mime: &str,
+    raw: Vec<u8>,
+    width_hint: Option<u32>,
+    height_hint: Option<u32>,
+    thumb_override: Option<(String, Vec<u8>)>,
+    source_mode: ClipSourceMode,
+) -> Result<ClipItemDto, CoreError> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    validate_clip_image_mime(mime)?;
+    if raw.is_empty() {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            "image clip payload cannot be empty",
+            "Provide valid bitmap bytes",
+        ));
+    }
+    if raw.len() > CLIP_BLOB_MAX_BYTES {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "image clip payload ({} bytes) exceeds 10 MiB limit ({CLIP_BLOB_MAX_BYTES} bytes)",
+                raw.len()
+            ),
+            "Resize or compress the image under 10 MiB",
+        ));
+    }
+    // Defense-in-depth: sniff bytes to guarantee zero SVG smuggling under a bitmap MIME!
+    let _sniffed = detect_image_mime_from_bytes_and_path(&raw, None)?;
+
+    let (width, height) = match (width_hint, height_hint) {
+        (Some(w), Some(h)) => (Some(w), Some(h)),
+        _ => match inspect_image_dimensions(&raw) {
+            Some((w, h)) => (Some(w), Some(h)),
+            None => (width_hint, height_hint),
+        },
+    };
+
+    let (thumb_mime, thumb_bytes) = if let Some((tm, tb)) = thumb_override {
+        (Some(tm), Some(tb))
+    } else if let Some((tm, tb)) = make_thumbnail(&raw, mime) {
+        (Some(tm), Some(tb))
+    } else {
+        (None, None)
+    };
+
+    let now = now_ms_daemon();
+    let (creds_opt, device_id, clip_id) = {
+        let mut store = state.store.lock().unwrap();
+        let creds = store.load_credentials()?;
+        let dev = store.device_id().clone();
+        let cid = store.next_clip_id(now as u64)?;
+        (creds, dev, cid)
+    };
+
+    let sha = clip_sha256_hex(&raw);
+    let meta = ClipMetaV1 {
+        v: 1,
+        kind: ClipKind::Image,
+        mime: mime.to_string(),
+        source_mode,
+        created_at_ms: now,
+        text: None,
+        blob: Some(ClipBlobMetaV1 {
+            byte_size: raw.len() as u64,
+            sha256_hex: sha.clone(),
+            width,
+            height,
+            thumb_mime: thumb_mime.clone(),
+            thumb_b64: thumb_bytes.as_ref().map(|b| b64.encode(b)),
+        }),
+    };
+
+    let (clip_kid, clip_key) = ensure_local_or_cloud_clip_key(state, creds_opt.as_ref()).await?;
+    let meta_env = encrypt_mnc1_meta(
+        clip_kid,
+        &clip_key,
+        clip_id,
+        &device_id,
+        &meta,
+        false,
+        rand_nonce_24()?,
+    )?;
+    let blob_env = encrypt_mnc1_blob(clip_kid, &clip_key, clip_id, &device_id, &raw, rand_nonce_24()?)?;
+
+    let mut created_at_ms = now;
+    let mut expires_at_ms = now + CLIP_DEFAULT_TTL_MS;
+    if let Some(creds) = creds_opt.as_ref() {
+        let client = RelayClient::from_credentials(creds)?;
+        let rec = client
+            .clip_push_blob(
+                &clip_id.to_string(),
+                &clip_kid.to_string(),
+                "image",
+                &meta_env,
+                &blob_env,
+            )
+            .await?;
+        created_at_ms = rec.created_at_ms;
+        if rec.expires_at_ms > 0 {
+            expires_at_ms = rec.expires_at_ms;
+        }
+    }
+
+    persist_and_broadcast_local_clip(
+        state,
+        ClipItemRow {
+            clip_id: clip_id.to_string(),
+            clip_kid: clip_kid.to_string(),
+            device_id: device_id.as_str().to_string(),
+            kind: "image".to_string(),
+            mime: mime.to_string(),
+            source_mode: source_mode.as_str().to_string(),
+            created_at_ms,
+            expires_at_ms,
+            text_preview: None,
+            has_blob: true,
+            blob_bytes: Some(raw.len() as i64),
+            blob_sha256: Some(sha),
+            width,
+            height,
+            thumb_mime,
+            thumb_blob: thumb_bytes,
+            local_blob_path: None,
+        },
+        Some(&raw),
+    )
+}
+
+async fn post_clip_inner(
+    state: &Arc<DaemonState>,
+    body: PostClipBody,
+) -> Result<serde_json::Value, CoreError> {
     match body.kind.as_str() {
         "text" => {
             let text = body.text.ok_or_else(|| {
@@ -828,6 +1152,14 @@ async fn post_clip_inner(
                         "Keep ephemeral pushes <= 256 KiB",
                     ));
                 }
+                let now = now_ms_daemon();
+                let (creds_opt, device_id, clip_id) = {
+                    let mut store = state.store.lock().unwrap();
+                    let creds = store.load_credentials()?;
+                    let dev = store.device_id().clone();
+                    let cid = store.next_clip_id(now as u64)?;
+                    (creds, dev, cid)
+                };
                 let creds = creds_opt.ok_or_else(|| {
                     CoreError::new(
                         ErrorCode::SyncOffline,
@@ -866,127 +1198,7 @@ async fn post_clip_inner(
                 }));
             }
 
-            if text.len() > CLIP_BLOB_MAX_BYTES {
-                return Err(CoreError::new(
-                    ErrorCode::InvalidArgument,
-                    format!(
-                        "text clip length ({} bytes) exceeds 10 MiB limit ({CLIP_BLOB_MAX_BYTES} bytes)",
-                        text.len()
-                    ),
-                    "Split large text under 10 MiB",
-                ));
-            }
-
-            let is_blob = text.len() > CLIP_INLINE_TEXT_MAX_BYTES;
-            let (clip_kid, clip_key) = ensure_local_or_cloud_clip_key(state, creds_opt.as_ref()).await?;
-
-            let (meta, blob_bytes_opt, sha_opt) = if is_blob {
-                let raw = text.as_bytes().to_vec();
-                let sha = clip_sha256_hex(&raw);
-                let preview = truncate_clip_preview(&text);
-                let meta = ClipMetaV1 {
-                    v: 1,
-                    kind: ClipKind::Text,
-                    mime: "text/plain".to_string(),
-                    source_mode: ClipSourceMode::Explicit,
-                    created_at_ms: now,
-                    text: Some(preview),
-                    blob: Some(ClipBlobMetaV1 {
-                        byte_size: raw.len() as u64,
-                        sha256_hex: sha.clone(),
-                        width: None,
-                        height: None,
-                        thumb_mime: None,
-                        thumb_b64: None,
-                    }),
-                };
-                (meta, Some(raw), Some(sha))
-            } else {
-                let meta = ClipMetaV1 {
-                    v: 1,
-                    kind: ClipKind::Text,
-                    mime: "text/plain".to_string(),
-                    source_mode: ClipSourceMode::Explicit,
-                    created_at_ms: now,
-                    text: Some(text),
-                    blob: None,
-                };
-                (meta, None, None)
-            };
-
-            let meta_env = encrypt_mnc1_meta(
-                clip_kid,
-                &clip_key,
-                clip_id,
-                &device_id,
-                &meta,
-                false,
-                rand_nonce_24()?,
-            )?;
-            let mut created_at_ms = now;
-            let mut expires_at_ms = now + CLIP_DEFAULT_TTL_MS;
-
-            if let Some(creds) = creds_opt.as_ref() {
-                let client = RelayClient::from_credentials(creds)?;
-                if let Some(ref raw) = blob_bytes_opt {
-                    let blob_env =
-                        encrypt_mnc1_blob(clip_kid, &clip_key, clip_id, &device_id, raw, rand_nonce_24()?)?;
-                    let rec = client
-                        .clip_push_blob(
-                            &clip_id.to_string(),
-                            &clip_kid.to_string(),
-                            "text",
-                            &meta_env,
-                            &blob_env,
-                        )
-                        .await?;
-                    created_at_ms = rec.created_at_ms;
-                    if rec.expires_at_ms > 0 {
-                        expires_at_ms = rec.expires_at_ms;
-                    }
-                } else {
-                    let rec = client
-                        .clip_push_meta(
-                            &clip_id.to_string(),
-                            &clip_kid.to_string(),
-                            "text",
-                            false,
-                            &meta_env,
-                        )
-                        .await?;
-                    if let Some(c) = rec.created_at_ms {
-                        created_at_ms = c;
-                    }
-                    if let Some(e) = rec.expires_at_ms {
-                        expires_at_ms = e;
-                    }
-                }
-            }
-
-            let dto = persist_and_broadcast_local_clip(
-                state,
-                ClipItemRow {
-                    clip_id: clip_id.to_string(),
-                    clip_kid: clip_kid.to_string(),
-                    device_id: device_id.as_str().to_string(),
-                    kind: "text".to_string(),
-                    mime: "text/plain".to_string(),
-                    source_mode: "explicit".to_string(),
-                    created_at_ms,
-                    expires_at_ms,
-                    text_preview: meta.text,
-                    has_blob: blob_bytes_opt.is_some(),
-                    blob_bytes: blob_bytes_opt.as_ref().map(|b| b.len() as i64),
-                    blob_sha256: sha_opt,
-                    width: None,
-                    height: None,
-                    thumb_mime: None,
-                    thumb_blob: None,
-                    local_blob_path: None,
-                },
-                blob_bytes_opt.as_deref(),
-            )?;
-
+            let dto = push_text_clip_persisted(state, text, ClipSourceMode::Explicit).await?;
             Ok(serde_json::json!({
                 "clip_id": dto.clip_id,
                 "ephemeral": false,
@@ -1018,35 +1230,8 @@ async fn post_clip_inner(
                 )
             })?;
             let raw = decode_b64_arg("data_b64", data_b64)?;
-            if raw.is_empty() {
-                return Err(CoreError::new(
-                    ErrorCode::InvalidArgument,
-                    "image clip payload cannot be empty",
-                    "Provide valid bitmap bytes",
-                ));
-            }
-            if raw.len() > CLIP_BLOB_MAX_BYTES {
-                return Err(CoreError::new(
-                    ErrorCode::InvalidArgument,
-                    format!(
-                        "image clip payload ({} bytes) exceeds 10 MiB limit ({CLIP_BLOB_MAX_BYTES} bytes)",
-                        raw.len()
-                    ),
-                    "Resize or compress the image under 10 MiB",
-                ));
-            }
-            // Defense-in-depth: sniff bytes to guarantee zero SVG smuggling under a bitmap MIME!
-            let _sniffed = detect_image_mime_from_bytes_and_path(&raw, None)?;
 
-            let (width, height) = match (body.width, body.height) {
-                (Some(w), Some(h)) => (Some(w), Some(h)),
-                _ => match inspect_image_dimensions(&raw) {
-                    Some((w, h)) => (Some(w), Some(h)),
-                    None => (body.width, body.height),
-                },
-            };
-
-            let (thumb_mime, thumb_bytes) = if let Some(tb64) = body.thumb_b64.as_deref() {
+            let thumb_override = if let Some(tb64) = body.thumb_b64.as_deref() {
                 let tm = body.thumb_mime.as_deref().ok_or_else(|| {
                     CoreError::new(
                         ErrorCode::InvalidArgument,
@@ -1073,86 +1258,21 @@ async fn post_clip_inner(
                         "Provide a JPEG/PNG/WebP/GIF thumbnail",
                     ));
                 }
-                (Some(tm.to_string()), Some(tb))
-            } else if let Some((tm, tb)) = make_thumbnail(&raw, mime) {
-                (Some(tm), Some(tb))
+                Some((tm.to_string(), tb))
             } else {
-                (None, None)
+                None
             };
 
-            let sha = clip_sha256_hex(&raw);
-            let meta = ClipMetaV1 {
-                v: 1,
-                kind: ClipKind::Image,
-                mime: mime.to_string(),
-                source_mode: ClipSourceMode::Explicit,
-                created_at_ms: now,
-                text: None,
-                blob: Some(ClipBlobMetaV1 {
-                    byte_size: raw.len() as u64,
-                    sha256_hex: sha.clone(),
-                    width,
-                    height,
-                    thumb_mime: thumb_mime.clone(),
-                    thumb_b64: thumb_bytes.as_ref().map(|b| b64.encode(b)),
-                }),
-            };
-
-            let (clip_kid, clip_key) = ensure_local_or_cloud_clip_key(state, creds_opt.as_ref()).await?;
-            let meta_env = encrypt_mnc1_meta(
-                clip_kid,
-                &clip_key,
-                clip_id,
-                &device_id,
-                &meta,
-                false,
-                rand_nonce_24()?,
-            )?;
-            let blob_env =
-                encrypt_mnc1_blob(clip_kid, &clip_key, clip_id, &device_id, &raw, rand_nonce_24()?)?;
-
-            let mut created_at_ms = now;
-            let mut expires_at_ms = now + CLIP_DEFAULT_TTL_MS;
-            if let Some(creds) = creds_opt.as_ref() {
-                let client = RelayClient::from_credentials(creds)?;
-                let rec = client
-                    .clip_push_blob(
-                        &clip_id.to_string(),
-                        &clip_kid.to_string(),
-                        "image",
-                        &meta_env,
-                        &blob_env,
-                    )
-                    .await?;
-                created_at_ms = rec.created_at_ms;
-                if rec.expires_at_ms > 0 {
-                    expires_at_ms = rec.expires_at_ms;
-                }
-            }
-
-            let dto = persist_and_broadcast_local_clip(
+            let dto = push_image_clip_persisted(
                 state,
-                ClipItemRow {
-                    clip_id: clip_id.to_string(),
-                    clip_kid: clip_kid.to_string(),
-                    device_id: device_id.as_str().to_string(),
-                    kind: "image".to_string(),
-                    mime: mime.to_string(),
-                    source_mode: "explicit".to_string(),
-                    created_at_ms,
-                    expires_at_ms,
-                    text_preview: None,
-                    has_blob: true,
-                    blob_bytes: Some(raw.len() as i64),
-                    blob_sha256: Some(sha),
-                    width,
-                    height,
-                    thumb_mime,
-                    thumb_blob: thumb_bytes,
-                    local_blob_path: None,
-                },
-                Some(&raw),
-            )?;
+                mime,
+                raw,
+                body.width,
+                body.height,
+                thumb_override,
+                ClipSourceMode::Explicit,
+            )
+            .await?;
 
             Ok(serde_json::json!({
                 "clip_id": dto.clip_id,
