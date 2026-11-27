@@ -3578,11 +3578,10 @@ mod tests {
 
         let ref_blocks = cluster.nodes[0].engine.all_blocks();
         let ref_digest = cluster.nodes[0].engine.keys.digest();
-        for idx in 0..3 {
-            assert_eq!(cluster.nodes[idx].engine.all_blocks(), ref_blocks);
-            assert_eq!(cluster.nodes[idx].engine.keys.digest(), ref_digest);
-            let (ok, missing) =
-                crate::keys::self_check_key_liveness(&ref_blocks, &cluster.nodes[idx].engine.keys);
+        for node in &cluster.nodes {
+            assert_eq!(node.engine.all_blocks(), ref_blocks);
+            assert_eq!(node.engine.keys.digest(), ref_digest);
+            let (ok, missing) = crate::keys::self_check_key_liveness(&ref_blocks, &node.engine.keys);
             assert!(ok && missing.is_empty(), "missing keys: {missing:?}");
         }
         assert_eq!(
