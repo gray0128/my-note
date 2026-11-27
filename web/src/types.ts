@@ -144,6 +144,8 @@ export interface BootstrapResponse {
   recovery_pk_b64?: string | null;
   blocked_tier2_ops?: BlockedTier2OpDto[];
   trash_count: number;
+  clip_count?: number;
+  daemon_version?: string;
   device_id: string;
   last_hlc: string | null;
 }
@@ -246,7 +248,8 @@ export interface AlertFrame {
     | "RECOVERY_DRILL_DUE"
     | "AUTH_REQUIRED"
     | "DEVICE_REVOKED"
-    | "CLIP_SECRET_BLOCKED";
+    | "CLIP_SECRET_BLOCKED"
+    | "DAEMON_UPDATED";
   details: Record<string, unknown>;
 }
 
@@ -261,7 +264,9 @@ export type LocalWsFrame =
       upserted: ClipItemDto[];
       deleted_ids: string[];
       cleared: boolean;
+      watch_enabled?: boolean;
       watch_paused: boolean;
+      auto_apply_mirror?: ClipAutoApplyMirrorMode;
     }
   | AlertFrame;
 

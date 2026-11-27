@@ -338,7 +338,7 @@ function makeDesktopClipMockApi(initialClips: ClipItemDto[] = []) {
   ];
   let clips: ClipItemDto[] = [...initialClips];
   let hasUndo = false;
-  let watchEnabled = true;
+  let watchEnabled = false;
   let watchPaused = false;
   let autoApplyMirror: "inbox-only" | "auto-apply" = "inbox-only";
   let wsListener: ((frame: LocalWsFrame) => void) | null = null;
@@ -885,11 +885,26 @@ describe("M4a-4: Desktop Clipboard UI, Mobile PWA Clipboard/IDB v2/ShareTarget, 
     const root = document.getElementById("app")!;
     const app = new MyNoteApp(root, api);
     await app.start();
+    await new Promise((r) => setTimeout(r, 20));
 
-    // Open clipboard drawer
+    // Startup hydrates clipboard badge count and visible label before opening the drawer
     const inboxBtn = root.querySelector<HTMLButtonElement>('[data-testid="clip-inbox-btn"]')!;
     expect(inboxBtn).not.toBeNull();
-    inboxBtn.click();
+    expect(inboxBtn.querySelector(".btn-label")?.textContent).toBeTruthy();
+    expect(inboxBtn.querySelector(".trash-badge-num")?.textContent).toBe("3");
+
+    // Quiet shortcut hints render below stream-add-block and open the Shortcuts modal
+    const streamHints = root.querySelector<HTMLElement>('[data-testid="stream-shortcut-hints"]');
+    expect(streamHints).not.toBeNull();
+    root.querySelector<HTMLButtonElement>('[data-testid="stream-shortcuts-btn"]')!.click();
+    const shortcutsBackdrop = root.querySelector<HTMLElement>('[data-testid="shortcuts-modal-backdrop"]')!;
+    expect(shortcutsBackdrop.classList.contains("hidden")).toBe(false);
+    expect(root.querySelector('[data-testid="shortcuts-modal"]')?.textContent).toContain("Switch to previous / next block");
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "/", code: "Slash", metaKey: true }));
+    expect(shortcutsBackdrop.classList.contains("hidden")).toBe(true);
+
+    // Mod+\ toggles the Clipboard drawer open
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "\\", code: "Backslash", metaKey: true }));
     await new Promise((r) => setTimeout(r, 30));
 
     const drawer = root.querySelector<HTMLElement>('[data-testid="clip-drawer"]')!;
@@ -966,11 +981,40 @@ describe("M4a-4: Desktop Clipboard UI, Mobile PWA Clipboard/IDB v2/ShareTarget, 
     await new Promise((r) => setTimeout(r, 20));
     expect(calls.pushImage.length).toBe(0);
 
-    // Auto-Watch pause toggle calls PATCH /v1/local/clip/watch
+    // Auto-Watch defaults OFF (secondary pause/mode controls hidden until enabled)
     const watchBtn = drawer.querySelector<HTMLButtonElement>('[data-testid="clip-watch-toggle"]')!;
+    const watchPauseBtn = drawer.querySelector<HTMLButtonElement>('[data-testid="clip-watch-pause"]')!;
+    const watchModeBtn = drawer.querySelector<HTMLButtonElement>('[data-testid="clip-watch-mode"]')!;
+    expect(watchBtn.getAttribute("aria-pressed")).toBe("false");
+    expect(watchPauseBtn.classList.contains("hidden")).toBe(true);
+    expect(watchModeBtn.classList.contains("hidden")).toBe(true);
+
+    // Enable Auto-Watch -> pause & mode controls appear -> toggle pause & switch to auto-apply -> disable
     watchBtn.click();
     await new Promise((r) => setTimeout(r, 20));
-    expect(calls.patchWatch).toEqual([{ paused: true }]);
+    expect(watchBtn.getAttribute("aria-pressed")).toBe("true");
+    expect(watchPauseBtn.classList.contains("hidden")).toBe(false);
+    expect(watchModeBtn.classList.contains("hidden")).toBe(false);
+
+    watchPauseBtn.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(watchPauseBtn.getAttribute("aria-pressed")).toBe("true");
+
+    watchModeBtn.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(watchModeBtn.dataset.mode).toBe("auto-apply");
+
+    watchBtn.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(watchBtn.getAttribute("aria-pressed")).toBe("false");
+    expect(watchPauseBtn.classList.contains("hidden")).toBe(true);
+
+    expect(calls.patchWatch).toEqual([
+      { enabled: true, paused: false },
+      { paused: true },
+      { auto_apply_mirror: "auto-apply" },
+      { enabled: false, paused: false },
+    ]);
 
     // Delete single clip & Clear All
     drawer.querySelector<HTMLButtonElement>('[data-testid="clip-delete-01CLIP00000000000000000003"]')!.click();

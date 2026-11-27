@@ -627,28 +627,23 @@ def main() -> None:
                 f"Promoted clip block missing from SQLite `mynote ls`: {ls_blocks}"
             )
 
-            # Toggle Auto-Watch (UI pause toggle + persisted enabled/auto_apply_mirror via PATCH /v1/local/clip/watch)
+            # Toggle Auto-Watch directly via UI (enable -> pause -> resume -> switch to auto-apply -> verify CLI -> disable)
+            assert c_page.get_attribute('[data-testid="clip-watch-toggle"]', "aria-pressed") == "false"
             with c_page.expect_response(lambda r: "/v1/local/clip/watch" in r.url and r.request.method == "PATCH" and r.status == 200):
                 c_page.click('[data-testid="clip-watch-toggle"]')
             assert c_page.get_attribute('[data-testid="clip-watch-toggle"]', "aria-pressed") == "true"
-            with c_page.expect_response(lambda r: "/v1/local/clip/watch" in r.url and r.request.method == "PATCH" and r.status == 200):
-                c_page.click('[data-testid="clip-watch-toggle"]')
-            assert c_page.get_attribute('[data-testid="clip-watch-toggle"]', "aria-pressed") == "false"
 
-            watch_patch = c_page.evaluate(
-                """async () => {
-                    const res = await fetch('/v1/local/clip/watch', {
-                        method: 'PATCH',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ enabled: true, auto_apply_mirror: 'auto-apply' }),
-                        credentials: 'same-origin',
-                    });
-                    return { status: res.status, json: await res.json() };
-                }"""
-            )
-            assert watch_patch["status"] == 200 and watch_patch["json"]["ok"] is True
-            assert watch_patch["json"]["data"]["watch_enabled"] is True
-            assert watch_patch["json"]["data"]["auto_apply_mirror"] == "auto-apply"
+            with c_page.expect_response(lambda r: "/v1/local/clip/watch" in r.url and r.request.method == "PATCH" and r.status == 200):
+                c_page.click('[data-testid="clip-watch-pause"]')
+            assert c_page.get_attribute('[data-testid="clip-watch-pause"]', "aria-pressed") == "true"
+
+            with c_page.expect_response(lambda r: "/v1/local/clip/watch" in r.url and r.request.method == "PATCH" and r.status == 200):
+                c_page.click('[data-testid="clip-watch-pause"]')
+            assert c_page.get_attribute('[data-testid="clip-watch-pause"]', "aria-pressed") == "false"
+
+            with c_page.expect_response(lambda r: "/v1/local/clip/watch" in r.url and r.request.method == "PATCH" and r.status == 200):
+                c_page.click('[data-testid="clip-watch-mode"]')
+            assert c_page.get_attribute('[data-testid="clip-watch-mode"]', "data-mode") == "auto-apply"
 
             cli_watch = json.loads(run_cli(tmp_desktop, ["--json", "clip", "watch"], env_extra=env_extra).stdout)["data"]
             assert cli_watch["watch_enabled"] is True

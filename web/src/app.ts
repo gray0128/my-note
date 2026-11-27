@@ -20,7 +20,25 @@ import {
 import { createIcon, type IconName } from "./icons";
 import { computeLineDiff } from "./render/diff";
 import { copyDualFormat } from "./render/markdown";
-import { createShortcutHint, formatShortcutTitle, type ShortcutKeyToken } from "./shortcuts";
+import {
+  createShortcutHint,
+  formatShortcutTitle,
+  SHORTCUT_CLIPBOARD,
+  SHORTCUT_COPY_BLOCK,
+  SHORTCUT_EDGE_ARROWS,
+  SHORTCUT_ESC,
+  SHORTCUT_FIND,
+  SHORTCUT_FORMAT,
+  SHORTCUT_HELP,
+  SHORTCUT_LANG,
+  SHORTCUT_LOCK_VAULT,
+  SHORTCUT_MARKDOWN_MODE,
+  SHORTCUT_MOVE_BLOCK_PAIR,
+  SHORTCUT_NEW_BLOCK,
+  SHORTCUT_SWITCH_BLOCK_PAIR,
+  SHORTCUT_SWITCH_BUFFER,
+  type ShortcutKeyToken,
+} from "./shortcuts";
 import { initTheme } from "./theme";
 import type {
   AlertFrame,
@@ -111,9 +129,13 @@ export class MyNoteApp {
   private trashBtnEl!: HTMLButtonElement;
   private trashCountEl!: HTMLSpanElement;
   private clipInboxBtnEl!: HTMLButtonElement;
+  private clipInboxLabelEl!: HTMLSpanElement;
   private clipInboxCountEl!: HTMLSpanElement;
+  private shortcutsBtnEl!: HTMLButtonElement;
+  private shortcutsBtnLabelEl!: HTMLSpanElement;
   private clipDrawer!: ClipDrawerController;
   private lastClipCount = 0;
+  private initialDaemonVersion: string | null = null;
   private alertStackEl!: HTMLElement;
   private findBarEl!: HTMLElement;
   private findInputEl!: HTMLInputElement;
@@ -144,6 +166,8 @@ export class MyNoteApp {
   private bufferFooterEl!: HTMLElement;
   private dialogBackdropEl!: HTMLElement;
   private dialogModalEl!: HTMLElement;
+  private shortcutsBackdropEl!: HTMLElement;
+  private shortcutsModalEl!: HTMLElement;
   private toastEl!: HTMLElement;
   public stream!: BlockStreamController;
 
@@ -157,6 +181,7 @@ export class MyNoteApp {
 
   async start(): Promise<void> {
     const boot = await this.api.bootstrap();
+    this.initialDaemonVersion = boot.daemon_version ?? null;
     this.setBuffers(boot.buffers);
     this.activeBufferId = boot.initial_buffer_id ?? this.buffers[0]?.id ?? null;
     this.syncStatus = boot.sync_status;
@@ -167,6 +192,8 @@ export class MyNoteApp {
     this.renderVaultBtn();
     this.renderSyncPill();
     this.updateTrashCount(boot.trash_count);
+    this.updateClipCount(boot.clip_count ?? 0);
+    void this.clipDrawer.refresh({ silent: true });
     this.stream.setBlocks(boot.blocks);
     if (this.activeBufferId) {
       this.knownBufferBlockCounts.set(this.activeBufferId, boot.blocks.length);
@@ -378,11 +405,28 @@ export class MyNoteApp {
     this.clipInboxBtnEl.className = "btn btn-ghost btn-has-icon trash-btn clip-inbox-btn";
     this.clipInboxBtnEl.dataset.testid = "clip-inbox-btn";
     this.clipInboxBtnEl.setAttribute("aria-pressed", "false");
+    this.clipInboxLabelEl = document.createElement("span");
+    this.clipInboxLabelEl.className = "btn-label btn-label-collapsible";
+    this.clipInboxLabelEl.textContent = t("topbar.clipInbox");
     this.clipInboxCountEl = document.createElement("span");
     this.clipInboxCountEl.className = "trash-count";
-    this.clipInboxBtnEl.append(createIcon("clipboard", "xs"), this.clipInboxCountEl);
+    this.clipInboxBtnEl.append(createIcon("clipboard", "xs"), this.clipInboxLabelEl, this.clipInboxCountEl);
     this.clipInboxBtnEl.addEventListener("click", () => void this.toggleClipDrawer());
     this.updateClipCount(0);
+
+    this.shortcutsBtnEl = document.createElement("button");
+    this.shortcutsBtnEl.type = "button";
+    this.shortcutsBtnEl.className = "btn btn-ghost btn-icon-only";
+    this.shortcutsBtnEl.dataset.testid = "shortcuts-btn";
+    this.shortcutsBtnEl.setAttribute("aria-label", t("topbar.shortcuts"));
+    this.shortcutsBtnEl.title = t("topbar.shortcutsTitle", {
+      shortcut: formatShortcutTitle(SHORTCUT_HELP),
+    });
+    this.shortcutsBtnLabelEl = document.createElement("span");
+    this.shortcutsBtnLabelEl.className = "sr-only";
+    this.shortcutsBtnLabelEl.textContent = t("topbar.shortcuts");
+    this.shortcutsBtnEl.append(createIcon("keyboard", "xs"), this.shortcutsBtnLabelEl);
+    this.shortcutsBtnEl.addEventListener("click", () => this.toggleShortcutsModal());
 
     this.syncPillEl = document.createElement("button");
     this.syncPillEl.type = "button";
@@ -413,6 +457,7 @@ export class MyNoteApp {
       this.createTopbarSep(),
       this.syncPillEl,
       this.createTopbarSep(),
+      this.shortcutsBtnEl,
       this.themeMenu.element,
       this.localeSwitch.element,
     );
@@ -509,6 +554,7 @@ export class MyNoteApp {
         this.renderAlerts();
       },
       onVaultActivity: () => this.resetVaultIdleTimer(),
+      onOpenShortcuts: () => this.openShortcutsModal(),
     });
 
     // Recycle Bin drawer
@@ -666,6 +712,20 @@ export class MyNoteApp {
     this.dialogModalEl.setAttribute("aria-modal", "true");
     this.dialogBackdropEl.appendChild(this.dialogModalEl);
 
+    // Keyboard Shortcuts reference modal
+    this.shortcutsBackdropEl = document.createElement("div");
+    this.shortcutsBackdropEl.className = "modal-backdrop hidden";
+    this.shortcutsBackdropEl.dataset.testid = "shortcuts-modal-backdrop";
+    this.shortcutsBackdropEl.addEventListener("click", (ev) => {
+      if (ev.target === this.shortcutsBackdropEl) this.closeShortcutsModal();
+    });
+    this.shortcutsModalEl = document.createElement("div");
+    this.shortcutsModalEl.className = "modal shortcuts-modal";
+    this.shortcutsModalEl.dataset.testid = "shortcuts-modal";
+    this.shortcutsModalEl.setAttribute("role", "dialog");
+    this.shortcutsModalEl.setAttribute("aria-modal", "true");
+    this.shortcutsBackdropEl.appendChild(this.shortcutsModalEl);
+
     this.toastEl = document.createElement("div");
     this.toastEl.className = "toast hidden";
     this.toastEl.setAttribute("role", "status");
@@ -677,6 +737,7 @@ export class MyNoteApp {
       workspace,
       this.modalBackdropEl,
       this.dialogBackdropEl,
+      this.shortcutsBackdropEl,
       this.clipDrawer.previewBackdropEl,
       this.toastEl,
     );
@@ -713,11 +774,19 @@ export class MyNoteApp {
 
     this.themeMenu.refreshLocale();
     this.localeSwitch.refreshLocale();
+    this.shortcutsBtnEl.setAttribute("aria-label", t("topbar.shortcuts"));
+    this.shortcutsBtnEl.title = t("topbar.shortcutsTitle", {
+      shortcut: formatShortcutTitle(SHORTCUT_HELP),
+    });
+    this.shortcutsBtnLabelEl.textContent = t("topbar.shortcuts");
     this.renderVaultBtn();
     this.renderSyncPill();
     this.updateTrashCount(this.lastTrashCount);
     this.updateClipCount(this.lastClipCount);
     this.clipDrawer.refreshLocale();
+    if (!this.shortcutsBackdropEl.classList.contains("hidden")) {
+      this.renderShortcutsModal();
+    }
     this.renderAlerts();
 
     if (this.trashOpen) {
@@ -786,15 +855,18 @@ export class MyNoteApp {
   private onWindowKeyDown = (ev: KeyboardEvent): void => {
     if (ev.defaultPrevented || ev.isComposing) return;
     const mod = ev.metaKey || ev.ctrlKey;
+    const shortcutsOpen = !this.shortcutsBackdropEl.classList.contains("hidden");
     const modalOpen =
       !this.modalBackdropEl.classList.contains("hidden") ||
-      !this.dialogBackdropEl.classList.contains("hidden");
+      !this.dialogBackdropEl.classList.contains("hidden") ||
+      shortcutsOpen;
     if (!mod) {
       if (ev.key === "Escape") {
         if (this.clipDrawer.isPreviewOpen()) {
           this.clipDrawer.closeImagePreview();
           return;
         }
+        this.closeShortcutsModal();
         this.closeBufferModal();
         this.closeDialog();
         this.toggleFindBar(false);
@@ -803,7 +875,19 @@ export class MyNoteApp {
       }
       return;
     }
+    if (!ev.shiftKey && !ev.altKey && (ev.key === "/" || ev.code === "Slash")) {
+      if (!modalOpen || shortcutsOpen) {
+        ev.preventDefault();
+        this.toggleShortcutsModal();
+      }
+      return;
+    }
     if (modalOpen) return;
+    if (!ev.shiftKey && !ev.altKey && (ev.key === "\\" || ev.code === "Backslash")) {
+      ev.preventDefault();
+      void this.toggleClipDrawer();
+      return;
+    }
     if (ev.altKey && (ev.key === "ArrowUp" || ev.key === "ArrowDown")) {
       ev.preventDefault();
       const dir: -1 | 1 = ev.key === "ArrowUp" ? -1 : 1;
@@ -1004,16 +1088,19 @@ export class MyNoteApp {
 
   private updateClipCount(count: number): void {
     this.lastClipCount = count;
-    this.clipInboxBtnEl.title = t("topbar.clipInboxTitle");
-    const sr = document.createElement("span");
-    sr.className = "sr-only";
-    sr.textContent = t("topbar.clipInbox");
-    this.clipInboxCountEl.replaceChildren(sr);
+    this.clipInboxLabelEl.textContent = t("topbar.clipInbox");
+    this.clipInboxBtnEl.title = t("topbar.clipInboxTitle", {
+      shortcut: formatShortcutTitle(SHORTCUT_CLIPBOARD),
+    });
+    this.clipInboxCountEl.replaceChildren();
     if (count > 0) {
       const num = document.createElement("span");
       num.className = "trash-badge-num";
       num.textContent = String(count);
       this.clipInboxCountEl.appendChild(num);
+      this.clipInboxCountEl.classList.remove("hidden");
+    } else {
+      this.clipInboxCountEl.classList.add("hidden");
     }
     this.clipInboxBtnEl.classList.toggle("has-items", count > 0);
   }
@@ -1165,6 +1252,10 @@ export class MyNoteApp {
             ? alert.details.pattern
             : JSON.stringify(alert.details);
         msgText = t("alert.clipSecretBlocked", { details: pattern });
+      } else if (alert.code === "DAEMON_UPDATED") {
+        const version =
+          typeof alert.details.version === "string" ? alert.details.version : "";
+        msgText = t("alert.daemonUpdated", { version });
       } else {
         msgText = `${alert.code}: ${JSON.stringify(alert.details)}`;
       }
@@ -1201,6 +1292,13 @@ export class MyNoteApp {
           this.renderAlerts();
         });
         div.appendChild(btn);
+      } else if (alert.code === "DAEMON_UPDATED") {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn btn-primary btn-icon";
+        btn.textContent = t("alert.refreshPage");
+        btn.addEventListener("click", () => window.location.reload());
+        div.appendChild(btn);
       }
       this.alertStackEl.appendChild(div);
     }
@@ -1214,8 +1312,23 @@ export class MyNoteApp {
       this.vaultHeader = boot.vault_header ?? this.vaultHeader;
       this.recoveryPkB64 = boot.recovery_pk_b64 ?? this.recoveryPkB64;
       this.alerts.delete("AUTH_REQUIRED");
+      if (
+        boot.daemon_version &&
+        this.initialDaemonVersion &&
+        boot.daemon_version !== this.initialDaemonVersion
+      ) {
+        this.alerts.set("DAEMON_UPDATED", {
+          type: "alert",
+          code: "DAEMON_UPDATED",
+          details: { version: boot.daemon_version },
+        });
+      }
       this.updateAlertsFromStatus(boot.sync_status);
       this.updateTrashCount(boot.trash_count);
+      if (boot.clip_count !== undefined) {
+        this.updateClipCount(boot.clip_count);
+      }
+      void this.clipDrawer.refresh({ silent: true });
       if (this.activeBufferId && this.buffers.some((b) => b.id === this.activeBufferId)) {
         const blocks = await this.api.listBlocks(this.activeBufferId);
         this.stream.upsertBlocks(
@@ -3369,6 +3482,102 @@ export class MyNoteApp {
       out.push({ kind: "create", name: trimmed });
     }
     return out;
+  }
+
+  private openShortcutsModal(): void {
+    this.renderShortcutsModal();
+    this.shortcutsBackdropEl.classList.remove("hidden");
+  }
+
+  private closeShortcutsModal(): void {
+    this.shortcutsBackdropEl.classList.add("hidden");
+  }
+
+  private toggleShortcutsModal(): void {
+    if (this.shortcutsBackdropEl.classList.contains("hidden")) {
+      this.openShortcutsModal();
+    } else {
+      this.closeShortcutsModal();
+    }
+  }
+
+  private renderShortcutsModal(): void {
+    this.shortcutsModalEl.replaceChildren();
+    this.shortcutsModalEl.setAttribute("aria-label", t("shortcuts.modalTitle"));
+
+    const hdr = document.createElement("div");
+    hdr.className = "drawer-header";
+    const title = document.createElement("span");
+    title.className = "drawer-header-title";
+    title.textContent = t("shortcuts.modalTitle");
+    const closeBtn = this.createCloseButton(() => this.closeShortcutsModal(), "shortcuts-modal-close");
+    hdr.append(title, closeBtn);
+
+    const groupsEl = document.createElement("div");
+    groupsEl.className = "shortcuts-groups";
+
+    const groups: ReadonlyArray<{
+      readonly title: string;
+      readonly items: ReadonlyArray<{ readonly label: string; readonly tokens: readonly ShortcutKeyToken[] }>;
+    }> = [
+      {
+        title: t("shortcuts.groupBlocks"),
+        items: [
+          { label: t("shortcuts.itemNewBlock"), tokens: SHORTCUT_NEW_BLOCK },
+          { label: t("shortcuts.itemSwitchBlock"), tokens: SHORTCUT_SWITCH_BLOCK_PAIR },
+          { label: t("shortcuts.itemEdgeArrows"), tokens: SHORTCUT_EDGE_ARROWS },
+          { label: t("shortcuts.itemMoveBlock"), tokens: SHORTCUT_MOVE_BLOCK_PAIR },
+          { label: t("shortcuts.itemFocusLang"), tokens: SHORTCUT_LANG },
+          { label: t("shortcuts.itemToggleMarkdown"), tokens: SHORTCUT_MARKDOWN_MODE },
+          { label: t("shortcuts.itemFormatBlock"), tokens: SHORTCUT_FORMAT },
+          { label: t("shortcuts.itemCopyBlock"), tokens: SHORTCUT_COPY_BLOCK },
+        ],
+      },
+      {
+        title: t("shortcuts.groupNavigation"),
+        items: [
+          { label: t("shortcuts.itemSwitchBuffer"), tokens: SHORTCUT_SWITCH_BUFFER },
+          { label: t("shortcuts.itemFind"), tokens: SHORTCUT_FIND },
+          { label: t("shortcuts.itemToggleClip"), tokens: SHORTCUT_CLIPBOARD },
+          { label: t("shortcuts.itemShowShortcuts"), tokens: SHORTCUT_HELP },
+          { label: t("shortcuts.itemClose"), tokens: SHORTCUT_ESC },
+        ],
+      },
+      {
+        title: t("shortcuts.groupVault"),
+        items: [{ label: t("shortcuts.itemLockVault"), tokens: SHORTCUT_LOCK_VAULT }],
+      },
+    ];
+
+    for (const grp of groups) {
+      const sec = document.createElement("section");
+      sec.className = "shortcuts-group";
+      const h = document.createElement("h3");
+      h.className = "shortcuts-group-title";
+      h.textContent = grp.title;
+      sec.appendChild(h);
+      for (const item of grp.items) {
+        const row = document.createElement("div");
+        row.className = "shortcuts-row";
+        const lbl = document.createElement("span");
+        lbl.className = "shortcuts-row-label";
+        lbl.textContent = item.label;
+        row.append(lbl, createShortcutHint(item.tokens));
+        sec.appendChild(row);
+      }
+      groupsEl.appendChild(sec);
+    }
+
+    const footer = document.createElement("div");
+    footer.className = "modal-hints";
+    const escHint = document.createElement("span");
+    escHint.className = "modal-hint-item";
+    const escLbl = document.createElement("span");
+    escLbl.textContent = t("buffer.hintClose");
+    escHint.append(createShortcutHint(SHORTCUT_ESC), escLbl);
+    footer.appendChild(escHint);
+
+    this.shortcutsModalEl.append(hdr, groupsEl, footer);
   }
 
   private renderBufferModalHints(): void {

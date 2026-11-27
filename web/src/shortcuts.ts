@@ -10,6 +10,74 @@ export type ShortcutKeyToken =
   | { readonly kind: "esc" }
   | { readonly kind: "char"; readonly label: string };
 
+export const SHORTCUT_NEW_BLOCK: readonly ShortcutKeyToken[] = [{ kind: "mod" }, { kind: "enter" }];
+export const SHORTCUT_SWITCH_BLOCK_PAIR: readonly ShortcutKeyToken[] = [
+  { kind: "mod" },
+  { kind: "alt" },
+  { kind: "up" },
+  { kind: "down" },
+];
+export const SHORTCUT_MOVE_UP: readonly ShortcutKeyToken[] = [
+  { kind: "mod" },
+  { kind: "alt" },
+  { kind: "shift" },
+  { kind: "up" },
+];
+export const SHORTCUT_MOVE_DOWN: readonly ShortcutKeyToken[] = [
+  { kind: "mod" },
+  { kind: "alt" },
+  { kind: "shift" },
+  { kind: "down" },
+];
+export const SHORTCUT_MOVE_BLOCK_PAIR: readonly ShortcutKeyToken[] = [
+  { kind: "mod" },
+  { kind: "alt" },
+  { kind: "shift" },
+  { kind: "up" },
+  { kind: "down" },
+];
+export const SHORTCUT_EDGE_ARROWS: readonly ShortcutKeyToken[] = [{ kind: "up" }, { kind: "down" }];
+export const SHORTCUT_SWITCH_BUFFER: readonly ShortcutKeyToken[] = [
+  { kind: "mod" },
+  { kind: "char", label: "P" },
+];
+export const SHORTCUT_FIND: readonly ShortcutKeyToken[] = [
+  { kind: "mod" },
+  { kind: "char", label: "F" },
+];
+export const SHORTCUT_CLIPBOARD: readonly ShortcutKeyToken[] = [
+  { kind: "mod" },
+  { kind: "char", label: "\\" },
+];
+export const SHORTCUT_HELP: readonly ShortcutKeyToken[] = [
+  { kind: "mod" },
+  { kind: "char", label: "/" },
+];
+export const SHORTCUT_LANG: readonly ShortcutKeyToken[] = [
+  { kind: "mod" },
+  { kind: "char", label: "L" },
+];
+export const SHORTCUT_MARKDOWN_MODE: readonly ShortcutKeyToken[] = [
+  { kind: "mod" },
+  { kind: "char", label: "E" },
+];
+export const SHORTCUT_FORMAT: readonly ShortcutKeyToken[] = [
+  { kind: "mod" },
+  { kind: "shift" },
+  { kind: "char", label: "F" },
+];
+export const SHORTCUT_COPY_BLOCK: readonly ShortcutKeyToken[] = [
+  { kind: "mod" },
+  { kind: "shift" },
+  { kind: "char", label: "C" },
+];
+export const SHORTCUT_LOCK_VAULT: readonly ShortcutKeyToken[] = [
+  { kind: "mod" },
+  { kind: "shift" },
+  { kind: "char", label: "L" },
+];
+export const SHORTCUT_ESC: readonly ShortcutKeyToken[] = [{ kind: "esc" }];
+
 export function isMacPlatform(): boolean {
   if (typeof navigator === "undefined") return true;
   const uaData = (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData;
