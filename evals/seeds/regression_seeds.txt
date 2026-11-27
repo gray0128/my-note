@@ -7,5 +7,9 @@
 0x0000000000000001 # INV-SYNC-1 baseline 3-device partition & heal smoke seed
 0x0000000000c0ffee # INV-SYNC-2 concurrent full-payload UPDATE + DELETE causal retention (Update-Wins) seed
 0x00000000deadbeef # INV-SYNC-3 DO PITR epoch rollback set-union non-truncation seed
+0x2026112500000002 # INV-KEY-LIVENESS + INV-RECOVERY multi-generation SMK rotation & delayed key table convergence seed
+0x2026112700000042 # INV-SYNC-1/2/3/5 high-churn partition + PITR rollback + tamper rejection seed
+0xB7485A28925B90C9 # INV-SYNC-2 + INV-KEY-LIVENESS offline Tier 1 UPDATE vs concurrent LOCK rekey reconciliation seed
+0xB8C36E45F2872445 # INV-SYNC-1/3 + INV-SHRED-BOUND PITR atomic batch boundary & shred mark reconciliation seed
 # RETIRED 0x00000000bad5ec01 # INV-SYNC-4 atomic LOCK + vault_key_records visibility seed — INV-SYNC-4 已删除（D2′：LOCK = 换钥，密钥表 2P-Set 取代 vault_keys），review §9.3
 # RETIRED 0x00000000f00dcafe # INV-SYNC-5 corrupted R2 snapshot K fallback to K-1 seed — R2 K=5 多代快照 + CAS 已删除（D1/D4），review §9.7

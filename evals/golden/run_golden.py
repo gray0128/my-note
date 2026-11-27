@@ -215,8 +215,8 @@ def parse_json_envelope(proc: subprocess.CompletedProcess[bytes], label: str) ->
         for k in ("code", "message", "hint", "retryable"):
             assert k in err, f"{label}: error missing key {k}"
         assert isinstance(err["code"], str) and err["code"], f"{label}: invalid error.code"
-        assert isinstance(err["message"], str) and err["message"], f"{label}: invalid error.message"
-        assert isinstance(err["hint"], str) and err["hint"], f"{label}: invalid error.hint"
+        assert isinstance(err["message"], str) and err["message"].strip(), f"{label}: invalid error.message"
+        assert isinstance(err["hint"], str) and err["hint"].strip(), f"{label}: invalid error.hint"
         assert isinstance(err["retryable"], bool), f"{label}: invalid error.retryable"
     return obj
 
@@ -233,6 +233,7 @@ def normalize_value(val: Any, key: str | None = None) -> Any:
             assert val, "position must be non-empty FractionalIndex"
             return "<POSITION>"
         if key in ("message", "hint"):
+            assert val.strip(), f"{key} must be non-whitespace"
             return f"<{key.upper()}>"
         if HLC_RE.match(val):
             return "<HLC>"
@@ -251,8 +252,10 @@ def normalize_value(val: Any, key: str | None = None) -> Any:
                 norm_err: dict[str, Any] = {}
                 for ek in sorted(err.keys()):
                     if ek == "message":
+                        assert isinstance(err[ek], str) and err[ek].strip(), "error.message must be non-whitespace"
                         norm_err[ek] = "<MESSAGE>"
                     elif ek == "hint":
+                        assert isinstance(err[ek], str) and err[ek].strip(), "error.hint must be non-whitespace"
                         norm_err[ek] = "<HINT>"
                     else:
                         norm_err[ek] = normalize_value(err[ek], ek)
@@ -276,7 +279,8 @@ def db_query_scalar(sandbox_dir: Path, sql: str, params: tuple[Any, ...] = ()) -
 class LoopbackBlindRelay:
     """Minimal zero-dependency loopback blind relay used ONLY for G09 multi-leaf conflict setup."""
 
-    def __init__(self) -> None:
+    def __init__(self, bootstrap_token: str = "golden-bootstrap-secret") -> None:
+        self.bootstrap_token = bootstrap_token
         self.epoch = "00000000-0000-4000-8000-000000000001"
         self.lock = threading.Lock()
         self.ops: list[dict[str, Any]] = []
@@ -296,7 +300,7 @@ class LoopbackBlindRelay:
             },
             sort_keys=True,
         ).encode("utf-8")
-        return hashlib.sha256(payload).hexdigest()
+        return f"blake3:{hashlib.sha256(payload).hexdigest()}"
 
     def start(self) -> str:
         relay = self
@@ -368,6 +372,9 @@ class LoopbackBlindRelay:
                 now_ms = int(time.time() * 1000)
                 with relay.lock:
                     if parsed.path == "/v1/devices/bootstrap":
+                        if self.headers.get("Authorization") != f"Bearer {relay.bootstrap_token}":
+                            self._send(401, {"ok": False, "error": {"code": "AUTH_REQUIRED", "message": "bad token"}})
+                            return
                         self._send(
                             200,
                             {
@@ -412,16 +419,42 @@ class LoopbackBlindRelay:
                         self._send(200, {"ok": True})
                         return
                     if parsed.path == "/v1/sync/push":
+                        head_seq_before = relay.ops[-1]["seq"] if relay.ops else 0
+                        if body.get("expected_epoch") != relay.epoch:
+                            self._send(
+                                409,
+                                {
+                                    "ok": False,
+                                    "error": {
+                                        "code": "CAS_MISMATCH",
+                                        "message": "epoch mismatch",
+                                        "details": {"head_seq": head_seq_before},
+                                    },
+                                },
+                            )
+                            return
+                        staged_keys = dict(relay.key_records)
                         for kr in body.get("key_records", []):
                             kid = kr["key_id"]
-                            prev = relay.key_records.get(kid)
+                            prev = staged_keys.get(kid)
                             if prev is None or kr.get("wrap_gen", 1) > prev.get("wrap_gen", 0):
-                                relay.key_records[kid] = {
+                                staged_keys[kid] = {
                                     "key_id": kid,
                                     "wrap_gen": kr.get("wrap_gen", 1),
                                     "key_record_b64": kr["key_record_b64"],
                                     "created_at_ms": now_ms,
                                 }
+                        for op in body.get("ops", []):
+                            if op["op_id"] in relay.op_ids:
+                                continue
+                            op_kid = op.get("key_id")
+                            if op_kid is not None and op_kid not in staged_keys:
+                                self._send(
+                                    409,
+                                    {"ok": False, "error": {"code": "KEY_UNKNOWN", "message": f"unknown {op_kid}"}},
+                                )
+                                return
+                        relay.key_records = staged_keys
                         acked = []
                         for op in body.get("ops", []):
                             oid = op["op_id"]
@@ -549,13 +582,90 @@ def run_static_checks(bin_path: Path, tmp_root: Path) -> None:
 
     skill_path = ROOT / "skill" / "SKILL.md"
     assert skill_path.exists(), f"missing {skill_path}"
-    skill_text = skill_path.read_text(encoding="utf-8")
+    check_skill_token_budget(skill_path.read_text(encoding="utf-8"))
+
+
+def check_skill_token_budget(skill_text: str) -> None:
     words = len(skill_text.split())
     bpe_est = math.ceil(words * 1.35)
     char_est = math.ceil(len(skill_text.encode("utf-8")) / 4)
     assert bpe_est < 250 and char_est < 250, (
         f"skill/SKILL.md exceeds <250 token budget: words={words}, bpe_est={bpe_est}, bytes/4={char_est}"
     )
+
+
+def run_verifier_selftest() -> None:
+    """Planted-error mutant gate (MG-01..MG-07) proving golden graders reject malformed outputs."""
+
+    def fake_proc(stdout: bytes) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(args=["mynote"], returncode=0, stdout=stdout, stderr=b"")
+
+    mutants: list[tuple[str, str, Any]] = [
+        (
+            "MG-01",
+            "must end with '\\n'",
+            lambda: parse_json_envelope(
+                fake_proc(b'{"ok":true,"data":{},"error":null,"meta":{}}'),
+                "MG-01",
+            ),
+        ),
+        (
+            "MG-02",
+            "single line JSON object",
+            lambda: parse_json_envelope(
+                fake_proc(b'{"debug":1}\n{"ok":true,"data":{},"error":null,"meta":{}}\n'),
+                "MG-02",
+            ),
+        ),
+        (
+            "MG-03",
+            "invalid error.hint",
+            lambda: parse_json_envelope(
+                fake_proc(
+                    b'{"ok":false,"data":null,"error":{"code":"HEAD_MISMATCH","message":"stale","hint":"   ","retryable":true},"meta":{}}\n'
+                ),
+                "MG-03",
+            ),
+        ),
+        (
+            "MG-04",
+            "ok=true must have error=null",
+            lambda: parse_json_envelope(
+                fake_proc(b'{"ok":true,"data":{},"error":{"code":"X"},"meta":{}}\n'),
+                "MG-04",
+            ),
+        ),
+        (
+            "MG-05",
+            "error missing key retryable",
+            lambda: parse_json_envelope(
+                fake_proc(
+                    b'{"ok":false,"data":null,"error":{"code":"HEAD_MISMATCH","message":"stale","hint":"retry"},"meta":{}}\n'
+                ),
+                "MG-05",
+            ),
+        ),
+        (
+            "MG-06",
+            "exceeds <250 token budget",
+            lambda: check_skill_token_budget(" ".join(["token"] * 220)),
+        ),
+        (
+            "MG-07",
+            "must be non-empty FractionalIndex",
+            lambda: normalize_value({"position": ""}),
+        ),
+    ]
+
+    for code, expected_substr, trigger in mutants:
+        try:
+            trigger()
+        except AssertionError as exc:
+            assert expected_substr in str(exc), (
+                f"{code}: expected '{expected_substr}' in failure message, got '{exc}'"
+            )
+            continue
+        raise AssertionError(f"SELFTEST FAILURE: {code} mutant escaped without AssertionError!")
 
 
 # ---------------------------------------------------------------------------
@@ -1186,11 +1296,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run mynote CLI golden tests (G01-G11 + static checks).")
     parser.add_argument("--bin", dest="bin_path", help="Path to compiled mynote binary")
     parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="Run planted-error mutant self-tests (MG-01..MG-07) on the golden verifier and exit",
+    )
+    parser.add_argument(
         "--write-snapshots",
         action="store_true",
         help="Write/overwrite frozen snapshots under evals/golden/snapshots/ (for [eval-only] PR updates only)",
     )
     args = parser.parse_args()
+
+    run_verifier_selftest()
+    if args.selftest:
+        print("[golden] selftest: MG-01..MG-07 planted mutants 100% caught PASS")
+        return 0
 
     bin_path = resolve_binary(args.bin_path)
     tmp_root = Path(tempfile.mkdtemp(prefix="mynote-golden-"))

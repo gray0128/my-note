@@ -4,16 +4,16 @@
 
 > **IMMUTABLE VERIFIER RULE (MANDATORY)**:
 > Feature and bugfix PRs **MUST NOT** modify any file inside `evals/`.
-> During CI on non-`[eval-only]` PRs, `evals/` is always checked out directly from `origin/main` before running checks (`git checkout origin/main -- evals/`).
-> To add or revise evaluation cases, schemas, or regression seeds, open a dedicated **`[eval-only]`** PR touching only `evals/` and [`docs/eval-framework.md`](../docs/eval-framework.md) (on `[eval-only]` PRs, CI verifies the diff touches no other paths and runs the PR's `evals/`).
+> During CI, `immutable-verifier-guard` blocks downstream jobs if a non-`[eval-only]` PR touches `evals/`, and every job resets `evals/` to the PR base commit before running checks (`rm -rf evals/ && git checkout <base-sha> -- evals/`).
+> To add or revise evaluation cases, snapshots, or regression seeds, open a dedicated **`[eval-only]`** PR touching only `evals/` and [`docs/eval-framework.md`](../docs/eval-framework.md) (on `[eval-only]` PRs, CI verifies the diff touches no other paths and runs the PR's `evals/`).
 
 ## Directory Layout
 
 ### 现行资产（Plane A，进 CI 门禁）
 
-- [`seeds/regression_seeds.txt`](./seeds/regression_seeds.txt) — Shrunk deterministic `SimCluster` `u64` seeds replayed on every commit (Tier 0/1)。同步核心 DST 与针对 workerd / miniflare 真实 Worker 的契约测试共用这些场景（F-12）；依赖已移除机制的种子以 `# RETIRED` 注释保留、不再回放。
+- [`seeds/regression_seeds.txt`](./seeds/regression_seeds.txt) — Shrunk deterministic `SimCluster` `u64` seeds replayed on every commit (Tier 0/1)。同步核心 DST 与针对 workerd / miniflare 真实 Worker 的契约测试共用场景语料（F-12）；依赖已移除机制的种子以 `# RETIRED` 注释保留、不再回放。
 - `fixtures/` — Dirty Heynote `∞∞∞` migration samples and XSS / `<foreignObject>` payload vectors（供导入差分、格式化幂等与渲染安全测试使用）。
-- [`golden/`](./golden/) — 11 个 CLI 黄金测试场景（`G01`–`G11`）及冻结规范化快照（[`snapshots/`](./golden/snapshots/)）与统一运行脚本 [`run_golden.sh`](./golden/run_golden.sh)：在隔离 `HOME`/`XDG_*`/`MYNOTE_DATA_DIR` 环境中断言 `--json` 输出结构、退出码、错误码、数据库终态、L1–L3 `--help` 非空与 `skill/SKILL.md < 250 tokens` 预算；取代 Plane B「Agent 能否正确使用 CLI」的目标。运行方式：`cargo build --bin mynote && ./evals/golden/run_golden.sh`。
+- [`golden/`](./golden/) — 11 个 CLI 黄金测试场景（`G01`–`G11`）、植错自检门禁（`--selftest`，`MG-01`–`MG-07`）及冻结规范化快照（[`snapshots/`](./golden/snapshots/)）与统一运行脚本 [`run_golden.sh`](./golden/run_golden.sh)：在隔离 `HOME`/`XDG_*`/`MYNOTE_DATA_DIR` 环境中断言 `--json` 输出结构、退出码、错误码、数据库终态、L1–L3 `--help` 非空与 `skill/SKILL.md < 250 tokens` 预算；取代 Plane B「Agent 能否正确使用 CLI」的目标。运行方式：`./evals/golden/run_golden.sh --selftest`（毫秒级判分器自检）或 `cargo build --bin mynote && ./evals/golden/run_golden.sh`。
 - `reports/` — Archived milestone gate results.
 
 门禁的完整清单（属性测试、DST、真实 Worker 契约测试、INV-RECOVERY、INV-KEY-LIVENESS / INV-SHRED-BOUND / INV-GRACE、SEC 取证、格式化幂等、CLI 黄金测试、可选信封 fuzz、macOS + Linux CI）以 [`docs/eval-framework.md`](../docs/eval-framework.md) 为单一事实来源，此处不重复定义。
