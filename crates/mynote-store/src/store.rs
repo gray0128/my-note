@@ -4875,10 +4875,14 @@ impl LocalStore {
                                     ));
                                 }
                             }
+                            KeyMaterialKind::ClipKey => {
+                                let _ = mynote_core::clip::decode_clip_key_material(blob)?;
+                            }
                         }
                         let kind_s = match kind {
                             KeyMaterialKind::Keyring => "keyring",
                             KeyMaterialKind::VaultHeader => "vault_header",
+                            KeyMaterialKind::ClipKey => "clip_key",
                         };
                         let cur_gen: Option<i64> = self
                             .conn

@@ -1,6 +1,9 @@
+use crate::error::{CoreError, ErrorCode};
 use crate::hlc::Hlc;
 use crate::ids::{BlockId, BufferId, DeviceId, JournalEpoch, KeyId, MarkId, OpId, SnapshotId};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 
 fn default_actor() -> String {
     "human".to_string()
@@ -295,11 +298,60 @@ pub struct ShredMarkRow {
     pub executed_at_ms: Option<i64>,
 }
 
+/// Four-state device token scope (`docs/interface-contracts.md` §4.1, D1′ / D8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DeviceScope {
+    #[serde(rename = "read")]
+    Read,
+    #[serde(rename = "read+clip")]
+    ReadClip,
+    #[serde(rename = "clip-write")]
+    ClipWrite,
+    #[serde(rename = "read-write")]
+    ReadWrite,
+}
+
+impl DeviceScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::ReadClip => "read+clip",
+            Self::ClipWrite => "clip-write",
+            Self::ReadWrite => "read-write",
+        }
+    }
+}
+
+impl fmt::Display for DeviceScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DeviceScope {
+    type Err = CoreError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "read" => Ok(Self::Read),
+            "read+clip" => Ok(Self::ReadClip),
+            "clip-write" => Ok(Self::ClipWrite),
+            "read-write" => Ok(Self::ReadWrite),
+            _ => Err(CoreError::new(
+                ErrorCode::InvalidArgument,
+                format!("invalid device scope '{s}'"),
+                "Expected one of: read, read+clip, clip-write, read-write",
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyMaterialKind {
     Keyring,
     VaultHeader,
+    ClipKey,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,5 +392,34 @@ mod tests {
         let pt = BlockBodyState::Plaintext(WritablePlaintext::from_new_user_input("hello".into()));
         assert_eq!(pt.as_writable_plaintext().unwrap().as_str(), "hello");
         assert_eq!(pt.edit_plaintext("world".into()).unwrap().as_str(), "world");
+    }
+
+    #[test]
+    fn device_scope_and_key_material_kind_wire_strings() {
+        for (scope, wire) in [
+            (DeviceScope::Read, "read"),
+            (DeviceScope::ReadClip, "read+clip"),
+            (DeviceScope::ClipWrite, "clip-write"),
+            (DeviceScope::ReadWrite, "read-write"),
+        ] {
+            assert_eq!(scope.as_str(), wire);
+            assert_eq!(scope.to_string(), wire);
+            assert_eq!(DeviceScope::from_str(wire).unwrap(), scope);
+            let json = serde_json::to_string(&scope).unwrap();
+            assert_eq!(json, format!("\"{wire}\""));
+            assert_eq!(serde_json::from_str::<DeviceScope>(&json).unwrap(), scope);
+        }
+        assert_eq!(
+            DeviceScope::from_str("admin").unwrap_err().code(),
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            serde_json::to_string(&KeyMaterialKind::ClipKey).unwrap(),
+            "\"clip_key\""
+        );
+        assert_eq!(
+            serde_json::from_str::<KeyMaterialKind>("\"clip_key\"").unwrap(),
+            KeyMaterialKind::ClipKey
+        );
     }
 }

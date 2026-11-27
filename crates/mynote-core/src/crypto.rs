@@ -1,5 +1,5 @@
 use crate::error::{CoreError, ErrorCode};
-use crate::ids::{BlockId, DeviceId, JournalEpoch, KeyId, OpId, SmkKid, Ulid, VkekKid};
+use crate::ids::{BlockId, ClipKid, DeviceId, JournalEpoch, KeyId, OpId, SmkKid, Ulid, VkekKid};
 use crate::model::{BlockPlaintextV1, InnerOpV1, KeyRecordRow, ShredMarkRow};
 use bip39::{Language, Mnemonic};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -21,6 +21,8 @@ pub const MAGIC_MNVH: &[u8; 4] = b"MNVH";
 pub const MAGIC_MNA1: &[u8; 4] = b"MNA1";
 pub const MAGIC_MNKS: &[u8; 4] = b"MNKS";
 pub const MAGIC_PAIR: &[u8; 4] = b"MNPR";
+pub const MAGIC_MNC1: &[u8; 4] = b"MNC1";
+pub const MAGIC_MNCK: &[u8; 4] = b"MNCK";
 
 pub const MNRS_KIND_SMK: u8 = 0x01;
 pub const MNRS_KIND_VKEK: u8 = 0x02;
@@ -704,6 +706,10 @@ pub struct PairingPayloadV1 {
     pub device_token: Option<String>,
     pub device_id: DeviceId,
     pub sync_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_kid: Option<ClipKid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_key: Option<[u8; 32]>,
 }
 
 pub fn encrypt_pairing_ticket(
@@ -989,6 +995,8 @@ mod tests {
             device_token: Some("tok_secret_123".into()),
             device_id: other_dev.clone(),
             sync_url: "https://note.example.com".into(),
+            clip_kid: None,
+            clip_key: None,
         };
         let k_pair = [0x99u8; 32];
         let pair_ct = encrypt_pairing_ticket("pair_abc", &k_pair, &pair_payload, [5u8; 24]).unwrap();
@@ -997,6 +1005,41 @@ mod tests {
             pair_payload
         );
         assert!(decrypt_pairing_ticket("pair_wrong", &k_pair, &pair_ct).is_err());
+
+        // 4b. PairingPayloadV1 backwards-compat & optional clip_kid/clip_key
+        #[derive(Serialize)]
+        struct LegacyPairingPayload<'a> {
+            smks: &'a [SmkGenerationBytes],
+            device_token: Option<&'a str>,
+            device_id: &'a DeviceId,
+            sync_url: &'a str,
+        }
+        let legacy_bytes = rmp_serde::to_vec_named(&LegacyPairingPayload {
+            smks: &pair_payload.smks,
+            device_token: pair_payload.device_token.as_deref(),
+            device_id: &pair_payload.device_id,
+            sync_url: &pair_payload.sync_url,
+        })
+        .unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<PairingPayloadV1>(&legacy_bytes).unwrap(),
+            pair_payload
+        );
+
+        let clip_kid = ClipKid::from_ulid(g.next(101, [9; 10]));
+        let clip_payload = PairingPayloadV1 {
+            smks: vec![],
+            device_token: Some("tok_clip_write".into()),
+            device_id: other_dev,
+            sync_url: "https://note.example.com".into(),
+            clip_kid: Some(clip_kid),
+            clip_key: Some([0xCC; 32]),
+        };
+        let clip_pair_ct = encrypt_pairing_ticket("pair_clip", &k_pair, &clip_payload, [6u8; 24]).unwrap();
+        assert_eq!(
+            decrypt_pairing_ticket("pair_clip", &k_pair, &clip_pair_ct).unwrap(),
+            clip_payload
+        );
     }
 
     #[test]

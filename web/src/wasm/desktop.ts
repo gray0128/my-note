@@ -1,10 +1,12 @@
 import initDesktopWasm, {
+  WasmClipCodec,
   WasmVaultSession,
   detectSecretPattern as wasmDetectRaw,
   formatSnippet as wasmFormatRaw,
   initSync,
 } from "./pkg/mynote_wasm.js";
 
+export { WasmClipCodec };
 export type { DecryptedBlockPayload, Tier2EncryptedOp, WasmVaultSession } from "./pkg/mynote_wasm.js";
 
 let initPromise: Promise<void> | null = null;

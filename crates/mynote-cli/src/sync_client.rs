@@ -85,6 +85,7 @@ fn map_error_code(code: &str) -> ErrorCode {
         "AUTH_REQUIRED" => ErrorCode::AuthRequired,
         "DEVICE_REVOKED" => ErrorCode::DeviceRevoked,
         "TOKEN_SCOPE_FORBIDDEN" => ErrorCode::TokenScopeForbidden,
+        "NO_ONLINE_DESKTOP" => ErrorCode::NoOnlineDesktop,
         "RATE_LIMITED" => ErrorCode::RateLimited,
         "INTEGRITY_ERROR" => ErrorCode::IntegrityError,
         _ => ErrorCode::SyncOffline,
@@ -415,6 +416,8 @@ impl RelayClient {
             device_token: Some(new_device_token),
             device_id: new_device_id.clone(),
             sync_url: self.base_url.clone(),
+            clip_kid: None,
+            clip_key: None,
         };
         let ct = encrypt_pairing_ticket(&pair_id, &k_pair, &payload, rand_bytes::<24>()?)?;
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -463,6 +466,8 @@ impl RelayClient {
             device_token: None,
             device_id: dev_id.clone(),
             sync_url: self.base_url.clone(),
+            clip_kid: None,
+            clip_key: None,
         };
         let ct = encrypt_pairing_ticket(&pair_id, &k_pair, &payload, rand_bytes::<24>()?)?;
         let b64 = base64::engine::general_purpose::STANDARD;

@@ -1,3 +1,4 @@
+pub mod clip;
 pub mod crypto;
 pub mod error;
 #[cfg(feature = "layer1-format")]

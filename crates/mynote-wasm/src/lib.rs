@@ -1,19 +1,24 @@
-//! `mynote-wasm`: Opaque Rust WASM security boundary for Desktop UI (Tier 2 Vault + Layer 1 format)
-//! and Mobile Read-Only PWA (`WasmSyncEngine` + `WasmVaultSession`).
+//! `mynote-wasm`: Opaque Rust WASM security boundary for Desktop UI (Tier 2 Vault + Layer 1 format + Clip)
+//! and Mobile Read-Only PWA (`WasmSyncEngine` + `WasmVaultSession` + `WasmClipCodec`).
 //!
-//! SSOT contract: `docs/interface-contracts.md` §5, `docs/data-structures.md` §3.3–§3.6.
+//! SSOT contract: `docs/interface-contracts.md` §5, `docs/data-structures.md` §3.3–§3.8.
 //!
 //! Hard invariants:
-//! - Unlocked `VKEK` and `SMK` key bytes NEVER leave Rust WASM linear memory as raw bytes.
-//! - `lockAndZeroize()` / `zeroizeSmk()` / `Drop` deterministically overwrite all key bytes via `Zeroize`.
+//! - Unlocked `VKEK`, `SMK`, and `ClipKey` key bytes NEVER leave Rust WASM linear memory as raw bytes.
+//! - `lockAndZeroize()` / `zeroizeSmk()` / `WasmClipCodec::zeroize()` / `Drop` deterministically overwrite all key bytes via `Zeroize`.
 //! - `WasmVaultSession` generates `(op_id, key_id)` BEFORE encrypting `MNB1` so `MNB1` AAD binds
 //!   the exact `op_id` that Desktop Daemon reuses verbatim for outer `MNS1` (F-01).
-//! - `WasmSyncEngine` is strictly read-only (D1): zero write ops, zero outbox.
+//! - `WasmSyncEngine` is strictly read-only for notes (D1): zero write ops, zero outbox.
 
 use base64::engine::general_purpose::STANDARD as B64;
 #[cfg(feature = "pwa")]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64U;
 use base64::Engine;
+#[cfg(feature = "pwa")]
+use mynote_core::clip::{decode_clip_key_material, unwrap_clip_key_material_with_keyring};
+use mynote_core::clip::{
+    decrypt_mnc1_blob, decrypt_mnc1_meta_json, encrypt_mnc1_blob, encrypt_mnc1_meta_json,
+};
 use mynote_core::crypto::{decrypt_mnb1, VaultHeaderV1};
 #[cfg(feature = "pwa")]
 use mynote_core::crypto::{
@@ -25,9 +30,9 @@ use mynote_core::error::CoreError;
 pub use mynote_core::error::ErrorCode;
 #[cfg(feature = "desktop")]
 use mynote_core::format::format_snippet as core_format_snippet;
-use mynote_core::ids::{BlockId, KeyId, OpId};
 #[cfg(feature = "pwa")]
-use mynote_core::ids::{DeviceId, SmkKid};
+use mynote_core::ids::SmkKid;
+use mynote_core::ids::{BlockId, ClipId, ClipKid, DeviceId, KeyId, OpId};
 #[cfg(feature = "desktop")]
 use mynote_core::ids::{MonotonicUlidGen, Ulid, VkekKid};
 #[cfg(feature = "pwa")]
@@ -42,6 +47,7 @@ use mynote_core::vault::{
     unseal_vault_with_recovery,
 };
 use mynote_core::vault::{unlock_vault_with_passphrase, UnlockedVaultKeys};
+#[cfg(any(feature = "desktop", feature = "pwa"))]
 use serde::Deserialize;
 #[cfg(feature = "pwa")]
 use serde::Serialize;
@@ -50,17 +56,20 @@ use std::collections::BTreeMap;
 use wasm_bindgen::prelude::*;
 use zeroize::{Zeroize, Zeroizing};
 
-#[cfg(all(target_arch = "wasm32", feature = "desktop"))]
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = ["globalThis", "crypto"], js_name = getRandomValues)]
     fn js_get_random_values(buf: &mut [u8]);
+}
 
+#[cfg(all(target_arch = "wasm32", feature = "desktop"))]
+#[wasm_bindgen]
+extern "C" {
     #[wasm_bindgen(js_namespace = Date, js_name = now)]
     fn js_date_now() -> f64;
 }
 
-#[cfg(feature = "desktop")]
 fn fill_random<const N: usize>() -> Result<[u8; N], CoreError> {
     let mut buf = [0u8; N];
     #[cfg(target_arch = "wasm32")]
@@ -754,13 +763,30 @@ impl WasmSyncEngine {
                 smk_b64: B64.encode(s.key),
             })
             .collect();
-        Ok(serde_json::json!({
+        let mut obj = serde_json::json!({
             "device_id": payload.device_id.to_string(),
             "device_token": payload.device_token,
             "sync_url": payload.sync_url,
             "smks": smks,
-        })
-        .to_string())
+        });
+        if let Some(clip_kid) = payload.clip_kid {
+            obj["clip_kid"] = serde_json::Value::String(clip_kid.to_string());
+        }
+        if let Some(clip_key) = payload.clip_key {
+            obj["clip_key_b64"] = serde_json::Value::String(B64.encode(clip_key));
+        }
+        Ok(obj.to_string())
+    }
+
+    pub fn create_clip_codec_inner(
+        &self,
+        device_id: &str,
+        clip_key_material_blob: &[u8],
+    ) -> Result<WasmClipCodec, CoreError> {
+        let dev = DeviceId::parse(device_id)?;
+        let material = decode_clip_key_material(clip_key_material_blob)?;
+        let clip_key = unwrap_clip_key_material_with_keyring(&material, &self.smks)?;
+        Ok(WasmClipCodec::from_unwrapped(dev, material.clip_kid, clip_key))
     }
 
     pub fn unpack_snapshot_inner(&self, snapshot_bytes: &[u8]) -> Result<String, CoreError> {
@@ -1273,6 +1299,16 @@ impl WasmSyncEngine {
             .map_err(err_to_js)
     }
 
+    #[wasm_bindgen(js_name = createClipCodec)]
+    pub fn create_clip_codec(
+        &self,
+        device_id: &str,
+        clip_key_material_blob: &[u8],
+    ) -> Result<WasmClipCodec, JsValue> {
+        self.create_clip_codec_inner(device_id, clip_key_material_blob)
+            .map_err(err_to_js)
+    }
+
     #[wasm_bindgen(js_name = zeroizeSmk)]
     pub fn zeroize_smk(&mut self) {
         for v in self.smks.values_mut() {
@@ -1286,6 +1322,178 @@ impl WasmSyncEngine {
 impl Drop for WasmSyncEngine {
     fn drop(&mut self) {
         self.zeroize_smk();
+    }
+}
+
+// ---------- Independent Clipboard MNC1 Codec (`WasmClipCodec`, Desktop & PWA) ----------
+
+/// Independent clipboard channel `MNC1` codec (`docs/interface-contracts.md` §5, D8).
+/// Holds rotatable `ClipKey` strictly in Rust WASM linear memory (`Zeroizing<[u8; 32]>`).
+#[wasm_bindgen]
+pub struct WasmClipCodec {
+    device_id: DeviceId,
+    clip_kid: ClipKid,
+    clip_key: Option<Zeroizing<[u8; 32]>>,
+}
+
+impl WasmClipCodec {
+    pub(crate) fn from_unwrapped(
+        device_id: DeviceId,
+        clip_kid: ClipKid,
+        clip_key: Zeroizing<[u8; 32]>,
+    ) -> Self {
+        Self {
+            device_id,
+            clip_kid,
+            clip_key: Some(clip_key),
+        }
+    }
+
+    fn require_key(&self) -> Result<&[u8; 32], CoreError> {
+        self.clip_key.as_deref().ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::BlockLocked,
+                "WasmClipCodec is locked or zeroized",
+                "Re-initialize WasmClipCodec with the active ClipKey",
+            )
+        })
+    }
+
+    pub fn new_inner(device_id: &str, clip_kid: &str, clip_key_bytes: &[u8]) -> Result<Self, CoreError> {
+        let dev = DeviceId::parse(device_id)?;
+        let kid = ClipKid::parse(clip_kid)?;
+        if clip_key_bytes.len() != 32 {
+            return Err(CoreError::new(
+                ErrorCode::InvalidArgument,
+                format!("clipKeyBytes must be 32 bytes, got {}", clip_key_bytes.len()),
+                "Provide a 32-byte ClipKey",
+            ));
+        }
+        let mut key = Zeroizing::new([0u8; 32]);
+        key.copy_from_slice(clip_key_bytes);
+        Ok(Self::from_unwrapped(dev, kid, key))
+    }
+
+    pub fn encrypt_meta_inner(
+        &self,
+        clip_id: &str,
+        meta_json: &str,
+        ephemeral: bool,
+    ) -> Result<Vec<u8>, CoreError> {
+        let key = self.require_key()?;
+        let cid = ClipId::parse(clip_id)?;
+        let nonce = fill_random::<24>()?;
+        encrypt_mnc1_meta_json(
+            self.clip_kid,
+            key,
+            cid,
+            &self.device_id,
+            meta_json,
+            ephemeral,
+            nonce,
+        )
+    }
+
+    pub fn decrypt_meta_inner(
+        &self,
+        clip_id: &str,
+        author_device_id: &str,
+        ephemeral: bool,
+        envelope: &[u8],
+    ) -> Result<String, CoreError> {
+        let key = self.require_key()?;
+        let cid = ClipId::parse(clip_id)?;
+        let author = DeviceId::parse(author_device_id)?;
+        decrypt_mnc1_meta_json(self.clip_kid, key, cid, &author, ephemeral, envelope)
+    }
+
+    pub fn encrypt_blob_inner(&self, clip_id: &str, raw_bytes: &[u8]) -> Result<Vec<u8>, CoreError> {
+        let key = self.require_key()?;
+        let cid = ClipId::parse(clip_id)?;
+        let nonce = fill_random::<24>()?;
+        encrypt_mnc1_blob(self.clip_kid, key, cid, &self.device_id, raw_bytes, nonce)
+    }
+
+    pub fn decrypt_blob_inner(
+        &self,
+        clip_id: &str,
+        author_device_id: &str,
+        envelope: &[u8],
+    ) -> Result<Vec<u8>, CoreError> {
+        let key = self.require_key()?;
+        let cid = ClipId::parse(clip_id)?;
+        let author = DeviceId::parse(author_device_id)?;
+        decrypt_mnc1_blob(self.clip_kid, key, cid, &author, envelope)
+    }
+}
+
+#[wasm_bindgen]
+impl WasmClipCodec {
+    #[wasm_bindgen(constructor)]
+    pub fn new(device_id: &str, clip_kid: &str, clip_key_bytes: &[u8]) -> Result<WasmClipCodec, JsValue> {
+        Self::new_inner(device_id, clip_kid, clip_key_bytes).map_err(err_to_js)
+    }
+
+    #[wasm_bindgen(getter, js_name = clipKid)]
+    pub fn clip_kid(&self) -> String {
+        self.clip_kid.to_string()
+    }
+
+    #[wasm_bindgen(getter, js_name = deviceId)]
+    pub fn device_id(&self) -> String {
+        self.device_id.to_string()
+    }
+
+    #[wasm_bindgen(js_name = isZeroized)]
+    pub fn is_zeroized(&self) -> bool {
+        self.clip_key.is_none()
+    }
+
+    #[wasm_bindgen(js_name = encryptMeta)]
+    pub fn encrypt_meta(&self, clip_id: &str, meta_json: &str, ephemeral: bool) -> Result<Vec<u8>, JsValue> {
+        self.encrypt_meta_inner(clip_id, meta_json, ephemeral)
+            .map_err(err_to_js)
+    }
+
+    #[wasm_bindgen(js_name = decryptMeta)]
+    pub fn decrypt_meta(
+        &self,
+        clip_id: &str,
+        author_device_id: &str,
+        ephemeral: bool,
+        envelope: &[u8],
+    ) -> Result<String, JsValue> {
+        self.decrypt_meta_inner(clip_id, author_device_id, ephemeral, envelope)
+            .map_err(err_to_js)
+    }
+
+    #[wasm_bindgen(js_name = encryptBlob)]
+    pub fn encrypt_blob(&self, clip_id: &str, raw_bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+        self.encrypt_blob_inner(clip_id, raw_bytes).map_err(err_to_js)
+    }
+
+    #[wasm_bindgen(js_name = decryptBlob)]
+    pub fn decrypt_blob(
+        &self,
+        clip_id: &str,
+        author_device_id: &str,
+        envelope: &[u8],
+    ) -> Result<Vec<u8>, JsValue> {
+        self.decrypt_blob_inner(clip_id, author_device_id, envelope)
+            .map_err(err_to_js)
+    }
+
+    #[wasm_bindgen]
+    pub fn zeroize(&mut self) {
+        if let Some(mut k) = self.clip_key.take() {
+            k.zeroize();
+        }
+    }
+}
+
+impl Drop for WasmClipCodec {
+    fn drop(&mut self) {
+        self.zeroize();
     }
 }
 
@@ -1401,6 +1609,8 @@ mod tests {
                 device_token: Some("tok_mobile_ro".into()),
                 device_id: dev_mob.clone(),
                 sync_url: "https://sync.example.com".into(),
+                clip_kid: None,
+                clip_key: None,
             },
             [9; 24],
         )
@@ -1628,5 +1838,154 @@ mod tests {
         // Zeroize SMK clears keys
         engine.zeroize_smk();
         assert!(engine.unpack_snapshot_inner(&mnp1_bytes).is_err());
+    }
+
+    #[test]
+    fn wasm_clip_codec_roundtrip_ephemeral_svg_rejection_zeroize_and_sync_engine_factory() {
+        use mynote_core::clip::{
+            clip_sha256_hex, encode_clip_key_material, wrap_clip_key_material, MNC1_HEADER_LEN, MNC1_TAG_LEN,
+        };
+
+        let mut g = MonotonicUlidGen::new();
+        let smk_kid = SmkKid::from_ulid(g.next(1_795_600_000_000, [0x01; 10]));
+        let smk = [0x42u8; 32];
+        let clip_kid = ClipKid::from_ulid(g.next(1_795_600_000_001, [0x02; 10]));
+        let clip_key = [0xA5u8; 32];
+        let clip_id_text = ClipId::from_ulid(g.next(1_795_600_000_002, [0x03; 10]));
+        let clip_id_blob = ClipId::from_ulid(g.next(1_795_600_000_003, [0x04; 10]));
+        let dev_mob = DeviceId::parse("dev_iphone00001").unwrap();
+        let dev_mac = DeviceId::parse("dev_mac00000001").unwrap();
+
+        // 1. Pairing ticket carrying optional clip_kid + clip_key_b64 (and empty smks for clip-write)
+        let k_pair = [0x66u8; 32];
+        let pair_ct = encrypt_pairing_ticket(
+            "pair_clip_01",
+            &k_pair,
+            &PairingPayloadV1 {
+                smks: vec![],
+                device_token: Some("tok_clip_only".into()),
+                device_id: dev_mob.clone(),
+                sync_url: "https://sync.example.com".into(),
+                clip_kid: Some(clip_kid),
+                clip_key: Some(clip_key),
+            },
+            [0x77; 24],
+        )
+        .unwrap();
+        let pair_json: serde_json::Value = serde_json::from_str(
+            &WasmSyncEngine::decrypt_pairing_ticket_inner("pair_clip_01", &B64U.encode(k_pair), &pair_ct)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pair_json["clip_kid"], clip_kid.to_string());
+        assert_eq!(pair_json["clip_key_b64"], B64.encode(clip_key));
+
+        // 2. WasmSyncEngine::createClipCodec unwraps ClipKeyMaterialV1 using SMK inside WASM
+        let smk_json = serde_json::json!([{
+            "smk_kid": smk_kid.to_string(),
+            "smk_b64": B64.encode(smk),
+        }])
+        .to_string();
+        let engine = WasmSyncEngine::new_inner(dev_mob.as_str(), &smk_json).unwrap();
+        let mat = wrap_clip_key_material(smk_kid, &smk, clip_kid, &clip_key, [0x12; 24]).unwrap();
+        let mat_blob = encode_clip_key_material(&mat).unwrap();
+        let mut mob_codec = engine
+            .create_clip_codec_inner(dev_mob.as_str(), &mat_blob)
+            .unwrap();
+        assert_eq!(mob_codec.clip_kid(), clip_kid.to_string());
+        assert_eq!(mob_codec.device_id(), dev_mob.to_string());
+        assert!(!mob_codec.is_zeroized());
+
+        // Peer codec constructed directly with raw ClipKey bytes
+        let mac_codec = WasmClipCodec::new_inner(dev_mac.as_str(), &clip_kid.to_string(), &clip_key).unwrap();
+
+        // 3. Regular & ephemeral text meta roundtrip + cross-channel isolation
+        let meta_json = r#"{"v":1,"kind":"text","mime":"text/plain","source_mode":"explicit","created_at_ms":1795600000002,"text":"hello wasm clip","blob":null}"#;
+        let reg_env = mob_codec
+            .encrypt_meta_inner(&clip_id_text.to_string(), meta_json, false)
+            .unwrap();
+        assert_eq!(
+            mac_codec
+                .decrypt_meta_inner(&clip_id_text.to_string(), dev_mob.as_str(), false, &reg_env)
+                .unwrap(),
+            meta_json
+        );
+        // Replaying regular meta on ephemeral channel MUST fail with IntegrityError
+        assert_eq!(
+            mac_codec
+                .decrypt_meta_inner(&clip_id_text.to_string(), dev_mob.as_str(), true, &reg_env)
+                .unwrap_err()
+                .code(),
+            ErrorCode::IntegrityError
+        );
+        // Wrong author_device_id MUST fail with IntegrityError
+        assert_eq!(
+            mac_codec
+                .decrypt_meta_inner(&clip_id_text.to_string(), dev_mac.as_str(), false, &reg_env)
+                .unwrap_err()
+                .code(),
+            ErrorCode::IntegrityError
+        );
+
+        let eph_env = mob_codec
+            .encrypt_meta_inner(&clip_id_text.to_string(), meta_json, true)
+            .unwrap();
+        assert_eq!(
+            mac_codec
+                .decrypt_meta_inner(&clip_id_text.to_string(), dev_mob.as_str(), true, &eph_env)
+                .unwrap(),
+            meta_json
+        );
+        assert_eq!(
+            mac_codec
+                .decrypt_meta_inner(&clip_id_text.to_string(), dev_mob.as_str(), false, &eph_env)
+                .unwrap_err()
+                .code(),
+            ErrorCode::IntegrityError
+        );
+
+        // 4. Raw PNG blob roundtrip (unpadded 45 + len + 16)
+        let png_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4, 5];
+        let blob_env = mob_codec
+            .encrypt_blob_inner(&clip_id_blob.to_string(), &png_bytes)
+            .unwrap();
+        assert_eq!(blob_env.len(), MNC1_HEADER_LEN + png_bytes.len() + MNC1_TAG_LEN);
+        assert_eq!(
+            mac_codec
+                .decrypt_blob_inner(&clip_id_blob.to_string(), dev_mob.as_str(), &blob_env)
+                .unwrap(),
+            png_bytes
+        );
+
+        // 5. SVG image MIME MUST be rejected
+        let svg_sha = clip_sha256_hex(b"<svg/>");
+        let svg_json = format!(
+            r#"{{"v":1,"kind":"image","mime":"image/svg+xml","source_mode":"explicit","created_at_ms":1795600000003,"text":null,"blob":{{"byte_size":6,"sha256_hex":"{svg_sha}"}}}}"#
+        );
+        assert_eq!(
+            mob_codec
+                .encrypt_meta_inner(&clip_id_blob.to_string(), &svg_json, false)
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidArgument
+        );
+
+        // 6. zeroize() immediately locks codec and refuses further encrypt/decrypt
+        mob_codec.zeroize();
+        assert!(mob_codec.is_zeroized());
+        assert_eq!(
+            mob_codec
+                .encrypt_meta_inner(&clip_id_text.to_string(), meta_json, false)
+                .unwrap_err()
+                .code(),
+            ErrorCode::BlockLocked
+        );
+        assert_eq!(
+            mob_codec
+                .decrypt_blob_inner(&clip_id_blob.to_string(), dev_mob.as_str(), &blob_env)
+                .unwrap_err()
+                .code(),
+            ErrorCode::BlockLocked
+        );
     }
 }
