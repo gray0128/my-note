@@ -1,7 +1,7 @@
 {
   "name": "my-note (Read-Only)",
   "short_name": "my-note",
-  "description": "End-to-end encrypted read-only mobile scratchpad companion",
+  "description": "End-to-end encrypted read-only mobile scratchpad and clipboard companion",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#111110",
@@ -13,5 +13,31 @@
       "type": "image/svg+xml",
       "purpose": "any maskable"
     }
-  ]
+  ],
+  "share_target": {
+    "action": "/clip-share",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url",
+      "files": [
+        {
+          "name": "image",
+          "accept": [
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "image/gif",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+            ".gif"
+          ]
+        }
+      ]
+    }
+  }
 }

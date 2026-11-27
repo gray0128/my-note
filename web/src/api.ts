@@ -6,12 +6,23 @@ import type {
   BlockHistoryEntryDto,
   BootstrapResponse,
   BufferDto,
+  ClipApplyResponse,
+  ClipAutoApplyMirrorMode,
+  ClipDeleteResponse,
+  ClipKind,
+  ClipListResponse,
+  ClipPromoteResponse,
+  ClipPushImageInput,
+  ClipPushResponse,
+  ClipUndoResponse,
+  ClipWatchResponse,
   LocalWsFrame,
   SyncStatusDto,
   TrashActionPrepareResponse,
   TrashItemDto,
   VaultHeaderDto,
 } from "./types";
+import { isAllowedBitmapMime, normalizeMime } from "./clipUtils";
 
 export class LocalApiError extends Error {
   constructor(public status: number, public body: ApiErrorBody) {
@@ -48,6 +59,34 @@ async function reqJson<T>(path: string, init: RequestInit = {}): Promise<T> {
     return env.data as T;
   }
   return parsed as T;
+}
+
+async function reqBlob(path: string): Promise<{ blob: Blob; contentType: string }> {
+  const res = await fetch(path, { method: "GET", credentials: "same-origin", redirect: "manual" });
+  if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
+    throw new LocalApiError(res.status || 302, {
+      code: "REDIRECT_REFUSED",
+      message: `Unexpected redirect HTTP ${res.status || 302}; refusing to follow`,
+    });
+  }
+  if (!res.ok) {
+    let err: ApiErrorBody = { code: "HTTP_ERROR", message: `HTTP ${res.status}` };
+    try {
+      const parsed = (await res.json()) as { error?: ApiErrorBody };
+      if (parsed?.error) err = parsed.error;
+    } catch {
+      // non-JSON error body
+    }
+    throw new LocalApiError(res.status, err);
+  }
+  const contentType = normalizeMime(res.headers.get("content-type"));
+  if (contentType && contentType !== "text/plain" && !isAllowedBitmapMime(contentType)) {
+    throw new LocalApiError(422, {
+      code: "INVALID_ARGUMENT",
+      message: `Refused disallowed clipboard blob MIME '${contentType}'`,
+    });
+  }
+  return { blob: await res.blob(), contentType: contentType || "application/octet-stream" };
 }
 
 export interface Tier2WritePayload {
@@ -155,6 +194,20 @@ export interface LocalApiClient {
   ): Promise<BlockDto>;
   formatSnippet(input: { content: string; lang: string; action?: string; block_id?: string }): Promise<{ formatted: string }>;
   syncNow(): Promise<SyncStatusDto>;
+  listClips?(opts?: { limit?: number; kind?: ClipKind }): Promise<ClipListResponse>;
+  pushClipText?(input: { text: string; ephemeral?: boolean }): Promise<ClipPushResponse>;
+  pushClipImage?(input: Omit<ClipPushImageInput, "kind">): Promise<ClipPushResponse>;
+  getClipBlob?(clipId: string): Promise<{ blob: Blob; contentType: string }>;
+  deleteClip?(clipId: string): Promise<ClipDeleteResponse>;
+  clearClips?(): Promise<ClipDeleteResponse>;
+  applyClip?(clipId: string): Promise<ClipApplyResponse>;
+  promoteClip?(clipId: string, opts?: { buffer_id?: string; lang?: string }): Promise<ClipPromoteResponse>;
+  undoClip?(): Promise<ClipUndoResponse>;
+  patchClipWatch?(input: {
+    paused?: boolean;
+    enabled?: boolean;
+    auto_apply_mirror?: ClipAutoApplyMirrorMode;
+  }): Promise<ClipWatchResponse>;
   connectWs(
     onFrame: (frame: LocalWsFrame) => void,
     onConnChange?: (connected: boolean, reconnected?: boolean) => void,
@@ -220,6 +273,41 @@ export function createLocalApiClient(): LocalApiClient {
       }),
     formatSnippet: (input) => reqJson<{ formatted: string }>("/v1/local/format", { method: "POST", body: JSON.stringify(input) }),
     syncNow: () => reqJson<SyncStatusDto>("/v1/local/sync/now", { method: "POST" }),
+    listClips: (opts) => {
+      const params = new URLSearchParams();
+      params.set("limit", String(opts?.limit ?? 100));
+      if (opts?.kind) params.set("kind", opts.kind);
+      return reqJson<ClipListResponse>(`/v1/local/clip?${params.toString()}`);
+    },
+    pushClipText: (input) =>
+      reqJson<ClipPushResponse>("/v1/local/clip", {
+        method: "POST",
+        body: JSON.stringify({
+          kind: "text",
+          text: input.text,
+          ...(input.ephemeral !== undefined ? { ephemeral: input.ephemeral } : {}),
+        }),
+      }),
+    pushClipImage: (input) =>
+      reqJson<ClipPushResponse>("/v1/local/clip", {
+        method: "POST",
+        body: JSON.stringify({ kind: "image", ...input }),
+      }),
+    getClipBlob: (clipId) => reqBlob(`/v1/local/clip/${encodeURIComponent(clipId)}/blob`),
+    deleteClip: (clipId) => reqJson<ClipDeleteResponse>(`/v1/local/clip/${encodeURIComponent(clipId)}`, { method: "DELETE" }),
+    clearClips: () => reqJson<ClipDeleteResponse>("/v1/local/clip", { method: "DELETE" }),
+    applyClip: (clipId) => reqJson<ClipApplyResponse>(`/v1/local/clip/${encodeURIComponent(clipId)}/apply`, { method: "POST" }),
+    promoteClip: (clipId, opts) =>
+      reqJson<ClipPromoteResponse>(`/v1/local/clip/${encodeURIComponent(clipId)}/promote`, {
+        method: "POST",
+        body: JSON.stringify(opts ?? {}),
+      }),
+    undoClip: () => reqJson<ClipUndoResponse>("/v1/local/clip/undo", { method: "POST" }),
+    patchClipWatch: (input) =>
+      reqJson<ClipWatchResponse>("/v1/local/clip/watch", {
+        method: "PATCH",
+        body: JSON.stringify(input),
+      }),
     connectWs(onFrame, onConnChange, onAuthExpired) {
       let closed = false;
       let hasConnectedOnce = false;

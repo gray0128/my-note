@@ -1,22 +1,41 @@
 /**
- * IndexedDB ciphertext-only storage for Mobile Read-Only PWA (`docs/data-structures.md` §4.3, `SEC-08`).
+ * IndexedDB ciphertext-only storage for Mobile PWA (`docs/data-structures.md` §6, `SEC-08`).
  *
  * Hard invariants:
- * - Database `mynote_pwa_v1` with exact 6 stores:
- *   `device_keystore`, `meta`, `buffers`, `blocks`, `block_keys`, `vault_header`.
+ * - Database `mynote_pwa_v1` (Schema v2) with exact 7 stores:
+ *   `device_keystore`, `meta`, `buffers`, `blocks`, `block_keys`, `vault_header`, `clip_items`.
  * - Non-extractable AES-256-GCM WebCrypto `CryptoKey` in `device_keystore` wraps `creds_wrapped`
  *   and `engine_state_wrapped` in `meta`.
- * - ZERO plaintext of ANY Tier 1 or Tier 2 block or buffer name, ZERO raw SMK/VKEK/passphrase
+ * - `clip_items` stores ONLY ciphertext `meta_envelope_b64` + envelope headers — ZERO decrypted
+ *   text, ZERO decrypted thumbnails, ZERO full image blobs (`SEC-08`).
+ * - ZERO plaintext of ANY Tier 1 or Tier 2 block or buffer name, ZERO raw SMK/VKEK/ClipKey/passphrase
  *   ever touches IndexedDB, `localStorage`, `sessionStorage`, or Cache Storage.
  */
 
 const DB_NAME = "mynote_pwa_v1";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const WRAP_KEY_ID = "device_wrap_key";
+const CLIP_MAX_ITEMS = 100;
+
+export const PWA_ALL_STORES = [
+  "device_keystore",
+  "meta",
+  "buffers",
+  "blocks",
+  "block_keys",
+  "vault_header",
+  "clip_items",
+] as const;
 
 export interface SmkEntry {
   smk_kid: string;
   smk_b64: string;
+}
+
+export interface PwaClipKeyEntry {
+  clip_kid: string;
+  clip_key_b64: string;
+  gen?: number;
 }
 
 export interface PwaCredentials {
@@ -24,6 +43,8 @@ export interface PwaCredentials {
   device_token: string;
   sync_url: string;
   smks: SmkEntry[];
+  scope?: "read" | "read+clip";
+  clip_key?: PwaClipKeyEntry | null;
 }
 
 export interface PwaSyncMeta {
@@ -31,6 +52,22 @@ export interface PwaSyncMeta {
   last_seq: number;
   keys_digest: string | null;
   updated_at_ms: number;
+}
+
+/**
+ * Ciphertext-only clipboard index record stored in IndexedDB `clip_items`.
+ * Contains ONLY ciphertext `meta_envelope_b64` and non-secret envelope headers.
+ */
+export interface CiphertextClipItem {
+  clip_id: string;
+  clip_kid: string;
+  device_id: string;
+  kind: "text" | "image";
+  created_at_ms: number;
+  expires_at_ms: number;
+  meta_envelope_b64: string;
+  has_blob: boolean;
+  blob_bytes: number | null;
 }
 
 interface WrappedBlob {
@@ -64,6 +101,27 @@ function txDone(tx: IDBTransaction): Promise<void> {
   });
 }
 
+function toStrictCiphertextClipRecord(item: CiphertextClipItem): CiphertextClipItem {
+  return {
+    clip_id: String(item.clip_id),
+    clip_kid: String(item.clip_kid),
+    device_id: String(item.device_id),
+    kind: item.kind === "image" ? "image" : "text",
+    created_at_ms: Number(item.created_at_ms),
+    expires_at_ms: Number(item.expires_at_ms),
+    meta_envelope_b64: String(item.meta_envelope_b64),
+    has_blob: Boolean(item.has_blob),
+    blob_bytes: item.blob_bytes === null || item.blob_bytes === undefined ? null : Number(item.blob_bytes),
+  };
+}
+
+function sortClipsDesc(items: readonly CiphertextClipItem[]): CiphertextClipItem[] {
+  return [...items].sort((a, b) => {
+    if (b.created_at_ms !== a.created_at_ms) return b.created_at_ms - a.created_at_ms;
+    return b.clip_id < a.clip_id ? -1 : b.clip_id > a.clip_id ? 1 : 0;
+  });
+}
+
 export function openPwaDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
@@ -75,6 +133,10 @@ export function openPwaDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains("blocks")) db.createObjectStore("blocks", { keyPath: "id" });
       if (!db.objectStoreNames.contains("block_keys")) db.createObjectStore("block_keys", { keyPath: "key_id" });
       if (!db.objectStoreNames.contains("vault_header")) db.createObjectStore("vault_header", { keyPath: "id" });
+      if (!db.objectStoreNames.contains("clip_items")) {
+        const clipStore = db.createObjectStore("clip_items", { keyPath: "clip_id" });
+        clipStore.createIndex("by_created", ["created_at_ms", "clip_id"], { unique: false });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error ?? new Error("Failed to open mynote_pwa_v1"));
@@ -235,11 +297,119 @@ export async function saveEngineState(stateObj: CiphertextStateMirror, keysDiges
   }
 }
 
+/**
+ * Save ciphertext-only clipboard items into `clip_items` (pruned to latest 100 unexpired items).
+ * Strictly strips any extra properties so plaintext/thumbnails/blobs NEVER enter IndexedDB.
+ */
+export async function saveClipItems(
+  items: readonly CiphertextClipItem[],
+  opts: { replaceAll?: boolean } = {},
+): Promise<CiphertextClipItem[]> {
+  const now = Date.now();
+  const db = await openPwaDb();
+  try {
+    let mergedMap = new Map<string, CiphertextClipItem>();
+    if (!opts.replaceAll) {
+      const rtx = db.transaction("clip_items", "readonly");
+      const existing = await reqPromise<CiphertextClipItem[]>(rtx.objectStore("clip_items").getAll());
+      for (const row of existing) {
+        if (row.expires_at_ms > now) {
+          mergedMap.set(row.clip_id, toStrictCiphertextClipRecord(row));
+        }
+      }
+    }
+    for (const item of items) {
+      if (item.expires_at_ms > now) {
+        mergedMap.set(item.clip_id, toStrictCiphertextClipRecord(item));
+      }
+    }
+    const retained = sortClipsDesc([...mergedMap.values()]).slice(0, CLIP_MAX_ITEMS);
+    const tx = db.transaction("clip_items", "readwrite");
+    const store = tx.objectStore("clip_items");
+    store.clear();
+    for (const row of retained) {
+      store.put(row);
+    }
+    await txDone(tx);
+    return retained;
+  } finally {
+    db.close();
+  }
+}
+
+export async function loadClipItems(): Promise<CiphertextClipItem[]> {
+  const now = Date.now();
+  const db = await openPwaDb();
+  try {
+    const rtx = db.transaction("clip_items", "readonly");
+    const all = await reqPromise<CiphertextClipItem[]>(rtx.objectStore("clip_items").getAll());
+    return sortClipsDesc(all.filter((row) => row.expires_at_ms > now).map(toStrictCiphertextClipRecord)).slice(
+      0,
+      CLIP_MAX_ITEMS,
+    );
+  } catch {
+    return [];
+  } finally {
+    db.close();
+  }
+}
+
+export async function deleteClipItemIdb(clipId: string): Promise<void> {
+  const db = await openPwaDb();
+  try {
+    const tx = db.transaction("clip_items", "readwrite");
+    tx.objectStore("clip_items").delete(clipId);
+    await txDone(tx);
+  } finally {
+    db.close();
+  }
+}
+
+export async function clearClipItemsIdb(): Promise<void> {
+  const db = await openPwaDb();
+  try {
+    const tx = db.transaction(["clip_items", "meta"], "readwrite");
+    tx.objectStore("clip_items").clear();
+    tx.objectStore("meta").delete("last_clip_id");
+    await txDone(tx);
+  } finally {
+    db.close();
+  }
+}
+
+export async function getLastClipId(): Promise<string | null> {
+  const db = await openPwaDb();
+  try {
+    const rtx = db.transaction("meta", "readonly");
+    const val = await reqPromise<unknown>(rtx.objectStore("meta").get("last_clip_id"));
+    return typeof val === "string" && val.length > 0 ? val : null;
+  } catch {
+    return null;
+  } finally {
+    db.close();
+  }
+}
+
+export async function setLastClipId(clipId: string | null): Promise<void> {
+  const db = await openPwaDb();
+  try {
+    const tx = db.transaction("meta", "readwrite");
+    if (clipId) {
+      tx.objectStore("meta").put(clipId, "last_clip_id");
+    } else {
+      tx.objectStore("meta").delete("last_clip_id");
+    }
+    await txDone(tx);
+  } finally {
+    db.close();
+  }
+}
+
 export async function clearAllPwaStorage(): Promise<void> {
   const db = await openPwaDb();
   try {
-    const tx = db.transaction(["device_keystore", "meta", "buffers", "blocks", "block_keys", "vault_header"], "readwrite");
-    for (const name of ["device_keystore", "meta", "buffers", "blocks", "block_keys", "vault_header"]) {
+    const tx = db.transaction([...PWA_ALL_STORES], "readwrite");
+    for (const name of PWA_ALL_STORES) {
       tx.objectStore(name).clear();
     }
     await txDone(tx);

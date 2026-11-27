@@ -42,7 +42,14 @@ export type IconName =
   | "alert-triangle"
   | "image-off"
   | "more-horizontal"
-  | "pencil";
+  | "pencil"
+  | "clipboard"
+  | "image"
+  | "send"
+  | "download"
+  | "file-plus"
+  | "pause"
+  | "play";
 
 type SvgPrimitive =
   | { readonly tag: "path"; readonly attrs: Readonly<Record<string, string>> }
@@ -245,6 +252,37 @@ const ICON_DEFS: Readonly<Record<IconName, readonly SvgPrimitive[]>> = {
   pencil: [
     { tag: "path", attrs: { d: "M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" } },
     { tag: "path", attrs: { d: "m15 5 4 4" } },
+  ],
+  clipboard: [
+    { tag: "rect", attrs: { x: "8", y: "2", width: "8", height: "4", rx: "1" } },
+    { tag: "path", attrs: { d: "M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" } },
+  ],
+  image: [
+    { tag: "rect", attrs: { x: "3", y: "3", width: "18", height: "18", rx: "2" } },
+    { tag: "circle", attrs: { cx: "8.5", cy: "8.5", r: "1.5" } },
+    { tag: "polyline", attrs: { points: "21 15 16 10 5 21" } },
+  ],
+  send: [
+    { tag: "line", attrs: { x1: "22", y1: "2", x2: "11", y2: "13" } },
+    { tag: "path", attrs: { d: "M22 2 15 22 11 13 2 9 22 2z" } },
+  ],
+  download: [
+    { tag: "path", attrs: { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" } },
+    { tag: "polyline", attrs: { points: "7 10 12 15 17 10" } },
+    { tag: "line", attrs: { x1: "12", y1: "15", x2: "12", y2: "3" } },
+  ],
+  "file-plus": [
+    { tag: "path", attrs: { d: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" } },
+    { tag: "polyline", attrs: { points: "14 2 14 8 20 8" } },
+    { tag: "line", attrs: { x1: "12", y1: "18", x2: "12", y2: "12" } },
+    { tag: "line", attrs: { x1: "9", y1: "15", x2: "15", y2: "15" } },
+  ],
+  pause: [
+    { tag: "rect", attrs: { x: "6", y: "4", width: "4", height: "16", rx: "1" } },
+    { tag: "rect", attrs: { x: "14", y: "4", width: "4", height: "16", rx: "1" } },
+  ],
+  play: [
+    { tag: "path", attrs: { d: "M6 4l14 8-14 8V4z" } },
   ],
 };
 

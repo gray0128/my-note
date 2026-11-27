@@ -4,13 +4,31 @@ import {
   type LocaleSwitchHandle,
   type ThemeMenuHandle,
 } from "../components/themeMenu";
-import { formatDeviceName, subscribeLocale, syncDocumentLocale, t } from "../i18n";
+import {
+  CLIP_BLOB_MAX_BYTES,
+  CLIP_EPHEMERAL_MAX_BYTES,
+  CLIP_INLINE_TEXT_MAX_BYTES,
+  CLIP_MAX_ITEMS,
+  bytesToBase64Chunked,
+  computeSha256Hex,
+  convertImageBytesToPngBlob,
+  formatClipBytes,
+  generateBitmapThumbnail,
+  generateUlid,
+  isAllowedBitmapMime,
+  truncatePreview,
+  validateClipImageFile,
+  type ClipMetaV1,
+} from "../clipUtils";
+import { formatDeviceName, formatHistoryTimestamp, subscribeLocale, syncDocumentLocale, t } from "../i18n";
 import { createIcon, type IconName } from "../icons";
 import { initTheme } from "../theme";
+import type { AllowedClipImageMime } from "../types";
 import {
   b64ToBytes,
   ensurePwaWasm,
   parseWasmError,
+  WasmClipCodec,
   WasmSyncEngine,
   WasmVaultSession,
 } from "../wasm/pwa";
@@ -20,19 +38,32 @@ import {
   claimPairing,
   CloudApiError,
   connectCloudWs,
+  deleteCloudClip,
   fetchCloudKeys,
   fetchCloudStateSnapshot,
+  getCloudClipBlob,
+  listCloudClips,
+  postCloudClip,
   pullCloudOps,
+  putCloudClipBlob,
 } from "./cloudApi";
 import {
   clearAllPwaStorage,
+  clearClipItemsIdb,
+  deleteClipItemIdb,
+  getLastClipId,
+  loadClipItems,
   loadCredentials,
   loadEngineStateJson,
+  saveClipItems,
   saveCredentials,
   saveEngineState,
+  setLastClipId,
+  type CiphertextClipItem,
   type CiphertextStateMirror,
   type PwaCredentials,
 } from "./idb";
+import { consumeShareHandoffCache } from "./shareHandoff";
 
 const MOBILE_VAULT_IDLE_MS = 5 * 60 * 1000;
 const isPageHidden = (): boolean => document.visibilityState === "hidden";
@@ -142,6 +173,15 @@ export class MobilePwaApp {
   private buffers: MobileBufferView[] = [];
   private blocks: MobileBlockView[] = [];
   private activeBufferId: string | null = null;
+  private activeTab: "notes" | "clip" = "notes";
+  private clipCodec: WasmClipCodec | null = null;
+  private clipItemsCipher: CiphertextClipItem[] = [];
+  private decryptedClips = new Map<string, ClipMetaV1>();
+  private clipDraftText = "";
+  private clipEphemeral = false;
+  private clipSending = false;
+  private clipErrorMsg: string | null = null;
+  private activeModalObjectUrl: string | null = null;
   private selectedVersionByBlock = new Map<string, string>();
   private viewModeByBlock = new Map<string, "preview" | "source">();
   private activePreviewCleanups: Array<() => void> = [];
@@ -201,6 +241,7 @@ export class MobilePwaApp {
     await ensurePwaWasm();
     this.creds = await loadCredentials();
     if (!this.creds) {
+      await this.consumePendingShareHandoff();
       this.render();
       return;
     }
@@ -211,9 +252,12 @@ export class MobilePwaApp {
       this.keysDigest = cached.meta?.keys_digest ?? null;
       this.materializeFromState();
     }
+    this.clipItemsCipher = await loadClipItems();
+    this.decryptClipsInRam();
     this.render();
     this.connectWs();
     await this.syncNow();
+    await this.consumePendingShareHandoff();
   }
 
   destroy(): void {
@@ -226,6 +270,8 @@ export class MobilePwaApp {
     this.closeModal();
     this.cleanupMountedPreviews();
     this.lockVaultNow(true);
+    this.destroyClipCodec();
+    this.decryptedClips.clear();
     this.disconnectWs?.();
     this.disconnectWs = null;
     if (this.engine) {
@@ -258,7 +304,8 @@ export class MobilePwaApp {
     brandName.textContent = "my-note";
     this.roPillEl = document.createElement("span");
     this.roPillEl.className = "ro-pill";
-    this.roPillEl.textContent = t("pwa.readOnlyPill");
+    this.roPillEl.textContent =
+      this.creds?.scope === "read+clip" ? t("pwa.clipScopeReadClip") : t("pwa.readOnlyPill");
     brand.append(createIcon("brand-mark", "sm"), brandName, this.roPillEl);
 
     const actions = document.createElement("div");
@@ -337,6 +384,69 @@ export class MobilePwaApp {
     }
   };
 
+  private destroyClipCodec(): void {
+    if (this.clipCodec) {
+      try {
+        this.clipCodec.zeroize();
+        this.clipCodec.free();
+      } catch {
+        // ignore if already freed
+      }
+      this.clipCodec = null;
+    }
+  }
+
+  private initClipCodecFromCreds(): void {
+    this.destroyClipCodec();
+    if (!this.creds?.clip_key?.clip_kid || !this.creds.clip_key.clip_key_b64) return;
+    try {
+      this.clipCodec = new WasmClipCodec(
+        this.creds.device_id,
+        this.creds.clip_key.clip_kid,
+        b64ToBytes(this.creds.clip_key.clip_key_b64),
+      );
+    } catch {
+      this.clipCodec = null;
+    }
+  }
+
+  private async applyClipKeyMaterial(clipKeyMat: { gen: number; blob_b64: string } | null | undefined): Promise<void> {
+    if (!clipKeyMat || !this.engine || !this.creds) return;
+    let nextCodec: WasmClipCodec;
+    try {
+      nextCodec = this.engine.createClipCodec(this.creds.device_id, b64ToBytes(clipKeyMat.blob_b64));
+    } catch {
+      return;
+    }
+    const prevKid = this.clipCodec?.clipKid ?? null;
+    const rotated = prevKid !== null && prevKid !== nextCodec.clipKid;
+    this.destroyClipCodec();
+    this.clipCodec = nextCodec;
+    if (rotated) {
+      this.clipItemsCipher = [];
+      this.decryptedClips.clear();
+      await clearClipItemsIdb();
+    } else {
+      this.decryptClipsInRam();
+    }
+  }
+
+  private decryptClipsInRam(): void {
+    this.decryptedClips.clear();
+    const codec = this.clipCodec;
+    if (!codec || codec.isZeroized()) return;
+    for (const row of this.clipItemsCipher) {
+      if (row.clip_kid !== codec.clipKid) continue;
+      try {
+        const metaJson = codec.decryptMeta(row.clip_id, row.device_id, false, b64ToBytes(row.meta_envelope_b64));
+        const parsed = JSON.parse(metaJson) as ClipMetaV1;
+        this.decryptedClips.set(row.clip_id, parsed);
+      } catch {
+        // leave undecryptable (e.g. rotated key)
+      }
+    }
+  }
+
   private initEngine(): void {
     if (!this.creds) return;
     if (this.engine) {
@@ -344,6 +454,7 @@ export class MobilePwaApp {
       this.engine.free();
     }
     this.engine = new WasmSyncEngine(this.creds.device_id, JSON.stringify(this.creds.smks));
+    this.initClipCodecFromCreds();
   }
 
   private connectWs(): void {
@@ -353,6 +464,8 @@ export class MobilePwaApp {
     this.disconnectWs = connectCloudWs(this.creds.sync_url, this.creds.device_token, {
       onWake: () => void this.syncNow(),
       onRevoked: () => this.handleDeviceRevoked(),
+      onClipWake: () => void this.syncClipsNow(undefined, { full: false }),
+      onClipCleared: (frame) => void this.handleRemoteClipCleared(frame.clip_id),
       onAbnormalClose: () => {
         if (this.creds && !this.revoked) void this.syncNow();
       },
@@ -368,6 +481,8 @@ export class MobilePwaApp {
     this.disconnectWs?.();
     this.disconnectWs = null;
     this.lockVaultNow(true);
+    this.destroyClipCodec();
+    this.decryptedClips.clear();
     this.render();
   }
 
@@ -435,8 +550,10 @@ export class MobilePwaApp {
       }
 
       // 2. Pull key table first if we have no keys yet (or later if digest changed)
+      let keysFetchedThisSync = false;
       const fetchAndMergeKeys = async () => {
         const kr = await fetchCloudKeys(sync_url, device_token, signal);
+        keysFetchedThisSync = true;
         lastOut = this.applyStep({
           type: "merge_key_table",
           key_records: kr.key_records,
@@ -447,6 +564,7 @@ export class MobilePwaApp {
           vault_header_b64: kr.key_material.vault_header?.blob_b64 ?? null,
         });
         parsedState = lastOut.state;
+        await this.applyClipKeyMaterial(kr.key_material.clip_key);
       };
 
       if (!this.keysDigest) {
@@ -497,11 +615,18 @@ export class MobilePwaApp {
 
       if (remoteDigest && remoteDigest !== this.keysDigest) {
         await fetchAndMergeKeys();
+      } else if (!this.clipCodec && !keysFetchedThisSync) {
+        // `keys_digest` intentionally excludes `clip_key` (`INV-CLIP-ISOLATION`); check `/v1/keys` if codec missing.
+        await fetchAndMergeKeys();
       }
 
       if (lastOut) {
         await saveEngineState(lastOut.state, lastOut.keys_digest);
       }
+
+      // 4. Sync independent 100-item clipboard index (ciphertext-only into IndexedDB `clip_items`)
+      await this.syncClipsNow(signal, { full: true, renderAfter: false });
+
       if (truncated) {
         this.syncTruncated = true;
         this.syncStatus = { kind: "partial", seq: parsedState.last_seq ?? 0 };
@@ -543,9 +668,11 @@ export class MobilePwaApp {
       };
       const cleanCodeUrl = validateSyncUrl(parsed.sync_url);
       const claimed = await claimPairing(cleanCodeUrl, parsed.pair_id);
-      // H19: Strictly enforce read-only scope and expected ticket kind before decrypting/saving credentials!
-      if (claimed.scope !== "read") {
-        throw new Error(`Refused pairing ticket with scope '${claimed.scope}' — Mobile PWA strictly requires scope 'read'`);
+      // H19 / D8: Mobile PWA strictly accepts only 'read' or 'read+clip' (NEVER 'read-write' or 'clip-write').
+      if (claimed.scope !== "read" && claimed.scope !== "read+clip") {
+        throw new Error(
+          `Refused pairing ticket with scope '${claimed.scope}' — Mobile PWA strictly requires scope 'read' or 'read+clip'`,
+        );
       }
       const expectedKind = isRefresh ? "refresh" : "add";
       if (claimed.kind !== expectedKind) {
@@ -553,7 +680,7 @@ export class MobilePwaApp {
       }
       const payload = JSON.parse(
         WasmSyncEngine.decryptPairingTicket(parsed.pair_id, parsed.k_pair_b64u, b64ToBytes(claimed.ciphertext_b64)),
-      ) as PwaCredentials;
+      ) as PwaCredentials & { clip_kid?: string; clip_key_b64?: string };
       const cleanPayloadUrl = validateSyncUrl(payload.sync_url);
       if (cleanPayloadUrl !== cleanCodeUrl) {
         throw new Error("Pairing ticket sync_url mismatch");
@@ -561,6 +688,13 @@ export class MobilePwaApp {
       if (payload.device_id !== claimed.device_id) {
         throw new Error("Pairing ticket device_id mismatch");
       }
+      const ticketClipKey =
+        typeof payload.clip_kid === "string" &&
+        payload.clip_kid.length > 0 &&
+        typeof payload.clip_key_b64 === "string" &&
+        payload.clip_key_b64.length > 0
+          ? { clip_kid: payload.clip_kid, clip_key_b64: payload.clip_key_b64 }
+          : null;
 
       if (isRefresh && this.creds) {
         if (payload.device_id !== this.creds.device_id || cleanPayloadUrl !== validateSyncUrl(this.creds.sync_url)) {
@@ -571,6 +705,8 @@ export class MobilePwaApp {
         for (const s of payload.smks) mergedMap.set(s.smk_kid, s.smk_b64);
         this.creds = {
           ...this.creds,
+          scope: claimed.scope,
+          clip_key: ticketClipKey ?? this.creds.clip_key ?? null,
           smks: [...mergedMap.entries()].map(([smk_kid, smk_b64]) => ({ smk_kid, smk_b64 })),
         };
         await saveCredentials(this.creds);
@@ -581,7 +717,14 @@ export class MobilePwaApp {
         return;
       }
 
-      this.creds = { ...payload, sync_url: cleanPayloadUrl };
+      this.creds = {
+        device_id: payload.device_id,
+        device_token: payload.device_token,
+        sync_url: cleanPayloadUrl,
+        smks: payload.smks,
+        scope: claimed.scope,
+        clip_key: ticketClipKey,
+      };
       this.revoked = false;
       this.stateJson = "{}";
       this.keysDigest = null;
@@ -812,6 +955,10 @@ export class MobilePwaApp {
   }
 
   private closeModal(): void {
+    if (this.activeModalObjectUrl) {
+      URL.revokeObjectURL(this.activeModalObjectUrl);
+      this.activeModalObjectUrl = null;
+    }
     for (const el of this.modalCardEl.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("input, textarea")) {
       el.value = "";
     }
@@ -890,7 +1037,8 @@ export class MobilePwaApp {
     const selStart = searchHadFocus ? prevSearch.selectionStart : null;
     const selEnd = searchHadFocus ? prevSearch.selectionEnd : null;
 
-    this.roPillEl.textContent = t("pwa.readOnlyPill");
+    this.roPillEl.textContent =
+      this.creds?.scope === "read+clip" ? t("pwa.clipScopeReadClip") : t("pwa.readOnlyPill");
 
     const dynamicActions: HTMLElement[] = [];
     if (this.creds && !this.revoked) {
@@ -942,38 +1090,78 @@ export class MobilePwaApp {
     this.headerDynamicActionsEl.replaceChildren(...dynamicActions);
 
     this.headerSubEl.replaceChildren();
-    if (this.creds && !this.revoked && this.buffers.length > 0) {
+    if (this.creds && !this.revoked) {
       this.headerSubEl.classList.remove("hidden");
-      const tabs = document.createElement("nav");
-      tabs.className = "pwa-tabs";
-      tabs.setAttribute("aria-label", t("topbar.buffersNav"));
-      for (const b of this.buffers) {
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = `tab-btn${b.id === this.activeBufferId ? " active" : ""}`;
-        btn.textContent = b.name;
-        btn.addEventListener("click", () => {
-          this.activeBufferId = b.id;
-          this.render();
-        });
-        tabs.appendChild(btn);
-      }
-      this.headerSubEl.appendChild(tabs);
 
-      const search = document.createElement("input");
-      search.type = "search";
-      search.className = "input";
-      search.placeholder = t("pwa.searchPlaceholder");
-      search.value = this.searchQuery;
-      search.addEventListener("input", () => {
-        this.searchQuery = search.value;
-        this.renderMain();
+      const viewSeg = document.createElement("div");
+      viewSeg.className = "pwa-view-seg";
+      viewSeg.setAttribute("role", "tablist");
+
+      const notesTabBtn = document.createElement("button");
+      notesTabBtn.type = "button";
+      notesTabBtn.setAttribute("role", "tab");
+      notesTabBtn.className = "pwa-view-seg-btn";
+      notesTabBtn.dataset.testid = "pwa-tab-notes";
+      notesTabBtn.setAttribute("aria-selected", String(this.activeTab === "notes"));
+      const notesLbl = document.createElement("span");
+      notesLbl.textContent = t("pwa.tabNotes");
+      notesTabBtn.append(createIcon("layers", "xs"), notesLbl);
+      notesTabBtn.addEventListener("click", () => {
+        if (this.activeTab === "notes") return;
+        this.activeTab = "notes";
+        this.render();
       });
-      this.headerSubEl.appendChild(search);
-      if (searchHadFocus) {
-        search.focus({ preventScroll: true });
-        if (selStart !== null && selEnd !== null) {
-          search.setSelectionRange(selStart, selEnd);
+
+      const clipTabBtn = document.createElement("button");
+      clipTabBtn.type = "button";
+      clipTabBtn.setAttribute("role", "tab");
+      clipTabBtn.className = "pwa-view-seg-btn";
+      clipTabBtn.dataset.testid = "pwa-tab-clip";
+      clipTabBtn.setAttribute("aria-selected", String(this.activeTab === "clip"));
+      const clipLbl = document.createElement("span");
+      clipLbl.textContent = t("pwa.tabClip");
+      clipTabBtn.append(createIcon("clipboard", "xs"), clipLbl);
+      clipTabBtn.addEventListener("click", () => {
+        if (this.activeTab === "clip") return;
+        this.activeTab = "clip";
+        this.render();
+      });
+
+      viewSeg.append(notesTabBtn, clipTabBtn);
+      this.headerSubEl.appendChild(viewSeg);
+
+      if (this.activeTab === "notes" && this.buffers.length > 0) {
+        const tabs = document.createElement("nav");
+        tabs.className = "pwa-tabs";
+        tabs.setAttribute("aria-label", t("topbar.buffersNav"));
+        for (const b of this.buffers) {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = `tab-btn${b.id === this.activeBufferId ? " active" : ""}`;
+          btn.textContent = b.name;
+          btn.addEventListener("click", () => {
+            this.activeBufferId = b.id;
+            this.render();
+          });
+          tabs.appendChild(btn);
+        }
+        this.headerSubEl.appendChild(tabs);
+
+        const search = document.createElement("input");
+        search.type = "search";
+        search.className = "input";
+        search.placeholder = t("pwa.searchPlaceholder");
+        search.value = this.searchQuery;
+        search.addEventListener("input", () => {
+          this.searchQuery = search.value;
+          this.renderMain();
+        });
+        this.headerSubEl.appendChild(search);
+        if (searchHadFocus) {
+          search.focus({ preventScroll: true });
+          if (selStart !== null && selEnd !== null) {
+            search.setSelectionRange(selStart, selEnd);
+          }
         }
       }
     } else {
@@ -991,6 +1179,7 @@ export class MobilePwaApp {
     this.disconnectWs = null;
     this.wsConnected = false;
     this.lockVaultNow(true);
+    this.destroyClipCodec();
     if (this.engine) {
       this.engine.zeroizeSmk();
       this.engine.free();
@@ -1004,6 +1193,12 @@ export class MobilePwaApp {
     this.buffers = [];
     this.blocks = [];
     this.activeBufferId = null;
+    this.activeTab = "notes";
+    this.clipItemsCipher = [];
+    this.decryptedClips.clear();
+    this.clipDraftText = "";
+    this.clipEphemeral = false;
+    this.clipErrorMsg = null;
     this.selectedVersionByBlock.clear();
     this.viewModeByBlock.clear();
     this.cleanupMountedPreviews();
@@ -1085,6 +1280,10 @@ export class MobilePwaApp {
     this.mainEl.classList.toggle("is-onboarding", !this.creds);
     if (!this.creds) {
       this.renderOnboarding();
+      return;
+    }
+    if (this.activeTab === "clip") {
+      this.renderClipboardView();
       return;
     }
     const q = this.searchQuery.trim().toLowerCase();
@@ -1457,6 +1656,768 @@ export class MobilePwaApp {
     }
 
     return card;
+  }
+
+  // ---------- M4 Mobile PWA Clipboard (IndexedDB v2 + WasmClipCodec + Share Target) ----------
+
+  private canWriteClip(): boolean {
+    return this.creds?.scope === "read+clip";
+  }
+
+  private async ensureClipCodec(signal?: AbortSignal): Promise<WasmClipCodec | null> {
+    if (this.clipCodec && !this.clipCodec.isZeroized()) return this.clipCodec;
+    if (!this.creds || !this.engine) return null;
+    try {
+      const kr = await fetchCloudKeys(this.creds.sync_url, this.creds.device_token, signal);
+      await this.applyClipKeyMaterial(kr.key_material.clip_key);
+    } catch {
+      // keep null
+    }
+    return this.clipCodec && !this.clipCodec.isZeroized() ? this.clipCodec : null;
+  }
+
+  private async syncClipsNow(
+    signal?: AbortSignal,
+    opts: { full?: boolean; renderAfter?: boolean } = {},
+  ): Promise<void> {
+    if (!this.creds || this.revoked) return;
+    const full = opts.full ?? false;
+    try {
+      const sinceId = full ? undefined : ((await getLastClipId()) ?? undefined);
+      const res = await listCloudClips(this.creds.sync_url, this.creds.device_token, sinceId, CLIP_MAX_ITEMS, signal);
+
+      const needKeyRefresh =
+        res.items.length > 0 &&
+        (!this.clipCodec || res.items.some((item) => item.clip_kid !== this.clipCodec?.clipKid));
+      if (needKeyRefresh && this.engine) {
+        const kr = await fetchCloudKeys(this.creds.sync_url, this.creds.device_token, signal);
+        const prevKid = this.clipCodec?.clipKid ?? null;
+        await this.applyClipKeyMaterial(kr.key_material.clip_key);
+        if (prevKid && this.clipCodec && this.clipCodec.clipKid !== prevKid && !full) {
+          // ClipKey rotated while online: pull full list under the fresh key.
+          const fresh = await listCloudClips(this.creds.sync_url, this.creds.device_token, undefined, CLIP_MAX_ITEMS, signal);
+          this.clipItemsCipher = await saveClipItems(fresh.items, { replaceAll: true });
+          const maxId = this.clipItemsCipher.reduce<string | null>(
+            (acc, r) => (!acc || r.clip_id > acc ? r.clip_id : acc),
+            null,
+          );
+          await setLastClipId(maxId);
+          this.decryptClipsInRam();
+          if (opts.renderAfter !== false) this.renderMain();
+          return;
+        }
+      }
+
+      if (full || res.items.length > 0) {
+        this.clipItemsCipher = await saveClipItems(res.items, { replaceAll: full });
+        const maxId = this.clipItemsCipher.reduce<string | null>(
+          (acc, r) => (!acc || r.clip_id > acc ? r.clip_id : acc),
+          null,
+        );
+        await setLastClipId(maxId);
+        this.decryptClipsInRam();
+      }
+      if (opts.renderAfter !== false && this.activeTab === "clip") {
+        this.renderMain();
+      }
+    } catch (e) {
+      if (signal?.aborted || (e instanceof DOMException && e.name === "AbortError")) return;
+      if (e instanceof CloudApiError && (e.status === 401 || e.code === "DEVICE_REVOKED" || e.code === "AUTH_REQUIRED")) {
+        this.handleDeviceRevoked();
+      }
+    }
+  }
+
+  private async handleRemoteClipCleared(clipId: string | null): Promise<void> {
+    if (clipId) {
+      await deleteClipItemIdb(clipId);
+      this.clipItemsCipher = this.clipItemsCipher.filter((c) => c.clip_id !== clipId);
+      this.decryptedClips.delete(clipId);
+    } else {
+      await clearClipItemsIdb();
+      this.clipItemsCipher = [];
+      this.decryptedClips.clear();
+    }
+    if (this.activeTab === "clip") {
+      this.renderMain();
+    }
+  }
+
+  /** Consume Android Web Share Target `/?clip_share=1` handoff and immediately wipe `mynote-share-handoff` (`SEC-08`). */
+  async consumePendingShareHandoff(): Promise<void> {
+    const hasParam =
+      typeof window !== "undefined" &&
+      new URLSearchParams(window.location.search).get("clip_share") === "1";
+    if (hasParam && typeof history !== "undefined" && typeof history.replaceState === "function") {
+      try {
+        history.replaceState(null, "", "/");
+      } catch {
+        // ignore history error
+      }
+    }
+    const payload = await consumeShareHandoffCache();
+    if (!payload) return;
+
+    if (!this.creds || this.revoked) {
+      this.showToast(t("clip.errReadOnlyScope"), true);
+      return;
+    }
+    this.activeTab = "clip";
+    this.render();
+
+    if (payload.kind === "error") {
+      this.clipErrorMsg =
+        payload.mime.includes("svg")
+          ? t("clip.errSvgRejected")
+          : t("clip.errUnsupportedMime", { mime: payload.mime });
+      this.renderMain();
+      return;
+    }
+    if (!this.canWriteClip()) {
+      this.clipErrorMsg = t("clip.errReadOnlyScope");
+      this.renderMain();
+      return;
+    }
+    if (payload.kind === "text") {
+      const ok = await this.sendClipText(payload.text, false);
+      if (ok) this.showToast(t("clip.toastShareSent"));
+    } else {
+      const copy = new Uint8Array(payload.bytes.byteLength);
+      copy.set(payload.bytes);
+      const blob = new Blob([copy], { type: payload.mime });
+      const ok = await this.sendClipImage(blob, payload.mime);
+      if (ok) this.showToast(t("clip.toastShareSent"));
+    }
+  }
+
+  private async sendClipText(text: string, ephemeral: boolean): Promise<boolean> {
+    if (!this.creds || this.revoked || this.clipSending) return false;
+    if (!this.canWriteClip()) {
+      this.clipErrorMsg = t("clip.errReadOnlyScope");
+      this.renderMain();
+      return false;
+    }
+    if (!text.length) {
+      this.clipErrorMsg = t("clip.errEmpty");
+      this.renderMain();
+      return false;
+    }
+    const utf8 = new TextEncoder().encode(text);
+    if (ephemeral && utf8.byteLength > CLIP_EPHEMERAL_MAX_BYTES) {
+      this.clipErrorMsg = t("clip.errEphemeralTooLarge");
+      this.renderMain();
+      return false;
+    }
+    if (utf8.byteLength > CLIP_BLOB_MAX_BYTES) {
+      this.clipErrorMsg = t("clip.errTooLarge");
+      this.renderMain();
+      return false;
+    }
+    const codec = await this.ensureClipCodec();
+    if (!codec) {
+      this.clipErrorMsg = t("clip.errNoKey");
+      this.renderMain();
+      return false;
+    }
+
+    this.clipErrorMsg = null;
+    this.clipSending = true;
+    this.renderMain();
+    try {
+      const clipId = generateUlid();
+      const now = Date.now();
+      if (ephemeral || utf8.byteLength <= CLIP_INLINE_TEXT_MAX_BYTES) {
+        const meta: ClipMetaV1 = {
+          v: 1,
+          kind: "text",
+          mime: "text/plain",
+          source_mode: "explicit",
+          created_at_ms: now,
+          text,
+          blob: null,
+        };
+        const metaEnv = codec.encryptMeta(clipId, JSON.stringify(meta), ephemeral);
+        const metaB64 = bytesToBase64Chunked(metaEnv);
+        const res = await postCloudClip(this.creds.sync_url, this.creds.device_token, {
+          clip_id: clipId,
+          clip_kid: codec.clipKid,
+          kind: "text",
+          ephemeral,
+          meta_envelope_b64: metaB64,
+        });
+        this.clipDraftText = "";
+        this.clipEphemeral = false;
+        if (ephemeral) {
+          this.showToast(t("clip.toastSentEphemeral", { count: res.delivered_to ?? 0 }));
+        } else {
+          const cipherItem: CiphertextClipItem = {
+            clip_id: clipId,
+            clip_kid: codec.clipKid,
+            device_id: this.creds.device_id,
+            kind: "text",
+            created_at_ms: res.created_at_ms ?? now,
+            expires_at_ms: res.expires_at_ms ?? now + 7 * 86_400_000,
+            meta_envelope_b64: metaB64,
+            has_blob: false,
+            blob_bytes: null,
+          };
+          this.clipItemsCipher = await saveClipItems([cipherItem], { replaceAll: false });
+          this.decryptedClips.set(clipId, meta);
+          await setLastClipId(clipId);
+          this.showToast(t("clip.toastSent"));
+        }
+      } else {
+        const sha256Hex = await computeSha256Hex(utf8);
+        const meta: ClipMetaV1 = {
+          v: 1,
+          kind: "text",
+          mime: "text/plain",
+          source_mode: "explicit",
+          created_at_ms: now,
+          text: truncatePreview(text),
+          blob: {
+            byte_size: utf8.byteLength,
+            sha256_hex: sha256Hex,
+            width: null,
+            height: null,
+            thumb_mime: null,
+            thumb_b64: null,
+          },
+        };
+        const metaEnv = codec.encryptMeta(clipId, JSON.stringify(meta), false);
+        const metaB64 = bytesToBase64Chunked(metaEnv);
+        const blobEnv = codec.encryptBlob(clipId, utf8);
+        const res = await putCloudClipBlob(
+          this.creds.sync_url,
+          this.creds.device_token,
+          { clipId, clipKid: codec.clipKid, kind: "text", metaEnvelopeB64: metaB64 },
+          blobEnv,
+        );
+        this.clipDraftText = "";
+        this.clipEphemeral = false;
+        const cipherItem: CiphertextClipItem = {
+          clip_id: clipId,
+          clip_kid: codec.clipKid,
+          device_id: this.creds.device_id,
+          kind: "text",
+          created_at_ms: res.created_at_ms,
+          expires_at_ms: res.expires_at_ms,
+          meta_envelope_b64: metaB64,
+          has_blob: true,
+          blob_bytes: res.blob_bytes,
+        };
+        this.clipItemsCipher = await saveClipItems([cipherItem], { replaceAll: false });
+        this.decryptedClips.set(clipId, meta);
+        await setLastClipId(clipId);
+        this.showToast(t("clip.toastSent"));
+      }
+      return true;
+    } catch (e) {
+      if (e instanceof CloudApiError && (e.status === 401 || e.code === "DEVICE_REVOKED")) {
+        this.handleDeviceRevoked();
+        return false;
+      }
+      const parsed = parseWasmError(e);
+      this.clipErrorMsg = `${parsed.code}: ${parsed.message}`;
+      this.showToast(this.clipErrorMsg, true);
+      return false;
+    } finally {
+      this.clipSending = false;
+      this.renderMain();
+    }
+  }
+
+  private async sendClipImage(fileBlob: Blob, rawMime: string): Promise<boolean> {
+    if (!this.creds || this.revoked || this.clipSending) return false;
+    if (!this.canWriteClip()) {
+      this.clipErrorMsg = t("clip.errReadOnlyScope");
+      this.renderMain();
+      return false;
+    }
+    const check = validateClipImageFile(rawMime, fileBlob.size);
+    if (!check.ok) {
+      this.clipErrorMsg =
+        check.reason === "svg"
+          ? t("clip.errSvgRejected")
+          : check.reason === "size"
+            ? t("clip.errTooLarge")
+            : check.reason === "empty"
+              ? t("clip.errEmpty")
+              : t("clip.errUnsupportedMime", { mime: check.mime });
+      this.renderMain();
+      return false;
+    }
+    const codec = await this.ensureClipCodec();
+    if (!codec) {
+      this.clipErrorMsg = t("clip.errNoKey");
+      this.renderMain();
+      return false;
+    }
+
+    this.clipErrorMsg = null;
+    this.clipSending = true;
+    this.renderMain();
+    try {
+      const rawBytes = new Uint8Array(await fileBlob.arrayBuffer());
+      const sha256Hex = await computeSha256Hex(rawBytes);
+      const thumb = await generateBitmapThumbnail(fileBlob, check.mime);
+      const clipId = generateUlid();
+      const now = Date.now();
+      const meta: ClipMetaV1 = {
+        v: 1,
+        kind: "image",
+        mime: check.mime,
+        source_mode: "explicit",
+        created_at_ms: now,
+        text: null,
+        blob: {
+          byte_size: rawBytes.byteLength,
+          sha256_hex: sha256Hex,
+          width: thumb.width,
+          height: thumb.height,
+          thumb_mime: thumb.thumb_mime,
+          thumb_b64: thumb.thumb_b64,
+        },
+      };
+      const metaEnv = codec.encryptMeta(clipId, JSON.stringify(meta), false);
+      const metaB64 = bytesToBase64Chunked(metaEnv);
+      const blobEnv = codec.encryptBlob(clipId, rawBytes);
+      const res = await putCloudClipBlob(
+        this.creds.sync_url,
+        this.creds.device_token,
+        { clipId, clipKid: codec.clipKid, kind: "image", metaEnvelopeB64: metaB64 },
+        blobEnv,
+      );
+      const cipherItem: CiphertextClipItem = {
+        clip_id: clipId,
+        clip_kid: codec.clipKid,
+        device_id: this.creds.device_id,
+        kind: "image",
+        created_at_ms: res.created_at_ms,
+        expires_at_ms: res.expires_at_ms,
+        meta_envelope_b64: metaB64,
+        has_blob: true,
+        blob_bytes: res.blob_bytes,
+      };
+      // SEC-08: ONLY ciphertext envelope saved to IndexedDB; decrypted thumb stays in RAM only!
+      this.clipItemsCipher = await saveClipItems([cipherItem], { replaceAll: false });
+      this.decryptedClips.set(clipId, meta);
+      await setLastClipId(clipId);
+      this.showToast(t("clip.toastSent"));
+      return true;
+    } catch (e) {
+      if (e instanceof CloudApiError && (e.status === 401 || e.code === "DEVICE_REVOKED")) {
+        this.handleDeviceRevoked();
+        return false;
+      }
+      const parsed = parseWasmError(e);
+      this.clipErrorMsg = `${parsed.code}: ${parsed.message}`;
+      this.showToast(this.clipErrorMsg, true);
+      return false;
+    } finally {
+      this.clipSending = false;
+      this.renderMain();
+    }
+  }
+
+  private async downloadAndVerifyClipBlob(item: CiphertextClipItem, meta: ClipMetaV1): Promise<Uint8Array> {
+    if (!this.creds || !this.clipCodec || this.clipCodec.isZeroized()) {
+      throw new Error(t("clip.errNoKey"));
+    }
+    const fetched = await getCloudClipBlob(this.creds.sync_url, this.creds.device_token, item.clip_id);
+    const authorDev = fetched.deviceId || item.device_id;
+    const rawBytes = this.clipCodec.decryptBlob(item.clip_id, authorDev, fetched.bytes);
+    const expectedHash = meta.blob?.sha256_hex?.toLowerCase() ?? "";
+    if (expectedHash) {
+      const actualHash = await computeSha256Hex(rawBytes);
+      if (actualHash !== expectedHash) {
+        throw new Error(t("clip.errIntegrity"));
+      }
+    }
+    return rawBytes;
+  }
+
+  private async fetchDecryptedPngBlob(item: CiphertextClipItem, meta: ClipMetaV1): Promise<Blob> {
+    if (!isAllowedBitmapMime(meta.mime)) {
+      throw new Error(t("clip.errUnsupportedMime", { mime: meta.mime }));
+    }
+    const rawBytes = await this.downloadAndVerifyClipBlob(item, meta);
+    return convertImageBytesToPngBlob(rawBytes, meta.mime as AllowedClipImageMime);
+  }
+
+  /**
+   * iOS Safari gesture-safe PNG copy: synchronously passes a `Promise<Blob>` inside `ClipboardItem`
+   * directly within the `click` event handler (ZERO `await` before `navigator.clipboard.write`).
+   */
+  private copyClipImageSyncGesture(item: CiphertextClipItem, meta: ClipMetaV1): void {
+    const ClipboardItemCtor = (globalThis as unknown as {
+      ClipboardItem?: new (items: Record<string, Blob | Promise<Blob>>) => ClipboardItem;
+    }).ClipboardItem;
+    if (!navigator.clipboard?.write || !ClipboardItemCtor) {
+      this.showToast(t("pwa.toastClipboardUnavailable"), true);
+      return;
+    }
+    const pngBlobPromise = this.fetchDecryptedPngBlob(item, meta);
+    navigator.clipboard.write([new ClipboardItemCtor({ "image/png": pngBlobPromise })]).then(
+      () => this.showToast(t("clip.toastImageCopied")),
+      (err) => {
+        const msg = err instanceof Error && err.message ? err.message : t("pwa.toastClipboardUnavailable");
+        this.showToast(msg, true);
+      },
+    );
+  }
+
+  private copyClipTextGesture(item: CiphertextClipItem, meta: ClipMetaV1): void {
+    if (!item.has_blob) {
+      this.copyTextGesture(meta.text ?? "", false);
+      return;
+    }
+    const ClipboardItemCtor = (globalThis as unknown as {
+      ClipboardItem?: new (items: Record<string, Blob | Promise<Blob>>) => ClipboardItem;
+    }).ClipboardItem;
+    const textPromise = this.downloadAndVerifyClipBlob(item, meta).then(
+      (raw) => new Blob([new Uint8Array(raw)], { type: "text/plain" }),
+    );
+    if (navigator.clipboard?.write && ClipboardItemCtor) {
+      navigator.clipboard.write([new ClipboardItemCtor({ "text/plain": textPromise })]).then(
+        () => this.showToast(t("pwa.toastCopied")),
+        () => this.showToast(t("pwa.toastClipboardUnavailable"), true),
+      );
+      return;
+    }
+    void textPromise
+      .then((b) => b.text())
+      .then((fullText) => this.copyTextGesture(fullText, false))
+      .catch(() => this.showToast(t("pwa.toastClipboardUnavailable"), true));
+  }
+
+  private async openClipImagePreview(item: CiphertextClipItem, meta: ClipMetaV1): Promise<void> {
+    if (!isAllowedBitmapMime(meta.mime)) {
+      this.showToast(t("clip.errSvgRejected"), true);
+      return;
+    }
+    this.closeModal();
+    const title = document.createElement("h3");
+    title.className = "onboard-title";
+    title.textContent = t("clip.previewModalTitle");
+    const status = document.createElement("p");
+    status.className = "muted";
+    status.textContent = t("clip.loadingPreview");
+    const closeRow = document.createElement("div");
+    closeRow.className = "pwa-row-end";
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "btn btn-sm";
+    closeBtn.textContent = t("topbar.close");
+    closeBtn.addEventListener("click", () => this.closeModal());
+    closeRow.appendChild(closeBtn);
+    this.modalCardEl.append(title, status, closeRow);
+    this.modalBackdropEl.classList.remove("hidden");
+
+    try {
+      const rawBytes = await this.downloadAndVerifyClipBlob(item, meta);
+      if (this.modalBackdropEl.classList.contains("hidden")) return;
+      const copy = new Uint8Array(rawBytes.byteLength);
+      copy.set(rawBytes);
+      const blob = new Blob([copy], { type: meta.mime });
+      const objUrl = URL.createObjectURL(blob);
+      this.activeModalObjectUrl = objUrl;
+      const img = document.createElement("img");
+      img.className = "pwa-clip-preview-img";
+      img.src = objUrl;
+      img.alt = t("clip.previewModalTitle");
+      this.modalCardEl.replaceChildren(title, img, closeRow);
+    } catch (e) {
+      this.closeModal();
+      this.showToast(e instanceof Error ? e.message : t("clip.errIntegrity"), true);
+    }
+  }
+
+  private async handleDeleteClip(clipId: string): Promise<void> {
+    if (!this.creds || !this.canWriteClip()) return;
+    try {
+      await deleteCloudClip(this.creds.sync_url, this.creds.device_token, clipId);
+      await deleteClipItemIdb(clipId);
+      this.clipItemsCipher = this.clipItemsCipher.filter((c) => c.clip_id !== clipId);
+      this.decryptedClips.delete(clipId);
+      this.renderMain();
+      this.showToast(t("clip.toastDeleted"));
+    } catch (e) {
+      this.showToast(e instanceof Error ? e.message : t("pwa.toastSyncFailed"), true);
+    }
+  }
+
+  private async handleClearClips(): Promise<void> {
+    if (!this.creds || !this.canWriteClip()) return;
+    try {
+      await deleteCloudClip(this.creds.sync_url, this.creds.device_token);
+      await clearClipItemsIdb();
+      this.clipItemsCipher = [];
+      this.decryptedClips.clear();
+      this.renderMain();
+      this.showToast(t("clip.toastCleared"));
+    } catch (e) {
+      this.showToast(e instanceof Error ? e.message : t("pwa.toastSyncFailed"), true);
+    }
+  }
+
+  private renderClipboardView(): void {
+    const view = document.createElement("section");
+    view.className = "pwa-clip-view";
+    view.dataset.testid = "pwa-clip-view";
+
+    if (this.canWriteClip()) {
+      const composer = document.createElement("div");
+      composer.className = "pwa-clip-composer";
+
+      const textarea = document.createElement("textarea");
+      textarea.className = "input pwa-clip-textarea";
+      textarea.rows = 3;
+      textarea.placeholder = t("pwa.clipTextareaPlaceholder");
+      textarea.value = this.clipDraftText;
+      textarea.dataset.testid = "pwa-clip-textarea";
+      textarea.addEventListener("input", () => {
+        this.clipDraftText = textarea.value;
+        if (this.clipErrorMsg) {
+          this.clipErrorMsg = null;
+          errBox.classList.add("hidden");
+        }
+      });
+      textarea.addEventListener("paste", (ev) => {
+        const files = ev.clipboardData?.files;
+        if (files && files.length > 0) {
+          for (let i = 0; i < files.length; i++) {
+            const f = files[i];
+            if (f && (f.type.toLowerCase().startsWith("image/") || f.name.toLowerCase().endsWith(".svg"))) {
+              ev.preventDefault();
+              const mime = f.type || (f.name.toLowerCase().endsWith(".svg") ? "image/svg+xml" : "");
+              void this.sendClipImage(f, mime);
+              return;
+            }
+          }
+        }
+      });
+
+      const controls = document.createElement("div");
+      controls.className = "pwa-clip-composer-row";
+
+      const ephLabel = document.createElement("label");
+      ephLabel.className = "pwa-clip-check";
+      const ephCheck = document.createElement("input");
+      ephCheck.type = "checkbox";
+      ephCheck.checked = this.clipEphemeral;
+      ephCheck.dataset.testid = "pwa-clip-ephemeral";
+      ephCheck.addEventListener("change", () => {
+        this.clipEphemeral = ephCheck.checked;
+      });
+      const ephSpan = document.createElement("span");
+      ephSpan.textContent = t("clip.ephemeralShort");
+      ephLabel.append(ephCheck, ephSpan);
+
+      const actionCluster = document.createElement("div");
+      actionCluster.className = "pwa-clip-actions";
+
+      const fileLabel = document.createElement("label");
+      fileLabel.className = "btn btn-sm btn-has-icon pwa-file-label";
+      fileLabel.title = t("clip.pickImageTitle");
+      const fileInput = document.createElement("input");
+      fileInput.type = "file";
+      fileInput.className = "sr-only";
+      fileInput.accept = "image/png,image/jpeg,image/webp,image/gif";
+      fileInput.dataset.testid = "pwa-clip-file";
+      fileInput.addEventListener("change", () => {
+        const file = fileInput.files?.[0];
+        fileInput.value = "";
+        if (file) {
+          const mime = file.type || (file.name.toLowerCase().endsWith(".svg") ? "image/svg+xml" : "");
+          void this.sendClipImage(file, mime);
+        }
+      });
+      const fileText = document.createElement("span");
+      fileText.textContent = t("clip.pickImage");
+      fileLabel.append(createIcon("image", "xs"), fileText, fileInput);
+
+      const sendBtn = document.createElement("button");
+      sendBtn.type = "button";
+      sendBtn.className = "btn btn-primary btn-sm btn-has-icon";
+      sendBtn.dataset.testid = "pwa-clip-send";
+      sendBtn.disabled = this.clipSending;
+      const sendSpan = document.createElement("span");
+      sendSpan.textContent = this.clipSending ? t("clip.sending") : t("clip.send");
+      sendBtn.append(createIcon("send", "xs"), sendSpan);
+      sendBtn.addEventListener("click", () => void this.sendClipText(this.clipDraftText, this.clipEphemeral));
+
+      actionCluster.append(fileLabel, sendBtn);
+      controls.append(ephLabel, actionCluster);
+
+      const errBox = document.createElement("div");
+      errBox.className = `pwa-clip-error${this.clipErrorMsg ? "" : " hidden"}`;
+      errBox.dataset.testid = "pwa-clip-error";
+      errBox.setAttribute("role", "alert");
+      if (this.clipErrorMsg) {
+        errBox.append(createIcon("alert-triangle", "xs"), document.createTextNode(this.clipErrorMsg));
+      }
+
+      composer.append(textarea, controls, errBox);
+      view.appendChild(composer);
+    } else {
+      const notice = document.createElement("div");
+      notice.className = "pwa-clip-notice";
+      notice.dataset.testid = "pwa-clip-readonly-notice";
+      notice.textContent = t("clip.errReadOnlyScope");
+      view.appendChild(notice);
+    }
+
+    const listBar = document.createElement("div");
+    listBar.className = "pwa-clip-list-bar";
+    const countSpan = document.createElement("span");
+    countSpan.textContent = `${t("clip.title")} · ${t("clip.count", { count: this.clipItemsCipher.length })}`;
+    listBar.appendChild(countSpan);
+
+    if (this.canWriteClip() && this.clipItemsCipher.length > 0) {
+      const clearBtn = document.createElement("button");
+      clearBtn.type = "button";
+      clearBtn.className = "btn btn-ghost btn-danger btn-sm";
+      clearBtn.dataset.testid = "pwa-clip-clear";
+      clearBtn.textContent = t("clip.clearAll");
+      clearBtn.addEventListener("click", () => void this.handleClearClips());
+      listBar.appendChild(clearBtn);
+    }
+    view.appendChild(listBar);
+
+    const list = document.createElement("div");
+    list.className = "pwa-clip-list";
+    list.dataset.testid = "pwa-clip-list";
+
+    if (this.clipItemsCipher.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "onboard-card";
+      empty.textContent = t("clip.empty");
+      list.appendChild(empty);
+    } else {
+      for (const row of this.clipItemsCipher) {
+        const meta = this.decryptedClips.get(row.clip_id);
+        const card = document.createElement("article");
+        card.className = "pwa-clip-card";
+        card.dataset.clipId = row.clip_id;
+
+        const head = document.createElement("div");
+        head.className = "pwa-clip-card-head";
+
+        const metaDiv = document.createElement("div");
+        metaDiv.className = "pwa-clip-card-meta";
+        const kindBadge = document.createElement("span");
+        kindBadge.className = "badge";
+        kindBadge.textContent =
+          row.kind === "image"
+            ? (meta?.mime ? meta.mime.replace(/^image\//, "").toUpperCase() : t("clip.kindImage"))
+            : t("clip.kindText");
+        metaDiv.appendChild(kindBadge);
+
+        if (meta?.blob?.width && meta.blob.height) {
+          const dim = document.createElement("span");
+          dim.textContent = `${meta.blob.width}x${meta.blob.height}`;
+          metaDiv.appendChild(dim);
+        }
+        const byteCount = meta?.blob?.byte_size ?? row.blob_bytes;
+        if (byteCount) {
+          const sz = document.createElement("span");
+          sz.textContent = formatClipBytes(byteCount);
+          metaDiv.appendChild(sz);
+        }
+        const dev = formatDeviceName(row.device_id);
+        const ts = formatHistoryTimestamp(row.created_at_ms);
+        if (dev || ts) {
+          const orig = document.createElement("span");
+          orig.textContent = dev && ts ? `${dev} · ${ts}` : dev || ts;
+          metaDiv.appendChild(orig);
+        }
+
+        const actions = document.createElement("div");
+        actions.className = "pwa-clip-card-actions";
+        if (meta) {
+          const copyBtn = document.createElement("button");
+          copyBtn.type = "button";
+          copyBtn.className = "btn btn-sm btn-has-icon";
+          copyBtn.dataset.testid = `pwa-clip-copy-${row.clip_id}`;
+          const cLbl = document.createElement("span");
+          cLbl.textContent = row.kind === "image" ? t("pwa.clipCopyImage") : t("block.copy");
+          copyBtn.append(createIcon("copy", "xs"), cLbl);
+          copyBtn.addEventListener("click", () => {
+            if (row.kind === "image") {
+              this.copyClipImageSyncGesture(row, meta);
+            } else {
+              this.copyClipTextGesture(row, meta);
+            }
+          });
+          actions.appendChild(copyBtn);
+
+          if (row.kind === "image") {
+            const prevBtn = document.createElement("button");
+            prevBtn.type = "button";
+            prevBtn.className = "btn btn-ghost btn-sm btn-has-icon";
+            prevBtn.dataset.testid = `pwa-clip-preview-${row.clip_id}`;
+            const pLbl = document.createElement("span");
+            pLbl.textContent = t("clip.preview");
+            prevBtn.append(createIcon("eye", "xs"), pLbl);
+            prevBtn.addEventListener("click", () => void this.openClipImagePreview(row, meta));
+            actions.appendChild(prevBtn);
+          }
+        }
+
+        if (this.canWriteClip()) {
+          const delBtn = document.createElement("button");
+          delBtn.type = "button";
+          delBtn.className = "btn btn-ghost btn-danger btn-sm";
+          delBtn.dataset.testid = `pwa-clip-delete-${row.clip_id}`;
+          delBtn.setAttribute("aria-label", t("clip.delete"));
+          delBtn.appendChild(createIcon("trash", "xs"));
+          delBtn.addEventListener("click", () => void this.handleDeleteClip(row.clip_id));
+          actions.appendChild(delBtn);
+        }
+
+        head.append(metaDiv, actions);
+        card.appendChild(head);
+
+        if (!meta) {
+          const locked = document.createElement("div");
+          locked.className = "ro-locked-body";
+          locked.append(createIcon("alert-triangle", "xs"), document.createTextNode(t("pwa.clipUnreadableItem")));
+          card.appendChild(locked);
+        } else if (row.kind === "image") {
+          const thumbWrap = document.createElement("div");
+          thumbWrap.className = "pwa-clip-thumb-wrap";
+          if (meta.blob?.thumb_mime && meta.blob.thumb_b64 && isAllowedBitmapMime(meta.blob.thumb_mime)) {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "pwa-clip-thumb-btn";
+            btn.addEventListener("click", () => void this.openClipImagePreview(row, meta));
+            const img = document.createElement("img");
+            img.className = "pwa-clip-thumb-img";
+            img.src = `data:${meta.blob.thumb_mime};base64,${meta.blob.thumb_b64}`;
+            img.alt = t("clip.kindImage");
+            btn.appendChild(img);
+            thumbWrap.appendChild(btn);
+          } else {
+            const ph = document.createElement("div");
+            ph.className = "muted";
+            ph.append(createIcon("image", "xs"), document.createTextNode(` ${meta.mime}`));
+            thumbWrap.appendChild(ph);
+          }
+          card.appendChild(thumbWrap);
+        } else {
+          const pre = document.createElement("pre");
+          pre.className = "ro-pre";
+          pre.textContent = meta.text ?? "";
+          card.appendChild(pre);
+        }
+
+        list.appendChild(card);
+      }
+    }
+
+    view.appendChild(list);
+    this.mainEl.appendChild(view);
   }
 
   private renderFooter(): void {
