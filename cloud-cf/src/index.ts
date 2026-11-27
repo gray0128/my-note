@@ -5,15 +5,21 @@ export interface Env {
   SYNC_DO: DurableObjectNamespace<SyncJournalDO>; ARCHIVE_BUCKET: R2Bucket; BOOTSTRAP_TOKEN: string; ASSETS?: Fetcher;
   DAILY_ARCHIVE_INTERVAL_MS?: string; PAIRING_TTL_MS?: string; T_GRACE_MIN_MS?: string; SHRED_BATCH_LIMIT_24H?: string; ALLOW_TEST_HOOKS?: string;
 }
-type Scope = "read" | "read-write";
+type Scope = "read" | "read+clip" | "clip-write" | "read-write";
+type ClipKind = "text" | "image";
 interface WsMeta { deviceId: string; scope: Scope; }
 interface KeyRecIn { key_id: string; wrap_gen: number; key_record_b64: string; }
 interface ShredMarkIn { mark_id: string; key_id: string; grace_ms: number; requested_by?: string; }
 interface ShredResultOut { key_id: string; state: ShredMarkState; not_before_ms: number | null; }
 class RelayError extends Error { constructor(public status: number, public code: string, message: string, public retryable = false, public details?: Record<string, unknown>) { super(message); } }
 const jsonRes = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
+const cancelBody = async (req: Request): Promise<void> => { if (req.body && !req.bodyUsed) { try { await req.body.cancel(); } catch { /* ignore */ } } };
+const VALID_SCOPES = new Set<string>(["read", "read+clip", "clip-write", "read-write"]);
+const isScope = (v: unknown): v is Scope => typeof v === "string" && VALID_SCOPES.has(v);
+const isClipKind = (v: unknown): v is ClipKind => v === "text" || v === "image";
 const MAX_PUSH_OPS = 500, MAX_PUSH_BYTES = 4 * 1024 * 1024, MAX_ARCHIVE_BYTES = 8 * 1024 * 1024, MAX_SNAP_BYTES = 16 * 1024 * 1024;
-const HEX64 = /^[0-9a-f]{64}$/i, DEV_ID_RE = /^dev_[a-z0-9_]{4,44}$/, SNAP_ID_RE = /^[0-9A-Za-z_-]{1,64}$/, INT_RE = /^\d+$/, DAY_MS = 86_400_000, WEEK_MS = 7 * DAY_MS;
+const CLIP_MAX_ITEMS = 100, CLIP_MAX_META_BYTES = 96 * 1024, CLIP_MAX_BLOB_META_BYTES = 32 * 1024, CLIP_MAX_BLOB_BYTES = 11_010_048, CLIP_MAX_EPHEMERAL_BYTES = 256 * 1024, MAX_CLIP_JSON_BYTES = 512 * 1024;
+const HEX64 = /^[0-9a-f]{64}$/i, DEV_ID_RE = /^dev_[a-z0-9_]{4,44}$/, SNAP_ID_RE = /^[0-9A-Za-z_-]{1,64}$/, ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/, INT_RE = /^\d+$/, DAY_MS = 86_400_000, WEEK_MS = 7 * DAY_MS, CLIP_TTL_MS = WEEK_MS;
 const posInt = (raw: string | undefined, def: number): number => { const n = Number(raw); return Number.isSafeInteger(n) && n > 0 ? n : def; };
 const buildPwaCsp = (u: URL): string => `default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data: blob:; font-src 'self'; manifest-src 'self'; worker-src 'self'; connect-src 'self' ${u.protocol === "http:" ? "ws:" : "wss:"}//${u.host}; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`;
 
@@ -21,6 +27,7 @@ export class SyncJournalDO extends DurableObject<Env> {
   private sql: SqlStorage;
   private epoch = "";
   private clockOffsetMs = 0;
+  private failNextClipBlobRegister = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -40,6 +47,8 @@ export class SyncJournalDO extends DurableObject<Env> {
   private metaSet(key: string, val: string): void { this.sql.exec(`INSERT OR REPLACE INTO journal_meta (key, value) VALUES (?, ?)`, key, val); }
 
   setClockOffsetMs(offsetMs: number): number { this.assertTestHook(); this.clockOffsetMs = offsetMs; return this.nowMs(); }
+  setFailNextClipBlobRegister(fail: boolean): void { this.assertTestHook(); this.failNextClipBlobRegister = fail; }
+  runInitSchemaForTest(): void { this.assertTestHook(); this.initSchema(); }
   async simulateWakeupReschedule(): Promise<number | null> { this.assertTestHook(); await this.rescheduleAlarm(this.nowMs()); return this.ctx.storage.getAlarm(); }
   simulatePitrRollback(keepSeq: number, newEpoch?: string): string {
     this.assertTestHook();
@@ -55,17 +64,48 @@ export class SyncJournalDO extends DurableObject<Env> {
   private initSchema(): void {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS journal_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, device_name TEXT NOT NULL, token_sha256_hex TEXT NOT NULL UNIQUE, scope TEXT NOT NULL CHECK (scope IN ('read', 'read-write')), last_pulled_seq INTEGER NOT NULL DEFAULT 0, last_seen_at_ms INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, claimed_at_ms INTEGER, revoked_at_ms INTEGER);
-      CREATE TABLE IF NOT EXISTS pairing_tickets (pair_id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'pair' CHECK (kind IN ('pair', 'refresh')), device_id TEXT NOT NULL REFERENCES devices(device_id), scope TEXT NOT NULL CHECK (scope IN ('read', 'read-write')), ciphertext BLOB NOT NULL, created_by TEXT NOT NULL, expires_at_ms INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, device_name TEXT NOT NULL, token_sha256_hex TEXT NOT NULL UNIQUE, scope TEXT NOT NULL CHECK (scope IN ('read', 'read+clip', 'clip-write', 'read-write')), last_pulled_seq INTEGER NOT NULL DEFAULT 0, last_seen_at_ms INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, claimed_at_ms INTEGER, revoked_at_ms INTEGER);
+      CREATE TABLE IF NOT EXISTS pairing_tickets (pair_id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'pair' CHECK (kind IN ('pair', 'refresh')), device_id TEXT NOT NULL REFERENCES devices(device_id), scope TEXT NOT NULL CHECK (scope IN ('read', 'read+clip', 'clip-write', 'read-write')), ciphertext BLOB NOT NULL, created_by TEXT NOT NULL, expires_at_ms INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS ops (seq INTEGER PRIMARY KEY, op_id TEXT NOT NULL UNIQUE, device_id TEXT NOT NULL, created_at INTEGER NOT NULL, key_id TEXT, envelope BLOB NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_ops_key ON ops (key_id, seq) WHERE key_id IS NOT NULL;
       CREATE TABLE IF NOT EXISTS block_keys (key_id TEXT PRIMARY KEY, wrap_gen INTEGER NOT NULL, key_record BLOB, created_by_device TEXT NOT NULL, created_at_ms INTEGER NOT NULL, shredded_at_ms INTEGER);
       CREATE TABLE IF NOT EXISTS shred_marks (mark_id TEXT PRIMARY KEY, key_id TEXT NOT NULL REFERENCES block_keys(key_id), seen_seq INTEGER NOT NULL, requested_by TEXT NOT NULL, requested_at_ms INTEGER NOT NULL, grace_ms INTEGER NOT NULL, not_before_ms INTEGER, state TEXT NOT NULL CHECK (state IN ('pending_confirm', 'scheduled', 'cancelled', 'executed')), confirmed_at_ms INTEGER, cancelled_by TEXT, executed_at_ms INTEGER);
       CREATE INDEX IF NOT EXISTS idx_shred_marks_due ON shred_marks (not_before_ms) WHERE state = 'scheduled';
       CREATE INDEX IF NOT EXISTS idx_shred_marks_key ON shred_marks (key_id);
-      CREATE TABLE IF NOT EXISTS key_material (kind TEXT PRIMARY KEY CHECK (kind IN ('keyring', 'vault_header')), gen INTEGER NOT NULL, blob BLOB NOT NULL, updated_at_ms INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS key_material (kind TEXT PRIMARY KEY CHECK (kind IN ('keyring', 'vault_header', 'clip_key')), gen INTEGER NOT NULL, blob BLOB NOT NULL, updated_at_ms INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS phone_snapshots (snapshot_id TEXT PRIMARY KEY, journal_epoch TEXT NOT NULL, covers_seq INTEGER NOT NULL, r2_key TEXT NOT NULL, created_by TEXT NOT NULL, created_at_ms INTEGER NOT NULL, UNIQUE (journal_epoch, covers_seq));
+      CREATE TABLE IF NOT EXISTS clip_items (clip_id TEXT PRIMARY KEY, clip_kid TEXT NOT NULL, device_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('text', 'image')), created_at_ms INTEGER NOT NULL, expires_at_ms INTEGER NOT NULL, meta_envelope BLOB NOT NULL, r2_key TEXT, blob_bytes INTEGER);
+      CREATE INDEX IF NOT EXISTS idx_clip_items_expires ON clip_items (expires_at_ms);
     `);
+    const tableSql = (name: string): string => String(this.sql.exec(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`, name).toArray()[0]?.sql ?? "");
+    const needsScopeMig = !tableSql("devices").includes("'read+clip'") || !tableSql("pairing_tickets").includes("'read+clip'");
+    const needsKmMig = !tableSql("key_material").includes("'clip_key'");
+    if (needsScopeMig || needsKmMig) {
+      this.ctx.storage.transactionSync(() => {
+        if (needsScopeMig) {
+          this.sql.exec(`
+            CREATE TABLE devices_m4 (device_id TEXT PRIMARY KEY, device_name TEXT NOT NULL, token_sha256_hex TEXT NOT NULL UNIQUE, scope TEXT NOT NULL CHECK (scope IN ('read', 'read+clip', 'clip-write', 'read-write')), last_pulled_seq INTEGER NOT NULL DEFAULT 0, last_seen_at_ms INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, claimed_at_ms INTEGER, revoked_at_ms INTEGER);
+            INSERT INTO devices_m4 SELECT device_id, device_name, token_sha256_hex, scope, last_pulled_seq, last_seen_at_ms, created_at_ms, claimed_at_ms, revoked_at_ms FROM devices;
+            CREATE TABLE pairing_tickets_tmp (pair_id TEXT PRIMARY KEY, kind TEXT NOT NULL, device_id TEXT NOT NULL, scope TEXT NOT NULL, ciphertext BLOB NOT NULL, created_by TEXT NOT NULL, expires_at_ms INTEGER NOT NULL);
+            INSERT INTO pairing_tickets_tmp SELECT pair_id, kind, device_id, scope, ciphertext, created_by, expires_at_ms FROM pairing_tickets;
+            DROP TABLE pairing_tickets;
+            DROP TABLE devices;
+            ALTER TABLE devices_m4 RENAME TO devices;
+            CREATE TABLE pairing_tickets (pair_id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'pair' CHECK (kind IN ('pair', 'refresh')), device_id TEXT NOT NULL REFERENCES devices(device_id), scope TEXT NOT NULL CHECK (scope IN ('read', 'read+clip', 'clip-write', 'read-write')), ciphertext BLOB NOT NULL, created_by TEXT NOT NULL, expires_at_ms INTEGER NOT NULL);
+            INSERT INTO pairing_tickets SELECT pair_id, kind, device_id, scope, ciphertext, created_by, expires_at_ms FROM pairing_tickets_tmp;
+            DROP TABLE pairing_tickets_tmp;
+          `);
+        }
+        if (needsKmMig) {
+          this.sql.exec(`
+            CREATE TABLE key_material_m4 (kind TEXT PRIMARY KEY CHECK (kind IN ('keyring', 'vault_header', 'clip_key')), gen INTEGER NOT NULL, blob BLOB NOT NULL, updated_at_ms INTEGER NOT NULL);
+            INSERT INTO key_material_m4 SELECT kind, gen, blob, updated_at_ms FROM key_material;
+            DROP TABLE key_material;
+            ALTER TABLE key_material_m4 RENAME TO key_material;
+          `);
+        }
+      });
+    }
     const existing = this.metaGet("journal_epoch");
     if (existing) this.epoch = existing;
     else { this.epoch = crypto.randomUUID(); this.metaSet("journal_epoch", this.epoch); this.metaSet("last_archive_seq", "0"); this.metaSet("m2_migration_exempt_used", "1"); }
@@ -78,12 +118,14 @@ export class SyncJournalDO extends DurableObject<Env> {
       mark_id: String(m.mark_id), key_id: String(m.key_id), seen_seq: Number(m.seen_seq), requested_by: String(m.requested_by), requested_at_ms: Number(m.requested_at_ms), grace_ms: Number(m.grace_ms),
       not_before_ms: m.not_before_ms === null ? null : Number(m.not_before_ms), state: String(m.state) as ShredMarkState, confirmed_at_ms: m.confirmed_at_ms === null ? null : Number(m.confirmed_at_ms), cancelled_by: m.cancelled_by === null ? null : String(m.cancelled_by), executed_at_ms: m.executed_at_ms === null ? null : Number(m.executed_at_ms),
     }));
-    let keyring: KeyMaterialEntry | null = null, vaultHeader: KeyMaterialEntry | null = null;
+    let keyring: KeyMaterialEntry | null = null, vaultHeader: KeyMaterialEntry | null = null, clipKey: KeyMaterialEntry | null = null;
     for (const m of this.sql.exec(`SELECT kind, gen, blob FROM key_material`).toArray()) {
       const entry = { gen: Number(m.gen), blob: toU8(m.blob) };
-      if (m.kind === "keyring") keyring = entry; else if (m.kind === "vault_header") vaultHeader = entry;
+      if (m.kind === "keyring") keyring = entry;
+      else if (m.kind === "vault_header") vaultHeader = entry;
+      else if (m.kind === "clip_key") clipKey = entry;
     }
-    return { records, marks, keyring, vaultHeader, digest: computeKeysDigest(records, marks, keyring, vaultHeader) };
+    return { records, marks, keyring, vaultHeader, clipKey, digest: computeKeysDigest(records, marks, keyring, vaultHeader) };
   }
 
   private upsertKeyRecord(rec: KeyRecIn, deviceId: string, now: number): void {
@@ -97,7 +139,7 @@ export class SyncJournalDO extends DurableObject<Env> {
     else if (rec.wrap_gen === curGen && !bytesEqual(toU8(cur.key_record), raw)) throw new RelayError(409, "INTEGRITY_ERROR", `conflicting key_record at wrap_gen=${curGen}`, false, { key_id: rec.key_id });
   }
 
-  private upsertKeyMaterial(kind: "keyring" | "vault_header", gen: number, blobB64: string, now: number): number {
+  private upsertKeyMaterial(kind: "keyring" | "vault_header" | "clip_key", gen: number, blobB64: string, now: number): number {
     if (!Number.isSafeInteger(gen) || gen < 0) throw new RelayError(400, "INVALID_ARGUMENT", `invalid ${kind} gen`);
     const raw = b64ToBytes(blobB64);
     const cur = this.sql.exec(`SELECT gen, blob FROM key_material WHERE kind = ?`, kind).toArray()[0];
@@ -201,6 +243,27 @@ export class SyncJournalDO extends DurableObject<Env> {
     }
   }
 
+  private broadcastClip(excludeDeviceId: string | null, payload: Record<string, unknown>): void {
+    const msg = JSON.stringify(payload);
+    for (const ws of this.ctx.getWebSockets()) {
+      const meta = ws.deserializeAttachment() as WsMeta | null;
+      if (meta && meta.scope !== "clip-write" && (!excludeDeviceId || meta.deviceId !== excludeDeviceId)) { try { ws.send(msg); } catch { /* ignore */ } }
+    }
+  }
+
+  private async deleteR2Keys(keys: string[]): Promise<void> {
+    for (const k of keys) { try { await this.env.ARCHIVE_BUCKET.delete(k); } catch { /* best-effort R2 cleanup */ } }
+  }
+
+  private pruneClipOverflow(): string[] {
+    const evicted: string[] = [];
+    for (const r of this.sql.exec(`SELECT clip_id, r2_key FROM clip_items ORDER BY clip_id DESC LIMIT -1 OFFSET ?`, CLIP_MAX_ITEMS).toArray()) {
+      this.sql.exec(`DELETE FROM clip_items WHERE clip_id = ?`, r.clip_id);
+      if (r.r2_key !== null) evicted.push(String(r.r2_key));
+    }
+    return evicted;
+  }
+
   private disconnectDeviceWs(deviceId: string): void {
     const msg = JSON.stringify({ type: "device_revoked" });
     for (const ws of this.ctx.getWebSockets()) {
@@ -208,7 +271,7 @@ export class SyncJournalDO extends DurableObject<Env> {
     }
   }
 
-  private async authenticate(req: Request, now: number): Promise<WsMeta> {
+  private async authenticate(req: Request, now: number, touchLastSeen = true): Promise<WsMeta> {
     const auth = req.headers.get("authorization") ?? "";
     let token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
     if (!token && req.headers.get("upgrade")?.toLowerCase() === "websocket") {
@@ -219,8 +282,9 @@ export class SyncJournalDO extends DurableObject<Env> {
     const row = this.sql.exec(`SELECT device_id, scope, claimed_at_ms, revoked_at_ms FROM devices WHERE token_sha256_hex = ?`, await sha256Hex(token)).toArray()[0];
     if (!row || row.claimed_at_ms === null) throw new RelayError(401, "AUTH_REQUIRED", "unknown or unclaimed device token");
     if (row.revoked_at_ms !== null) throw new RelayError(401, "DEVICE_REVOKED", "device token revoked");
-    this.sql.exec(`UPDATE devices SET last_seen_at_ms = ? WHERE device_id = ?`, now, row.device_id);
-    return { deviceId: String(row.device_id), scope: String(row.scope) as Scope };
+    if (!isScope(row.scope)) throw new RelayError(500, "INTEGRITY_ERROR", "invalid stored device scope");
+    if (touchLastSeen) this.sql.exec(`UPDATE devices SET last_seen_at_ms = ? WHERE device_id = ?`, now, row.device_id);
+    return { deviceId: String(row.device_id), scope: row.scope };
   }
 
   private async rescheduleAlarm(now: number): Promise<void> {
@@ -231,11 +295,95 @@ export class SyncJournalDO extends DurableObject<Env> {
     if (duePair?.t !== null && duePair?.t !== undefined) nextAt = Math.min(nextAt, Number(duePair.t));
     const dueShred = this.sql.exec(`SELECT MIN(not_before_ms) AS t FROM shred_marks WHERE state = 'scheduled' AND not_before_ms IS NOT NULL`).toArray()[0];
     if (dueShred?.t !== null && dueShred?.t !== undefined) nextAt = Math.min(nextAt, Number(dueShred.t));
+    const dueClip = this.sql.exec(`SELECT MIN(expires_at_ms) AS t FROM clip_items`).toArray()[0];
+    if (dueClip?.t !== null && dueClip?.t !== undefined) nextAt = Math.min(nextAt, Number(dueClip.t));
     await this.ctx.storage.setAlarm(Math.max(Date.now() + 1_000, nextAt - this.clockOffsetMs));
+  }
+
+  private async handleClipPost(req: Request, auth: WsMeta, now: number): Promise<Response> {
+    const raw = await req.text();
+    if (raw.length > MAX_CLIP_JSON_BYTES) throw new RelayError(413, "PAYLOAD_TOO_LARGE", "clip request body too large");
+    const b = JSON.parse(raw) as { clip_id?: unknown; clip_kid?: unknown; kind?: unknown; ephemeral?: unknown; meta_envelope_b64?: unknown };
+    if (typeof b.clip_id !== "string" || !ULID_RE.test(b.clip_id) || typeof b.clip_kid !== "string" || !ULID_RE.test(b.clip_kid) || b.kind !== "text") {
+      throw new RelayError(400, "INVALID_ARGUMENT", "invalid clip_id, clip_kid, or kind");
+    }
+    if (b.ephemeral !== undefined && typeof b.ephemeral !== "boolean") throw new RelayError(400, "INVALID_ARGUMENT", "ephemeral must be boolean");
+    const envBytes = b64ToBytes(b.meta_envelope_b64);
+    if (envBytes.byteLength === 0) throw new RelayError(400, "INVALID_ARGUMENT", "empty meta_envelope_b64");
+    if (b.ephemeral === true) {
+      if (envBytes.byteLength > CLIP_MAX_EPHEMERAL_BYTES) throw new RelayError(413, "PAYLOAD_TOO_LARGE", "ephemeral clip exceeds 256 KiB");
+      const frame = JSON.stringify({ type: "clip_ephemeral", clip_id: b.clip_id, clip_kid: b.clip_kid, device_id: auth.deviceId, envelope_b64: b.meta_envelope_b64 });
+      let deliveredTo = 0;
+      for (const ws of this.ctx.getWebSockets()) {
+        const meta = ws.deserializeAttachment() as WsMeta | null;
+        if (meta?.scope === "read-write" && meta.deviceId !== auth.deviceId) { try { ws.send(frame); deliveredTo++; } catch { /* ignore stale socket */ } }
+      }
+      if (deliveredTo === 0) throw new RelayError(409, "NO_ONLINE_DESKTOP", "no online desktop daemon to receive ephemeral clip", true);
+      return jsonRes({ ok: true, clip_id: b.clip_id, delivered_to: deliveredTo });
+    }
+    if (envBytes.byteLength > CLIP_MAX_META_BYTES) throw new RelayError(413, "PAYLOAD_TOO_LARGE", "clip meta envelope exceeds 96 KiB");
+    let createdAtMs = now, expiresAtMs = now + CLIP_TTL_MS, inserted = false, evictedR2Keys: string[] = [];
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(`UPDATE devices SET last_seen_at_ms = ? WHERE device_id = ?`, now, auth.deviceId);
+      const existing = this.sql.exec(`SELECT created_at_ms, expires_at_ms FROM clip_items WHERE clip_id = ?`, b.clip_id as string).toArray()[0];
+      if (existing) { createdAtMs = Number(existing.created_at_ms); expiresAtMs = Number(existing.expires_at_ms); return; }
+      this.sql.exec(`INSERT INTO clip_items (clip_id, clip_kid, device_id, kind, created_at_ms, expires_at_ms, meta_envelope, r2_key, blob_bytes) VALUES (?, ?, ?, 'text', ?, ?, ?, NULL, NULL)`, b.clip_id as string, b.clip_kid as string, auth.deviceId, createdAtMs, expiresAtMs, envBytes);
+      evictedR2Keys = this.pruneClipOverflow();
+      inserted = true;
+    });
+    if (evictedR2Keys.length > 0) await this.deleteR2Keys(evictedR2Keys);
+    if (inserted) { await this.rescheduleAlarm(now); this.broadcastClip(auth.deviceId, { type: "clip_wake", clip_id: b.clip_id, kind: "text", created_at_ms: createdAtMs }); }
+    return jsonRes({ ok: true, clip_id: b.clip_id, created_at_ms: createdAtMs, expires_at_ms: expiresAtMs });
+  }
+
+  private async handleClipBlobPut(req: Request, auth: WsMeta, now: number): Promise<Response> {
+    const clipId = req.headers.get("x-clip-id")?.trim() ?? "", clipKid = req.headers.get("x-clip-kid")?.trim() ?? "", kind = req.headers.get("x-clip-kind")?.trim() ?? "", metaB64 = req.headers.get("x-clip-meta-b64")?.trim() ?? "", clRaw = req.headers.get("content-length")?.trim() ?? "";
+    if (!ULID_RE.test(clipId) || !ULID_RE.test(clipKid) || !isClipKind(kind) || !metaB64) throw new RelayError(400, "INVALID_ARGUMENT", "invalid X-Clip-* headers");
+    const metaBytes = b64ToBytes(metaB64);
+    if (metaBytes.byteLength === 0 || metaBytes.byteLength > CLIP_MAX_BLOB_META_BYTES) throw new RelayError(400, "INVALID_ARGUMENT", "X-Clip-Meta-B64 must decode to 1..32768 bytes");
+    if (!INT_RE.test(clRaw)) throw new RelayError(400, "INVALID_ARGUMENT", "missing or invalid Content-Length");
+    const contentLength = Number(clRaw);
+    if (!Number.isSafeInteger(contentLength) || contentLength <= 0) throw new RelayError(400, "INVALID_ARGUMENT", "Content-Length must be positive");
+    if (contentLength > CLIP_MAX_BLOB_BYTES) throw new RelayError(413, "PAYLOAD_TOO_LARGE", `clip blob exceeds ${CLIP_MAX_BLOB_BYTES} bytes`);
+    if (!req.body) throw new RelayError(400, "INVALID_ARGUMENT", "request body required");
+    const existing0 = this.sql.exec(`SELECT created_at_ms, expires_at_ms, blob_bytes FROM clip_items WHERE clip_id = ?`, clipId).toArray()[0];
+    if (existing0) {
+      await cancelBody(req);
+      return jsonRes({ ok: true, clip_id: clipId, blob_bytes: Number(existing0.blob_bytes ?? contentLength), created_at_ms: Number(existing0.created_at_ms), expires_at_ms: Number(existing0.expires_at_ms) });
+    }
+    const r2Key = `clip/blobs/${clipId}.mnc1`;
+    const fixed = new FixedLengthStream(contentLength);
+    const [pipeRes, putRes] = await Promise.allSettled([
+      req.body.pipeTo(fixed.writable),
+      this.env.ARCHIVE_BUCKET.put(r2Key, fixed.readable, { httpMetadata: { contentType: "application/octet-stream" }, customMetadata: { clip_id: clipId, clip_kid: clipKid, device_id: auth.deviceId } }),
+    ]);
+    if (pipeRes.status === "rejected" || putRes.status === "rejected" || !putRes.value) {
+      await this.deleteR2Keys([r2Key]);
+      const reason = pipeRes.status === "rejected" ? String(pipeRes.reason) : putRes.status === "rejected" ? String(putRes.reason) : "R2 put returned null";
+      throw new RelayError(400, "INVALID_ARGUMENT", `CONTENT_LENGTH_MISMATCH: ${reason}`);
+    }
+    let createdAtMs = now, expiresAtMs = now + CLIP_TTL_MS, blobBytes = contentLength, inserted = false, evictedR2Keys: string[] = [];
+    try {
+      this.ctx.storage.transactionSync(() => {
+        if (this.failNextClipBlobRegister) { this.failNextClipBlobRegister = false; throw new RelayError(503, "SYNC_OFFLINE", "injected DO clip registration failure", true); }
+        const existing = this.sql.exec(`SELECT created_at_ms, expires_at_ms, blob_bytes FROM clip_items WHERE clip_id = ?`, clipId).toArray()[0];
+        if (existing) { createdAtMs = Number(existing.created_at_ms); expiresAtMs = Number(existing.expires_at_ms); blobBytes = Number(existing.blob_bytes ?? contentLength); return; }
+        this.sql.exec(`INSERT INTO clip_items (clip_id, clip_kid, device_id, kind, created_at_ms, expires_at_ms, meta_envelope, r2_key, blob_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, clipId, clipKid, auth.deviceId, kind, createdAtMs, expiresAtMs, metaBytes, r2Key, contentLength);
+        evictedR2Keys = this.pruneClipOverflow();
+        inserted = true;
+      });
+    } catch (err) {
+      await this.deleteR2Keys([r2Key]);
+      throw err;
+    }
+    if (evictedR2Keys.length > 0) await this.deleteR2Keys(evictedR2Keys);
+    if (inserted) { await this.rescheduleAlarm(now); this.broadcastClip(auth.deviceId, { type: "clip_wake", clip_id: clipId, kind, created_at_ms: createdAtMs }); }
+    return jsonRes({ ok: true, clip_id: clipId, blob_bytes: blobBytes, created_at_ms: createdAtMs, expires_at_ms: expiresAtMs });
   }
 
   async fetch(req: Request): Promise<Response> {
     try { return await this.route(req); } catch (e) {
+      await cancelBody(req);
       if (e instanceof RelayError) return jsonRes({ ok: false, error: { code: e.code, message: e.message, retryable: e.retryable, ...(e.details ? { details: e.details } : {}) } }, e.status);
       const badInput = e instanceof SyntaxError || e instanceof TypeError || (e instanceof Error && e.name === "InvalidCharacterError");
       return jsonRes({ ok: false, error: { code: badInput ? "INVALID_ARGUMENT" : "SYNC_OFFLINE", message: e instanceof Error ? e.message : "relay error", retryable: !badInput } }, badInput ? 400 : 503);
@@ -291,7 +439,76 @@ export class SyncJournalDO extends DurableObject<Env> {
       return jsonRes({ ok: true, ...claimed });
     }
 
-    const auth = await this.authenticate(req, now);
+    const isClipPost = req.method === "POST" && path === "/v1/clip";
+    const auth = await this.authenticate(req, now, !isClipPost);
+
+    if (isClipPost) {
+      if (auth.scope === "read") throw new RelayError(403, "TOKEN_SCOPE_FORBIDDEN", "read-only token cannot write clip items");
+      return await this.handleClipPost(req, auth, now);
+    }
+
+    if (req.method === "PUT" && path === "/v1/clip/blob") {
+      if (auth.scope === "read") throw new RelayError(403, "TOKEN_SCOPE_FORBIDDEN", "read-only token cannot upload clip blobs");
+      return await this.handleClipBlobPut(req, auth, now);
+    }
+
+    if (auth.scope === "clip-write") throw new RelayError(403, "TOKEN_SCOPE_FORBIDDEN", "clip-write token may only invoke POST /v1/clip and PUT /v1/clip/blob");
+
+    if (req.method === "GET" && path === "/v1/clip") {
+      const sinceId = url.searchParams.get("since_id") ?? "";
+      if (sinceId && !ULID_RE.test(sinceId)) throw new RelayError(400, "INVALID_ARGUMENT", "invalid since_id");
+      const limit = Math.min(CLIP_MAX_ITEMS, Math.max(1, Number.parseInt(url.searchParams.get("limit") ?? String(CLIP_MAX_ITEMS), 10) || CLIP_MAX_ITEMS));
+      const rows = this.sql.exec(`SELECT clip_id, clip_kid, device_id, kind, created_at_ms, expires_at_ms, meta_envelope, r2_key, blob_bytes FROM clip_items WHERE expires_at_ms > ? AND clip_id > ? ORDER BY clip_id ASC LIMIT ?`, now, sinceId, limit).toArray();
+      return jsonRes({
+        ok: true,
+        items: rows.map((r) => ({
+          clip_id: String(r.clip_id), clip_kid: String(r.clip_kid), device_id: String(r.device_id), kind: String(r.kind),
+          created_at_ms: Number(r.created_at_ms), expires_at_ms: Number(r.expires_at_ms), meta_envelope_b64: bytesToB64(toU8(r.meta_envelope)),
+          has_blob: r.r2_key !== null, blob_bytes: r.blob_bytes === null ? null : Number(r.blob_bytes),
+        })),
+      });
+    }
+
+    const clipBlobMatch = path.match(/^\/v1\/clip\/([^/]+)\/blob$/);
+    if (req.method === "GET" && clipBlobMatch) {
+      const clipId = decodeURIComponent(clipBlobMatch[1]);
+      if (!ULID_RE.test(clipId)) throw new RelayError(400, "INVALID_ARGUMENT", "invalid clip_id");
+      const row = this.sql.exec(`SELECT clip_id, clip_kid, device_id, expires_at_ms, r2_key FROM clip_items WHERE clip_id = ?`, clipId).toArray()[0];
+      if (!row || Number(row.expires_at_ms) <= now || row.r2_key === null) throw new RelayError(404, "NOT_FOUND", "clip blob not found or expired");
+      const obj = await this.env.ARCHIVE_BUCKET.get(String(row.r2_key));
+      if (!obj) throw new RelayError(404, "NOT_FOUND", "clip blob missing from R2");
+      return new Response(obj.body, {
+        status: 200,
+        headers: {
+          "content-type": "application/octet-stream", "content-length": String(obj.size), "cache-control": "no-store",
+          "x-clip-id": String(row.clip_id), "x-clip-kid": String(row.clip_kid), "x-clip-device-id": String(row.device_id),
+        },
+      });
+    }
+
+    const clipDelMatch = path === "/v1/clip" ? ["", ""] : path.match(/^\/v1\/clip\/([^/]+)$/);
+    if (req.method === "DELETE" && clipDelMatch) {
+      if (auth.scope === "read") throw new RelayError(403, "TOKEN_SCOPE_FORBIDDEN", "read-only token cannot delete clip items");
+      const targetId = clipDelMatch[1] ? decodeURIComponent(clipDelMatch[1]) : null;
+      if (targetId !== null && !ULID_RE.test(targetId)) throw new RelayError(400, "INVALID_ARGUMENT", "invalid clip_id");
+      let deletedCount = 0;
+      const r2Keys: string[] = [];
+      this.ctx.storage.transactionSync(() => {
+        const rows = targetId !== null
+          ? this.sql.exec(`SELECT clip_id, r2_key FROM clip_items WHERE clip_id = ?`, targetId).toArray()
+          : this.sql.exec(`SELECT clip_id, r2_key FROM clip_items`).toArray();
+        deletedCount = rows.length;
+        for (const r of rows) if (r.r2_key !== null) r2Keys.push(String(r.r2_key));
+        if (deletedCount > 0) {
+          if (targetId !== null) this.sql.exec(`DELETE FROM clip_items WHERE clip_id = ?`, targetId);
+          else this.sql.exec(`DELETE FROM clip_items`);
+        }
+      });
+      if (r2Keys.length > 0) await this.deleteR2Keys(r2Keys);
+      await this.rescheduleAlarm(now);
+      this.broadcastClip(auth.deviceId, { type: "clip_cleared", clip_id: targetId });
+      return jsonRes({ ok: true, deleted_count: deletedCount });
+    }
 
     if (req.method === "GET" && path === "/v1/sync/ws" && req.headers.get("upgrade")?.toLowerCase() === "websocket") {
       const [client, server] = Object.values(new WebSocketPair());
@@ -316,12 +533,13 @@ export class SyncJournalDO extends DurableObject<Env> {
     }
 
     if (req.method === "GET" && path === "/v1/keys") {
-      const { records, marks, keyring, vaultHeader, digest } = this.loadKeyState();
+      const { records, marks, keyring, vaultHeader, clipKey, digest } = this.loadKeyState();
       return jsonRes({
         ok: true,
         key_material: {
           keyring: keyring ? { gen: keyring.gen, blob_b64: bytesToB64(keyring.blob) } : null,
           vault_header: vaultHeader ? { gen: vaultHeader.gen, blob_b64: bytesToB64(vaultHeader.blob) } : null,
+          clip_key: clipKey ? { gen: clipKey.gen, blob_b64: bytesToB64(clipKey.blob) } : null,
         },
         key_records: records.map((r) => ({ key_id: r.key_id, wrap_gen: r.wrap_gen, key_record_b64: r.key_record ? bytesToB64(r.key_record) : null, created_at_ms: r.created_at_ms })),
         shred_marks: marks, digest,
@@ -342,7 +560,7 @@ export class SyncJournalDO extends DurableObject<Env> {
       });
     }
 
-    if (auth.scope !== "read-write") throw new RelayError(403, "TOKEN_SCOPE_FORBIDDEN", "read-only token cannot invoke write or device routes");
+    if (auth.scope !== "read-write") throw new RelayError(403, "TOKEN_SCOPE_FORBIDDEN", "token scope cannot invoke note write, key, shred, snapshot, or device routes");
 
     if (req.method === "POST" && path === "/v1/sync/push") {
       const raw = await req.text();
@@ -385,13 +603,27 @@ export class SyncJournalDO extends DurableObject<Env> {
     }
 
     if (req.method === "POST" && path === "/v1/keys") {
-      const b = (await req.json()) as { key_records?: KeyRecIn[]; key_material?: { keyring?: { gen: number; blob_b64: string }; vault_header?: { gen: number; blob_b64: string } } };
-      const ackedKeyIds: string[] = [], matGens: { keyring?: number; vault_header?: number } = {};
+      const b = (await req.json()) as {
+        key_records?: KeyRecIn[];
+        key_material?: { keyring?: { gen: number; blob_b64: string }; vault_header?: { gen: number; blob_b64: string }; clip_key?: { gen: number; blob_b64: string } };
+        clear_clips?: boolean;
+      };
+      const ackedKeyIds: string[] = [], matGens: { keyring?: number; vault_header?: number; clip_key?: number } = {}, clearedR2Keys: string[] = [];
       this.ctx.storage.transactionSync(() => {
         for (const rec of b.key_records ?? []) { this.upsertKeyRecord(rec, auth.deviceId, now); ackedKeyIds.push(rec.key_id); }
         if (b.key_material?.keyring) matGens.keyring = this.upsertKeyMaterial("keyring", b.key_material.keyring.gen, b.key_material.keyring.blob_b64, now);
         if (b.key_material?.vault_header) matGens.vault_header = this.upsertKeyMaterial("vault_header", b.key_material.vault_header.gen, b.key_material.vault_header.blob_b64, now);
+        if (b.key_material?.clip_key) matGens.clip_key = this.upsertKeyMaterial("clip_key", b.key_material.clip_key.gen, b.key_material.clip_key.blob_b64, now);
+        if (b.clear_clips === true) {
+          for (const r of this.sql.exec(`SELECT r2_key FROM clip_items WHERE r2_key IS NOT NULL`).toArray()) clearedR2Keys.push(String(r.r2_key));
+          this.sql.exec(`DELETE FROM clip_items`);
+        }
       });
+      if (b.clear_clips === true) {
+        if (clearedR2Keys.length > 0) await this.deleteR2Keys(clearedR2Keys);
+        await this.rescheduleAlarm(now);
+        this.broadcastClip(auth.deviceId, { type: "clip_cleared", clip_id: null });
+      }
       if (ackedKeyIds.length > 0 || Object.keys(matGens).length > 0) this.broadcastWake(auth.deviceId, this.headSeq());
       return jsonRes({ ok: true, acked_key_ids: ackedKeyIds, key_material_gens: matGens });
     }
@@ -476,13 +708,13 @@ export class SyncJournalDO extends DurableObject<Env> {
         try { await this.env.ARCHIVE_BUCKET.delete(r2Key); } catch { /* best-effort orphan cleanup */ }
         throw err;
       }
-      for (const k of pruneKeys) { try { await this.env.ARCHIVE_BUCKET.delete(k); } catch { /* best-effort R2 trim */ } }
+      await this.deleteR2Keys(pruneKeys);
       return jsonRes({ ok: true, snapshot_id: snapshotId, journal_epoch: epochAtStart, covers_seq: coversSeq });
     }
 
     if (req.method === "POST" && path === "/v1/devices") {
-      const b = (await req.json()) as { device_name: string; scope: Scope; token_sha256_hex: string; ciphertext_b64: string; device_id?: string; pair_id?: string };
-      if (!b.device_name || (b.scope !== "read" && b.scope !== "read-write") || !HEX64.test(b.token_sha256_hex ?? "")) throw new RelayError(400, "INVALID_ARGUMENT", "invalid pairing request");
+      const b = (await req.json()) as { device_name: string; scope: unknown; token_sha256_hex: string; ciphertext_b64: string; device_id?: string; pair_id?: string };
+      if (!b.device_name || !isScope(b.scope) || !HEX64.test(b.token_sha256_hex ?? "")) throw new RelayError(400, "INVALID_ARGUMENT", "invalid pairing request");
       const deviceId = b.device_id ?? randomDeviceId(), pairId = b.pair_id ?? randomPairId(), expiresAt = now + this.pairingTtlMs();
       this.ctx.storage.transactionSync(() => {
         this.sql.exec(`INSERT INTO devices (device_id, device_name, token_sha256_hex, scope, last_pulled_seq, last_seen_at_ms, created_at_ms, claimed_at_ms, revoked_at_ms) VALUES (?, ?, ?, ?, 0, ?, ?, NULL, NULL)`, deviceId, b.device_name, b.token_sha256_hex.toLowerCase(), b.scope, now, now);
@@ -530,7 +762,8 @@ export class SyncJournalDO extends DurableObject<Env> {
 
   async alarm(info?: AlarmInvocationInfo): Promise<void> {
     const now = this.nowMs();
-    let expiredTickets = 0, executedShreds = 0;
+    let expiredTickets = 0, executedShreds = 0, expiredClips = 0;
+    const expiredClipR2Keys: string[] = [];
     this.ctx.storage.transactionSync(() => {
       for (const m of this.sql.exec(`SELECT DISTINCT key_id FROM shred_marks WHERE state = 'scheduled' AND not_before_ms IS NOT NULL AND not_before_ms <= ?`, now).toArray()) {
         executedShreds++;
@@ -542,10 +775,16 @@ export class SyncJournalDO extends DurableObject<Env> {
         this.sql.exec(`DELETE FROM pairing_tickets WHERE pair_id = ?`, t.pair_id);
         if (t.kind === "pair") this.sql.exec(`DELETE FROM devices WHERE device_id = ? AND claimed_at_ms IS NULL`, t.device_id);
       }
+      for (const c of this.sql.exec(`SELECT clip_id, r2_key FROM clip_items WHERE expires_at_ms <= ?`, now).toArray()) {
+        expiredClips++;
+        if (c.r2_key !== null) expiredClipR2Keys.push(String(c.r2_key));
+        this.sql.exec(`DELETE FROM clip_items WHERE clip_id = ?`, c.clip_id);
+      }
     });
+    if (expiredClipR2Keys.length > 0) await this.deleteR2Keys(expiredClipR2Keys);
     if (executedShreds > 0) this.broadcastWake(null, this.headSeq());
     const nextArchiveAt = Number(this.metaGet("next_archive_at_ms") ?? 0);
-    if (now >= nextArchiveAt || (expiredTickets === 0 && executedShreds === 0)) {
+    if (now >= nextArchiveAt || (expiredTickets === 0 && executedShreds === 0 && expiredClips === 0)) {
       try {
         let lastArchived = Number(this.metaGet("last_archive_seq") ?? 0);
         for (;;) {

@@ -123,13 +123,13 @@ jobs:
           cache-dependency-path: cloud-cf/pnpm-lock.yaml
       - name: Install cloud-cf dependencies
         run: pnpm --dir cloud-cf install --frozen-lockfile
-      - name: Enforce M2 LOC budget (<= 700 lines in cloud-cf/src/)
+      - name: Enforce M4 LOC budget (<= 950 lines in cloud-cf/src/)
         shell: bash
         run: |
           LOC=$(find cloud-cf/src -type f \( -name '*.ts' -o -name '*.mts' -o -name '*.js' -o -name '*.mjs' \) -print0 | xargs -0 cat | wc -l | awk '{print $1}')
           echo "cloud-cf/src total lines = ${LOC}"
-          if [ "$LOC" -gt 700 ]; then
-            echo "ERROR: cloud-cf/src/ exceeded M2 <= 700 LOC target ($LOC lines)"
+          if [ "$LOC" -gt 950 ]; then
+            echo "ERROR: cloud-cf/src/ exceeded M4 <= 950 LOC target ($LOC lines)"
             exit 1
           fi
       - name: Typecheck cloud-cf
