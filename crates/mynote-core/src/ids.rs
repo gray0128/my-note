@@ -215,6 +215,8 @@ define_ulid_newtype!(SmkKid);
 define_ulid_newtype!(VkekKid);
 define_ulid_newtype!(MarkId);
 define_ulid_newtype!(SnapshotId);
+define_ulid_newtype!(ClipId);
+define_ulid_newtype!(ClipKid);
 
 /// Device identifier (`dev_` + lowercase alphanumeric/underscore, strictly no hyphens `-`).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -349,5 +351,26 @@ mod tests {
         assert!(DeviceId::parse("dev_01jdf8z9x4k7m2n5").is_ok());
         assert!(DeviceId::parse("dev_bad-hyphen").is_err());
         assert!(DeviceId::parse("mac_01234567").is_err());
+    }
+
+    #[test]
+    fn clip_ids_roundtrip_and_preserve_order() {
+        let mut g = MonotonicUlidGen::new();
+        let c1 = ClipId::from_ulid(g.next(1_795_600_000_000, [0x11; 10]));
+        let c2 = ClipId::from_ulid(g.next(1_795_600_000_000, [0x00; 10]));
+        assert!(c1 < c2);
+        assert_eq!(ClipId::parse(&c1.to_string()).unwrap(), c1);
+        assert_eq!(ClipId::from_bytes(*c1.as_bytes()), c1);
+
+        let k1 = ClipKid::parse("01JDF8Z9X4K7M2N5P8Q1R3S6T9").unwrap();
+        assert_eq!(k1.to_string(), "01JDF8Z9X4K7M2N5P8Q1R3S6T9");
+        assert_eq!(
+            serde_json::to_string(&k1).unwrap(),
+            "\"01JDF8Z9X4K7M2N5P8Q1R3S6T9\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ClipKid>("\"01JDF8Z9X4K7M2N5P8Q1R3S6T9\"").unwrap(),
+            k1
+        );
     }
 }

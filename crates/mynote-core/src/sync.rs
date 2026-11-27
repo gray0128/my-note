@@ -856,6 +856,9 @@ impl EngineSnapshot {
                     KeyMaterialKind::VaultHeader => {
                         self.keys.update_vault_header_material(*gen, blob.clone())
                     }
+                    KeyMaterialKind::ClipKey => {
+                        // INV-CLIP-ISOLATION: ClipKey never enters note KeyTableState::digest().
+                    }
                 },
                 StoreMutation::ExecuteShred { key_id } => {
                     self.keys.executed_tombstones.insert(*key_id);

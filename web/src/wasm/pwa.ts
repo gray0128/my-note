@@ -1,6 +1,6 @@
-import initPwaWasm, { WasmSyncEngine, WasmVaultSession, initSync } from "./pkg-pwa/mynote_wasm.js";
+import initPwaWasm, { WasmClipCodec, WasmSyncEngine, WasmVaultSession, initSync } from "./pkg-pwa/mynote_wasm.js";
 
-export { WasmSyncEngine, WasmVaultSession };
+export { WasmClipCodec, WasmSyncEngine, WasmVaultSession };
 export type { DecryptedBlockPayload } from "./pkg-pwa/mynote_wasm.js";
 
 let initPromise: Promise<void> | null = null;

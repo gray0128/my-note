@@ -27,7 +27,7 @@ build_target() {
     --no-default-features --features "$features"
 
   local wasm_in="$target_dir/wasm32-unknown-unknown/wasm-release/mynote_wasm.wasm"
-  wasm-bindgen "$wasm_in" --target web --out-dir "$out_dir" --out-name mynote_wasm
+  wasm-bindgen "$wasm_in" --target web --remove-name-section --out-dir "$out_dir" --out-name mynote_wasm
 
   local wasm_out="$out_dir/mynote_wasm_bg.wasm"
   if wasm_opt_supports_externref; then

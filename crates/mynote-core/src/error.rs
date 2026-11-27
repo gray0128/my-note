@@ -24,6 +24,7 @@ pub enum ErrorCode {
     DeviceRevoked,
     TokenScopeForbidden,
     SyncOffline,
+    NoOnlineDesktop,
     RateLimited,
     FormatSyntaxError,
     KeyMissing,
@@ -51,7 +52,7 @@ impl ErrorCode {
             | Self::AuthRequired
             | Self::DeviceRevoked
             | Self::TokenScopeForbidden => 5,
-            Self::SyncOffline | Self::RateLimited => 6,
+            Self::SyncOffline | Self::NoOnlineDesktop | Self::RateLimited => 6,
             Self::FormatSyntaxError => 7,
             Self::KeyMissing | Self::IntegrityError => 8,
         }
@@ -68,7 +69,8 @@ impl ErrorCode {
             | Self::CasMismatch
             | Self::KeyUnknown
             | Self::KeyPendingShred
-            | Self::ShredStale => 409,
+            | Self::ShredStale
+            | Self::NoOnlineDesktop => 409,
             Self::BlockLocked => 423,
             Self::KeyShredded => 410,
             Self::GraceTooShort | Self::FormatSyntaxError => 422,
@@ -88,6 +90,7 @@ impl ErrorCode {
                 | Self::KeyPendingShred
                 | Self::ShredStale
                 | Self::SyncOffline
+                | Self::NoOnlineDesktop
                 | Self::RateLimited
         )
     }
@@ -113,6 +116,7 @@ impl ErrorCode {
             Self::DeviceRevoked => "DEVICE_REVOKED",
             Self::TokenScopeForbidden => "TOKEN_SCOPE_FORBIDDEN",
             Self::SyncOffline => "SYNC_OFFLINE",
+            Self::NoOnlineDesktop => "NO_ONLINE_DESKTOP",
             Self::RateLimited => "RATE_LIMITED",
             Self::FormatSyntaxError => "FORMAT_SYNTAX_ERROR",
             Self::KeyMissing => "KEY_MISSING",
@@ -171,5 +175,24 @@ impl CoreError {
         match self {
             Self::Coded { details, .. } => details.as_ref(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_online_desktop_error_code_mapping() {
+        let code = ErrorCode::NoOnlineDesktop;
+        assert_eq!(code.exit_code(), 6);
+        assert_eq!(code.http_status(), 409);
+        assert!(code.retryable());
+        assert_eq!(code.as_str(), "NO_ONLINE_DESKTOP");
+        assert_eq!(serde_json::to_string(&code).unwrap(), "\"NO_ONLINE_DESKTOP\"");
+        assert_eq!(
+            serde_json::from_str::<ErrorCode>("\"NO_ONLINE_DESKTOP\"").unwrap(),
+            ErrorCode::NoOnlineDesktop
+        );
     }
 }
