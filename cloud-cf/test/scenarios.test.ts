@@ -187,6 +187,40 @@ describe("Shared DST/Worker Protocol Scenarios (F-12)", () => {
         const body = (await res.json()) as { ok: boolean; results?: { state: string }[]; error?: { code: string } };
         if (exp.status === 200) expect(body.results!.map((r) => r.state), `step=${id}`).toEqual(exp.shred_states);
         else expect(body.error!.code, `step=${id}`).toBe(exp.error_code);
+      } else if (step.action === "keys_post") {
+        const res = await SELF.fetch("https://relay.test/v1/keys", {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify({ key_records: step.key_records ?? [] }),
+        });
+        expect(res.status, `step=${id}`).toBe(exp.status);
+      } else if (step.action === "keys_confirm") {
+        const payload: Record<string, unknown> = { key_ids: step.key_ids };
+        if ("grace_ms" in step) payload.grace_ms = step.grace_ms;
+        const res = await SELF.fetch("https://relay.test/v1/keys/confirm", {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        expect(res.status, `step=${id}`).toBe(exp.status);
+        const body = (await res.json()) as { ok: boolean; results?: { state: string }[]; error?: { code: string } };
+        if (exp.status === 200) {
+          expect(body.results!.map((r) => r.state), `step=${id}`).toEqual(exp.shred_states);
+          if ("grace_ms" in step && typeof step.grace_ms === "number") {
+            const keysRes = await SELF.fetch("https://relay.test/v1/keys", {
+              headers: { authorization: `Bearer ${token}` },
+            });
+            const keysJson = (await keysRes.json()) as {
+              shred_marks: { key_id: string; state: string; grace_ms: number; confirmed_at_ms: number | null }[];
+            };
+            for (const kid of step.key_ids as string[]) {
+              const marks = keysJson.shred_marks.filter((m) => m.key_id === kid);
+              expect(marks.every((m) => m.state === "scheduled" && m.grace_ms === step.grace_ms && m.confirmed_at_ms !== null), `step=${id} ${kid}`).toBe(true);
+            }
+          }
+        } else {
+          expect(body.error!.code, `step=${id}`).toBe(exp.error_code);
+        }
       } else if (step.action === "keys_cancel") {
         const res = await SELF.fetch("https://relay.test/v1/keys/cancel", {
           method: "POST",

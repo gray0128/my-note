@@ -286,6 +286,12 @@ def run_check1_and_check2_desktop(p, browser_name: str, data_dir: Path, vectors:
             outbound_urls.append(req.url)
 
     page.on("pageerror", lambda err: page_errors.append(str(err)))
+    page.on(
+        "console",
+        lambda m: page_errors.append(f"console.error: {m.text}")
+        if m.type == "error" and "Failed to load resource" not in m.text
+        else None,
+    )
     page.on("request", on_request)
 
     # Initial page load (all blocks start in source mode -> pele-*.js MUST NOT load!)

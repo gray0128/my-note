@@ -21,6 +21,8 @@ Thumbs.db
 *.swo
 .idea/
 .vscode/
+__pycache__/
+*.py[cod]
 
 # Local databases & runtime artifacts
 *.db

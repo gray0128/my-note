@@ -156,6 +156,104 @@
       "action": "snapshot_get",
       "as_device": "dev_mac00001",
       "expect": { "status": 200, "covers_seq": 5, "body_b64": "TU5QMVsxX3NuYXAz" }
+    },
+    {
+      "id": "m2_16_same_batch_rekey_old_op_lock_op_and_shred_old_key",
+      "action": "push",
+      "as_device": "dev_mac00001",
+      "seen_seq": 5,
+      "key_records": [
+        { "key_id": "01JDF9M20000000000000000K4", "wrap_gen": 1, "key_record_b64": "bW5yMV9tMl9rNA==" }
+      ],
+      "ops": [
+        { "op_id": "01JDF9M20000000000000000P7", "device_id": "dev_mac00001", "key_id": "01JDF9M20000000000000000K1", "envelope_b64": "bW5zMV9tMl9vcDdfYmVmb3JlX2xvY2s=" },
+        { "op_id": "01JDF9M20000000000000000P8", "device_id": "dev_mac00001", "key_id": "01JDF9M20000000000000000K4", "envelope_b64": "bW5zMV9tMl9vcDhfbG9ja19yZWtleQ==" }
+      ],
+      "shred_marks": [
+        { "mark_id": "01JDF9M20000000000000000M4", "key_id": "01JDF9M20000000000000000K1", "grace_ms": 604800000, "requested_by": "dev_mac00001" }
+      ],
+      "expect": { "status": 200, "acked_seqs": [6, 7], "head_seq": 7, "shred_states": ["scheduled"] }
+    },
+    {
+      "id": "m2_17_upload_20_keys_for_rolling_batch_limit_test",
+      "action": "keys_post",
+      "as_device": "dev_mac00001",
+      "key_records": [
+        { "key_id": "01JDF9M200000000000000KB01", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjAx" },
+        { "key_id": "01JDF9M200000000000000KB02", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjAy" },
+        { "key_id": "01JDF9M200000000000000KB03", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjAz" },
+        { "key_id": "01JDF9M200000000000000KB04", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjA0" },
+        { "key_id": "01JDF9M200000000000000KB05", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjA1" },
+        { "key_id": "01JDF9M200000000000000KB06", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjA2" },
+        { "key_id": "01JDF9M200000000000000KB07", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjA3" },
+        { "key_id": "01JDF9M200000000000000KB08", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjA4" },
+        { "key_id": "01JDF9M200000000000000KB09", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjA5" },
+        { "key_id": "01JDF9M200000000000000KB10", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjEw" },
+        { "key_id": "01JDF9M200000000000000KB11", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjEx" },
+        { "key_id": "01JDF9M200000000000000KB12", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjEy" },
+        { "key_id": "01JDF9M200000000000000KB13", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjEz" },
+        { "key_id": "01JDF9M200000000000000KB14", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjE0" },
+        { "key_id": "01JDF9M200000000000000KB15", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjE1" },
+        { "key_id": "01JDF9M200000000000000KB16", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjE2" },
+        { "key_id": "01JDF9M200000000000000KB17", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjE3" },
+        { "key_id": "01JDF9M200000000000000KB18", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjE4" },
+        { "key_id": "01JDF9M200000000000000KB19", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjE5" },
+        { "key_id": "01JDF9M200000000000000KB20", "wrap_gen": 1, "key_record_b64": "bW5yMV9rYjIw" }
+      ],
+      "expect": { "status": 200 }
+    },
+    {
+      "id": "m2_18_batch_shred_exceeds_rolling_20_puts_21st_into_pending_confirm",
+      "action": "keys_shred",
+      "as_device": "dev_mac00001",
+      "seen_seq": 7,
+      "marks": [
+        { "mark_id": "01JDF9M200000000000000MB01", "key_id": "01JDF9M200000000000000KB01", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB02", "key_id": "01JDF9M200000000000000KB02", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB03", "key_id": "01JDF9M200000000000000KB03", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB04", "key_id": "01JDF9M200000000000000KB04", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB05", "key_id": "01JDF9M200000000000000KB05", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB06", "key_id": "01JDF9M200000000000000KB06", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB07", "key_id": "01JDF9M200000000000000KB07", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB08", "key_id": "01JDF9M200000000000000KB08", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB09", "key_id": "01JDF9M200000000000000KB09", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB10", "key_id": "01JDF9M200000000000000KB10", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB11", "key_id": "01JDF9M200000000000000KB11", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB12", "key_id": "01JDF9M200000000000000KB12", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB13", "key_id": "01JDF9M200000000000000KB13", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB14", "key_id": "01JDF9M200000000000000KB14", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB15", "key_id": "01JDF9M200000000000000KB15", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB16", "key_id": "01JDF9M200000000000000KB16", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB17", "key_id": "01JDF9M200000000000000KB17", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB18", "key_id": "01JDF9M200000000000000KB18", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB19", "key_id": "01JDF9M200000000000000KB19", "grace_ms": 604800000, "requested_by": "dev_mac00001" },
+        { "mark_id": "01JDF9M200000000000000MB20", "key_id": "01JDF9M200000000000000KB20", "grace_ms": 604800000, "requested_by": "dev_mac00001" }
+      ],
+      "expect": {
+        "status": 200,
+        "shred_states": [
+          "scheduled", "scheduled", "scheduled", "scheduled", "scheduled",
+          "scheduled", "scheduled", "scheduled", "scheduled", "scheduled",
+          "scheduled", "scheduled", "scheduled", "scheduled", "scheduled",
+          "scheduled", "scheduled", "scheduled", "scheduled", "pending_confirm"
+        ]
+      }
+    },
+    {
+      "id": "m2_19_confirm_pending_rejects_grace_below_24h",
+      "action": "keys_confirm",
+      "as_device": "dev_mac00001",
+      "key_ids": ["01JDF9M200000000000000KB20"],
+      "grace_ms": 3600000,
+      "expect": { "status": 422, "error_code": "GRACE_TOO_SHORT" }
+    },
+    {
+      "id": "m2_20_confirm_pending_transitions_to_scheduled_with_updated_grace",
+      "action": "keys_confirm",
+      "as_device": "dev_mac00001",
+      "key_ids": ["01JDF9M200000000000000KB20"],
+      "grace_ms": 86400000,
+      "expect": { "status": 200, "shred_states": ["scheduled"] }
     }
   ]
 }

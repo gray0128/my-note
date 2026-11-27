@@ -220,9 +220,15 @@ def main():
         snapshot_responses: list[tuple[int, str]] = []
         with sync_playwright() as p:
             browser = p.webkit.launch()
-            context = browser.new_context(viewport={"width": 390, "height": 844})
+            context = browser.new_context(viewport={"width": 390, "height": 844}, locale="en-US")
             page = context.new_page()
             page.on("pageerror", lambda err: page_errors.append(str(err)))
+            page.on(
+                "console",
+                lambda m: page_errors.append(f"console.error: {m.text}")
+                if m.type == "error" and "status of 404" not in m.text and "Failed to load resource" not in m.text
+                else None,
+            )
             page.on(
                 "response",
                 lambda r: snapshot_responses.append((r.status, r.headers.get("x-covers-seq", "")))
@@ -309,7 +315,7 @@ def main():
             subprocess.run([str(BIN), "--data-dir", str(tmp_desktop), "add", live_canary], check=True, capture_output=True)
             subprocess.run([str(BIN), "--data-dir", str(tmp_desktop), "sync", "push"], check=True, capture_output=True)
             page.wait_for_function(
-                f"() => document.body.innerText.includes('{live_canary}') && document.querySelector('[data-testid=\"pwa-sync-btn\"]')?.textContent?.includes('Synced')",
+                f"() => document.body.innerText.includes('{live_canary}') && ['Synced', '已同步'].some(s => document.querySelector('[data-testid=\"pwa-sync-btn\"]')?.textContent?.includes(s))",
                 timeout=15000,
             )
             print("[sec-08] 6. WebKit received live WS wake & decrypted new tail op OK")

@@ -130,6 +130,7 @@ body {
 /* ---------- Buttons & Interactive Controls ---------- */
 
 .btn {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -715,6 +716,7 @@ body {
 }
 
 .vault-badge {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 4px;

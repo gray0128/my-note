@@ -4644,6 +4644,57 @@ impl LocalStore {
                             .map_err(|e| {
                                 CoreError::new(ErrorCode::IntegrityError, e.to_string(), "clear server_seq")
                             })?;
+                        // Re-queue non-Executed shred marks & cancellations across DO PITR / epoch change
+                        let mut cancel_set = self.load_pending_cancel_keys();
+                        {
+                            let mut cstmt = self
+                                .conn
+                                .prepare(
+                                    "SELECT DISTINCT sm.key_id FROM shred_marks sm
+                                     JOIN block_keys bk ON bk.key_id = sm.key_id
+                                     WHERE sm.server_acked = 1 AND sm.state = 'cancelled' AND bk.key_record IS NOT NULL",
+                                )
+                                .map_err(|e| {
+                                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "read cancelled marks")
+                                })?;
+                            let crows = cstmt.query_map([], |r| r.get::<_, String>(0)).map_err(|e| {
+                                CoreError::new(
+                                    ErrorCode::IntegrityError,
+                                    e.to_string(),
+                                    "map cancelled marks",
+                                )
+                            })?;
+                            for s in crows.flatten() {
+                                if let Ok(kid) = KeyId::parse(&s) {
+                                    cancel_set.insert(kid);
+                                }
+                            }
+                        }
+                        self.save_pending_cancel_keys(&cancel_set)?;
+                        self.conn
+                            .execute(
+                                "DELETE FROM shred_marks WHERE server_acked = 1 AND state = 'cancelled'",
+                                [],
+                            )
+                            .map_err(|e| {
+                                CoreError::new(
+                                    ErrorCode::IntegrityError,
+                                    e.to_string(),
+                                    "clear cancelled marks",
+                                )
+                            })?;
+                        self.conn
+                            .execute(
+                                "UPDATE shred_marks
+                                 SET server_acked = 0, state = 'pending_confirm', not_before_ms = NULL, confirmed_at_ms = NULL
+                                 WHERE server_acked = 1 AND state IN ('pending_confirm', 'scheduled')
+                                   AND key_id IN (SELECT key_id FROM block_keys WHERE key_record IS NOT NULL)",
+                                [],
+                            )
+                            .map_err(|e| {
+                                CoreError::new(ErrorCode::IntegrityError, e.to_string(), "requeue shred marks")
+                            })?;
+                        marks_changed = true;
                         self.set_local_meta("reconciling_epoch", &new_epoch.to_string())?;
                         self.set_local_meta("last_seq", "0")?;
                     }

@@ -43,6 +43,8 @@ jobs:
 
   web-checks:
     name: WASM + Desktop Web UI + Mobile Read-Only PWA
+    needs: [immutable-verifier-guard]
+    if: always() && (github.event_name != 'pull_request' || needs.immutable-verifier-guard.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -52,6 +54,10 @@ jobs:
       - name: Pin evals/ to PR base commit on non-[eval-only] PRs
         if: github.event_name == 'pull_request' && !startsWith(github.event.pull_request.title, '[eval-only]')
         run: rm -rf evals/ && git checkout "${{ github.event.pull_request.base.sha }}" -- evals/
+      - name: Run Tier 0 static architecture & budget guard (with mutant selftest)
+        run: |
+          python3 scripts/check-architecture.py --selftest
+          python3 scripts/check-architecture.py
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -225,3 +231,5 @@ jobs:
         run: python3 tests/e2e/test_m2_sec08_mobile_webkit.py
       - name: Run M3 SEC-06 / Pele Copy PNG (Chromium & WebKit) / Time Travel E2E
         run: python3 tests/e2e/test_m3_sec06_pele_history.py
+      - name: Run UI CDP Viewport Geometry, Console Error & SQLite Equivalence Gate
+        run: python3 tests/e2e/test_ui_cdp_equivalence.py
