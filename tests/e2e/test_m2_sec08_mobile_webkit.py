@@ -390,8 +390,8 @@ def main():
                 }"""
             )
 
-            expected_stores = sorted(["device_keystore", "meta", "buffers", "blocks", "block_keys", "vault_header"])
-            assert audit["storeNames"] == expected_stores, f"Expected exact 6 IDB stores {expected_stores}, got {audit['storeNames']}"
+            expected_stores = sorted(["device_keystore", "meta", "buffers", "blocks", "block_keys", "vault_header", "clip_items"])
+            assert audit["storeNames"] == expected_stores, f"Expected exact 7 IDB stores {expected_stores}, got {audit['storeNames']}"
             assert audit["wrapKeyExtractable"] is False, f"SEC-08 VIOLATION: device_wrap_key extractable={audit['wrapKeyExtractable']}"
             assert len(audit["ls"]) == 0, f"SEC-08 VIOLATION: localStorage non-empty: {audit['ls']}"
             assert len(audit["ss"]) == 0, f"SEC-08 VIOLATION: sessionStorage non-empty: {audit['ss']}"
@@ -404,7 +404,7 @@ def main():
             assert len(audit["stores"]["blocks"]) >= 3, f"Expected >= 3 ciphertext blocks in IDB, got {len(audit['stores']['blocks'])}"
             assert len(audit["stores"]["block_keys"]) >= 3, f"Expected >= 3 ciphertext keys in IDB, got {len(audit['stores']['block_keys'])}"
             assert len(audit["stores"]["vault_header"]) == 1, "Expected ciphertext vault_header in IDB"
-            print("[sec-08] 7. WebKit Forensic Storage Audit (6 IDB stores + non-extractable CryptoKey + 0 LS/SS/Cache leaks + 0 plaintext): PASS!")
+            print("[sec-08] 7. WebKit Forensic Storage Audit (7 IDB stores + non-extractable CryptoKey + 0 LS/SS/Cache leaks + 0 plaintext): PASS!")
 
             # Eviction resilience: delete IndexedDB & reload -> clean onboarding prompt without errors!
             page.evaluate(

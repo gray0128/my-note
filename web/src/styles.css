@@ -2418,6 +2418,251 @@ body {
   }
 }
 
+/* ---------- M4 Cross-Device Clipboard Drawer ---------- */
+
+.clip-drawer {
+  width: 400px;
+  max-width: 45vw;
+}
+
+.clip-drawer-title-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.clip-count-pill {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.clip-header-actions {
+  justify-content: space-between;
+}
+
+.clip-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-card);
+  flex-shrink: 0;
+}
+
+.clip-composer-input {
+  width: 100%;
+  resize: vertical;
+  min-height: 54px;
+  max-height: 160px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+.clip-composer-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.clip-ephemeral-check {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  align-items: center;
+}
+
+.clip-composer-buttons {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-inline-start: auto;
+}
+
+.clip-file-label {
+  position: relative;
+}
+
+.clip-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--red-bg);
+  color: var(--red);
+  font-size: 12px;
+  line-height: 1.45;
+  text-wrap: pretty;
+}
+
+.clip-filter-bar {
+  padding: 8px 14px 4px;
+  flex-shrink: 0;
+}
+
+.clip-filter-seg {
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.clip-item {
+  flex: 0 0 auto;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.clip-item-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.clip-item-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.clip-badge {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--bg-inset);
+  color: var(--text-secondary);
+}
+
+.clip-badge-auto {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.clip-meta-detail,
+.clip-meta-origin {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.clip-text-preview {
+  margin: 0;
+  padding: 7px 9px;
+  border-radius: 5px;
+  background: var(--bg-inset);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.clip-image-body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-inset);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.clip-thumb-btn {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.clip-thumb-img {
+  display: block;
+  width: 100%;
+  max-height: 160px;
+  object-fit: contain;
+  outline: 1px solid var(--img-outline);
+  outline-offset: -1px;
+}
+
+.clip-thumb-placeholder {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 16px 12px;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+.clip-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.clip-item-actions > .btn-danger {
+  margin-inline-start: auto;
+}
+
+.clip-preview-modal {
+  width: min(860px, 92vw);
+  max-height: 84vh;
+}
+
+.clip-preview-body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 180px;
+  max-height: 70vh;
+  overflow: auto;
+  background: var(--bg-inset);
+  border-radius: var(--radius-md);
+  padding: 8px;
+}
+
+.clip-preview-img {
+  display: block;
+  max-width: 100%;
+  max-height: 66vh;
+  object-fit: contain;
+  border-radius: var(--radius-sm);
+}
+
+.clip-preview-loading {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
 /* Keep visibility utilities at the end of the cascade so component display rules never override .hidden */
 [hidden],
 .hidden {

@@ -1,4 +1,5 @@
 import { LocalApiError, type LocalApiClient, type Tier2WritePayload } from "./api";
+import { ClipDrawerController } from "./components/clipDrawer";
 import {
   createLocaleSwitch,
   createThemeMenu,
@@ -109,6 +110,10 @@ export class MyNoteApp {
   private syncIconEl!: HTMLSpanElement;
   private trashBtnEl!: HTMLButtonElement;
   private trashCountEl!: HTMLSpanElement;
+  private clipInboxBtnEl!: HTMLButtonElement;
+  private clipInboxCountEl!: HTMLSpanElement;
+  private clipDrawer!: ClipDrawerController;
+  private lastClipCount = 0;
   private alertStackEl!: HTMLElement;
   private findBarEl!: HTMLElement;
   private findInputEl!: HTMLInputElement;
@@ -194,6 +199,7 @@ export class MyNoteApp {
     this.unsubLocale = null;
     this.themeMenu?.destroy();
     this.localeSwitch?.destroy();
+    this.clipDrawer?.destroy();
     this.lockVaultNow({ skipFlush: true, silent: true });
     this.disconnectWs?.();
     if (this.toastTimer !== null) {
@@ -367,6 +373,17 @@ export class MyNoteApp {
     this.trashBtnEl.addEventListener("click", () => void this.toggleTrash());
     this.updateTrashCount(0);
 
+    this.clipInboxBtnEl = document.createElement("button");
+    this.clipInboxBtnEl.type = "button";
+    this.clipInboxBtnEl.className = "btn btn-ghost btn-has-icon trash-btn clip-inbox-btn";
+    this.clipInboxBtnEl.dataset.testid = "clip-inbox-btn";
+    this.clipInboxBtnEl.setAttribute("aria-pressed", "false");
+    this.clipInboxCountEl = document.createElement("span");
+    this.clipInboxCountEl.className = "trash-count";
+    this.clipInboxBtnEl.append(createIcon("clipboard", "xs"), this.clipInboxCountEl);
+    this.clipInboxBtnEl.addEventListener("click", () => void this.toggleClipDrawer());
+    this.updateClipCount(0);
+
     this.syncPillEl = document.createElement("button");
     this.syncPillEl.type = "button";
     this.syncPillEl.className = "sync-pill";
@@ -390,6 +407,7 @@ export class MyNoteApp {
       this.findBtnEl,
       this.vimBtnEl,
       this.createTopbarSep(),
+      this.clipInboxBtnEl,
       this.vaultBtnEl,
       this.trashBtnEl,
       this.createTopbarSep(),
@@ -542,10 +560,25 @@ export class MyNoteApp {
     this.historyDiffEl.className = "history-diff-pane";
     this.historyDrawerEl.append(histHdr, this.historyActionsEl, this.historyListEl, this.historyDiffEl);
 
+    // M4 Cross-Device 100-item Clipboard Drawer
+    this.clipDrawer = new ClipDrawerController(this.api, {
+      getActiveBufferId: () => this.activeBufferId,
+      onBlockPromoted: (blk) => {
+        if (blk.buffer_id === this.activeBufferId) {
+          this.stream.upsertBlocks([blk], [], this.activeBufferId);
+          this.knownBufferBlockCounts.set(this.activeBufferId, this.stream.getBlocks().length);
+        }
+      },
+      onFeedback: (msg, isError) => this.showToast(msg, isError),
+      onError: (err) => this.handleErr(err),
+      onCountChange: (count) => this.updateClipCount(count),
+      onOpenChange: (open) => this.syncClipBtnState(open),
+    });
+
     const workspaceMain = document.createElement("div");
     workspaceMain.className = "workspace-main";
     workspaceMain.append(this.findBarEl, streamEl);
-    workspace.append(workspaceMain, this.trashDrawerEl, this.historyDrawerEl);
+    workspace.append(workspaceMain, this.trashDrawerEl, this.historyDrawerEl, this.clipDrawer.element);
 
     // Buffer Switcher modal (Quick Switcher ⌘P — single unified Filter / Create command bar)
     this.modalBackdropEl = document.createElement("div");
@@ -644,6 +677,7 @@ export class MyNoteApp {
       workspace,
       this.modalBackdropEl,
       this.dialogBackdropEl,
+      this.clipDrawer.previewBackdropEl,
       this.toastEl,
     );
   }
@@ -682,6 +716,8 @@ export class MyNoteApp {
     this.renderVaultBtn();
     this.renderSyncPill();
     this.updateTrashCount(this.lastTrashCount);
+    this.updateClipCount(this.lastClipCount);
+    this.clipDrawer.refreshLocale();
     this.renderAlerts();
 
     if (this.trashOpen) {
@@ -755,10 +791,15 @@ export class MyNoteApp {
       !this.dialogBackdropEl.classList.contains("hidden");
     if (!mod) {
       if (ev.key === "Escape") {
+        if (this.clipDrawer.isPreviewOpen()) {
+          this.clipDrawer.closeImagePreview();
+          return;
+        }
         this.closeBufferModal();
         this.closeDialog();
         this.toggleFindBar(false);
         this.closeHistoryDrawer();
+        this.clipDrawer.close();
       }
       return;
     }
@@ -956,6 +997,39 @@ export class MyNoteApp {
     this.trashBtnEl.classList.toggle("is-active", this.trashOpen);
   }
 
+  private syncClipBtnState(open: boolean): void {
+    this.clipInboxBtnEl.setAttribute("aria-pressed", String(open));
+    this.clipInboxBtnEl.classList.toggle("is-active", open);
+  }
+
+  private updateClipCount(count: number): void {
+    this.lastClipCount = count;
+    this.clipInboxBtnEl.title = t("topbar.clipInboxTitle");
+    const sr = document.createElement("span");
+    sr.className = "sr-only";
+    sr.textContent = t("topbar.clipInbox");
+    this.clipInboxCountEl.replaceChildren(sr);
+    if (count > 0) {
+      const num = document.createElement("span");
+      num.className = "trash-badge-num";
+      num.textContent = String(count);
+      this.clipInboxCountEl.appendChild(num);
+    }
+    this.clipInboxBtnEl.classList.toggle("has-items", count > 0);
+  }
+
+  private async toggleClipDrawer(): Promise<void> {
+    if (!this.clipDrawer.isOpen()) {
+      if (this.trashOpen) {
+        this.trashOpen = false;
+        this.trashDrawerEl.classList.add("hidden");
+        this.syncTrashBtnState();
+      }
+      this.closeHistoryDrawer();
+    }
+    await this.clipDrawer.toggle();
+  }
+
   private updateTrashCount(count: number): void {
     this.lastTrashCount = count;
     const fullText = t("topbar.trashCount", { count });
@@ -1085,6 +1159,12 @@ export class MyNoteApp {
         msgText = t("alert.shredPendingConfirm");
       } else if (alert.code === "NEEDS_VAULT_REKEY") {
         msgText = t("alert.needsVaultRekey");
+      } else if (alert.code === "CLIP_SECRET_BLOCKED") {
+        const pattern =
+          typeof alert.details.pattern === "string"
+            ? alert.details.pattern
+            : JSON.stringify(alert.details);
+        msgText = t("alert.clipSecretBlocked", { details: pattern });
       } else {
         msgText = `${alert.code}: ${JSON.stringify(alert.details)}`;
       }
@@ -1110,6 +1190,16 @@ export class MyNoteApp {
         btn.className = "btn btn-primary btn-icon";
         btn.textContent = t("alert.unlockRekey");
         btn.addEventListener("click", () => this.openVaultModal());
+        div.appendChild(btn);
+      } else if (alert.code === "CLIP_SECRET_BLOCKED") {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn btn-icon";
+        btn.textContent = t("alert.dismiss");
+        btn.addEventListener("click", () => {
+          this.alerts.delete("CLIP_SECRET_BLOCKED");
+          this.renderAlerts();
+        });
         div.appendChild(btn);
       }
       this.alertStackEl.appendChild(div);
@@ -1208,9 +1298,18 @@ export class MyNoteApp {
     } else if (frame.type === "vault_header_changed") {
       this.vaultHeader = frame.vault_header;
       this.renderVaultBtn();
+    } else if (frame.type === "clip_changed") {
+      this.clipDrawer.applyWsUpdate(frame);
     } else if (frame.type === "alert") {
       this.alerts.set(frame.code, frame);
       this.renderAlerts();
+      if (frame.code === "CLIP_SECRET_BLOCKED") {
+        const pattern =
+          typeof frame.details.pattern === "string"
+            ? frame.details.pattern
+            : JSON.stringify(frame.details);
+        this.showToast(t("alert.clipSecretBlocked", { details: pattern }), true);
+      }
       if (frame.code === "NEEDS_VAULT_REKEY" && this.isVaultUnlocked()) {
         void this.rescueBlockedTier2Ops();
       }
@@ -2454,6 +2553,7 @@ export class MyNoteApp {
       this.trashDrawerEl.classList.add("hidden");
       this.syncTrashBtnState();
     }
+    this.clipDrawer.close();
 
     const reqSeq = ++this.historyLoadSeq;
     const lockEpoch = this.stream.getVaultLockEpoch();
@@ -2925,7 +3025,10 @@ export class MyNoteApp {
 
   private async toggleTrash(): Promise<void> {
     this.trashOpen = !this.trashOpen;
-    if (this.trashOpen) this.closeHistoryDrawer();
+    if (this.trashOpen) {
+      this.closeHistoryDrawer();
+      this.clipDrawer.close();
+    }
     this.trashDrawerEl.classList.toggle("hidden", !this.trashOpen);
     this.syncTrashBtnState();
     if (this.trashOpen) await this.refreshTrash();

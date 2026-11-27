@@ -933,7 +933,7 @@ def run_check5_mobile_pwa_webkit(p, raw_vectors: dict) -> None:
                 return { ls, ss, cacheEntries, storeNames, wrapKeyExtractable, stores };
             }"""
         )
-        expected_stores = sorted(["device_keystore", "meta", "buffers", "blocks", "block_keys", "vault_header"])
+        expected_stores = sorted(["device_keystore", "meta", "buffers", "blocks", "block_keys", "vault_header", "clip_items"])
         assert audit["storeNames"] == expected_stores, f"Unexpected IDB stores: {audit['storeNames']}"
         assert audit["wrapKeyExtractable"] is False, f"SEC-08 VIOLATION: extractable wrap key!"
         assert len(audit["ls"]) == 0 and len(audit["ss"]) == 0, f"SEC-08 VIOLATION: LS/SS non-empty!"

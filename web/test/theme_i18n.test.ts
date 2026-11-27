@@ -657,7 +657,7 @@ describe("Theme controller, Bilingual i18n, CSP & Emoji Hygiene", () => {
       }
     }
 
-    expect(swJs).toContain("mynote-pwa-shell-v4");
+    expect(swJs).toContain("mynote-pwa-shell-v5");
     expect(swJs).toContain('"/theme-init.js"');
     expect(desktopInit).toBe(pwaInit);
 

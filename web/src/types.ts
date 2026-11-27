@@ -156,6 +156,86 @@ export interface ApiErrorBody {
   details?: Record<string, unknown>;
 }
 
+export type ClipKind = "text" | "image";
+export type ClipSourceMode = "explicit" | "auto";
+export type ClipAutoApplyMirrorMode = "inbox-only" | "auto-apply";
+export type AllowedClipImageMime = "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+
+export interface ClipItemDto {
+  clip_id: string;
+  clip_kid: string;
+  device_id: string;
+  kind: ClipKind;
+  mime: string;
+  source_mode: ClipSourceMode;
+  created_at_ms: number;
+  expires_at_ms: number;
+  text_preview: string | null;
+  has_blob: boolean;
+  blob_bytes: number | null;
+  blob_sha256: string | null;
+  width: number | null;
+  height: number | null;
+  thumb_mime: string | null;
+  thumb_data_url: string | null;
+  cached_locally: boolean;
+}
+
+export interface ClipListResponse {
+  items: ClipItemDto[];
+  has_undo: boolean;
+  watch_enabled: boolean;
+  watch_paused: boolean;
+  auto_apply_mirror: ClipAutoApplyMirrorMode;
+}
+
+export interface ClipPushTextInput {
+  kind: "text";
+  text: string;
+  ephemeral?: boolean;
+}
+
+export interface ClipPushImageInput {
+  kind: "image";
+  mime: AllowedClipImageMime;
+  data_b64: string;
+  width?: number;
+  height?: number;
+  thumb_mime?: AllowedClipImageMime;
+  thumb_b64?: string;
+}
+
+export interface ClipPushResponse {
+  clip_id: string;
+  ephemeral: boolean;
+  delivered_to?: number;
+  item: ClipItemDto | null;
+}
+
+export interface ClipDeleteResponse {
+  deleted_count: number;
+}
+
+export interface ClipApplyResponse {
+  applied: boolean;
+  clip_id: string;
+  has_undo: boolean;
+}
+
+export interface ClipPromoteResponse {
+  block: BlockDto;
+}
+
+export interface ClipUndoResponse {
+  restored: boolean;
+}
+
+export interface ClipWatchResponse {
+  watch_enabled: boolean;
+  watch_paused: boolean;
+  auto_apply_mirror: ClipAutoApplyMirrorMode;
+}
+
 export interface AlertFrame {
   type: "alert";
   code:
@@ -165,7 +245,8 @@ export interface AlertFrame {
     | "CLOCK_SKEW"
     | "RECOVERY_DRILL_DUE"
     | "AUTH_REQUIRED"
-    | "DEVICE_REVOKED";
+    | "DEVICE_REVOKED"
+    | "CLIP_SECRET_BLOCKED";
   details: Record<string, unknown>;
 }
 
@@ -175,5 +256,12 @@ export type LocalWsFrame =
   | { type: "trash_changed"; count: number; pending_confirm_count: number; next_shred_ms: number | null }
   | { type: "sync_status"; state: SyncStateLabel; last_seq: number; pending_ops?: number }
   | { type: "vault_header_changed"; vault_header: VaultHeaderDto }
+  | {
+      type: "clip_changed";
+      upserted: ClipItemDto[];
+      deleted_ids: string[];
+      cleared: boolean;
+      watch_paused: boolean;
+    }
   | AlertFrame;
 
