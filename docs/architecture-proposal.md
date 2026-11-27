@@ -1,8 +1,8 @@
 # 轻量级多端可靠同步开发者笔记软件：深度调研与架构方案
 
-> 2026-11-25 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D7 及 2026-11-25 真机实测拍板（D5′ 移除 macOS Tauri 薄壳 + S0-3 iPhone Argon2id 定值 `(32768, 2, 1)`）更新。
+> 2026-11-27 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D8（含 D1′、D2′、D5′、2026-11-25 真机实测拍板与 2026-11-27 剪贴板同步拍板 D8）更新。
 
-> **定位**：面向开发者的高频临时记录 / Scratchpad 工具，继承 Heynote「多语言分块 + 一键格式化」的顺手体验，从架构根源消除同步丢数问题，原生适配 **macOS**、**Omarchy（Arch + Hyprland）** 与 **移动端（只读 + 复制 + Vault 解锁）**，并兼顾**块级加密**、**Markdown/Mermaid 渲染**与 **CLI + Skill（Agent 友好）**。
+> **定位**：面向开发者的高频临时记录 / Scratchpad 工具，继承 Heynote「多语言分块 + 一键格式化」的顺手体验，从架构根源消除同步丢数问题，原生适配 **macOS**、**Omarchy（Arch + Hyprland）** 与 **移动端（笔记只读 + Vault 解锁 + 独立剪贴板双向图文同步）**，并兼顾**块级加密**、**Markdown/Mermaid 渲染**、**跨端 100 条图文剪贴板同步（M4）**与 **CLI + Skill（Agent 友好）**。
 >
 > **文档状态**：Proposed。本文是总览、ADR 与路线图的单一事实来源；协议、线格式、安全承诺等细节只在下方配套规范中定义，本文仅做概述并链接。
 
@@ -23,7 +23,7 @@
    - [5.5 Agent 友好设计：CLI + Skill 与四级渐进披露帮助体系](#55-agent-友好设计cli--skill-与四级渐进披露帮助体系)
    - [5.6 Markdown 与 Mermaid 图渲染设计（轻量、离线与防 XSS）](#56-markdown-与-mermaid-图渲染设计轻量离线与防-xss)
 6. [多端形态与技术栈选型对比](#6-多端形态与技术栈选型对比)
-7. [分阶段演进路线图（S0 → M3）](#7-分阶段演进路线图s0--m3)
+7. [分阶段演进路线图（S0 → M4）](#7-分阶段演进路线图s0--m4)
 8. [架构决策记录（ADR 摘要）](#8-架构决策记录adr-摘要)
 9. [已移除 / 推迟的机制（2026-11-24）](#9-已移除--推迟的机制2026-11-24)
 
@@ -34,6 +34,7 @@
 > - [安全架构与威胁模型规范 (`threat-model.md`)](./threat-model.md)
 > - [Cloudflare 技术栈云端架构专项评估 (`cloudflare-cloud-architecture.md`)](./cloudflare-cloud-architecture.md)
 > - [评测与质量门禁规范 (`eval-framework.md`)](./eval-framework.md)
+> - [跨端剪贴板同步可行性调研与决策归档 (`clipboard-sync-proposal.md`)](./clipboard-sync-proposal.md)（`Decided`，2026-11-27 拍板为 D8，调研证据与移动端三梯队交互归档；正式契约以本清单其余 SSOT 规范为准）
 
 ---
 
@@ -45,18 +46,19 @@
 
 - **G1 永不静默丢数**：涵盖同步 bug、**丢钥匙**、误操作、平台驱逐、逻辑 bug 扩散。
 - **G2 随手即记、随叫随到**：CLI 本地读写 `< 15 ms` [目标]；桌面统一通过浏览器 / Web App（Omarchy Hyprland 键绑定 / macOS 系统级切窗工具或 `mynote open`）直达常驻本地页面。
-- **G3 多端可得**：桌面之间实时同步；**手机能读、能复制，并能解锁 Vault**（D1、D7）。
+- **G3 多端可得**：桌面之间实时同步；**手机对笔记保持只读、可复制并可解锁 Vault（D1′、D7），并通过物理隔离的剪贴板通道与桌面双向同步 100 条文本与位图图片剪贴板（D8，M4）**。
 - **G4 秘密不落明文、不以明文进云端。**
 - **G5 Agent 可读写**（通过 CLI）。
 - **G6 Heynote 式分块与格式化，Markdown / Mermaid 渲染。**
-- **C1 一个人能长期维护**：复杂度预算建议为 M1 结束时云端代码 < 500 行 [目标]（M2 加入碎纸状态机与竞态校验后约 500–700 行 [估算]）、core 同步部分 < 3k 行 [目标]；任何新机制都需附上触发它的测量数据（F-08）。
-- **C2 成本约 \$5/月**（Cloudflare Workers Paid）[估算]，并配置支出告警（D4）。
+- **C1 一个人能长期维护**：复杂度预算建议为 M1 结束时云端代码 < 500 行 [目标]（M2 实测 `690` 行 `[已测]` <= `700` 行；M4 纳入 100 条图文剪贴板与流式 R2 后约 `870–930` 行 `[估算]`）、core 同步部分 < 3k 行 [目标]（剪贴板逻辑置于独立 `clip` 模块，不增加 `sync` 状态机复杂度）；任何新机制都需附上触发它的测量数据（F-08）。
+- **C2 成本约 \$5/月**（Cloudflare Workers Paid）[估算]，并配置支出告警（D4）；M4 图文剪贴板复用 R2 `10 GB/月` 免费额度与零出口流量，仍无额外月费 [估算]。
 
 ### 0.2 非目标（Non-goals）
 
 - 多人协作、共享与权限管理。
 - 字符级实时协同 / 自动合并：同块并发编辑以多版本并列 + 手动合并呈现，不引入 CRDT 库（D3）。
-- 手机编辑或追加（按数据触发再议，§7）。
+- 手机编辑或追加笔记块（按数据触发再议，§7；D8 仅开放与笔记物理隔离的 `/v1/clip*` 剪贴板通道，手机仍不可改写/删除笔记）。
+- 移动端后台静默自动监听剪贴板、替代 Maccy / `cliphist` 的重型富文本/OCR 剪贴板管理器、任意大文件（视频/压缩包/PDF）同步、以及原生 iOS / Android 独立 App（D8）。
 - 本地或云端 MCP、开放 API。
 - P2P、自托管多节点等去中心化部署。
 - 防御能持久化篡改执行环境的同 UID 攻击者（F-07，见 [`threat-model.md`](./threat-model.md)）。
@@ -296,23 +298,25 @@ flowchart TD
     end
 
     subgraph Mobile["手机 (iOS / Android)"]
-        PWA["只读 PWA (Pele 渲染 + 复制按钮 + mynote-wasm 解密)"]
-        IDB[("IndexedDB 只读缓存 (可随时丢弃重拉)")]
+        PWA["PWA (笔记只读 + Vault 解锁 + 100 条图文剪贴板, read+clip)"]
+        SC["iOS Shortcuts + Scriptable (不切屏快传文本/压缩图, clip-write)"]
+        IDB[("IndexedDB 只读笔记缓存 + 剪贴板轻索引 (可随时丢弃重拉)")]
         VaultM["Vault 解锁 (口令 → Argon2id, VKEK 仅在内存)"]
         PWA <--> IDB
         PWA <--> VaultM
     end
 
     subgraph Cloud["Cloudflare Workers Paid (单 Worker + SQLite DO + R2 + Static Assets)"]
-        SyncAPI["盲中继 (幂等追加 / seq / epoch / 令牌范围 / WS 唤醒)"]
-        CloudDB[("DO SQLite (盲 ops 全历史 + block_keys + key_material + shred_marks + devices)")]
-        R2[("R2 (op 密文归档永久 + 密钥快照 latest/30天历史 + 手机状态快照 2 份)")]
+        SyncAPI["盲中继 (笔记 ops / 密钥表 / 碎纸 / WS 唤醒 / 独立 /v1/clip* 通道)"]
+        CloudDB[("DO SQLite (盲 ops 全历史 + block_keys + key_material + shred_marks + devices + M4 100 条 clip_items 索引)")]
+        R2[("R2 (op 密文归档永久 + 密钥快照 + 手机快照 2 份 + M4 clip/blobs/ 加密原图 8 天生命周期)")]
         SyncAPI --> CloudDB
         SyncAPI --> R2
     end
 
-    Daemon <-->|"HTTPS push/pull + WSS 唤醒 (read-write 令牌)"| SyncAPI
-    PWA -->|"HTTPS 拉取快照 + 尾部 op (read 令牌)"| SyncAPI
+    Daemon <-->|"HTTPS push/pull + /v1/clip* + WSS 唤醒 (read-write 令牌)"| SyncAPI
+    PWA <-->|"笔记只读拉取 + /v1/clip* 双向 (read+clip 令牌)"| SyncAPI
+    SC -->|"仅 POST/PUT /v1/clip* 单向加密投递 (clip-write 令牌)"| SyncAPI
 ```
 
 > 云端实现细节见 [`cloudflare-cloud-architecture.md`](./cloudflare-cloud-architecture.md)；本地 API / CLI 契约见 [`interface-contracts.md`](./interface-contracts.md)。
@@ -442,11 +446,11 @@ sequenceDiagram
 6. **`epoch` 并集对账**：PITR 回滚或迁移导致 `epoch` 变化时，客户端按 `op_id` 求本地与远端的**集合并集**（不清空本地表），补推远端缺失项。
 7. **密钥表与 op 日志分开同步**：`block_keys` / `key_material` / `shred_marks` 按 2P-Set 合并、每次同步全量比对；删除的唯一路径是带服务端强制宽限期的加密碎纸（§5.4）。
 
-#### 跨设备复制粘贴场景（低延迟 × 高可靠）
+#### 跨设备复制粘贴与独立 100 条图文剪贴板通道（D8，M4）
 
-1. **粘贴快车道（Fast-Flush）**：普通输入防抖 `400–500ms` 本地合并；**粘贴（`paste`）、失焦（`blur`）或 CLI 写入**时立即 HTTP `push`，其他桌面经 WebSocket 唤醒后 `pull`（WebSocket 携带 op 推迟，触发条件见 §7）。
-2. **一键复制**：块顶一键 Copy（桌面 `Cmd/Ctrl+Shift+C`）；手机每块一个「复制」按钮（在用户点击手势内调用 `navigator.clipboard.writeText`），满足「桌面 → 手机」的跨端剪贴板需求。
-3. **手机前台唤醒即拉**：PWA 在 `visibilitychange` / `pageshow` 回到前台时执行 HTTP `pull` 与 WS 重连。
+1. **笔记块快车道（M1–M3 既有）**：普通输入防抖 `400–500ms` 本地合并；粘贴（`paste`）、失焦（`blur`）或 CLI 写入时立即 HTTP `push`，其他桌面经 WebSocket 唤醒后 `pull`；块顶与手机端提供一键复制按钮。
+2. **独立 100 条图文剪贴板通道（D8，M4）**：与笔记 `ops` / `block_keys` / R2 永久归档 / 手机状态快照完全物理隔离，采用「**DO SQLite 存 100 条轻索引（默认 7 天 TTL、≤ `64 KiB` 小文本内联与 ≤ `16 KiB` 图片缩略图）+ R2 `clip/blobs/` 流式存加密原图与长文本（单条上限 `10 MiB`，0 DO 30 天 PITR）**」分离架构；全端统一 `MNC1` 信封与独立可轮换 `ClipKey`，并支持 `≤ 256 KiB` 零写库 `--ephemeral` 纯内存 WS 直推。
+3. **移动端 → 桌面分流入口**：Android 通过 PWA `share_target` 直接从系统分享菜单接收文本与图片文件，由 `mynote-wasm` 加密直传；iOS 采用主屏 PWA（`mynote-wasm` 无损发最高 `10 MiB` 大图 + 原生输入框零弹窗粘贴文本）与 iOS Shortcuts + Scriptable（Keychain 存密钥、Share Sheet / Action Button 不切屏发文本及前置缩放 `≤ 1.5 MiB` 压缩图）双通道；桌面收到显式发送项后默认自动写入系统剪贴板（macOS 原生 `NSPasteboard`、Omarchy `wl-copy`）并保留可撤销槽 `mynote clip undo`，支持文本项一键 Promote 为正式笔记块。协议细节见 [`sync-protocol.md`](./sync-protocol.md) §11，调研与交互方案见 [`clipboard-sync-proposal.md`](./clipboard-sync-proposal.md)。
 
 ---
 
@@ -715,19 +719,22 @@ my-note/
 
 ---
 
-## 7. 分阶段演进路线图（S0 → M3）
+## 7. 分阶段演进路线图（S0 → M4）
 
 <a id="7-分阶段演进路线图m0--m3"></a>
 
 > [!IMPORTANT]
-> 2026-11-24：本节整体替换为 [审查 §9.11](../review/2026-11-24-first-principles-review.md) 的路线图。原「M0 桌面本地闭环 → M1 同步」的排序作废：M0 不含同步，结束时仍要靠 Heynote + iCloud 跨端（F-10）。**第一个里程碑就是能卸载 Heynote + iCloud 的最小闭环。**
+> 2026-11-24：本节按 [审查 §9.11](../review/2026-11-24-first-principles-review.md) 重排路线图；2026-11-27 依据 **D8** 追加 `S-Clip → M4a → M4b → M4c` 剪贴板同步迭代阶段。
 
 ```mermaid
 flowchart LR
-    S0["S0 技术 Spike<br/>(约 1-1.5 周)"] --> M1["M1 替换 Heynote+iCloud<br/>桌面双端 E2EE 同步 (γ) + macOS 热键"]
-    M1 --> M2["M2 手机只读 + Vault + 碎纸<br/>只读 PWA + 状态快照 + 双端 Vault 解锁 + 彻底删除"]
-    M2 --> M3["M3 渲染与打磨<br/>Markdown/Pele/Layer 2/时间旅行"]
-    M3 --> T["按数据触发的待办"]
+    S0["S0 技术 Spike<br/>(已完成)"] --> M1["M1 替换 Heynote+iCloud<br/>(已落地)"]
+    M1 --> M2["M2 手机只读 + Vault + 碎纸<br/>(已落地)"]
+    M2 --> M3["M3 渲染与打磨<br/>(已落地)"]
+    M3 --> SC["S-Clip 技术 Spike<br/>(3-4 天真机实测)"]
+    SC --> M4a["M4a 100 条图文显式剪贴板<br/>+ 移动端→桌面双向通道"]
+    M4a --> M4b["M4b 桌面↔桌面<br/>后台自动镜像 (opt-in)"]
+    M4b --> T["按数据触发的待办 (含 M4c)"]
 ```
 
 ### S0：技术 spike（约 1–1.5 周 [估算]，每项限时）
@@ -761,11 +768,17 @@ flowchart LR
 - [x] **Layer 2 外部格式化管道（`#22 [M3-3]`，§5.3）**：支持 `formatters.toml` 数组与字符串命令解析、非零退出（含半截 stdout）/ 0 字节输出 / 非法 UTF-8 / 超时 / 敏感环境变量隔离全 5 类故障熔断（退出码 `7` `FORMAT_SYNTAX_ERROR` 且零写库）；Daemon `POST /v1/local/format` 经 `spawn_blocking` 执行并强制拒绝锁定块（HTTP `423` `BLOCK_LOCKED`，零外部子进程，`SEC-03`）。
 - [x] **历史时间旅行与全链路真实浏览器 E2E 门禁（`#22 [M3-3]`，[`tests/e2e/test_m3_sec06_pele_history.py`](../tests/e2e/test_m3_sec06_pele_history.py)）**：`mynote block history` / `block revert --to-op` / `--undo-actor` / `--dry-run`、Daemon `GET /v1/local/blocks/{id}/history/{op_id}`（Tier 2 仅返密文零明文）与 `POST /v1/local/blocks/{id}/revert`（支持 Tier 2 WASM 加密提交）、桌面历史抽屉（`actor` 徽标、有界 LCS 行级 diff、一键回滚与撤销整批 `actor` 写入、碎纸祖先 fail-closed 标记、切后台 `visibilitychange -> hidden` 立即清空历史与 Tier 2 预览 DOM）。macOS aarch64 实测门禁全绿 `[已测]`：Rust workspace `75/75`、Web Vitest `31/31`（含 `m3_render.test.ts` 20 项）、`cloud-cf` `workerd` `8/8`（`690 LOC` TS <= `700 LOC`），以及全部 4 套真实编译二进制 + `wrangler dev` + Playwright E2E 脚本全通过——其中 `SEC-06` 覆盖 [`tests/fixtures/xss_vectors.json`](../tests/fixtures/xss_vectors.json) 全部 36 条向量（22 Markdown XSS + 7 外链图片 + 7 Mermaid XSS），在桌面 Chromium + WebKit 与手机 PWA WebKit 下均 **0 XSS、0 禁用标签/属性/内联样式、0 外发请求、0 CSP 违规**，`Copy PNG` 在桌面 Chromium（`30,611 B`）、桌面 WebKit（`23,867 B`）与手机 PWA WebKit（`18,216 B`）三端均输出合法 PNG 魔数且零 Tainted Canvas 异常，`SEC-08` 手机 PWA 取证零明文落盘；已接入 CI（[`.github/workflows/ci.yml`](../.github/workflows/ci.yml)）。
 
+### S-Clip 与 M4：独立 100 条图文跨端剪贴板同步（D8，2026-11-27 拍板）
+- [ ] **S-Clip 技术 Spike（3–4 天 `[估算]`，隔离于 `spikes/`）**：在修改正式代码前完成 5 项真机核验——`S-Clip-1` iPhone Scriptable 纯同步 JS `XChaCha20-Poly1305` 与 Rust `mynote-core` `MNC1` 互通及压缩图（`500 KiB` / `1.5 MiB`）耗时与内存稳定性；`S-Clip-2` PWA WASM 加入 `MNC1` 后的 gzip -9 体积基线与 iOS Safari 同步 Promise `ClipboardItem({ 'image/png': promise })` 写图验证；`S-Clip-3` macOS 原生 `NSPasteboard`（优先读 `public.png` 避开 `public.tiff`、过滤 `ConcealedType` 与 `com.apple.is-remote-clipboard`）；`S-Clip-4` Omarchy Hyprland `wl-copy --type image/png` 与 `cliphist` 共存零冲突；`S-Clip-5` Worker 流式直写 `10 MiB` 密文至 R2 `clip/blobs/` 及 8 天前缀生命周期与 `archives/ops/` Bucket Lock 互不干扰。通过后将 `ADR-11` 升为 `Accepted`。
+- [ ] **M4a：100 条图文显式剪贴板 + 移动端 → 桌面双向通道（零桌面后台监听）**：`mynote-core` 新增 `clip` 模块（`MNC1`、独立可轮换 `ClipKey`、位图 MIME 白名单拒 SVG）；`cloud-cf/` 新增 `clip_items` 100 条/7 天 TTL 轻索引表、`read+clip` / `clip-write` 令牌范围、`/v1/clip*` 与流式 R2 `clip/blobs/` 路由、`≤ 256 KiB` 零写库 `--ephemeral` WS 直推（`cloud-cf/src/` 约 `870–930 LOC` TS `[估算]`）；桌面 Daemon/CLI 接入 macOS 原生 `NSPasteboard` 与 Linux `wl-copy`/`wl-paste`、`mynote clip` 子命令、本地 `clip_cache/` LRU `256 MiB`、可撤销防覆盖槽与桌面 UI 100 条图文浮层；手机 PWA 新增 100 条剪贴板面板（Android `share_target` 图文 + iOS 无损大图 `mynote-wasm` + 同步 Promise 复制 PNG）与 iOS Shortcuts/Scriptable 模板；接入 `INV-CLIP-ISOLATION` 与 `SEC-09` 门禁。
+- [ ] **M4b：桌面 ↔ 桌面图文后台自动镜像（默认关闭，opt-in）**：macOS `NSPasteboard.changeCount` 轮询器 + Omarchy `ext-data-control-v1` / `wlr-data-control` 只读观察者；硬过滤敏感 UTI/MIME 与 `com.apple.is-remote-clipboard`、接入 `detect_secret_pattern` 拦截高危凭据、含 JPEG → PNG 转码哈希的双重防回环与速率限制、桌面 UI 一键暂停/恢复监听开关。
+
 ### 按数据触发的待办
 
 | 机制 | 触发条件 |
 | --- | --- |
-| 手机追加 / 编辑（届时再引入 outbox、持久化存储申请、写令牌） | 每周多次出现「想在手机上记一条却记不了」 |
+| M4c 剪贴板远期增强（图片 Promote 为笔记块、`MNCB` 公钥单向信封、极薄原生 iOS Companion App） | 分别在 `blobs/` 附件落地、对组合失守提出更高安全要求、或 M4a 长期使用后 Scriptable 压缩图/单步体验成为高频痛点时触发 |
+| 手机追加 / 编辑笔记块（届时再引入 outbox、持久化存储申请、写令牌） | 每周多次出现「想在手机上记一条却记不了」 |
 | 加密图片 / 二进制附件（`blobs/`，每个附件独立随机 32B `BlobKey` 存入 `BlockPlaintextV1`，避免块换钥时重传附件） | 纯文本 + Mermaid 不足以承载日常临时截图或文件片段需求 |
 | `SPAN_PATCH` / delta | 单条 op 体积 p95 > 64 KB，或日上行 > 50 MB |
 | WebSocket 携带 op | 跨端粘贴 p95 > 1 s，且瓶颈确认在多出的那一次 pull |
@@ -795,6 +808,7 @@ flowchart LR
 | ADR-08 | **Agent 集成** | 纯 CLI（Daemon 运行时 UDS `apply` / 未起时直写 WAL）+ 极轻 `SKILL.md`（L0–L3a，`--help-json` 推迟）；不做本地与云端 MCP；CLI 只能把块删进回收站 | §5.5、D2′ | Proposed（`mynote-cli` + UDS `apply` 实时 WS 刷新 + 离线 WAL 回退 + `skill/SKILL.md` + `G01–G11` + PTY Vault/Trash 边界测试绿灯 `[已测]`；待独立 `[eval-only]` 黄金快照） |
 | ADR-09 | **分发与升级** | Homebrew tap / AUR / `cargo install`，二进制装在用户不可写位置；不做自升级；Schema 迁移前 `VACUUM INTO` 备份 | F-14、F-07 | Proposed（`VACUUM INTO` 备份、`SCHEMA_TOO_NEW` 守卫与 systemd/Hyprland/launchd 模板已就绪 `[已测]`；待打包发布） |
 | ADR-10 | **质量保障** | 只保留 Plane A 确定性门禁（属性测试、DST、真实 Worker 契约测试、INV-RECOVERY、SEC 取证、格式化幂等、CLI 黄金测试、双平台 CI） | D6 | Proposed（双平台 CI + 500 种子 M1/M2 DST + 100k 夜间浸泡 + `cloud-cf` 真实 `workerd` 契约与 M1/M2 共用场景 + `SEC-01`/`03`/`04`/`05`/`08` 已全部接入 CI `[已测]`；待独立 `[eval-only]` 黄金快照） |
+| ADR-11 | **独立 100 条图文剪贴板通道** | 与笔记 `ops` 物理隔离；DO SQLite `clip_items` 存最近 100 条轻索引（7 天 TTL、≤ `64 KiB` 小文本内联 + ≤ `16 KiB` 缩略图），图片与长文本（上限 `10 MiB`）流式存 R2 `clip/blobs/`（8 天前缀生命周期，0 DO PITR）；四态令牌新增 `read+clip` / `clip-write`（笔记写仍 `403`）；全端统一 `MNC1` + 可轮换 `ClipKey` + 可选 `≤ 256 KiB` 零写库 `--ephemeral` 直推；移动端 → 桌面由 PWA + iOS Shortcuts/Scriptable 分流；macOS 改用原生 `NSPasteboard`；分 `S-Clip → M4a → M4b` 交付 | D8、D1′ | Proposed（调研与设计决策见 [`clipboard-sync-proposal.md`](./clipboard-sync-proposal.md)；待 `S-Clip-1`–`S-Clip-5` 真机实测证据通过后升为 `Accepted`） |
 
 ---
 
@@ -812,7 +826,7 @@ flowchart LR
 - Vault 第二套 24 词恢复码：并入统一恢复包（F-05）。
 - `/v1/archive/*` 云端归档 HTTP 路由与恢复专用挑战-应答鉴权：移除，改为 `BOOTSTRAP_TOKEN`（DO 健在时）+ 从 R2 下载目录本地执行 `mynote restore --from-archive <local-dir>`（§9.12）。
 - `/v1/blobs/:sha256` 加密附件：推迟至「按数据触发的待办」（届时每附件独立随机 `BlobKey`，§9.12）。
-- 瞬态加密剪贴板（`clip push --ephemeral`）：手机复制按钮取代（§9.2）。
+- 旧版写入 DO SQLite 且声称零 PITR 的 `ephemeral_clips`（`/v1/sync/ephemeral-clip`）：已永久废弃（F-06）；2026-11-27 拍板 **D8** 以「物理隔离 100 条图文通道（DO 轻索引 + R2 流式原图 + 独立可轮换 `ClipKey` + 零写库 `--ephemeral` WS 直推）」重新纳入 M4（见 §5.2、§7、ADR-11）。
 - 移动端编辑器 / outbox / 冲突合并 UI / Layer 3 移动端格式化：手机只读（§9.2）。
 - WebSocket 携带 op（「顺风车」）：推迟，WebSocket 只发通知（§9.11 待办）。
 - WebAuthn PRF 多槽位：推迟，口令为主路径（§9.10）。

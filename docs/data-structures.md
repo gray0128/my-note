@@ -1,6 +1,6 @@
 # 核心数据结构、存储 Schema 与二进制线格式规范 (`data-structures.md`)
 
-> 2026-11-24 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D7 更新。
+> 2026-11-27 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D8（含 2026-11-27 剪贴板同步拍板 D8 / D1′）更新。
 
 > 本文档是 [总架构设计方案 (`architecture-proposal.md`)](./architecture-proposal.md)、[同步协议规范 (`sync-protocol.md`)](./sync-protocol.md) 与 [威胁模型规范 (`threat-model.md`)](./threat-model.md) 的底层数据结构基准，定义全端统一的标识符编码、`mynote-core` Rust 类型定义、精确到字节偏移的二进制信封格式、**AAD 的唯一权威定义**、密钥表 / 密钥环 / 恢复包结构，以及桌面 SQLite、云端 Durable Object SQLite 与移动端 IndexedDB 的完整 Schema。
 >
@@ -15,8 +15,8 @@
 3. [密码学信封、密钥结构、快照与归档包字节布局（Wire Layout v1）](#3-密码学信封密钥结构快照与归档包字节布局wire-layout-v1)
 4. [桌面端本地 SQLite 完整 DDL Schema（`mynote-store`）](#4-桌面端本地-sqlite-完整-ddl-schemamynote-store)
 5. [云端 Cloudflare DO SQLite 完整 DDL Schema（`cloud-cf`）](#5-云端-cloudflare-do-sqlite-完整-ddl-schemacloud-cf)
-6. [移动端 PWA IndexedDB 存储结构规范（`web`，只读缓存）](#6-移动端-pwa-indexeddb-存储结构规范web只读缓存)
-7. [已移除 / 推迟的机制（2026-11-24）](#7-已移除--推迟的机制2026-11-24)
+6. [移动端 PWA IndexedDB 存储结构规范（`web`，笔记只读缓存 + M4 剪贴板索引）](#6-移动端-pwa-indexeddb-存储结构规范web笔记只读缓存--m4-剪贴板索引)
+7. [已移除 / 推迟的机制（2026-11-24 / 2026-11-27 修订）](#7-已移除--推迟的机制2026-11-24--2026-11-27-修订)
 
 ---
 
@@ -36,6 +36,8 @@
 | `MarkId` | 26 字符大写 ULID | `[u8; 16]` | 碎纸标记 ID（见 §3.4） |
 | `DeviceId` | `dev_` + 16 字符小写 Base32 | UTF-8 `String` | 设备唯一标识（注册时生成，只含 `[a-z0-9_]`，严禁包含连字符 `-` 以免干扰 HLC 解析） |
 | `SnapshotId` | 26 字符大写 ULID | `[u8; 16]` | R2 上「手机用当前状态快照」的标识（见 §3.6） |
+| `ClipId` (`clip_id`) | 26 字符大写 ULID | `[u8; 16]` | **（M4，D8）**独立剪贴板条目唯一主键，按字典序兼作时间顺序游标（见 §3.8） |
+| `ClipKid` (`clip_kid`) | 26 字符大写 ULID | `[u8; 16]` | **（M4，D8）**当前独立可轮换剪贴板密钥 `ClipKey` 的标识（见 §3.8） |
 | `JournalEpoch` | 标准 36 字符 UUIDv4 | `[u8; 16]` | 云端 DO 日志纪元标识（PITR 回滚或迁移新同步服时变更） |
 
 ### 1.2 混合逻辑时钟（`Hlc`）规范化编码
@@ -297,6 +299,7 @@ pub enum SyncCommand {
 | (5) `MNRS` 恢复公钥封装（sealed box，头部格式见 §3.5） | `recovery_kid` | 32 B SMK / VKEK | `RecoveryKeyringV1.smk_entries`、`VaultHeaderV1.sealed_vkek`（§3.5） |
 | (6) `MNVH` Vault 头部内的 VKEK 包裹 | `vkek_kid` | 32 B VKEK | `VaultHeaderV1.wrapped_vkek`（§3.5） |
 | (7) `MNP1` 手机状态快照 | `smk_kid` | 头 / 体两段（§3.6） | R2 |
+| (8) `MNC1` 独立剪贴板密文（M4，D8） | `clip_kid`（`ClipKey`） | `payload_type=0`：`pad256(utf8_json(ClipMetaV1))`；`payload_type=1`：原始图片或长文本字节流（§3.8） | DO `clip_items.meta_envelope` / R2 `clip/blobs/<clip_id>.mnc1` / WS `clip_ephemeral` |
 
 - `MNB1` 两层填充：外层 `MNS1` 已填充，`MNB1` 再填充一次是为了让 Tier 2 正文长度对持有 SMK 的一方同样只按 256 B 档位可见；代价每 op ≤ 255 B [估算]。
 - `zstd` 解压在手机端需要 WASM 实现（或日后改用浏览器原生 `DecompressionStream` 支持的格式，届时升 `version`）。
@@ -316,6 +319,7 @@ pub enum SyncCommand {
 | `MNVH` | `"MNVH" \|\| ver \|\| vkek_kid \|\| msgpack(KdfParamsV1)` |
 | `MNP1` 头 | `"MNP1" \|\| ver \|\| smk_kid \|\| snapshot_id \|\| covers_seq (i64 LE)` |
 | `MNP1` 体 | `"MNP1" \|\| ver \|\| smk_kid \|\| hdr_blake3 (32B)` |
+| `MNC1`（M4，D8） | `"MNC1" \|\| ver \|\| clip_kid \|\| clip_id \|\| device_id.as_bytes() \|\| flags (1B)`（`flags` 见 §3.8） |
 
 **`op_id` 的生成方与本地 Tier 2 封装分工（修正 F-01）**：
 
@@ -562,6 +566,42 @@ pub enum SnapshotLeafBody {
 - 极端双重灾难恢复（`mynote restore --from-archive <local-dir>`，契约见 [`interface-contracts.md`](./interface-contracts.md)）= 本地导出的全部 `MNA1` + `latest.mnks` + 统一恢复包。若仅客户端设备全失而 DO 仍健在，直接凭 `BOOTSTRAP_TOKEN` + 24 词从 DO 全量拉回即可。
 - 彻底不可恢复的上界（`T_grace + max(DO PITR 30 天, T_snap)` ≈ 37 天）的推导与承诺见 [`threat-model.md`](./threat-model.md)。
 
+### 3.8 独立剪贴板通道：`MNC1` 双载荷、`ClipMetaV1` 与 `ClipKey`（M4，D8）
+
+独立剪贴板通道与笔记主日志完全隔离，不复用 `SMK` / `VKEK` / `BDEK`，统一采用 45 B 标准信封头 `magic ("MNC1") || ver (0x01) || clip_kid (16B) || nonce (24B) || XChaCha20-Poly1305 ciphertext (含 16B Tag)`，AAD 以 §3.3 为准：
+
+- **`flags` 字节位定义（参与 AAD 认证）**：
+  - `bit 0`（`0x01`）：`ephemeral`（`1` = 纯内存 WS 直推，零写库零 R2；`0` = 常规 100 条环形队列）；
+  - `bit 1`（`0x02`）：`payload_type`（`0` = `pad256(utf8_json(ClipMetaV1))` 元数据/小文本帧；`1` = R2 原始二进制大对象帧，直接加密原始图片或长文本字节，不做 JSON 包装与 Base64 膨胀）；
+  - 其余位保留为 `0`（解码器收到非零保留位必须报 `INTEGRITY_ERROR`）。
+- **`ClipMetaV1`（UTF-8 紧凑 JSON，避免在 iOS Scriptable 快捷指令引入 MsgPack / zstd 编码依赖）**：
+  ```json
+  {
+    "v": 1,
+    "kind": "image",
+    "mime": "image/png",
+    "source_mode": "explicit",
+    "created_at_ms": 1795600000000,
+    "text": null,
+    "blob": {
+      "byte_size": 1842310,
+      "sha256_hex": "a1b2c3...",
+      "width": 1920,
+      "height": 1080,
+      "thumb_mime": "image/webp",
+      "thumb_b64": "<可选，<= 12 KiB 缩略图>"
+    }
+  }
+  ```
+  - **小文本（`kind = "text"` 且 `≤ 64 KiB`）**：正文直接内联在 `text`，`blob = null`；
+  - **长文本（`kind = "text"` 且 `64 KiB < size ≤ 10 MiB`）**：`text` 仅放前 240 字预览，`blob` 指向 R2 完整密文（`thumb_b64 = null`）；
+  - **图片（`kind = "image"` 且 `≤ 10 MiB`）**：`mime` 严格限定位图白名单 **`image/png` | `image/jpeg` | `image/webp` | `image/gif`**，**拒绝 `image/svg+xml`**（SVG 一律按 `kind = "text"`、`mime = "text/plain"` 同步）；解密 R2 `blob` 后强制比对 `sha256_hex`；
+  - `source_mode` 取值为 `"explicit"`（手机、CLI `clip push`、UI 发送）或 `"auto"`（M4b 桌面后台自动镜像）。
+- **独立剪贴板密钥 `ClipKey`（存入 `key_material(kind = 'clip_key')`）**：
+  - 32 B 随机对称密钥 + 16 B `clip_kid`，使用当前 `SMK` 经 `XChaCha20-Poly1305` 封装为 `ClipKeyMaterialV1`（`{ v: 1, clip_kid, smk_kid, wrapped_clip_key }`）存入 `key_material` 表，按单调递增 `gen` 同步给所有桌面与 `read+clip` 手机；
+  - **不进入统一恢复包 `RecoveryKeyringV1`**（7 天临时缓存数据，灾难恢复后直接生成新 `ClipKey`）；
+  - **轮换不保留旧钥**：`mynote clip rotate-key` 生成全新 `(clip_kid', ClipKey')` 递增 `gen` 覆盖并清空云端 `clip_items` 与 R2 `clip/blobs/*`，各端立即销毁旧 `ClipKey`，使 DO 30 天 PITR 中的旧剪贴板密文立即可证明无法解密。
+
 ---
 
 ## 4. 桌面端本地 SQLite 完整 DDL Schema（`mynote-store`）
@@ -718,11 +758,11 @@ CREATE TABLE IF NOT EXISTS shred_marks (
 
 CREATE INDEX IF NOT EXISTS idx_shred_marks_key ON shred_marks (key_id);
 
--- 9. 密钥环与 Vault 头部的本地副本（§3.5；SMK 明文代际存于 OS Keychain / Secret Service，不在此表）
+-- 9. 密钥环、Vault 头部与剪贴板密钥材料的本地副本（§3.5 / §3.8；SMK 明文代际存于 OS Keychain / Secret Service，不在此表）
 CREATE TABLE IF NOT EXISTS key_material (
-    kind           TEXT PRIMARY KEY CHECK (kind IN ('keyring', 'vault_header')),
-    gen            INTEGER NOT NULL,         -- keyring_gen；vault_header 用 updated_at_ms 单调值
-    blob           BLOB NOT NULL,            -- msgpack(RecoveryKeyringV1) / msgpack(VaultHeaderV1)
+    kind           TEXT PRIMARY KEY CHECK (kind IN ('keyring', 'vault_header', 'clip_key')),
+    gen            INTEGER NOT NULL,         -- keyring_gen / vault_header / clip_key 单调递增代际
+    blob           BLOB NOT NULL,            -- msgpack(RecoveryKeyringV1) / msgpack(VaultHeaderV1) / ClipKeyMaterialV1
     updated_at_ms  INTEGER NOT NULL
 ) STRICT;
 
@@ -734,6 +774,29 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     op_id          TEXT NOT NULL,
     created_at_ms  INTEGER NOT NULL
 ) STRICT;
+
+-- 11. 独立 100 条图文剪贴板本地索引表（M4，D8；原图本体存独立文件目录 clip_cache/，严禁大二进制入主库）
+CREATE TABLE IF NOT EXISTS clip_items (
+    clip_id        TEXT PRIMARY KEY,          -- 26B ULID
+    clip_kid       TEXT NOT NULL,             -- 26B ULID
+    device_id      TEXT NOT NULL,
+    kind           TEXT NOT NULL CHECK (kind IN ('text', 'image')),
+    mime           TEXT NOT NULL,
+    source_mode    TEXT NOT NULL CHECK (source_mode IN ('explicit', 'auto')),
+    created_at_ms  INTEGER NOT NULL,
+    expires_at_ms  INTEGER NOT NULL,
+    text_preview   TEXT,                      -- 小文本完整正文或大文本前 240 字预览；图片为 NULL
+    has_blob       INTEGER NOT NULL DEFAULT 0 CHECK (has_blob IN (0, 1)),
+    blob_bytes     INTEGER,
+    blob_sha256    TEXT,
+    width          INTEGER,
+    height         INTEGER,
+    thumb_mime     TEXT,
+    thumb_blob     BLOB,                      -- 本地物化缩略图（<= 16 KiB）
+    local_blob_path TEXT                      -- 相对 clip_cache/ 的本地已下载文件名，未下载为 NULL
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_local_clip_created ON clip_items (created_at_ms DESC, clip_id DESC);
 ```
 
 **删除与碎纸对本地存储的作用**（流程见 [`sync-protocol.md`](./sync-protocol.md)）：
@@ -752,6 +815,7 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   - 仅在版本升级触发 `PRAGMA user_version` 递增前自动通过 `VACUUM INTO` 生成单文件快照（权限 `0600`，最多保留最近 2 代）。
 - **每日自动备份（`backups/auto-<yyyy-mm-dd>.db`）**：`VACUUM INTO` 生成，权限 `0600`，按 `T_snap`（30 天）轮换删除，使碎纸后的残留副本在有界时间内消失。
 - **只读 Markdown 镜像（`mirror/`）**：只含 `ACTIVE` 且未加锁块的展示版本，块删除时同步删除对应文件。
+- **剪贴板大对象本地缓存（`clip_cache/`，M4，D8）**：权限 `0700`，仅存放按需下载并已解密校验的剪贴板原图与长文本文件，按 **100 条 / `256 MiB`** LRU 自动淘汰；与 `mynote.db` 物理分离，不进入 `VACUUM INTO` 自动备份与只读镜像。
 
 ---
 
@@ -775,7 +839,7 @@ CREATE TABLE IF NOT EXISTS devices (
     device_id        TEXT PRIMARY KEY,
     device_name      TEXT NOT NULL,
     token_sha256_hex TEXT NOT NULL UNIQUE,
-    scope            TEXT NOT NULL CHECK (scope IN ('read', 'read-write')), -- 手机为 'read'：push / 碎纸 / 撤销 / 快照上传一律 403
+    scope            TEXT NOT NULL CHECK (scope IN ('read', 'read+clip', 'clip-write', 'read-write')), -- 非 'read-write' 对笔记 push / 密钥 / 碎纸 / 快照上传一律 403；'clip-write' 对一切 GET 均 403（D1′、D8）
     last_pulled_seq  INTEGER NOT NULL DEFAULT 0,
     last_seen_at_ms  INTEGER NOT NULL,
     created_at_ms    INTEGER NOT NULL,
@@ -791,8 +855,8 @@ CREATE TABLE IF NOT EXISTS pairing_tickets (
     pair_id          TEXT PRIMARY KEY,
     kind             TEXT NOT NULL DEFAULT 'pair' CHECK (kind IN ('pair', 'refresh')),
     device_id        TEXT NOT NULL REFERENCES devices(device_id),
-    scope            TEXT NOT NULL CHECK (scope IN ('read', 'read-write')),
-    ciphertext       BLOB NOT NULL,          -- XChaCha20-Poly1305(K_pair, msgpack({ smks, device_token?, device_id, sync_url }))
+    scope            TEXT NOT NULL CHECK (scope IN ('read', 'read+clip', 'clip-write', 'read-write')),
+    ciphertext       BLOB NOT NULL,          -- XChaCha20-Poly1305(K_pair, msgpack({ smks?, clip_kid?, clip_key?, device_token?, device_id, sync_url }))（clip-write 票据不含 smks）
     created_by       TEXT NOT NULL,
     expires_at_ms    INTEGER NOT NULL        -- created + 10 分钟
 );
@@ -840,9 +904,9 @@ CREATE INDEX IF NOT EXISTS idx_shred_marks_due
     ON shred_marks (not_before_ms)
     WHERE state = 'scheduled';
 
--- 7. 密钥环与 Vault 头部（§3.5；服务端只存密文，随 /v1/keys 读写，仅接受更大的 gen 替换）
+-- 7. 密钥环、Vault 头部与剪贴板密钥材料（§3.5 / §3.8；服务端只存密文，随 /v1/keys 读写，仅接受更大的 gen 替换）
 CREATE TABLE IF NOT EXISTS key_material (
-    kind           TEXT PRIMARY KEY CHECK (kind IN ('keyring', 'vault_header')),
+    kind           TEXT PRIMARY KEY CHECK (kind IN ('keyring', 'vault_header', 'clip_key')),
     gen            INTEGER NOT NULL,
     blob           BLOB NOT NULL,
     updated_at_ms  INTEGER NOT NULL
@@ -859,26 +923,42 @@ CREATE TABLE IF NOT EXISTS phone_snapshots (
     created_at_ms      INTEGER NOT NULL,
     UNIQUE (journal_epoch, covers_seq)
 );
+
+-- 9. 独立 100 条图文剪贴板环形索引表（§3.8，M4，D8；严禁进入 R2 每日 op 归档与手机状态快照）
+CREATE TABLE IF NOT EXISTS clip_items (
+    clip_id        TEXT PRIMARY KEY,          -- 26B ULID（时间有序）
+    clip_kid       TEXT NOT NULL,             -- 26B ULID
+    device_id      TEXT NOT NULL,
+    kind           TEXT NOT NULL CHECK (kind IN ('text', 'image')),
+    created_at_ms  INTEGER NOT NULL,
+    expires_at_ms  INTEGER NOT NULL,          -- 默认 created_at_ms + 7 * 86_400_000 (7 天)
+    meta_envelope  BLOB NOT NULL,             -- MNC1 (payload_type=0，含小文本或图片元数据+缩略图，<= 96 KiB)
+    r2_key         TEXT,                      -- NULL 表示内联小文本；非 NULL 时为 'clip/blobs/<clip_id>.mnc1'
+    blob_bytes     INTEGER                    -- R2 密文字节数（上限 <= 10.5 MiB）
+);
+
+CREATE INDEX IF NOT EXISTS idx_clip_items_expires ON clip_items (expires_at_ms);
 ```
 
 各表的端点、校验与 alarm 实现见 [`cloudflare-cloud-architecture.md`](./cloudflare-cloud-architecture.md) 与 [`interface-contracts.md`](./interface-contracts.md)。
 
 ---
 
-## 6. 移动端 PWA IndexedDB 存储结构规范（`web`，只读缓存）
+## 6. 移动端 PWA IndexedDB 存储结构规范（`web`，笔记只读缓存 + M4 剪贴板索引）
 
-手机是只读客户端（D1）：IndexedDB 只是一份**可随时丢弃的缓存**，被 iOS 驱逐的后果只是下次打开时重新下载「最新快照 + 尾部 op」。**无 outbox、无本地 op 日志写路径、无冲突合并数据**。
+手机对笔记主库保持只读（D1′）：IndexedDB 只是一份**可随时丢弃的缓存**，被 iOS 驱逐的后果只是下次打开时重新下载「最新快照 + 尾部 op + 最近 100 条剪贴板索引」。**笔记侧无 outbox、无本地 op 日志写路径、无冲突合并数据**。
 
-数据库名称：`mynote_pwa_v1`（Schema Version `1`），共 **6 个 Object Stores**：
+数据库名称：`mynote_pwa_v1`（M2 为 Schema Version `1` 共 6 个 Object Stores；M4 升至 Version `2` 新增 `clip_items` 共 **7 个 Object Stores**）：
 
 | Object Store 名称 | `keyPath` | 二级索引（Indexes） | 存储内容说明 |
 | --- | --- | --- | --- |
-| `device_keystore` | `"id"` | 无 | 存 `{ id: "wrapping_key", cryptoKey: CryptoKey(AES-GCM, extractable=false) }` 及被其包裹的 `{ id: "credentials", iv, wrapped_smks (当前及历史 SMK 代际), wrapped_token (scope = read), device_id, sync_url }` |
-| `meta` | `"key"` | 无 | `journal_epoch`、`snapshot_covers_seq`、`last_seq`、PWA 版本号等非机密游标 |
+| `device_keystore` | `"id"` | 无 | 存 `{ id: "wrapping_key", cryptoKey: CryptoKey(AES-GCM, extractable=false) }` 及被其包裹的 `{ id: "credentials", iv, wrapped_smks (当前及历史 SMK 代际), wrapped_clip_key? (M4 独立 ClipKey), wrapped_token (scope = read \| read+clip), device_id, sync_url }` |
+| `meta` | `"key"` | 无 | `journal_epoch`、`snapshot_covers_seq`、`last_seq`、`last_clip_id`（M4）、PWA 版本号等非机密游标 |
 | `buffers` | `"id"` | `by_position`: `["position", "id"]` | `SnapshotBufferV1` 形状：名称保持 `MNB1` 密文，渲染时于内存中解密 |
 | `blocks` | `"id"` | `by_buffer_pos`: `["buffer_id", "position", "id"]` | `SnapshotBlockV1` 形状：字段 LWW 结果 + 全部叶子。**叶子正文一律保持 `MNB1` 密文**（Tier 1 也不例外），只在渲染 / 复制时于内存中解密 |
 | `block_keys` | `"key_id"` | 无 | 同步下来的可用密钥记录（`MNR1`）；收到碎纸执行即 `store.delete(key_id)`，并删除该块的缓存 |
 | `vault_header` | `"id"` | 无 | `VaultHeaderV1`（KDF 参数、盐、`wrapped_vkek`），供手机解锁 Vault |
+| `clip_items`（M4，D8） | `"clip_id"` | `by_created`: `["created_at_ms", "clip_id"]` | 最近 100 条剪贴板轻元数据（**`meta_envelope` 保持 `MNC1` 密文**，不落盘明文正文与原图大对象；原图仅点击查看/复制时按需流式拉取并在内存中解密） |
 
 - **VKEK 永不落盘**：口令 → Argon2id（WASM）→ PassKey → 解开 `wrapped_vkek` 得到的 VKEK 只存在于内存，**永不写入 IndexedDB 或 Cache Storage**；`visibilitychange` 或闲置 N 分钟后清零上锁。
 - 恢复密钥环（`RecoveryKeyringV1`）、Root Seed 与 `recovery_sk` 不进入手机。
@@ -886,7 +966,7 @@ CREATE TABLE IF NOT EXISTS phone_snapshots (
 
 ---
 
-## 7. 已移除 / 推迟的机制（2026-11-24）
+## 7. 已移除 / 推迟的机制（2026-11-24 / 2026-11-27 修订）
 
 依据 [第一性原理审查](../review/2026-11-24-first-principles-review.md)：
 
@@ -897,7 +977,7 @@ CREATE TABLE IF NOT EXISTS phone_snapshots (
 - `SPAN_PATCH` / `BlockSpanPatch` / `SpanPatchV1` / 每 20 步全量检查点：op 只用全量载荷；单条 op p95 > 64 KB 时再议（§9.4、§9.11、F-02）。
 - `block_conflicts` 及其允许明文分支的 Lock-Wins 约束：由 `block_leaves`（多叶子并列、任一叶子加锁则整块按加锁渲染）取代（§9.4、F-06）。
 - `purge_op_ids` / `sync_ops.is_purged` / 可置空的 `ops.envelope` / `ScrubBlockPlaintextHistory`：op 密文永不删除，删除只作用于密钥（§9.3、F-04）。
-- `ephemeral_clips` 瞬态加密剪贴板：手机复制按钮取代（§9.2、F-06）。
+- 旧版写入 DO SQLite 且声称零 PITR 的 `ephemeral_clips` 表：已永久废弃（F-06）；2026-11-27 拍板 **D8** 改为 §3.8 / §5 的独立 `clip_items` 100 条轻索引 + R2 `clip/blobs/` 流式原图 + 独立可轮换 `ClipKey`（`MNC1`）+ 零写库 `--ephemeral` WS 直推。
 - R2 K=5 多世代快照 + CAS（`snapshot_meta`、`prev_snapshot_id`、`rolling_op_hash`、`state_blake3`、`covers_key_seq`）：改为只给手机用的当前状态快照（§9.2、F-02）。
 - DO 滑动窗口 GC 与 `min_retained_seq`：Paid 套餐 10 GB 下不需要（§9.5）。
 - HLC 漂移钳制 `MAX_FORWARD_DRIFT_MS` / `ClockDriftExceeded`：HLC 只决定展示顺序，只做本地偏差提示（§9.4、F-03）。
