@@ -1,0 +1,58 @@
+[workspace]
+
+[package]
+name = "s-clip-3-macos-pasteboard"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "s-clip-3-macos-pasteboard"
+path = "src/main.rs"
+
+[[bin]]
+name = "run-tests"
+path = "src/bin/run_tests.rs"
+required-features = ["backend-objc2-typed", "img-full"]
+
+[features]
+default = ["backend-objc2-typed", "img-full"]
+
+# 1. Zero-dependency baseline: --no-default-features
+# 2. Recommended: typed objc2-app-kit + objc2-foundation with surgical per-class features
+backend-objc2-typed = [
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-app-kit",
+]
+# 3. Minimal alternative: raw objc2 msg_send! + manual AppKit framework link
+backend-objc2-raw = ["dep:objc2"]
+# 4. Control comparison: objc2-app-kit + objc2-foundation with default features enabled
+backend-objc2-appkit-default = [
+    "backend-objc2-typed",
+    "objc2-app-kit/default",
+    "objc2-foundation/default",
+]
+
+# Image codecs (pure Rust, no rayon / avif / exr)
+img-png-tiff = ["dep:image", "image/png", "image/tiff"]
+img-full = [
+    "dep:image",
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "image/tiff",
+]
+
+[dependencies]
+objc2 = { version = "0.6.5", default-features = false, features = ["std"], optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSEnumerator", "NSString"], optional = true }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem"], optional = true }
+image = { version = "0.25.10", default-features = false, optional = true }
+
+[profile.release]
+# Matches root Cargo.toml [profile.release]
+lto = "thin"
+strip = true
