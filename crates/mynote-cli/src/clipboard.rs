@@ -605,8 +605,8 @@ pub fn dib_to_png(dib: &[u8]) -> Result<(Vec<u8>, u32, u32), CoreError> {
     }
 
     if bit_count == 32 && a_mask == 0 && !any_nonzero_alpha {
-        for chunk in rgba.chunks_exact_mut(4) {
-            chunk[3] = 0xFF;
+        for [_, _, _, a] in rgba.as_chunks_mut::<4>().0 {
+            *a = 0xFF;
         }
     }
 
@@ -651,8 +651,8 @@ pub fn utf8_to_utf16le_clipboard_bytes(text: &str) -> Vec<u8> {
 /// Decode NUL-terminated UTF-16LE bytes from Win32 `CF_UNICODETEXT` into a UTF-8 `String`.
 pub fn utf16le_clipboard_bytes_to_utf8(raw: &[u8]) -> Result<String, CoreError> {
     let mut units = Vec::with_capacity(raw.len() / 2);
-    for pair in raw.chunks_exact(2) {
-        let unit = u16::from_le_bytes([pair[0], pair[1]]);
+    for &[lo, hi] in raw.as_chunks::<2>().0 {
+        let unit = u16::from_le_bytes([lo, hi]);
         if unit == 0 {
             break;
         }
