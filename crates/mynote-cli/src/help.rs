@@ -159,7 +159,7 @@ const TOPIC_AGENT: &str = "\
   3  NOT_FOUND | IN_TRASH (check details.deleted_at_ms; undo via `mynote trash restore <id>`)
   4  HEAD_MISMATCH (retryable; read error.details.actual_heads) | CONFLICT_PRESENT | CAS_MISMATCH
   5  BLOCK_LOCKED | KEY_SHREDDED | AUTH_REQUIRED | DEVICE_REVOKED | TOKEN_SCOPE_FORBIDDEN
-  6  SYNC_OFFLINE | RATE_LIMITED (retryable)
+  6  SYNC_OFFLINE | NO_ONLINE_DESKTOP | RATE_LIMITED | CLIP_QUOTA_EXCEEDED (5 GiB cloud clip cap)
   7  FORMAT_SYNTAX_ERROR (zero writes; original block untouched)
   8  KEY_MISSING | INTEGRITY_ERROR (e.g., SCHEMA_TOO_NEW)
 

@@ -237,6 +237,22 @@ describe("M4a-2: Independent 100-item Clip Channel, 4-State Scopes, Streaming R2
     const phoneMsgs: Record<string, unknown>[] = [];
     wsPhone.addEventListener("message", (ev) => { phoneMsgs.push(JSON.parse(String(ev.data)) as Record<string, unknown>); });
 
+    // Verify default production window is 1000 items / 30 days / 5 GiB, then lower maxItems to 100 for fast eviction check
+    const initialList = (await (await SELF.fetch("https://relay.test/v1/clip", { headers: { authorization: `Bearer ${deskAToken}` } })).json()) as {
+      ok: boolean;
+      has_more: boolean;
+      quota: { used_bytes: number; limit_bytes: number; item_count: number; item_limit: number };
+    };
+    expect(initialList.ok).toBe(true);
+    expect(initialList.has_more).toBe(false);
+    expect(initialList.quota).toEqual({
+      used_bytes: 0,
+      limit_bytes: 5 * 1024 * 1024 * 1024,
+      item_count: 0,
+      item_limit: 1000,
+    });
+    await runInDurableObject(stub, (inst) => (inst as SyncJournalDO).setClipLimitsForTest({ maxItems: 100 }));
+
     // Push 105 mixed clips (0..104):
     // - indices 0..4 include 3 blobs (0, 2, 4) so eviction MUST delete their R2 blobs
     // - index 50 is a real 10 MiB streaming blob uploaded via ReadableStream
@@ -269,7 +285,7 @@ describe("M4a-2: Independent 100-item Clip Channel, 4-State Scopes, Streaming R2
         expect(pj.ok).toBe(true);
         expect(pj.clip_id).toBe(clipId);
         expect(pj.blob_bytes).toBe(size);
-        expect(pj.expires_at_ms - pj.created_at_ms).toBe(7 * DAY_MS);
+        expect(pj.expires_at_ms - pj.created_at_ms).toBe(30 * DAY_MS);
       } else {
         const postRes = await SELF.fetch("https://relay.test/v1/clip", {
           method: "POST",
@@ -285,7 +301,7 @@ describe("M4a-2: Independent 100-item Clip Channel, 4-State Scopes, Streaming R2
         const tj = (await postRes.json()) as { ok: boolean; clip_id: string; created_at_ms: number; expires_at_ms: number };
         expect(tj.ok).toBe(true);
         expect(tj.clip_id).toBe(clipId);
-        expect(tj.expires_at_ms - tj.created_at_ms).toBe(7 * DAY_MS);
+        expect(tj.expires_at_ms - tj.created_at_ms).toBe(30 * DAY_MS);
       }
     }
 
@@ -309,16 +325,18 @@ describe("M4a-2: Independent 100-item Clip Channel, 4-State Scopes, Streaming R2
     expect(listJson.items[0].clip_id).toBe(ulidFor("01JDFC11P0000000000000", 5));
     expect(listJson.items[99].clip_id).toBe(ulidFor("01JDFC11P0000000000000", 104));
 
-    // Pagination via since_id & limit
+    // Pagination via since_id & limit reports has_more + next_since_id
     const pageRes = await SELF.fetch(`https://relay.test/v1/clip?since_id=${ulidFor("01JDFC11P0000000000000", 100)}&limit=2`, {
       headers: { authorization: `Bearer ${phoneToken}` },
     });
     expect(pageRes.status).toBe(200);
-    const pageJson = (await pageRes.json()) as { items: { clip_id: string }[] };
+    const pageJson = (await pageRes.json()) as { items: { clip_id: string }[]; has_more: boolean; next_since_id: string };
     expect(pageJson.items.map((x) => x.clip_id)).toEqual([
       ulidFor("01JDFC11P0000000000000", 101),
       ulidFor("01JDFC11P0000000000000", 102),
     ]);
+    expect(pageJson.has_more).toBe(true);
+    expect(pageJson.next_since_id).toBe(ulidFor("01JDFC11P0000000000000", 102));
 
     // Evicted oldest 5 items (indices 0, 2, 4 were blobs) MUST have 0 leftover R2 objects
     for (const evictedIdx of [0, 2, 4]) {
@@ -448,16 +466,16 @@ describe("M4a-2: Independent 100-item Clip Channel, 4-State Scopes, Streaming R2
     expect(failRes.status).toBe(503);
     expect(await env.ARCHIVE_BUCKET.head(`clip/blobs/${failId}.mnc1`)).toBeNull();
 
-    // DELETE single blob item removes R2 object and broadcasts clip_cleared
+    // DELETE single blob item removes R2 object and broadcasts clip_cleared (scope: all)
     const delOneRes = await SELF.fetch(`https://relay.test/v1/clip/${bigClipId}`, {
       method: "DELETE",
       headers: { authorization: `Bearer ${deskAToken}` },
     });
     expect(delOneRes.status).toBe(200);
-    expect(await delOneRes.json()).toEqual({ ok: true, deleted_count: 1 });
+    expect(await delOneRes.json()).toMatchObject({ ok: true, deleted_count: 1, freed_bytes: TEN_MIB });
     expect(await env.ARCHIVE_BUCKET.head(`clip/blobs/${bigClipId}.mnc1`)).toBeNull();
     await vi.waitFor(() => {
-      expect(phoneMsgs.some((m) => m.type === "clip_cleared" && m.clip_id === bigClipId)).toBe(true);
+      expect(phoneMsgs.some((m) => m.type === "clip_cleared" && m.clip_id === bigClipId && m.scope === "all")).toBe(true);
     });
 
     // Zero changes to ops, block_keys, shred_marks, phone_snapshots, and R2 archives/ before alarm
@@ -478,8 +496,8 @@ describe("M4a-2: Independent 100-item Clip Channel, 4-State Scopes, Streaming R2
     expect((await env.ARCHIVE_BUCKET.list({ prefix: "archives/ops/" })).objects.map((o) => `${o.key}:${o.size}`).sort()).toEqual(baseOpsArchive);
     expect((await env.ARCHIVE_BUCKET.list({ prefix: "archives/keys/" })).objects.map((o) => `${o.key}:${o.size}`).sort()).toEqual(baseKeysArchive);
 
-    // Advance virtual clock > 7 days and trigger DO alarm -> ALL clip_items + ALL clip/blobs/* purged
-    await runInDurableObject(stub, (inst) => (inst as SyncJournalDO).setClockOffsetMs(7 * DAY_MS + 60_000));
+    // Advance virtual clock > 30 days and trigger DO alarm -> ALL clip_items + ALL clip/blobs/* purged
+    await runInDurableObject(stub, (inst) => (inst as SyncJournalDO).setClockOffsetMs(30 * DAY_MS + 60_000));
     await runDurableObjectAlarm(stub);
 
     const afterExpList = (await (await SELF.fetch("https://relay.test/v1/clip", { headers: { authorization: `Bearer ${deskAToken}` } })).json()) as { items: unknown[] };
@@ -490,6 +508,7 @@ describe("M4a-2: Independent 100-item Clip Channel, 4-State Scopes, Streaming R2
     // Note ops archive STILL unchanged (zero clip leakage into archives/ops/)
     expect((await env.ARCHIVE_BUCKET.list({ prefix: "archives/ops/" })).objects.map((o) => `${o.key}:${o.size}`).sort()).toEqual(baseOpsArchive);
 
+    await runInDurableObject(stub, (inst) => (inst as SyncJournalDO).setClipLimitsForTest({ maxItems: null, ttlMs: null, quotaBytes: null }));
     wsDeskB.close();
     wsPhone.close();
   });
@@ -701,10 +720,11 @@ describe("M4a-2: Independent 100-item Clip Channel, 4-State Scopes, Streaming R2
       ["DELETE", `/v1/devices/${rcId}`, null],
     ];
 
-    // 1. clip-write MUST get 403 on ALL GETs, ALL DELETEs, WS upgrade, and ALL note/key/shred/snapshot/device routes
+    // 1. clip-write MUST get 403 on ALL GETs, ALL DELETEs, POST /v1/clip/prune, WS upgrade, and ALL note/key/shred/snapshot/device routes
     for (const [m, p, body, hdrs] of [
       ["GET", "/v1/clip", null],
       ["GET", `/v1/clip/${seedBlobId}/blob`, null],
+      ["POST", "/v1/clip/prune", JSON.stringify({ kind: "image" }), { "content-type": "application/json" }],
       ["DELETE", `/v1/clip/${seedBlobId}`, null],
       ["DELETE", "/v1/clip", null],
       ["GET", "/v1/sync/pull?since=0", null],
@@ -758,6 +778,7 @@ describe("M4a-2: Independent 100-item Clip Channel, 4-State Scopes, Streaming R2
     });
     await expectForbidden(roToken, "DELETE", `/v1/clip/${seedBlobId}`, null);
     await expectForbidden(roToken, "DELETE", "/v1/clip", null);
+    await expectForbidden(roToken, "POST", "/v1/clip/prune", JSON.stringify({ kind: "image" }), { "content-type": "application/json" });
     for (const [m, p, body, hdrs] of noteWriteEndpoints) {
       await expectForbidden(roToken, m, p, body, hdrs);
     }
@@ -993,5 +1014,131 @@ describe("M4a-2: Independent 100-item Clip Channel, 4-State Scopes, Streaming R2
       }),
     });
     expect(postClip.status).toBe(200);
+  });
+
+  it("D8': enforces hard cloud blob quota (507 CLIP_QUOTA_EXCEEDED), allows text while full, supports POST /v1/clip/prune and scoped DELETE /v1/clip", async () => {
+    const deskAToken = "tok-d8p-desk-a";
+    const deskBToken = "tok-d8p-desk-b";
+    const phoneToken = "tok-d8p-phone-rc";
+    const stub = env.SYNC_DO.get(env.SYNC_DO.idFromName("d8-prime-quota-prune"));
+    await bootstrapDevice("MacD8P", deskAToken, { deviceId: "dev_d8pmac000001", fetcher: stub });
+    await pairDevice(deskAToken, "LinuxD8P", "read-write", deskBToken, { fetcher: stub });
+    await pairDevice(deskAToken, "PhoneD8P", "read+clip", phoneToken, { fetcher: stub });
+
+    // Set a tight 5000 B quota via test hook so we can test exact 507 boundary fast
+    await runInDurableObject(stub, (inst) => (inst as SyncJournalDO).setClipLimitsForTest({ maxItems: 1000, quotaBytes: 5000 }));
+
+    const wsDeskBRes = await stub.fetch("https://relay.test/v1/sync/ws", {
+      headers: { authorization: `Bearer ${deskBToken}`, upgrade: "websocket" },
+    });
+    const wsDeskB = wsDeskBRes.webSocket!;
+    wsDeskB.accept();
+    const deskBMsgs: Record<string, unknown>[] = [];
+    wsDeskB.addEventListener("message", (ev) => { deskBMsgs.push(JSON.parse(String(ev.data)) as Record<string, unknown>); });
+
+    const putBlob = (id: string, size: number, kind: "image" | "text" = "image") =>
+      stub.fetch("https://relay.test/v1/clip/blob", {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${deskAToken}`,
+          "content-type": "application/octet-stream",
+          "content-length": String(size),
+          "x-clip-id": id,
+          "x-clip-kid": CLIP_KID,
+          "x-clip-kind": kind,
+          "x-clip-meta-b64": b64(`meta_${id}`),
+        },
+        body: new Uint8Array(size).fill(3),
+      });
+
+    const b1 = ulidFor("01JDFD8PQV0TA000000000", 1);
+    const b2 = ulidFor("01JDFD8PQV0TA000000000", 2);
+    const b3 = ulidFor("01JDFD8PQV0TA000000000", 3);
+    const t1 = ulidFor("01JDFD8PQV0TA000000000", 4);
+
+    // Upload 2 x 2000 B blobs = 4000 B / 5000 B
+    expect((await putBlob(b1, 2000, "image")).status).toBe(200);
+    await runInDurableObject(stub, (inst) => (inst as SyncJournalDO).setClockOffsetMs(10_000));
+    const r2 = await putBlob(b2, 2000, "image");
+    expect(r2.status).toBe(200);
+    expect(await r2.json()).toMatchObject({ ok: true, quota: { used_bytes: 4000, limit_bytes: 5000, item_count: 2, item_limit: 1000 } });
+
+    // 3rd blob (2000 B -> 6000 > 5000) MUST return 507 CLIP_QUOTA_EXCEEDED with 0 R2 write
+    const r3 = await putBlob(b3, 2000, "image");
+    expect(r3.status).toBe(507);
+    expect(await r3.json()).toMatchObject({
+      ok: false,
+      error: {
+        code: "CLIP_QUOTA_EXCEEDED",
+        retryable: false,
+        details: { used_bytes: 4000, limit_bytes: 5000, incoming_bytes: 2000 },
+      },
+    });
+    expect(await env.ARCHIVE_BUCKET.head(`clip/blobs/${b3}.mnc1`)).toBeNull();
+
+    // Small inline text POST /v1/clip MUST STILL SUCCEED even when blob quota is nearly full
+    const rt1 = await stub.fetch("https://relay.test/v1/clip", {
+      method: "POST",
+      headers: { authorization: `Bearer ${deskAToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ clip_id: t1, clip_kid: CLIP_KID, kind: "text", meta_envelope_b64: b64("small_text_ok") }),
+    });
+    expect(rt1.status).toBe(200);
+
+    // Dry-run prune keeping latest 1 image matches b1 (2000 B) without deleting anything
+    const dryRes = await stub.fetch("https://relay.test/v1/clip/prune", {
+      method: "POST",
+      headers: { authorization: `Bearer ${phoneToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ kind: "image", keep_latest: 1, dry_run: true }),
+    });
+    expect(dryRes.status).toBe(200);
+    expect(await dryRes.json()).toMatchObject({ ok: true, dry_run: true, matched_count: 1, deleted_count: 0, freed_bytes: 2000 });
+    expect(await env.ARCHIVE_BUCKET.head(`clip/blobs/${b1}.mnc1`)).not.toBeNull();
+
+    // Execute prune keeping latest 1 image -> frees b1 (2000 B), keeps b2 + t1, broadcasts scope='cloud'
+    const pruneRes = await stub.fetch("https://relay.test/v1/clip/prune", {
+      method: "POST",
+      headers: { authorization: `Bearer ${phoneToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ kind: "image", keep_latest: 1 }),
+    });
+    expect(pruneRes.status).toBe(200);
+    expect(await pruneRes.json()).toMatchObject({
+      ok: true,
+      dry_run: false,
+      matched_count: 1,
+      deleted_count: 1,
+      freed_bytes: 2000,
+      quota: { used_bytes: 2000, limit_bytes: 5000, item_count: 2, item_limit: 1000 },
+    });
+    expect(await env.ARCHIVE_BUCKET.head(`clip/blobs/${b1}.mnc1`)).toBeNull();
+    expect(await env.ARCHIVE_BUCKET.head(`clip/blobs/${b2}.mnc1`)).not.toBeNull();
+    await vi.waitFor(() => {
+      expect(deskBMsgs.some((m) => m.type === "clip_cleared" && m.clip_id === null && m.scope === "cloud" && m.pruned === true)).toBe(true);
+    });
+
+    // Now b3 (2000 B -> 4000 <= 5000) succeeds!
+    expect((await putBlob(b3, 2000, "image")).status).toBe(200);
+
+    // DELETE /v1/clip defaults to scope='cloud' (protects desktop local archive); explicit ?scope=all broadcasts scope='all'
+    const clearCloudRes = await stub.fetch("https://relay.test/v1/clip", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${phoneToken}` },
+    });
+    expect(clearCloudRes.status).toBe(200);
+    expect(await clearCloudRes.json()).toMatchObject({ ok: true, deleted_count: 3, freed_bytes: 4000, scope: "cloud" });
+    await vi.waitFor(() => {
+      expect(deskBMsgs.some((m) => m.type === "clip_cleared" && m.clip_id === null && m.scope === "cloud" && !m.pruned)).toBe(true);
+    });
+
+    const clearAllRes = await stub.fetch("https://relay.test/v1/clip?scope=all", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${deskAToken}` },
+    });
+    expect(clearAllRes.status).toBe(200);
+    expect(await clearAllRes.json()).toMatchObject({ ok: true, deleted_count: 0, scope: "all" });
+    await vi.waitFor(() => {
+      expect(deskBMsgs.some((m) => m.type === "clip_cleared" && m.clip_id === null && m.scope === "all")).toBe(true);
+    });
+
+    wsDeskB.close();
   });
 });

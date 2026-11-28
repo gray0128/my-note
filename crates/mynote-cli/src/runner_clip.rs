@@ -8,14 +8,16 @@ use crate::clipboard::{
     make_thumbnail, ClipboardPayload, ClipboardWriteOpts, ReadClipboardResult,
 };
 use crate::daemon::{clip_blob_cache_name, truncate_clip_preview};
-use crate::sync_client::{ensure_clip_key, refresh_clip_key_from_remote, rotate_clip_key, RemoteClipItem};
+use crate::sync_client::{
+    ensure_clip_key, refresh_clip_key_from_remote, rotate_clip_key_with_options, RemoteClipItem,
+};
 use mynote_core::clip::{
     clip_sha256_hex, decrypt_mnc1_blob, decrypt_mnc1_meta, encrypt_mnc1_blob, encrypt_mnc1_meta,
     validate_clip_image_mime, verify_clip_blob_sha256, ClipBlobMetaV1, ClipKind, ClipMetaV1, ClipSourceMode,
     CLIP_BLOB_MAX_BYTES, CLIP_DEFAULT_TTL_MS, CLIP_EPHEMERAL_MAX_BYTES, CLIP_INLINE_TEXT_MAX_BYTES,
 };
 use mynote_core::ids::{ClipId, ClipKid};
-use mynote_store::{ClipItemRow, CLIP_LOCAL_MAX_ITEMS};
+use mynote_store::{ClipItemRow, ClipListQuery, ClipPruneFilter};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -447,9 +449,6 @@ pub(super) fn handle_clip(
             if cur.as_deref().is_none_or(|c| stored_row.clip_id.as_str() > c) {
                 let _ = store.set_clip_cursor(Some(&stored_row.clip_id));
             }
-            for evicted in store.trim_clip_items(CLIP_LOCAL_MAX_ITEMS)? {
-                let _ = cache.delete(&evicted);
-            }
             let _ = try_send_uds(
                 store.data_dir(),
                 &UdsRequest::ClipPoke {
@@ -656,13 +655,21 @@ pub(super) fn handle_clip(
             Ok(0)
         }
 
-        ClipCommand::History { limit, kind } => {
+        ClipCommand::History {
+            limit,
+            before_id,
+            kind,
+            query,
+        } => {
             let cache = store.clip_cache();
-            for expired in store.prune_expired_clip_items(now_ms_cli() as i64)? {
-                let _ = cache.delete(&expired);
-            }
-            let rows = store.list_clip_items(limit, kind.as_deref())?;
-            let summaries: Vec<ClipHistorySummaryDto> = rows
+            let page = store.list_clip_items_page(&ClipListQuery {
+                limit,
+                before_id: before_id.as_deref(),
+                kind: kind.as_deref(),
+                query: query.as_deref(),
+            })?;
+            let summaries: Vec<ClipHistorySummaryDto> = page
+                .items
                 .iter()
                 .map(|r| ClipHistorySummaryDto {
                     clip_id: r.clip_id.clone(),
@@ -710,6 +717,211 @@ pub(super) fn handle_clip(
                                 item.clip_id, item.kind, item.source_mode, detail
                             );
                         }
+                        if page.has_more {
+                            if let Some(last) = summaries.last() {
+                                println!(
+                                    "... ({} shown of {}; pass --before-id {} for older items)",
+                                    summaries.len(),
+                                    page.total_count,
+                                    last.clip_id
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(0)
+        }
+
+        ClipCommand::Prune {
+            before,
+            keep,
+            kind,
+            scope,
+            dry_run,
+        } => {
+            if scope != "local" && scope != "cloud" && scope != "all" {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("invalid prune scope '{scope}'"),
+                    "Use --scope local, --scope cloud, or --scope all",
+                ));
+            }
+            if let Some(ref k) = kind {
+                if k != "text" && k != "image" {
+                    return Err(CoreError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("invalid clip kind '{k}'"),
+                        "Use --kind text or --kind image",
+                    ));
+                }
+            }
+            let before_ms = match before.as_deref() {
+                Some(raw) => {
+                    let dur_ms = parse_clip_duration_ms(raw)?;
+                    Some((now_ms_cli() as i64).saturating_sub(dur_ms))
+                }
+                None => None,
+            };
+            if before_ms.is_none() && keep.is_none() && kind.is_none() {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    "at least one of --before, --keep, or --kind is required",
+                    "Specify a prune filter or use 'mynote clip clear --scope <local|cloud|all>'",
+                ));
+            }
+
+            let mut local_res = None;
+            if scope == "local" || scope == "all" {
+                let res = store.prune_clip_items(&ClipPruneFilter {
+                    before_ms,
+                    keep_latest: keep,
+                    kind: kind.clone(),
+                    dry_run,
+                })?;
+                local_res = Some(res);
+            }
+
+            let mut cloud_res = None;
+            if scope == "cloud" || scope == "all" {
+                let Some(creds) = store.load_credentials()? else {
+                    if scope == "cloud" {
+                        return Err(CoreError::new(
+                            ErrorCode::SyncOffline,
+                            "clip prune --scope cloud requires a configured sync relay",
+                            "Configure cloud sync or use --scope local",
+                        ));
+                    } else {
+                        // Offline / unconfigured in 'all' scope still reports local prune result
+                        return emit_clip_prune_output(
+                            store, mode, started, &scope, dry_run, local_res, None,
+                        );
+                    }
+                };
+                let client = RelayClient::from_credentials(&creds)?;
+                let rec = run_async(client.clip_prune(before_ms, keep, kind.as_deref(), dry_run))?;
+                cloud_res = Some(rec);
+            }
+
+            if !dry_run
+                && (local_res.as_ref().is_some_and(|r| r.deleted_count > 0)
+                    || cloud_res.as_ref().is_some_and(|r| r.deleted_count > 0))
+            {
+                let _ = try_send_uds(
+                    store.data_dir(),
+                    &UdsRequest::ClipPoke {
+                        clip_id: None,
+                        cleared: scope != "cloud",
+                    },
+                    Duration::from_secs(2),
+                );
+            }
+
+            emit_clip_prune_output(store, mode, started, &scope, dry_run, local_res, cloud_res)
+        }
+
+        ClipCommand::Clear { scope } => {
+            if scope != "local" && scope != "cloud" && scope != "all" {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("invalid clear scope '{scope}'"),
+                    "Use --scope local, --scope cloud, or --scope all",
+                ));
+            }
+            let mut cloud_deleted = 0usize;
+            let mut cloud_freed = 0u64;
+            let mut cloud_quota = None;
+            if scope == "cloud" || scope == "all" {
+                let Some(creds) = store.load_credentials()? else {
+                    return Err(CoreError::new(
+                        ErrorCode::SyncOffline,
+                        "clearing cloud clipboard requires a configured sync relay",
+                        "Configure cloud sync or use --scope local",
+                    ));
+                };
+                let client = RelayClient::from_credentials(&creds)?;
+                let relay_scope = if scope == "all" { "all" } else { "cloud" };
+                let rec = run_async(client.clip_delete_scoped(None, Some(relay_scope)))?;
+                cloud_deleted = rec.deleted_count;
+                cloud_freed = rec.freed_bytes;
+                cloud_quota = rec.quota;
+                if scope == "cloud" {
+                    let _ = store.set_clip_cursor(None);
+                }
+            }
+            let mut local_deleted = 0usize;
+            let mut local_freed = 0u64;
+            if scope == "local" || scope == "all" {
+                let (_, bytes_before) = store.clip_cache().stats();
+                let (n, _) = store.clear_clip_items()?;
+                let _ = store.clip_cache().clear();
+                local_deleted = n;
+                local_freed = bytes_before;
+            }
+            let _ = try_send_uds(
+                store.data_dir(),
+                &UdsRequest::ClipPoke {
+                    clip_id: None,
+                    cleared: scope != "cloud",
+                },
+                Duration::from_secs(2),
+            );
+            let out = serde_json::json!({
+                "scope": scope,
+                "deleted_count": local_deleted.max(cloud_deleted),
+                "local_deleted": local_deleted,
+                "cloud_deleted": cloud_deleted,
+                "freed_bytes": local_freed.max(cloud_freed),
+                "cloud_quota": cloud_quota,
+            });
+            match mode {
+                OutputMode::Json | OutputMode::Jsonl => emit_json(out, store_meta(store, started, None)),
+                OutputMode::Human => println!(
+                    "cleared clip history (scope={scope}, local_deleted={local_deleted}, cloud_deleted={cloud_deleted}, freed={} bytes)",
+                    local_freed.max(cloud_freed)
+                ),
+            }
+            Ok(0)
+        }
+
+        ClipCommand::Stats => {
+            let local = store.clip_storage_stats()?;
+            let cloud_quota = if let Some(creds) = store.load_credentials()? {
+                let client = RelayClient::from_credentials(&creds)?;
+                run_async(client.clip_list_page(None, 1))
+                    .ok()
+                    .and_then(|p| p.quota)
+            } else {
+                None
+            };
+            let out = serde_json::json!({
+                "local": local,
+                "cloud_quota": cloud_quota,
+            });
+            match mode {
+                OutputMode::Json | OutputMode::Jsonl => emit_json(out, store_meta(store, started, None)),
+                OutputMode::Human => {
+                    println!(
+                        "local clip archive: {} items ({} text, {} image), {} cached blobs ({} bytes), {} uncached blobs",
+                        local.total_items,
+                        local.text_items,
+                        local.image_items,
+                        local.cached_blob_files,
+                        local.cached_blob_bytes,
+                        local.uncached_blob_items
+                    );
+                    if let Some(q) = cloud_quota {
+                        let pct = if q.limit_bytes > 0 {
+                            (q.used_bytes as f64 / q.limit_bytes as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        println!(
+                            "cloud clip window:  {}/{} items, {}/{} bytes ({:.1}%)",
+                            q.item_count, q.item_limit, q.used_bytes, q.limit_bytes, pct
+                        );
+                    } else {
+                        println!("cloud clip window:  (offline or unconfigured)");
                     }
                 }
             }
@@ -826,7 +1038,7 @@ pub(super) fn handle_clip(
             Ok(0)
         }
 
-        ClipCommand::RotateKey => {
+        ClipCommand::RotateKey { wipe_local } => {
             require_tty(non_interactive, "clip rotate-key")?;
             let Some(creds) = store.load_credentials()? else {
                 return Err(CoreError::new(
@@ -836,12 +1048,12 @@ pub(super) fn handle_clip(
                 ));
             };
             let client = RelayClient::from_credentials(&creds)?;
-            let (new_kid, new_gen) = run_async(rotate_clip_key(store, &client))?;
+            let (new_kid, new_gen) = run_async(rotate_clip_key_with_options(store, &client, wipe_local))?;
             let _ = try_send_uds(
                 store.data_dir(),
                 &UdsRequest::ClipPoke {
                     clip_id: None,
-                    cleared: true,
+                    cleared: wipe_local,
                 },
                 Duration::from_secs(2),
             );
@@ -850,14 +1062,23 @@ pub(super) fn handle_clip(
                 "clip_kid": new_kid.to_string(),
                 "gen": new_gen,
                 "cleared": true,
+                "wiped_local": wipe_local,
             });
             match mode {
                 OutputMode::Json | OutputMode::Jsonl => {
                     emit_json(data, store_meta(store, started, None));
                 }
-                OutputMode::Human => println!(
-                    "rotated ClipKey to {new_kid} (gen={new_gen}); cloud & local clip history cleared"
-                ),
+                OutputMode::Human => {
+                    if wipe_local {
+                        println!(
+                            "rotated ClipKey to {new_kid} (gen={new_gen}); cloud & local clip history cleared"
+                        );
+                    } else {
+                        println!(
+                            "rotated ClipKey to {new_kid} (gen={new_gen}); cloud clip buffer cleared (local desktop archive preserved)"
+                        );
+                    }
+                }
             }
             Ok(0)
         }
@@ -954,10 +1175,95 @@ pub(super) fn handle_clip(
     }
 }
 
+fn parse_clip_duration_ms(raw: &str) -> Result<i64, CoreError> {
+    let s = raw.trim().to_ascii_lowercase();
+    let (num_str, mult_ms): (&str, i64) = if let Some(v) = s.strip_suffix('d') {
+        (v, 86_400_000)
+    } else if let Some(v) = s.strip_suffix('h') {
+        (v, 3_600_000)
+    } else if let Some(v) = s.strip_suffix('m') {
+        (v, 60_000)
+    } else {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!("invalid duration '{raw}' (expected suffix d, h, or m, e.g. 30d or 24h)"),
+            "Use --before 30d, --before 7d, or --before 24h",
+        ));
+    };
+    let n: i64 = num_str.parse().map_err(|_| {
+        CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!("invalid duration number in '{raw}'"),
+            "Use a positive integer followed by d, h, or m (e.g. 30d)",
+        )
+    })?;
+    if n <= 0 {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!("duration '{raw}' must be positive"),
+            "Use a positive duration like 7d or 30d",
+        ));
+    }
+    Ok(n.saturating_mul(mult_ms))
+}
+
+fn emit_clip_prune_output(
+    store: &LocalStore,
+    mode: OutputMode,
+    started: Instant,
+    scope: &str,
+    dry_run: bool,
+    local_res: Option<mynote_store::ClipPruneResult>,
+    cloud_res: Option<crate::sync_client::CloudClipPruneReceipt>,
+) -> Result<i32, CoreError> {
+    let matched_count = local_res
+        .as_ref()
+        .map(|r| r.matched_count)
+        .unwrap_or(0)
+        .max(cloud_res.as_ref().map(|r| r.matched_count).unwrap_or(0));
+    let deleted_count = local_res
+        .as_ref()
+        .map(|r| r.deleted_count)
+        .unwrap_or(0)
+        .max(cloud_res.as_ref().map(|r| r.deleted_count).unwrap_or(0));
+    let freed_bytes = local_res
+        .as_ref()
+        .map(|r| r.freed_bytes)
+        .unwrap_or(0)
+        .max(cloud_res.as_ref().map(|r| r.freed_bytes).unwrap_or(0));
+    let cloud_quota = cloud_res.as_ref().and_then(|c| c.quota.clone());
+    let out = serde_json::json!({
+        "dry_run": dry_run,
+        "scope": scope,
+        "matched_count": matched_count,
+        "deleted_count": deleted_count,
+        "freed_bytes": freed_bytes,
+        "local": local_res,
+        "cloud": cloud_res,
+        "cloud_quota": cloud_quota,
+    });
+    match mode {
+        OutputMode::Json | OutputMode::Jsonl => emit_json(out, store_meta(store, started, None)),
+        OutputMode::Human => {
+            if dry_run {
+                println!(
+                    "[dry-run] prune (scope={scope}): would delete {matched_count} items (freed ~{freed_bytes} bytes)"
+                );
+            } else {
+                println!(
+                    "pruned clip history (scope={scope}): deleted {deleted_count} items (freed {freed_bytes} bytes)"
+                );
+            }
+        }
+    }
+    Ok(0)
+}
+
 async fn sync_cloud_clips_cli(store: &mut LocalStore, client: &RelayClient) -> Result<usize, CoreError> {
     let (mut clip_kid, mut clip_key, _gen) = ensure_clip_key(store, client).await?;
     let cursor = store.get_clip_cursor();
-    let mut remote: Vec<RemoteClipItem> = client.clip_list(cursor.as_deref(), CLIP_LOCAL_MAX_ITEMS).await?;
+    let (mut remote, _quota): (Vec<RemoteClipItem>, _) =
+        client.clip_list_all_since(cursor.as_deref()).await?;
     if remote.is_empty() {
         return Ok(0);
     }
@@ -1027,13 +1333,6 @@ async fn sync_cloud_clips_cli(store: &mut LocalStore, client: &RelayClient) -> R
 
     if let Some(ref cur) = max_clip_id {
         let _ = store.set_clip_cursor(Some(cur));
-    }
-    let cache = store.clip_cache();
-    for evicted in store.trim_clip_items(CLIP_LOCAL_MAX_ITEMS)? {
-        let _ = cache.delete(&evicted);
-    }
-    for expired in store.prune_expired_clip_items(now_ms_cli() as i64)? {
-        let _ = cache.delete(&expired);
     }
     Ok(upserted)
 }

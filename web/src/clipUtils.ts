@@ -1,6 +1,10 @@
 import type { AllowedClipImageMime, ClipKind, ClipSourceMode } from "./types";
 
-export const CLIP_MAX_ITEMS = 100;
+export const CLIP_CLOUD_MAX_ITEMS = 1000;
+export const CLIP_MAX_ITEMS = CLIP_CLOUD_MAX_ITEMS;
+export const CLIP_PAGE_LIMIT = 50;
+export const CLIP_CLOUD_QUOTA_BYTES = 5 * 1024 * 1024 * 1024;
+export const CLIP_CLOUD_QUOTA_WARN_RATIO = 0.8;
 export const CLIP_INLINE_TEXT_MAX_BYTES = 64 * 1024;
 export const CLIP_EPHEMERAL_MAX_BYTES = 256 * 1024;
 export const CLIP_BLOB_MAX_BYTES = 10 * 1024 * 1024;
@@ -91,7 +95,8 @@ export function formatClipBytes(bytes: number | null | undefined): string {
   if (bytes === null || bytes === undefined || !Number.isFinite(bytes) || bytes < 0) return "";
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
 }
 
 export function extForClipMime(mime: string): string {

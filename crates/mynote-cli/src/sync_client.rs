@@ -90,6 +90,7 @@ fn map_error_code(code: &str) -> ErrorCode {
         "TOKEN_SCOPE_FORBIDDEN" => ErrorCode::TokenScopeForbidden,
         "NO_ONLINE_DESKTOP" => ErrorCode::NoOnlineDesktop,
         "RATE_LIMITED" => ErrorCode::RateLimited,
+        "CLIP_QUOTA_EXCEEDED" => ErrorCode::ClipQuotaExceeded,
         "INTEGRITY_ERROR" => ErrorCode::IntegrityError,
         _ => ErrorCode::SyncOffline,
     }
@@ -1620,12 +1621,46 @@ pub struct RemoteClipItem {
     pub blob_bytes: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudClipQuota {
+    pub used_bytes: u64,
+    pub limit_bytes: u64,
+    pub item_count: usize,
+    pub item_limit: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CloudClipListPage {
+    pub items: Vec<RemoteClipItem>,
+    pub has_more: bool,
+    pub next_since_id: Option<String>,
+    pub quota: Option<CloudClipQuota>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CloudClipDeleteReceipt {
+    pub deleted_count: usize,
+    pub freed_bytes: u64,
+    pub quota: Option<CloudClipQuota>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CloudClipPruneReceipt {
+    pub dry_run: bool,
+    pub matched_count: usize,
+    pub deleted_count: usize,
+    pub freed_bytes: u64,
+    pub quota: Option<CloudClipQuota>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClipMetaPushReceipt {
     pub clip_id: String,
     pub created_at_ms: Option<i64>,
     pub expires_at_ms: Option<i64>,
     pub delivered_to: Option<usize>,
+    #[serde(default)]
+    pub quota: Option<CloudClipQuota>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1634,6 +1669,8 @@ pub struct ClipBlobPushReceipt {
     pub blob_bytes: i64,
     pub created_at_ms: i64,
     pub expires_at_ms: i64,
+    #[serde(default)]
+    pub quota: Option<CloudClipQuota>,
 }
 
 #[derive(Clone, Debug)]
@@ -1663,6 +1700,7 @@ pub enum CloudWsEvent {
     },
     ClipCleared {
         clip_id: Option<String>,
+        scope: Option<String>,
     },
 }
 
@@ -1760,6 +1798,7 @@ where
                                             Some("clip_cleared") => {
                                                 on_event(CloudWsEvent::ClipCleared {
                                                     clip_id: v["clip_id"].as_str().map(ToString::to_string),
+                                                    scope: v["scope"].as_str().map(ToString::to_string),
                                                 });
                                             }
                                             _ => {}
@@ -1843,8 +1882,20 @@ impl RelayClient {
         blob: &[u8],
         clear_clips: bool,
     ) -> Result<i64, CoreError> {
+        self.push_clip_key_material_scoped(gen, blob, clear_clips, None)
+            .await
+    }
+
+    /// Upload `key_material.clip_key` (`POST /v1/keys`) with explicit `clear_clips_scope` (`"cloud"` or `"all"`).
+    pub async fn push_clip_key_material_scoped(
+        &self,
+        gen: i64,
+        blob: &[u8],
+        clear_clips: bool,
+        clear_clips_scope: Option<&str>,
+    ) -> Result<i64, CoreError> {
         let b64 = base64::engine::general_purpose::STANDARD;
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "key_records": [],
             "key_material": {
                 "clip_key": {
@@ -1854,6 +1905,9 @@ impl RelayClient {
             },
             "clear_clips": clear_clips,
         });
+        if let Some(scope) = clear_clips_scope {
+            body["clear_clips_scope"] = serde_json::Value::String(scope.to_string());
+        }
         let res = self
             .add_headers(self.http.post(self.endpoint("/v1/keys")).json(&body))
             .send()
@@ -1898,11 +1952,15 @@ impl RelayClient {
                 )
             })?;
         let val = parse_relay_json(res).await?;
+        let quota = val
+            .get("quota")
+            .and_then(|q| serde_json::from_value::<CloudClipQuota>(q.clone()).ok());
         Ok(ClipMetaPushReceipt {
             clip_id: val["clip_id"].as_str().unwrap_or(clip_id).to_string(),
             created_at_ms: val["created_at_ms"].as_i64(),
             expires_at_ms: val["expires_at_ms"].as_i64(),
             delivered_to: val["delivered_to"].as_u64().map(|n| n as usize),
+            quota,
         })
     }
 
@@ -1939,20 +1997,24 @@ impl RelayClient {
                 )
             })?;
         let val = parse_relay_json(res).await?;
+        let quota = val
+            .get("quota")
+            .and_then(|q| serde_json::from_value::<CloudClipQuota>(q.clone()).ok());
         Ok(ClipBlobPushReceipt {
             clip_id: val["clip_id"].as_str().unwrap_or(clip_id).to_string(),
             blob_bytes: val["blob_bytes"].as_i64().unwrap_or(blob_envelope.len() as i64),
             created_at_ms: val["created_at_ms"].as_i64().unwrap_or(now_ms() as i64),
             expires_at_ms: val["expires_at_ms"].as_i64().unwrap_or(0),
+            quota,
         })
     }
 
-    /// `GET /v1/clip?since_id=&limit=`: fetch encrypted clip metadata envelopes.
-    pub async fn clip_list(
+    /// `GET /v1/clip?since_id=&limit=`: fetch one page (<= 100) of encrypted clip metadata envelopes.
+    pub async fn clip_list_page(
         &self,
         since_id: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<RemoteClipItem>, CoreError> {
+    ) -> Result<CloudClipListPage, CoreError> {
         let lim = limit.clamp(1, 100);
         let url = match since_id.filter(|s| !s.is_empty()) {
             Some(since) => format!("{}/v1/clip?since_id={since}&limit={lim}", self.base_url),
@@ -1966,13 +2028,64 @@ impl RelayClient {
             )
         })?;
         let val = parse_relay_json(res).await?;
-        serde_json::from_value(val["items"].clone()).map_err(|e| {
+        let items: Vec<RemoteClipItem> = serde_json::from_value(val["items"].clone()).map_err(|e| {
             CoreError::new(
                 ErrorCode::IntegrityError,
                 format!("invalid GET /v1/clip items payload: {e}"),
                 "Verify relay version",
             )
+        })?;
+        let has_more = val.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
+        let next_since_id = val
+            .get("next_since_id")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string)
+            .or_else(|| items.last().map(|r| r.clip_id.clone()));
+        let quota = val
+            .get("quota")
+            .and_then(|q| serde_json::from_value::<CloudClipQuota>(q.clone()).ok());
+        Ok(CloudClipListPage {
+            items,
+            has_more,
+            next_since_id,
+            quota,
         })
+    }
+
+    /// Fetch all incremental pages from `GET /v1/clip` (bounded at 20 pages / 2,000 items safety cap).
+    pub async fn clip_list_all_since(
+        &self,
+        since_id: Option<&str>,
+    ) -> Result<(Vec<RemoteClipItem>, Option<CloudClipQuota>), CoreError> {
+        let mut cursor = since_id.filter(|s| !s.is_empty()).map(ToString::to_string);
+        let mut all = Vec::new();
+        let mut latest_quota = None;
+        for _ in 0..20 {
+            let page = self.clip_list_page(cursor.as_deref(), 100).await?;
+            if page.quota.is_some() {
+                latest_quota = page.quota;
+            }
+            let next_cur = page.next_since_id.clone();
+            let page_empty = page.items.is_empty();
+            all.extend(page.items);
+            if !page.has_more || page_empty {
+                break;
+            }
+            if next_cur == cursor {
+                break;
+            }
+            cursor = next_cur;
+        }
+        Ok((all, latest_quota))
+    }
+
+    /// `GET /v1/clip?since_id=&limit=`: fetch encrypted clip metadata envelopes (single page).
+    pub async fn clip_list(
+        &self,
+        since_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RemoteClipItem>, CoreError> {
+        Ok(self.clip_list_page(since_id, limit).await?.items)
     }
 
     /// `GET /v1/clip/:clip_id/blob`: fetch raw `MNC1` (`payload_type=1`) blob from R2 via Worker.
@@ -2055,11 +2168,18 @@ impl RelayClient {
         })
     }
 
-    /// `DELETE /v1/clip` or `DELETE /v1/clip/:clip_id`.
-    pub async fn clip_delete(&self, clip_id: Option<&str>) -> Result<usize, CoreError> {
+    /// `DELETE /v1/clip` (optionally with `?scope=cloud|all`) or `DELETE /v1/clip/:clip_id`.
+    pub async fn clip_delete_scoped(
+        &self,
+        clip_id: Option<&str>,
+        scope: Option<&str>,
+    ) -> Result<CloudClipDeleteReceipt, CoreError> {
         let path = match clip_id {
             Some(id) => format!("/v1/clip/{id}"),
-            None => "/v1/clip".to_string(),
+            None => match scope {
+                Some(sc) => format!("/v1/clip?scope={sc}"),
+                None => "/v1/clip".to_string(),
+            },
         };
         let res = self
             .add_headers(self.http.delete(self.endpoint(&path)))
@@ -2073,7 +2193,57 @@ impl RelayClient {
                 )
             })?;
         let val = parse_relay_json(res).await?;
-        Ok(val["deleted_count"].as_u64().unwrap_or(0) as usize)
+        let quota = val
+            .get("quota")
+            .and_then(|q| serde_json::from_value::<CloudClipQuota>(q.clone()).ok());
+        Ok(CloudClipDeleteReceipt {
+            deleted_count: val["deleted_count"].as_u64().unwrap_or(0) as usize,
+            freed_bytes: val["freed_bytes"].as_u64().unwrap_or(0),
+            quota,
+        })
+    }
+
+    /// `DELETE /v1/clip` or `DELETE /v1/clip/:clip_id`.
+    pub async fn clip_delete(&self, clip_id: Option<&str>) -> Result<usize, CoreError> {
+        Ok(self.clip_delete_scoped(clip_id, None).await?.deleted_count)
+    }
+
+    /// `POST /v1/clip/prune`: selectively prune cloud clipboard items & R2 blobs.
+    pub async fn clip_prune(
+        &self,
+        before_ms: Option<i64>,
+        keep_latest: Option<usize>,
+        kind: Option<&str>,
+        dry_run: bool,
+    ) -> Result<CloudClipPruneReceipt, CoreError> {
+        let body = serde_json::json!({
+            "before_ms": before_ms,
+            "keep_latest": keep_latest,
+            "kind": kind,
+            "dry_run": dry_run,
+        });
+        let res = self
+            .add_headers(self.http.post(self.endpoint("/v1/clip/prune")).json(&body))
+            .send()
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::SyncOffline,
+                    format!("POST /v1/clip/prune failed: {e}"),
+                    "Check network connectivity and retry",
+                )
+            })?;
+        let val = parse_relay_json(res).await?;
+        let quota = val
+            .get("quota")
+            .and_then(|q| serde_json::from_value::<CloudClipQuota>(q.clone()).ok());
+        Ok(CloudClipPruneReceipt {
+            dry_run: val["dry_run"].as_bool().unwrap_or(dry_run),
+            matched_count: val["matched_count"].as_u64().unwrap_or(0) as usize,
+            deleted_count: val["deleted_count"].as_u64().unwrap_or(0) as usize,
+            freed_bytes: val["freed_bytes"].as_u64().unwrap_or(0),
+            quota,
+        })
     }
 }
 
@@ -2181,22 +2351,40 @@ pub async fn refresh_clip_key_from_remote_with_mutex(
     store_mutex.lock().unwrap().unwrap_local_clip_key()
 }
 
-/// Rotate `ClipKey` to a brand-new generation, instruct the relay to wipe `clip_items` & `clip/blobs/*`
-/// (`clear_clips: true`), destructively overwrite local `key_material(kind='clip_key')`, and clear
-/// local `clip_items` & `clip_cache/`.
+/// Rotate `ClipKey` to a brand-new generation, instruct the relay to wipe cloud `clip_items` &
+/// `clip/blobs/*` (`clear_clips: true`), and destructively overwrite local `key_material(kind='clip_key')`.
+///
+/// By default (`wipe_local = false`, D8′), already-decrypted desktop local archive entries in
+/// `clip_items` and `clip_cache/` are preserved; pass `wipe_local = true` to wipe local & broadcast
+/// `scope = "all"` to peer desktops.
 pub async fn rotate_clip_key(
     store: &mut LocalStore,
     client: &RelayClient,
+) -> Result<(ClipKid, i64), CoreError> {
+    rotate_clip_key_with_options(store, client, false).await
+}
+
+pub async fn rotate_clip_key_with_options(
+    store: &mut LocalStore,
+    client: &RelayClient,
+    wipe_local: bool,
 ) -> Result<(ClipKid, i64), CoreError> {
     let remote_gen = client.fetch_remote_clip_key().await?.map(|(g, _)| g).unwrap_or(0);
     let local_gen = store.get_clip_key_material()?.map(|m| m.gen).unwrap_or(0);
     let next_gen = remote_gen.max(local_gen) + 1;
     let now = now_ms();
     let (new_kid, _new_key, blob) = store.generate_wrapped_clip_key(now)?;
-    let acked_gen = client.push_clip_key_material(next_gen, &blob, true).await?;
+    let scope = if wipe_local { "all" } else { "cloud" };
+    let acked_gen = client
+        .push_clip_key_material_scoped(next_gen, &blob, true, Some(scope))
+        .await?;
     store.upsert_clip_key_material(acked_gen, &blob, now as i64)?;
-    let _ = store.clear_clip_items()?;
-    let _ = store.clip_cache().clear();
+    if wipe_local {
+        let _ = store.clear_clip_items()?;
+        let _ = store.clip_cache().clear();
+    } else {
+        let _ = store.set_clip_cursor(None);
+    }
     Ok((new_kid, acked_gen))
 }
 

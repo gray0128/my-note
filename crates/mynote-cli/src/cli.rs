@@ -567,16 +567,57 @@ pub enum ClipCommand {
         out: Option<PathBuf>,
     },
 
-    /// List recent clipboard history summaries (token-budget safe)
+    /// List clipboard history summaries (paginated & searchable over unbounded desktop archive)
     History {
-        /// Maximum items to return (1..=100)
-        #[arg(long, default_value_t = 100)]
+        /// Maximum items to return per page (1..=1000)
+        #[arg(long, default_value_t = 50)]
         limit: usize,
+
+        /// Cursor clip ULID for fetching older items
+        #[arg(long, value_name = "CLIP_ID")]
+        before_id: Option<String>,
 
         /// Filter by kind: text or image
         #[arg(long, value_name = "KIND")]
         kind: Option<String>,
+
+        /// Case-insensitive substring search across text preview, MIME, and clip_id
+        #[arg(long, value_name = "QUERY")]
+        query: Option<String>,
     },
+
+    /// Manually prune clipboard history by age, retain count, and/or kind
+    Prune {
+        /// Delete items older than this duration (e.g. 30d, 7d, 24h)
+        #[arg(long, value_name = "DURATION")]
+        before: Option<String>,
+
+        /// Keep at least the newest N matching items
+        #[arg(long, value_name = "N")]
+        keep: Option<usize>,
+
+        /// Restrict pruning to kind: text or image
+        #[arg(long, value_name = "KIND")]
+        kind: Option<String>,
+
+        /// Target scope: local (default), cloud, or all
+        #[arg(long, default_value = "local", value_name = "SCOPE")]
+        scope: String,
+
+        /// Preview matched item count and bytes without deleting
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Clear all clipboard history in the chosen scope
+    Clear {
+        /// Target scope: local (default), cloud, or all
+        #[arg(long, default_value = "local", value_name = "SCOPE")]
+        scope: String,
+    },
+
+    /// Show local clipboard archive usage and cloud 5 GiB quota status
+    Stats,
 
     /// Promote a text clip item into a standard note block
     Promote {
@@ -595,8 +636,12 @@ pub enum ClipCommand {
     /// Restore the desktop clipboard to its state prior to the last overwrite
     Undo,
 
-    /// Rotate ClipKey and wipe cloud + local clip history (TTY required)
-    RotateKey,
+    /// Rotate ClipKey and wipe cloud clip buffer (preserves desktop local archive unless --wipe-local; TTY required)
+    RotateKey {
+        /// Also wipe desktop local clip history & cache (and broadcast full wipe to peer desktops)
+        #[arg(long)]
+        wipe_local: bool,
+    },
 
     /// Configure or inspect background desktop clipboard auto-watch (default OFF, opt-in)
     Watch {

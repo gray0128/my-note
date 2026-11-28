@@ -6,9 +6,9 @@ import {
 } from "../components/themeMenu";
 import {
   CLIP_BLOB_MAX_BYTES,
+  CLIP_CLOUD_QUOTA_WARN_RATIO,
   CLIP_EPHEMERAL_MAX_BYTES,
   CLIP_INLINE_TEXT_MAX_BYTES,
-  CLIP_MAX_ITEMS,
   bytesToBase64Chunked,
   computeSha256Hex,
   convertImageBytesToPngBlob,
@@ -42,10 +42,12 @@ import {
   fetchCloudKeys,
   fetchCloudStateSnapshot,
   getCloudClipBlob,
-  listCloudClips,
+  listAllCloudClipsSince,
   postCloudClip,
+  pruneCloudClips,
   pullCloudOps,
   putCloudClipBlob,
+  type CloudClipQuotaWire,
 } from "./cloudApi";
 import {
   clearAllPwaStorage,
@@ -177,6 +179,8 @@ export class MobilePwaApp {
   private clipCodec: WasmClipCodec | null = null;
   private clipItemsCipher: CiphertextClipItem[] = [];
   private decryptedClips = new Map<string, ClipMetaV1>();
+  private cloudClipQuota: CloudClipQuotaWire | null = null;
+  private clipRenderLimit = 40;
   private clipDraftText = "";
   private clipEphemeral = false;
   private clipSending = false;
@@ -1684,7 +1688,10 @@ export class MobilePwaApp {
     const full = opts.full ?? false;
     try {
       const sinceId = full ? undefined : ((await getLastClipId()) ?? undefined);
-      const res = await listCloudClips(this.creds.sync_url, this.creds.device_token, sinceId, CLIP_MAX_ITEMS, signal);
+      const res = await listAllCloudClipsSince(this.creds.sync_url, this.creds.device_token, sinceId, signal);
+      if (res.quota) {
+        this.cloudClipQuota = res.quota;
+      }
 
       const needKeyRefresh =
         res.items.length > 0 &&
@@ -1695,7 +1702,8 @@ export class MobilePwaApp {
         await this.applyClipKeyMaterial(kr.key_material.clip_key);
         if (prevKid && this.clipCodec && this.clipCodec.clipKid !== prevKid && !full) {
           // ClipKey rotated while online: pull full list under the fresh key.
-          const fresh = await listCloudClips(this.creds.sync_url, this.creds.device_token, undefined, CLIP_MAX_ITEMS, signal);
+          const fresh = await listAllCloudClipsSince(this.creds.sync_url, this.creds.device_token, undefined, signal);
+          if (fresh.quota) this.cloudClipQuota = fresh.quota;
           this.clipItemsCipher = await saveClipItems(fresh.items, { replaceAll: true });
           const maxId = this.clipItemsCipher.reduce<string | null>(
             (acc, r) => (!acc || r.clip_id > acc ? r.clip_id : acc),
@@ -1847,6 +1855,7 @@ export class MobilePwaApp {
         });
         this.clipDraftText = "";
         this.clipEphemeral = false;
+        if (res.quota) this.cloudClipQuota = res.quota;
         if (ephemeral) {
           this.showToast(t("clip.toastSentEphemeral", { count: res.delivered_to ?? 0 }));
         } else {
@@ -1856,7 +1865,7 @@ export class MobilePwaApp {
             device_id: this.creds.device_id,
             kind: "text",
             created_at_ms: res.created_at_ms ?? now,
-            expires_at_ms: res.expires_at_ms ?? now + 7 * 86_400_000,
+            expires_at_ms: res.expires_at_ms ?? now + 30 * 86_400_000,
             meta_envelope_b64: metaB64,
             has_blob: false,
             blob_bytes: null,
@@ -1893,6 +1902,7 @@ export class MobilePwaApp {
           { clipId, clipKid: codec.clipKid, kind: "text", metaEnvelopeB64: metaB64 },
           blobEnv,
         );
+        if (res.quota) this.cloudClipQuota = res.quota;
         this.clipDraftText = "";
         this.clipEphemeral = false;
         const cipherItem: CiphertextClipItem = {
@@ -1915,6 +1925,11 @@ export class MobilePwaApp {
     } catch (e) {
       if (e instanceof CloudApiError && (e.status === 401 || e.code === "DEVICE_REVOKED")) {
         this.handleDeviceRevoked();
+        return false;
+      }
+      if (e instanceof CloudApiError && e.code === "CLIP_QUOTA_EXCEEDED") {
+        this.clipErrorMsg = t("clip.quotaFull");
+        this.showToast(this.clipErrorMsg, true);
         return false;
       }
       const parsed = parseWasmError(e);
@@ -1988,6 +2003,7 @@ export class MobilePwaApp {
         { clipId, clipKid: codec.clipKid, kind: "image", metaEnvelopeB64: metaB64 },
         blobEnv,
       );
+      if (res.quota) this.cloudClipQuota = res.quota;
       const cipherItem: CiphertextClipItem = {
         clip_id: clipId,
         clip_kid: codec.clipKid,
@@ -2008,6 +2024,11 @@ export class MobilePwaApp {
     } catch (e) {
       if (e instanceof CloudApiError && (e.status === 401 || e.code === "DEVICE_REVOKED")) {
         this.handleDeviceRevoked();
+        return false;
+      }
+      if (e instanceof CloudApiError && e.code === "CLIP_QUOTA_EXCEEDED") {
+        this.clipErrorMsg = t("clip.quotaFull");
+        this.showToast(this.clipErrorMsg, true);
         return false;
       }
       const parsed = parseWasmError(e);
@@ -2136,7 +2157,8 @@ export class MobilePwaApp {
   private async handleDeleteClip(clipId: string): Promise<void> {
     if (!this.creds || !this.canWriteClip()) return;
     try {
-      await deleteCloudClip(this.creds.sync_url, this.creds.device_token, clipId);
+      const res = await deleteCloudClip(this.creds.sync_url, this.creds.device_token, clipId);
+      if (res.quota) this.cloudClipQuota = res.quota;
       await deleteClipItemIdb(clipId);
       this.clipItemsCipher = this.clipItemsCipher.filter((c) => c.clip_id !== clipId);
       this.decryptedClips.delete(clipId);
@@ -2150,12 +2172,35 @@ export class MobilePwaApp {
   private async handleClearClips(): Promise<void> {
     if (!this.creds || !this.canWriteClip()) return;
     try {
-      await deleteCloudClip(this.creds.sync_url, this.creds.device_token);
+      const res = await deleteCloudClip(this.creds.sync_url, this.creds.device_token, undefined, undefined, "cloud");
+      if (res.quota) this.cloudClipQuota = res.quota;
       await clearClipItemsIdb();
       this.clipItemsCipher = [];
       this.decryptedClips.clear();
+      this.clipErrorMsg = null;
       this.renderMain();
       this.showToast(t("clip.toastCleared"));
+    } catch (e) {
+      this.showToast(e instanceof Error ? e.message : t("pwa.toastSyncFailed"), true);
+    }
+  }
+
+  private async handlePruneCloudImages(): Promise<void> {
+    if (!this.creds || !this.canWriteClip()) return;
+    try {
+      const res = await pruneCloudClips(this.creds.sync_url, this.creds.device_token, {
+        kind: "image",
+        dry_run: false,
+      });
+      if (res.quota) this.cloudClipQuota = res.quota;
+      this.clipErrorMsg = null;
+      await this.syncClipsNow(undefined, { full: true, renderAfter: true });
+      this.showToast(
+        t("clip.toastPruned", {
+          count: res.deleted_count,
+          bytes: formatClipBytes(res.freed_bytes) || "0 B",
+        }),
+      );
     } catch (e) {
       this.showToast(e instanceof Error ? e.message : t("pwa.toastSyncFailed"), true);
     }
@@ -2268,6 +2313,37 @@ export class MobilePwaApp {
       view.appendChild(notice);
     }
 
+    if (this.cloudClipQuota && this.cloudClipQuota.limit_bytes > 0) {
+      const q = this.cloudClipQuota;
+      const ratio = q.used_bytes / q.limit_bytes;
+      const pct = Math.min(100, Math.round(ratio * 100));
+      const quotaCard = document.createElement("div");
+      quotaCard.className = "pwa-clip-quota";
+      quotaCard.dataset.testid = "pwa-clip-quota";
+
+      const label = document.createElement("div");
+      label.textContent = t("clip.storageCloud", {
+        used: formatClipBytes(q.used_bytes) || "0 B",
+        limit: formatClipBytes(q.limit_bytes) || "5.00 GiB",
+        items: q.item_count,
+        max: q.item_limit,
+      });
+      const meter = document.createElement("progress");
+      meter.className = `pwa-clip-quota-meter${ratio >= 1 ? " is-full" : ratio >= CLIP_CLOUD_QUOTA_WARN_RATIO ? " is-warn" : ""}`;
+      meter.max = 100;
+      meter.value = pct;
+      const note = document.createElement("div");
+      note.className = `pwa-clip-quota-note${ratio >= 1 ? " is-full" : ratio >= CLIP_CLOUD_QUOTA_WARN_RATIO ? " is-warn" : ""}`;
+      note.textContent =
+        ratio >= 1
+          ? t("clip.quotaFull")
+          : ratio >= CLIP_CLOUD_QUOTA_WARN_RATIO
+            ? t("clip.quotaWarn")
+            : t("clip.cloudClearNote");
+      quotaCard.append(label, meter, note);
+      view.appendChild(quotaCard);
+    }
+
     const listBar = document.createElement("div");
     listBar.className = "pwa-clip-list-bar";
     const countSpan = document.createElement("span");
@@ -2275,13 +2351,25 @@ export class MobilePwaApp {
     listBar.appendChild(countSpan);
 
     if (this.canWriteClip() && this.clipItemsCipher.length > 0) {
+      const btnGroup = document.createElement("div");
+      btnGroup.className = "pwa-clip-list-actions";
+
+      const pruneImgBtn = document.createElement("button");
+      pruneImgBtn.type = "button";
+      pruneImgBtn.className = "btn btn-ghost btn-sm";
+      pruneImgBtn.dataset.testid = "pwa-clip-prune-images";
+      pruneImgBtn.textContent = t("clip.pruneCloudImages");
+      pruneImgBtn.addEventListener("click", () => void this.handlePruneCloudImages());
+
       const clearBtn = document.createElement("button");
       clearBtn.type = "button";
       clearBtn.className = "btn btn-ghost btn-danger btn-sm";
       clearBtn.dataset.testid = "pwa-clip-clear";
-      clearBtn.textContent = t("clip.clearAll");
+      clearBtn.textContent = t("clip.clearCloud");
       clearBtn.addEventListener("click", () => void this.handleClearClips());
-      listBar.appendChild(clearBtn);
+
+      btnGroup.append(pruneImgBtn, clearBtn);
+      listBar.appendChild(btnGroup);
     }
     view.appendChild(listBar);
 
@@ -2295,7 +2383,8 @@ export class MobilePwaApp {
       empty.textContent = t("clip.empty");
       list.appendChild(empty);
     } else {
-      for (const row of this.clipItemsCipher) {
+      const visibleSlice = this.clipItemsCipher.slice(0, this.clipRenderLimit);
+      for (const row of visibleSlice) {
         const meta = this.decryptedClips.get(row.clip_id);
         const card = document.createElement("article");
         card.className = "pwa-clip-card";
@@ -2413,6 +2502,18 @@ export class MobilePwaApp {
         }
 
         list.appendChild(card);
+      }
+      if (this.clipItemsCipher.length > this.clipRenderLimit) {
+        const moreBtn = document.createElement("button");
+        moreBtn.type = "button";
+        moreBtn.className = "btn btn-ghost pwa-clip-load-more";
+        moreBtn.dataset.testid = "pwa-clip-load-more";
+        moreBtn.textContent = t("clip.loadMore");
+        moreBtn.addEventListener("click", () => {
+          this.clipRenderLimit += 40;
+          this.renderMain();
+        });
+        list.appendChild(moreBtn);
       }
     }
 

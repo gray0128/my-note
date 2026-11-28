@@ -19,7 +19,9 @@ use image::{ImageFormat, RgbaImage};
 use mynote_cli::clipboard::{ClipboardPayload, InMemoryClipboard};
 use mynote_cli::daemon::{start_daemon_with_clipboard, DaemonConfig};
 use mynote_cli::runner::run_from;
-use mynote_cli::sync_client::{decode_pairing_code, ensure_clip_key, rotate_clip_key, RelayClient};
+use mynote_cli::sync_client::{
+    decode_pairing_code, ensure_clip_key, rotate_clip_key, rotate_clip_key_with_options, RelayClient,
+};
 use mynote_core::clip::{
     clip_sha256_hex, encrypt_mnc1_blob, encrypt_mnc1_meta, ClipBlobMetaV1, ClipKind, ClipMetaV1,
     ClipSourceMode, CLIP_BLOB_MAX_BYTES, CLIP_DEFAULT_TTL_MS,
@@ -30,7 +32,7 @@ use mynote_core::ids::JournalEpoch;
 use mynote_store::LocalStore;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -392,9 +394,11 @@ async fn mock_keys_post(
         ck_gen_out = Some(gen);
     }
     if body["clear_clips"].as_bool().unwrap_or(false) {
+        let scope = body["clear_clips_scope"].as_str().unwrap_or("cloud");
         g.clips.clear();
         let _ = g.ws_tx.send(
-            serde_json::json!({ "type": "clip_cleared", "clip_id": serde_json::Value::Null }).to_string(),
+            serde_json::json!({ "type": "clip_cleared", "clip_id": serde_json::Value::Null, "scope": scope })
+                .to_string(),
         );
     }
     Json(serde_json::json!({
@@ -664,17 +668,108 @@ async fn mock_clip_get_blob(
     res
 }
 
-async fn mock_clip_delete_all(State(st): State<Arc<Mutex<ClipRelayState>>>, headers: HeaderMap) -> Response {
+async fn mock_clip_delete_all(
+    State(st): State<Arc<Mutex<ClipRelayState>>>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let mut g = st.lock().unwrap();
     if let Err(resp) = g.auth(&headers) {
         return resp.into_response();
     }
+    let scope = q.get("scope").map(String::as_str).unwrap_or("cloud");
     let count = g.clips.len();
+    let freed: u64 = g
+        .clips
+        .values()
+        .filter_map(|c| c.blob_bytes.map(|b| b.max(0) as u64))
+        .sum();
     g.clips.clear();
-    let _ = g
-        .ws_tx
-        .send(serde_json::json!({ "type": "clip_cleared", "clip_id": serde_json::Value::Null }).to_string());
-    Json(serde_json::json!({ "ok": true, "deleted_count": count })).into_response()
+    let _ = g.ws_tx.send(
+        serde_json::json!({ "type": "clip_cleared", "clip_id": serde_json::Value::Null, "scope": scope })
+            .to_string(),
+    );
+    Json(serde_json::json!({
+        "ok": true,
+        "deleted_count": count,
+        "freed_bytes": freed,
+        "scope": scope,
+        "quota": { "used_bytes": 0, "limit_bytes": 5_368_709_120u64, "item_count": 0, "item_limit": 1000 },
+    }))
+    .into_response()
+}
+
+async fn mock_clip_prune(
+    State(st): State<Arc<Mutex<ClipRelayState>>>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let mut g = st.lock().unwrap();
+    if let Err(resp) = g.auth(&headers) {
+        return resp.into_response();
+    }
+    let dry_run = body["dry_run"].as_bool().unwrap_or(false);
+    let kind_filter = body["kind"].as_str().map(ToString::to_string);
+    let before_ms = body["before_ms"].as_i64();
+    let keep_latest = body["keep_latest"].as_u64().map(|v| v as usize);
+
+    let mut rows: Vec<(String, i64, u64)> = g
+        .clips
+        .values()
+        .filter(|r| kind_filter.as_deref().is_none_or(|k| r.kind == k))
+        .map(|r| {
+            (
+                r.clip_id.clone(),
+                r.created_at_ms,
+                r.blob_bytes.unwrap_or(0).max(0) as u64,
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+
+    let mut matched = Vec::new();
+    let mut freed = 0u64;
+    for (idx, (cid, ts, bytes)) in rows.into_iter().enumerate() {
+        if keep_latest.is_some_and(|k| idx < k) {
+            continue;
+        }
+        if before_ms.is_some_and(|b| ts >= b) {
+            continue;
+        }
+        freed += bytes;
+        matched.push(cid);
+    }
+    let matched_count = matched.len();
+    if !dry_run {
+        for cid in &matched {
+            g.clips.remove(cid);
+        }
+        if matched_count > 0 {
+            let _ = g.ws_tx.send(
+                serde_json::json!({ "type": "clip_cleared", "clip_id": serde_json::Value::Null, "scope": "cloud", "pruned": true })
+                    .to_string(),
+            );
+        }
+    }
+    let used_bytes: u64 = g
+        .clips
+        .values()
+        .filter_map(|c| c.blob_bytes.map(|b| b.max(0) as u64))
+        .sum();
+    Json(serde_json::json!({
+        "ok": true,
+        "dry_run": dry_run,
+        "matched_count": matched_count,
+        "deleted_count": if dry_run { 0 } else { matched_count },
+        "freed_bytes": freed,
+        "quota": {
+            "used_bytes": used_bytes,
+            "limit_bytes": 5_368_709_120u64,
+            "item_count": g.clips.len(),
+            "item_limit": 1000
+        }
+    }))
+    .into_response()
 }
 
 async fn mock_clip_delete_one(
@@ -759,6 +854,7 @@ async fn spawn_mock_clip_relay(
             "/v1/clip/blob",
             put(mock_clip_put_blob).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
+        .route("/v1/clip/prune", post(mock_clip_prune))
         .route("/v1/clip/{clip_id}", delete(mock_clip_delete_one))
         .route("/v1/clip/{clip_id}/blob", get(mock_clip_get_blob))
         .route("/v1/sync/ws", get(mock_ws))
@@ -1471,10 +1567,44 @@ async fn pairing_scope_isolation_and_cloud_ws_clip_wake_ephemeral_and_rotate_key
         "ephemeral auto-clear must NEVER clobber user's newer clipboard item"
     );
 
-    // --- Test `rotate_clip_key` -> `clip_cleared` broadcasts to Desktop B & refreshes ClipKey ---
+    // --- Test `rotate_clip_key` (D8′ default: preserves desktop local archive; refreshes ClipKey to gen=2) ---
+    let b_count_before_rot = daemon_b
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .count_all_clip_items()
+        .unwrap();
+    assert!(b_count_before_rot > 0);
     let (new_ck, new_gen) = rotate_clip_key(&mut store_a, &client_a).await.unwrap();
     assert_eq!(new_gen, 2);
     assert_ne!(new_ck, ck);
+
+    let mut b_rotated_preserving_local = false;
+    for _ in 0..50 {
+        let done = {
+            let store = daemon_b.state.store.lock().unwrap();
+            let count = store.count_all_clip_items().unwrap();
+            let key_gen = store.unwrap_local_clip_key().unwrap().map(|(_, _, g)| g);
+            count == b_count_before_rot && key_gen == Some(2)
+        };
+        if done {
+            b_rotated_preserving_local = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(
+        b_rotated_preserving_local,
+        "Default rotate_clip_key must preserve Desktop B local archive while picking up rotated ClipKey gen=2"
+    );
+
+    // --- Test `rotate_clip_key_with_options(..., wipe_local=true)` -> broadcasts scope='all' & wipes Desktop B ---
+    let (new_ck3, new_gen3) = rotate_clip_key_with_options(&mut store_a, &client_a, true)
+        .await
+        .unwrap();
+    assert_eq!(new_gen3, 3);
+    assert_ne!(new_ck3, new_ck);
 
     let mut b_cleared_and_rotated = false;
     for _ in 0..50 {
@@ -1482,7 +1612,7 @@ async fn pairing_scope_isolation_and_cloud_ws_clip_wake_ephemeral_and_rotate_key
             let store = daemon_b.state.store.lock().unwrap();
             let items = store.list_clip_items(100, None).unwrap();
             let key_gen = store.unwrap_local_clip_key().unwrap().map(|(_, _, g)| g);
-            items.is_empty() && key_gen == Some(2)
+            items.is_empty() && key_gen == Some(3)
         };
         if done {
             b_cleared_and_rotated = true;
@@ -1492,7 +1622,7 @@ async fn pairing_scope_isolation_and_cloud_ws_clip_wake_ephemeral_and_rotate_key
     }
     assert!(
         b_cleared_and_rotated,
-        "Desktop B must wipe local clip_items/cache and pick up rotated ClipKey gen=2 on clip_cleared"
+        "Desktop B must wipe local clip_items/cache and pick up rotated ClipKey gen=3 on wipe_local=true"
     );
 
     daemon_b.shutdown();
@@ -1720,6 +1850,77 @@ async fn cli_clip_subcommands_and_device_revoke_clip_write_hint() {
             0
         );
 
+        // 11. D8' CLI subcommands: clip stats, clip prune (--dry-run & execute), clip clear --scope local
+        let stats_out = std::process::Command::new(env!("CARGO_BIN_EXE_mynote"))
+            .args(["--data-dir", &dir_s, "--json", "clip", "stats"])
+            .output()
+            .expect("spawn mynote clip stats");
+        assert!(stats_out.status.success());
+        let stats_json: serde_json::Value =
+            serde_json::from_slice(&stats_out.stdout).expect("valid stats JSON");
+        assert_eq!(stats_json["ok"], true);
+        assert!(stats_json["data"]["local"]["total_items"].as_u64().unwrap_or(0) >= 2);
+
+        let prune_dry = std::process::Command::new(env!("CARGO_BIN_EXE_mynote"))
+            .args([
+                "--data-dir",
+                &dir_s,
+                "--json",
+                "clip",
+                "prune",
+                "--keep",
+                "1",
+                "--scope",
+                "local",
+                "--dry-run",
+            ])
+            .output()
+            .expect("spawn mynote clip prune --dry-run");
+        assert!(prune_dry.status.success());
+        let prune_dry_json: serde_json::Value =
+            serde_json::from_slice(&prune_dry.stdout).expect("valid prune dry-run JSON");
+        assert_eq!(prune_dry_json["data"]["dry_run"], true);
+        assert!(prune_dry_json["data"]["matched_count"].as_u64().unwrap_or(0) >= 1);
+        assert_eq!(prune_dry_json["data"]["deleted_count"], 0);
+
+        let prune_exec = std::process::Command::new(env!("CARGO_BIN_EXE_mynote"))
+            .args([
+                "--data-dir",
+                &dir_s,
+                "--json",
+                "clip",
+                "prune",
+                "--keep",
+                "1",
+                "--scope",
+                "local",
+            ])
+            .output()
+            .expect("spawn mynote clip prune");
+        assert!(prune_exec.status.success());
+        let prune_exec_json: serde_json::Value =
+            serde_json::from_slice(&prune_exec.stdout).expect("valid prune JSON");
+        assert!(prune_exec_json["data"]["deleted_count"].as_u64().unwrap_or(0) >= 1);
+
+        let clear_local = std::process::Command::new(env!("CARGO_BIN_EXE_mynote"))
+            .args([
+                "--data-dir",
+                &dir_s,
+                "--json",
+                "clip",
+                "clear",
+                "--scope",
+                "local",
+            ])
+            .output()
+            .expect("spawn mynote clip clear --scope local");
+        assert!(clear_local.status.success());
+        let clear_local_json: serde_json::Value =
+            serde_json::from_slice(&clear_local.stdout).expect("valid clear JSON");
+        assert_eq!(clear_local_json["data"]["scope"], "local");
+        assert_eq!(clear_local_json["data"]["local_deleted"], 1);
+        assert_eq!(clear_local_json["data"]["cloud_deleted"], 0);
+
         std::env::remove_var("MYNOTE_CLIPBOARD_MOCK_FILE");
     })
     .await
@@ -1727,4 +1928,277 @@ async fn cli_clip_subcommands_and_device_revoke_clip_write_hint() {
 
     relay_srv.abort();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d8_prime_daemon_eager_prefetch_pagination_search_prune_and_cloud_clear_preserves_local() {
+    std::env::set_var("MYNOTE_NO_NOTIFY", "1");
+    let (relay_url, relay_st, relay_srv) = spawn_mock_clip_relay("d8p-boot").await;
+
+    let dir_a = temp_dir("d8p_a");
+    let dir_b = temp_dir("d8p_b");
+
+    // Bootstrap Desk A and pair Desk B
+    let mut store_a = LocalStore::open(&dir_a).unwrap();
+    RelayClient::bootstrap_device(&relay_url, "d8p-boot", &store_a, "DeskA", false)
+        .await
+        .unwrap();
+    let creds_a = store_a.load_credentials().unwrap().unwrap();
+    let client_a = RelayClient::from_credentials(&creds_a).unwrap();
+    let (ck, ck_bytes, _) = ensure_clip_key(&mut store_a, &client_a).await.unwrap();
+    let pair_b = client_a
+        .create_pairing_ticket(
+            "DeskB",
+            "read-write",
+            store_a.current_smks_for_pairing(),
+            Some((ck, ck_bytes.clone())),
+        )
+        .await
+        .unwrap();
+    RelayClient::claim_pairing_code(&pair_b.pairing_code, &dir_b)
+        .await
+        .unwrap();
+
+    let clip_b = Arc::new(InMemoryClipboard::new());
+    let daemon_b = start_daemon_with_clipboard(
+        DaemonConfig {
+            data_dir: dir_b.clone(),
+            port: 0,
+            enable_cloud_sync: true,
+        },
+        clip_b,
+    )
+    .await
+    .unwrap();
+    let base = format!("http://127.0.0.1:{}", daemon_b.port);
+    let host = format!("localhost:{}", daemon_b.port);
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let ticket_url = daemon_b.state.issue_open_ticket().unwrap();
+    let ticket = ticket_url.split("ticket=").nth(1).unwrap();
+    let ex_resp = http
+        .get(format!("{base}/v1/local/auth/exchange?ticket={ticket}"))
+        .header("Host", &host)
+        .send()
+        .await
+        .unwrap();
+    let cookie = ex_resp
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Wait briefly for Desk B WS to subscribe
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // Desk A uploads an auto-mode image (inbox-only on Desk B, so NOT auto-applied!).
+    // Eager Prefetch MUST still download and persist its blob locally to Desk B's clip_cache/!
+    let png_bytes = sample_image_bytes(4, 4, ImageFormat::Png);
+    let img_cid = store_a.next_clip_id(now_ms_test() as u64).unwrap();
+    let sha = clip_sha256_hex(&png_bytes);
+    let img_meta = ClipMetaV1 {
+        v: 1,
+        kind: ClipKind::Image,
+        mime: "image/png".to_string(),
+        source_mode: ClipSourceMode::Auto,
+        created_at_ms: now_ms_test(),
+        text: None,
+        blob: Some(ClipBlobMetaV1 {
+            byte_size: png_bytes.len() as u64,
+            sha256_hex: sha,
+            width: Some(1),
+            height: Some(1),
+            thumb_mime: None,
+            thumb_b64: None,
+        }),
+    };
+    let meta_env = encrypt_mnc1_meta(
+        ck,
+        &ck_bytes,
+        img_cid,
+        store_a.device_id(),
+        &img_meta,
+        false,
+        [0x41; 24],
+    )
+    .unwrap();
+    let blob_env = encrypt_mnc1_blob(
+        ck,
+        &ck_bytes,
+        img_cid,
+        store_a.device_id(),
+        &png_bytes,
+        [0x42; 24],
+    )
+    .unwrap();
+    client_a
+        .clip_push_blob(
+            &img_cid.to_string(),
+            &ck.to_string(),
+            "image",
+            &meta_env,
+            &blob_env,
+        )
+        .await
+        .unwrap();
+
+    // Push 2 searchable text items from Desk A
+    for label in ["alpha_needle_one", "beta_second_item"] {
+        let cid = store_a.next_clip_id(now_ms_test() as u64 + 10).unwrap();
+        let meta = ClipMetaV1 {
+            v: 1,
+            kind: ClipKind::Text,
+            mime: "text/plain".to_string(),
+            source_mode: ClipSourceMode::Auto,
+            created_at_ms: now_ms_test() + 10,
+            text: Some(label.to_string()),
+            blob: None,
+        };
+        let env =
+            encrypt_mnc1_meta(ck, &ck_bytes, cid, store_a.device_id(), &meta, false, [0x43; 24]).unwrap();
+        client_a
+            .clip_push_meta(&cid.to_string(), &ck.to_string(), "text", false, &env)
+            .await
+            .unwrap();
+    }
+
+    // Wait for Desk B to pull all 3 items AND eagerly prefetch the auto-mode image blob!
+    let mut prefetched = false;
+    for _ in 0..60 {
+        let ready = {
+            let store = daemon_b.state.store.lock().unwrap();
+            let stats = store.clip_storage_stats().unwrap();
+            stats.total_items == 3 && stats.cached_blob_files == 1 && stats.uncached_blob_items == 0
+        };
+        if ready {
+            prefetched = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert!(
+        prefetched,
+        "Desk B must eagerly prefetch remote image blob into local clip_cache/ even in inbox-only mode"
+    );
+
+    // Search + pagination via GET /v1/local/clip
+    let search_resp: serde_json::Value = http
+        .get(format!("{base}/v1/local/clip?limit=10&q=ALPHA_NEEDLE"))
+        .header("Host", &host)
+        .header("Cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(search_resp["data"]["total_count"], 1);
+    assert_eq!(search_resp["data"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(search_resp["data"]["has_more"], false);
+
+    let page1: serde_json::Value = http
+        .get(format!("{base}/v1/local/clip?limit=2"))
+        .header("Host", &host)
+        .header("Cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page1["data"]["total_count"], 3);
+    assert_eq!(page1["data"]["has_more"], true);
+    let cursor = page1["data"]["items"][1]["clip_id"].as_str().unwrap();
+    let page2: serde_json::Value = http
+        .get(format!("{base}/v1/local/clip?limit=2&before_id={cursor}"))
+        .header("Host", &host)
+        .header("Cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page2["data"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page2["data"]["has_more"], false);
+
+    // DELETE /v1/local/clip?scope=cloud clears relay (3 -> 0) while PRESERVING all 3 items + cached blob on Desk B!
+    let clear_cloud: serde_json::Value = http
+        .delete(format!("{base}/v1/local/clip?scope=cloud"))
+        .header("Host", &host)
+        .header("Origin", format!("http://{host}"))
+        .header("Cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(clear_cloud["ok"], true);
+    assert_eq!(clear_cloud["data"]["scope"], "cloud");
+    assert_eq!(clear_cloud["data"]["cloud_deleted"], 3);
+    assert_eq!(clear_cloud["data"]["local_deleted"], 0);
+    assert!(relay_st.lock().unwrap().clips.is_empty());
+    assert_eq!(
+        daemon_b
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .count_all_clip_items()
+            .unwrap(),
+        3
+    );
+
+    // Even after cloud wiped the image blob, Desk B STILL serves it from local clip_cache/!
+    let blob_after_cloud_clear = http
+        .get(format!("{base}/v1/local/clip/{img_cid}/blob"))
+        .header("Host", &host)
+        .header("Cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blob_after_cloud_clear.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        blob_after_cloud_clear.bytes().await.unwrap().as_ref(),
+        png_bytes.as_slice()
+    );
+
+    // POST /v1/local/clip/prune (dry-run + execute) prunes local images cleanly
+    let prune_local: serde_json::Value = http
+        .post(format!("{base}/v1/local/clip/prune"))
+        .header("Host", &host)
+        .header("Origin", format!("http://{host}"))
+        .header("Cookie", &cookie)
+        .json(&serde_json::json!({ "scope": "local", "kind": "image", "dry_run": false }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(prune_local["ok"], true);
+    assert_eq!(prune_local["data"]["deleted_count"], 1);
+    assert_eq!(
+        daemon_b
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .count_all_clip_items()
+            .unwrap(),
+        2
+    );
+
+    daemon_b.shutdown();
+    relay_srv.abort();
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
 }

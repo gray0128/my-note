@@ -668,7 +668,7 @@ fn sqlite_v1_to_v2_migration_creates_backup_preserves_key_material_and_adds_clip
         ErrorCode::CasMismatch
     );
 
-    // 4. Insert 105 clip_items -> trim_clip_items(100) keeps 100 newest and returns 5 evicted blob paths
+    // 4. Insert 105 clip_items -> unbounded local archive retains all 105; explicit trim_clip_items(100) still works
     for i in 0..105u64 {
         let cid = store.next_clip_id(1_795_600_100_000 + i).unwrap();
         let rel = format!("{cid}.png");
@@ -694,9 +694,12 @@ fn sqlite_v1_to_v2_migration_creates_backup_preserves_key_material_and_adds_clip
             })
             .unwrap();
     }
-    let evicted = store.trim_clip_items(CLIP_LOCAL_MAX_ITEMS).unwrap();
+    assert_eq!(store.count_all_clip_items().unwrap(), 105);
+    assert_eq!(store.list_clip_items(200, None).unwrap().len(), 105);
+    let evicted = store.trim_clip_items(100).unwrap();
     assert_eq!(evicted.len(), 5);
     assert_eq!(store.list_clip_items(100, None).unwrap().len(), 100);
+    let _ = CLIP_LOCAL_MAX_ITEMS;
 
     // SVG mime must be rejected at store boundary
     let svg_cid = store.next_clip_id(1_795_600_200_000).unwrap().to_string();
@@ -862,6 +865,148 @@ fn clip_cache_enforces_lru_file_count_byte_budget_permissions_and_isolation() {
     assert_eq!(cache.stats(), (0, 0));
     assert_eq!(count_rows("sync_ops"), ops_before);
     assert_eq!(count_rows("blocks"), blocks_before);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn unbounded_local_clip_archive_pagination_search_prune_and_uncached_blobs() {
+    use mynote_store::{ClipItemRow, ClipListQuery, ClipPruneFilter};
+
+    let dir = temp_dir("clip_unbounded_d8p");
+    let mut store = LocalStore::open(&dir).unwrap();
+    let (ck, _, blob) = store.generate_wrapped_clip_key(1_795_600_000_000).unwrap();
+    store
+        .upsert_clip_key_material(1, &blob, 1_795_600_000_000)
+        .unwrap();
+    let cache = store.clip_cache();
+
+    // Insert 120 items (exceeding legacy 100-item cap), including expired cloud TTL rows & blobs
+    let mut ids = Vec::new();
+    for i in 0..120u64 {
+        let ts = (1_795_600_000_000 + i * 1_000) as i64;
+        let cid = store.next_clip_id(ts as u64).unwrap().to_string();
+        let is_img = i % 3 == 0;
+        let is_cached = is_img && i < 114;
+        let rel = if is_cached {
+            let name = format!("{cid}.png");
+            cache.write(&name, &vec![0xABu8; 512]).unwrap();
+            Some(name)
+        } else {
+            None
+        };
+        store
+            .upsert_clip_item(&ClipItemRow {
+                clip_id: cid.clone(),
+                clip_kid: ck.to_string(),
+                device_id: store.device_id().as_str().to_string(),
+                kind: if is_img { "image" } else { "text" }.to_string(),
+                mime: if is_img { "image/png" } else { "text/plain" }.to_string(),
+                source_mode: "explicit".to_string(),
+                created_at_ms: ts,
+                // First 20 items have already passed cloud TTL relative to now = 1_795_600_500_000
+                expires_at_ms: if i < 20 { ts + 10_000 } else { ts + 30 * 86_400_000 },
+                text_preview: if is_img {
+                    None
+                } else if i == 55 {
+                    Some("100%_exact_needle_alpha".to_string())
+                } else {
+                    Some(format!("clip item #{i}"))
+                },
+                has_blob: is_img,
+                blob_bytes: if is_img { Some(512) } else { None },
+                blob_sha256: if is_img { Some("c".repeat(64)) } else { None },
+                width: if is_img { Some(32) } else { None },
+                height: if is_img { Some(32) } else { None },
+                thumb_mime: None,
+                thumb_blob: None,
+                local_blob_path: rel,
+            })
+            .unwrap();
+        ids.push(cid);
+    }
+
+    // All 120 items and all 38 cached files survive without automatic eviction
+    assert_eq!(store.count_all_clip_items().unwrap(), 120);
+    let stats = store.clip_storage_stats().unwrap();
+    assert_eq!(stats.total_items, 120);
+    assert_eq!(stats.image_items, 40);
+    assert_eq!(stats.text_items, 80);
+    assert_eq!(stats.cached_blob_files, 38);
+    assert_eq!(stats.cached_blob_bytes, 38 * 512);
+    assert_eq!(stats.uncached_blob_items, 2);
+
+    // Uncached remote blobs only returns the 2 unexpired uncached images (indices 114, 117)
+    let uncached = store.list_uncached_remote_blobs(1_795_600_500_000, 10).unwrap();
+    assert_eq!(uncached.len(), 2);
+    assert_eq!(uncached[0].clip_id, ids[117]);
+    assert_eq!(uncached[1].clip_id, ids[114]);
+
+    // Cursor pagination walks all 120 items without duplicates or gaps
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = store
+            .list_clip_items_page(&ClipListQuery {
+                limit: 35,
+                before_id: cursor.as_deref(),
+                kind: None,
+                query: None,
+            })
+            .unwrap();
+        assert_eq!(page.total_count, 120);
+        for row in &page.items {
+            seen.push(row.clip_id.clone());
+        }
+        if !page.has_more {
+            break;
+        }
+        cursor = page.items.last().map(|r| r.clip_id.clone());
+    }
+    assert_eq!(seen.len(), 120);
+    assert_eq!(seen[0], ids[119]);
+    assert_eq!(seen[119], ids[0]);
+
+    // Search escapes LIKE wildcards (% and _) accurately
+    let search = store
+        .list_clip_items_page(&ClipListQuery {
+            limit: 50,
+            before_id: None,
+            kind: None,
+            query: Some("100%_EXACT_NEEDLE"),
+        })
+        .unwrap();
+    assert_eq!(search.total_count, 1);
+    assert_eq!(search.items[0].clip_id, ids[55]);
+
+    // Manual prune dry-run + execute: delete images keeping newest 10 -> deletes 30 images (all 30 cached -> 30 * 512 bytes)
+    let dry = store
+        .prune_clip_items(&ClipPruneFilter {
+            before_ms: None,
+            keep_latest: Some(10),
+            kind: Some("image".to_string()),
+            dry_run: true,
+        })
+        .unwrap();
+    assert!(dry.dry_run);
+    assert_eq!(dry.matched_count, 30);
+    assert_eq!(dry.deleted_count, 0);
+    assert_eq!(dry.freed_bytes, 30 * 512);
+    assert_eq!(store.count_all_clip_items().unwrap(), 120);
+
+    let applied = store
+        .prune_clip_items(&ClipPruneFilter {
+            before_ms: None,
+            keep_latest: Some(10),
+            kind: Some("image".to_string()),
+            dry_run: false,
+        })
+        .unwrap();
+    assert!(!applied.dry_run);
+    assert_eq!(applied.deleted_count, 30);
+    assert_eq!(applied.freed_bytes, 30 * 512);
+    assert_eq!(store.count_all_clip_items().unwrap(), 90);
+    assert_eq!(cache.stats(), (8, 8 * 512));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

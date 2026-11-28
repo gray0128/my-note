@@ -26,6 +26,7 @@ pub enum ErrorCode {
     SyncOffline,
     NoOnlineDesktop,
     RateLimited,
+    ClipQuotaExceeded,
     FormatSyntaxError,
     KeyMissing,
     IntegrityError,
@@ -52,7 +53,7 @@ impl ErrorCode {
             | Self::AuthRequired
             | Self::DeviceRevoked
             | Self::TokenScopeForbidden => 5,
-            Self::SyncOffline | Self::NoOnlineDesktop | Self::RateLimited => 6,
+            Self::SyncOffline | Self::NoOnlineDesktop | Self::RateLimited | Self::ClipQuotaExceeded => 6,
             Self::FormatSyntaxError => 7,
             Self::KeyMissing | Self::IntegrityError => 8,
         }
@@ -78,6 +79,7 @@ impl ErrorCode {
             Self::TokenScopeForbidden => 403,
             Self::SyncOffline => 503,
             Self::RateLimited => 429,
+            Self::ClipQuotaExceeded => 507,
             Self::KeyMissing | Self::IntegrityError => 500,
         }
     }
@@ -118,6 +120,7 @@ impl ErrorCode {
             Self::SyncOffline => "SYNC_OFFLINE",
             Self::NoOnlineDesktop => "NO_ONLINE_DESKTOP",
             Self::RateLimited => "RATE_LIMITED",
+            Self::ClipQuotaExceeded => "CLIP_QUOTA_EXCEEDED",
             Self::FormatSyntaxError => "FORMAT_SYNTAX_ERROR",
             Self::KeyMissing => "KEY_MISSING",
             Self::IntegrityError => "INTEGRITY_ERROR",
@@ -193,6 +196,20 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ErrorCode>("\"NO_ONLINE_DESKTOP\"").unwrap(),
             ErrorCode::NoOnlineDesktop
+        );
+    }
+
+    #[test]
+    fn clip_quota_exceeded_error_code_mapping() {
+        let code = ErrorCode::ClipQuotaExceeded;
+        assert_eq!(code.exit_code(), 6);
+        assert_eq!(code.http_status(), 507);
+        assert!(!code.retryable());
+        assert_eq!(code.as_str(), "CLIP_QUOTA_EXCEEDED");
+        assert_eq!(serde_json::to_string(&code).unwrap(), "\"CLIP_QUOTA_EXCEEDED\"");
+        assert_eq!(
+            serde_json::from_str::<ErrorCode>("\"CLIP_QUOTA_EXCEEDED\"").unwrap(),
+            ErrorCode::ClipQuotaExceeded
         );
     }
 }

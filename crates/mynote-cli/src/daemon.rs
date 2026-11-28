@@ -79,6 +79,8 @@ pub struct DaemonState {
     pub ws_tx: broadcast::Sender<String>,
     pub sync_lock: tokio::sync::Mutex<()>,
     pub clip_sync_lock: tokio::sync::Mutex<()>,
+    pub clip_prefetch_lock: tokio::sync::Mutex<()>,
+    pub cloud_clip_quota: Mutex<Option<crate::sync_client::CloudClipQuota>>,
     pub sync_notify: Arc<Notify>,
     pub creds_tx: watch::Sender<Option<mynote_store::DeviceCredentials>>,
     pub enable_cloud_sync: bool,
@@ -829,6 +831,8 @@ pub async fn start_daemon_with_clipboard(
         ws_tx,
         sync_lock: tokio::sync::Mutex::new(()),
         clip_sync_lock: tokio::sync::Mutex::new(()),
+        clip_prefetch_lock: tokio::sync::Mutex::new(()),
+        cloud_clip_quota: Mutex::new(None),
         sync_notify: sync_notify.clone(),
         creds_tx,
         enable_cloud_sync: cfg.enable_cloud_sync,
@@ -949,6 +953,7 @@ pub async fn start_daemon_with_clipboard(
             // Trigger initial note sync & non-intrusive clip pull on startup
             let _ = sync_state.run_cloud_sync_now().await;
             let _ = sync_state.pull_cloud_clips(false).await;
+            sync_state.spawn_clip_blob_prefetch();
             loop {
                 tokio::select! {
                     _ = rx.changed() => break,
@@ -958,6 +963,7 @@ pub async fn start_daemon_with_clipboard(
                     _ = poll.tick() => {
                         let _ = sync_state.run_cloud_sync_now().await;
                         let _ = sync_state.pull_cloud_clips(false).await;
+                        sync_state.spawn_clip_blob_prefetch();
                     }
                 }
             }
@@ -1119,6 +1125,7 @@ fn build_router(state: Arc<DaemonState>) -> Router {
                 .layer(DefaultBodyLimit::max(20 * 1024 * 1024)),
         )
         .route("/v1/local/clip/undo", post(daemon_clip::handle_undo_clip))
+        .route("/v1/local/clip/prune", post(daemon_clip::handle_prune_clips))
         .route(
             "/v1/local/clip/watch",
             patch(daemon_clip::handle_patch_clip_watch),
@@ -1379,11 +1386,7 @@ async fn handle_bootstrap(State(state): State<Arc<DaemonState>>) -> Response {
             };
             let sync_status = store.sync_status()?;
             let trash_count = sync_status.trash.count;
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(1);
-            let clip_count = store.count_active_clip_items(now_ms).unwrap_or(0);
+            let clip_count = store.count_all_clip_items().unwrap_or(0);
             let vault_header = store.get_vault_header()?;
             let recovery_pk_b64 = store
                 .recovery_pk()
