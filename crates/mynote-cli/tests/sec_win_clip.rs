@@ -849,29 +849,29 @@ mod windows_live {
 
         let dir_a = temp_dir("desk_a");
         let dir_b = temp_dir("desk_b");
+        let mock_clip_b = dir_b.join("desk_b_mock_clip.json");
         let tok_a = "mnt_win_clip_desk_a_token";
         let tok_b = "mnt_win_clip_desk_b_token";
         {
             let mut st_a = LocalStore::open(&dir_a).unwrap();
-            let dev_a = st_a.device_id().unwrap().to_string();
-            st_a.save_credentials(&DeviceCredentials {
+            let dev_a = st_a.device_id().as_str().to_string();
+            let creds_a = DeviceCredentials {
                 sync_url: relay_url.clone(),
                 device_token: tok_a.to_string(),
                 scope: "read-write".to_string(),
-            })
-            .unwrap();
+            };
+            st_a.save_credentials(&creds_a).unwrap();
+            let smks_a = st_a.current_smks_for_pairing();
 
             let mut st_b = LocalStore::open(&dir_b).unwrap();
-            let dev_b = st_b.device_id().unwrap().to_string();
-            let smk = st_a.active_smk().unwrap().1;
-            let b_gen = st_b.active_smk().unwrap().0 + 1;
-            st_b.put_local_smk(b_gen, &smk).unwrap();
-            st_b.save_credentials(&DeviceCredentials {
+            st_b.install_refreshed_smks(&smks_a).unwrap();
+            let dev_b = st_b.device_id().as_str().to_string();
+            let creds_b = DeviceCredentials {
                 sync_url: relay_url.clone(),
                 device_token: tok_b.to_string(),
                 scope: "read-write".to_string(),
-            })
-            .unwrap();
+            };
+            st_b.save_credentials(&creds_b).unwrap();
 
             {
                 let mut g = relay_state.lock().unwrap();
@@ -879,9 +879,9 @@ mod windows_live {
                 g.register_device(&dev_b, tok_b, "read-write");
             }
 
-            let client_a = RelayClient::new(&relay_url, tok_a).unwrap();
+            let client_a = RelayClient::from_credentials(&creds_a).unwrap();
             let _ = ensure_clip_key(&mut st_a, &client_a).await.unwrap();
-            let client_b = RelayClient::new(&relay_url, tok_b).unwrap();
+            let client_b = RelayClient::from_credentials(&creds_b).unwrap();
             let _ = ensure_clip_key(&mut st_b, &client_b).await.unwrap();
         }
 
@@ -1035,11 +1035,13 @@ mod windows_live {
             "CF_DIBV5 image must auto-upload as PNG once"
         );
 
-        // Verify Desktop B pulls all 3 encrypted clips losslessly
+        // Verify Desktop B pulls all 3 encrypted clips losslessly (isolated via MYNOTE_CLIPBOARD_MOCK_FILE)
         let dir_b_pull = dir_b.clone();
+        let mock_b_pull = mock_clip_b.to_string_lossy().to_string();
         let ls_b = tokio::task::spawn_blocking(move || {
-            let _ = run_cli_with_env(&dir_b_pull, &["clip", "pull", "--json"], None, &[]);
-            run_cli_with_env(&dir_b_pull, &["clip", "ls", "--json"], None, &[])
+            let env_b = [("MYNOTE_CLIPBOARD_MOCK_FILE", mock_b_pull.as_str())];
+            let _ = run_cli_with_env(&dir_b_pull, &["clip", "pull", "--json"], None, &env_b);
+            run_cli_with_env(&dir_b_pull, &["clip", "ls", "--json"], None, &env_b)
         })
         .await
         .unwrap();
@@ -1054,24 +1056,42 @@ mod windows_live {
         let cid_txt = items[2]["clip_id"].as_str().unwrap().to_string();
 
         let dir_b1 = dir_b.clone();
+        let mock_b1 = mock_clip_b.to_string_lossy().to_string();
         let out_txt = tokio::task::spawn_blocking(move || {
-            run_cli_with_env(&dir_b1, &["clip", "pull", "--id", &cid_txt, "--raw"], None, &[])
+            run_cli_with_env(
+                &dir_b1,
+                &["clip", "pull", "--id", &cid_txt, "--raw"],
+                None,
+                &[("MYNOTE_CLIPBOARD_MOCK_FILE", mock_b1.as_str())],
+            )
         })
         .await
         .unwrap();
         assert_eq!(String::from_utf8(out_txt.stdout).unwrap(), user_cn);
 
         let dir_b2 = dir_b.clone();
+        let mock_b2 = mock_clip_b.to_string_lossy().to_string();
         let out_png = tokio::task::spawn_blocking(move || {
-            run_cli_with_env(&dir_b2, &["clip", "pull", "--id", &cid_png, "--raw"], None, &[])
+            run_cli_with_env(
+                &dir_b2,
+                &["clip", "pull", "--id", &cid_png, "--raw"],
+                None,
+                &[("MYNOTE_CLIPBOARD_MOCK_FILE", mock_b2.as_str())],
+            )
         })
         .await
         .unwrap();
         assert_eq!(out_png.stdout, orig_png);
 
         let dir_b3 = dir_b.clone();
+        let mock_b3 = mock_clip_b.to_string_lossy().to_string();
         let out_dib = tokio::task::spawn_blocking(move || {
-            run_cli_with_env(&dir_b3, &["clip", "pull", "--id", &cid_dib, "--raw"], None, &[])
+            run_cli_with_env(
+                &dir_b3,
+                &["clip", "pull", "--id", &cid_dib, "--raw"],
+                None,
+                &[("MYNOTE_CLIPBOARD_MOCK_FILE", mock_b3.as_str())],
+            )
         })
         .await
         .unwrap();
@@ -1097,12 +1117,13 @@ mod windows_live {
         std::fs::write(&jpg_file, &jpeg_bytes).unwrap();
         let jpg_str = jpg_file.to_string_lossy().to_string();
         let dir_b_push = dir_b.clone();
+        let mock_b4 = mock_clip_b.to_string_lossy().to_string();
         let push_b_out = tokio::task::spawn_blocking(move || {
             run_cli_with_env(
                 &dir_b_push,
                 &["clip", "push", "--file", &jpg_str, "--json"],
                 None,
-                &[],
+                &[("MYNOTE_CLIPBOARD_MOCK_FILE", mock_b4.as_str())],
             )
         })
         .await
