@@ -406,14 +406,14 @@ INV-SHRED-BOUND（碎纸到期后本地数据库、WAL、FTS、本地备份、�
 
 ### 10.1 每日 op 密文归档（永久、只追加）
 
-- DO 每日 alarm 把新增 `seq` 范围内的 op（原样密文，含 `op_id`、`key_id`、`device_id`）写入 R2 `archives/ops/<journal_epoch>/<from_seq:012>-<to_seq:012>.mna1`。
+- DO 每日 alarm 把新增 `seq` 范围内的 op（原样密文，含 `op_id`、`key_id`、`device_id`）写入 R2 `archives/ops/<journal_epoch>/<from_seq:012>-<to_seq:012>.mna1`（M6 多租户空间路径为 `archives/ops/<space_id>/<journal_epoch>/<from_seq:012>-<to_seq:012>.mna1`，见 [`data-structures.md`](./data-structures.md) §3.7）。
 - 归档**只追加、永久保留**，Worker **不暴露任何归档读写或删除路由**；里面只有密文，碎纸只作用于密钥，因此「永久归档」与「彻底删除」不再冲突（审查 F-06）。
 
 ### 10.2 每日密钥表快照（`latest.mnks` + `T_snap` 历史生命周期）
 
-- DO 每日把密钥表（未碎纸的密钥记录、标记与 `key_material`）同时写入两处：
-  1. `archives/keys/latest.mnks`：**每日覆写、不挂自动过期规则**——碎纸执行次日即从 `latest.mnks` 中移除，不延长约 37 天的不可恢复上界；同时即使长期停写（如休假或告警停摆超 30 天）也永远保留最后一份完整可用密钥，不会因生命周期规则把钥匙删空；
-  2. `archives/keys/history/<yyyy-mm-dd>.mnks`：由 R2 生命周期规则在 `T_snap = 30` 天后自动删除（供误碎纸后 30 天内手工找回）。
+- DO 在密钥表或 `key_material` 存在未归档变更时把密钥表（未碎纸的密钥记录、标记与 `key_material`）同时写入两处（M6 多租户空间分别写入 `archives/keys/latest/<space_id>.mnks` 与 `archives/keys/history/<space_id>/<yyyy-mm-dd>.mnks`）：
+  1. `archives/keys/latest.mnks`（或 `latest/<space_id>.mnks`）：**按变更覆写、不挂自动过期规则**——碎纸执行置空导致 `keys_digest` 变化后，由 Alarm 覆写移除该密钥并更新 `last_archived_keys_digest`（`INV-MT-IDLE-ALARM`，修正 `F-MT-06`），不延长约 37 天的不可恢复上界；同时即使空间长期闲置免设日常 Alarm 超 30 天，也永远保留最后一份完整可用密钥，不会因生命周期规则把钥匙删空；
+  2. `archives/keys/history/<yyyy-mm-dd>.mnks`（或 `history/<space_id>/<yyyy-mm-dd>.mnks`）：均命中 R2 `archives/keys/history/` 静态前缀生命周期规则，在 `T_snap = 30` 天后自动删除（供误碎纸后 30 天内手工找回）。
 
 ### 10.3 密钥环轮换与旧 SMK 代际
 
@@ -423,15 +423,27 @@ INV-SHRED-BOUND（碎纸到期后本地数据库、WAL、FTS、本地备份、�
 
 ### 10.4 灾难恢复与 `mynote restore --from-archive`
 
-遵循「临时笔记不为极端场景增加云端复杂度」原则，按故障范围分两级最简路径（命令参数见 [`interface-contracts.md`](./interface-contracts.md)）：
+遵循「临时笔记不为极端场景增加云端归档复杂度」原则，按故障范围分两级最简路径（命令参数与接口见 [`interface-contracts.md`](./interface-contracts.md)）：
 
-1. **仅客户端设备全失、云端 DO 仍健在（常见硬件损坏 / 失窃）**：新桌面凭部署时的 `BOOTSTRAP_TOKEN` 注册新 `read-write` 令牌（可选一键吊销全部旧设备），输入 24 词运行 `mynote keyring unlock` 从 `/v1/keys` 解封密钥环，随后从 `seq = 0` 常规 pull 即可零丢失恢复全部未删除笔记（含最近 24 小时尚未写入 R2 的实时尾部）。
-2. **极端双重灾难（所有设备与云端 DO 同时损毁）**：通过 Cloudflare 控制台 / `wrangler` / `rclone` 将 R2 `archives/` 下载到本地目录，运行纯离线命令 `mynote restore --from-archive <local-dir> --to <empty-data-dir>`：
-   - 输入统一恢复包 → 解封 `latest.mnks` 中的恢复密钥环与 `VaultHeaderV1`；
+1. **仅客户端设备全失、云端 DO 仍健在（常见硬件损坏 / 失窃）**：
+   - **运营者 `"primary"` 空间**：新桌面凭部署时的 `BOOTSTRAP_TOKEN` 调用 `POST /v1/devices/bootstrap` 注册新 `read-write` 令牌（可选一键吊销全部旧设备），输入 24 词运行 `mynote keyring unlock` 从 `/v1/keys` 解封密钥环，随后从 `seq = 0` 常规 pull 零丢失恢复；
+   - **M6 受邀无账号空间（D11）**：受邀成员不持有 `BOOTSTRAP_TOKEN`，新桌面凭离线保管的「公开空间定位串 `mynote-space:v1:...` + 24 词恢复包」执行 `mynote space recover`（或桌面 UI 首次启动恢复向导）：本地由 24 词临时派生 `ed25519-space-owner-v1` 私钥完成 `/v1/spaces/recover/challenge` → `/bootstrap` 两步挑战-应答注册新 `read-write` 桌面（可选同时吊销全部旧设备），随即用同一份 24 词解封 `/v1/keys` 密钥环并从 `seq = 0` 零丢失恢复全部未删除笔记。
+2. **极端双重灾难（所有设备与云端 DO 同时损毁）**：通过 Cloudflare 控制台 / `wrangler` / `rclone` 将 R2 对应前缀（`primary` 为 `archives/`；M6 受邀空间由运营者按 `archives/ops/<space_id>/` 与 `archives/keys/latest/<space_id>.mnks` 导出交付）下载到本地目录，运行纯离线命令 `mynote restore --from-archive <local-dir> [--space-id <space_id>] --to <empty-data-dir>`：
+   - 输入统一恢复包 → 解封 `latest.mnks`（或 `latest/<space_id>.mnks`）中的恢复密钥环与 `VaultHeaderV1`；
    - 重放目录内全部 `MNA1` 归档，密钥可用的 op 正常物化，密钥已碎纸的 op 跳过；
-   - 设置 `bootstrap_completed = true`，连上新 DO 后按 §6 自动全量补推（至多损失距上次每日归档 `< 24h` 的临时草稿，无需在 Worker 中维护专门的归档下载或恢复鉴权 API）。
+   - 设置 `bootstrap_completed = true`，连上新 DO 后按 §6 自动全量补推（至多损失距上次归档 `< 24h` 的临时草稿，Worker 不暴露任何 `/v1/archive/*` 归档下载接口）。
 
 保证：从零设备 + 恢复包 + R2 归档目录，能恢复全部已归档且**未删除**的数据（INV-RECOVERY）。本地 `VACUUM INTO` 备份按 `T_snap` 轮换，只读 Markdown 镜像随删除同步删除文件（见 [`architecture-proposal.md`](./architecture-proposal.md)）。
+
+### 10.5 首次启动 `UnclaimedFresh` 空间引导与被移除设备差异化停机协议（M6，D11）
+
+1. **桌面 UI 首次启动无死锁空间引导（修正 `F-MT-01`）**：
+   - 桌面 Daemon 启动时已创建本地 SQLite 库并生成初始空 `"scratch"` buffer 与 `space_owner_pk`。若用户选择「凭邀请码初始化新云空间」，Daemon 直接复用当前本地库与 `gen = 1` 密钥环调用 `POST /v1/spaces/create`，无需清库（即使已离线记过笔记也会在建空间后自动首轮上推）；
+   - 若用户选择「粘贴配对码加入既有空间（`claim`）」或「凭 24 词恢复既有空间（`recover`）」，Daemon 必须在持有同步锁的前提下校验 [`data-structures.md`](./data-structures.md) §4.1 定义的 `UnclaimedFresh` 谓词：满足时先执行 `VACUUM INTO backups/pre-join-<ts>.db` 留存兜底快照（严守 **G1**），再在进程内原子替换为新引导的 `LocalStore` 并经 `creds_tx` watch 通道热启动云端同步；若本地已存在任何用户笔记块或剪贴板条目（`UnclaimedFresh == false`），硬拒绝原地覆盖，防止误吞本地未同步笔记。
+2. **被远程移除设备（HTTP `401 DEVICE_REVOKED` / WS Close `4401`）的差异化收敛语义（修正 `F-MT-04`、Q5）**：
+   - **三端桌面（macOS / Omarchy / Windows）**：**严禁自动删除本地 SQLite 数据库、`clip_cache/` 或只读 Markdown 镜像**。收到服务端明确 `DEVICE_REVOKED` 时，立即从凭据存储擦除失效的机密 `device_token`，保留 `sync_url` 与 `space_id`，写入 `local_meta('device_revoked_at_ms')`，使 `sync_state` 持久转入 `"device_revoked"`，并**立即终止云端 WS 重连及后台 60s HTTP 笔记/剪贴板/预取轮询**（零空转请求），向 UI 推送常驻告警引导用户备份或重新配对；
+   - **手机只读 PWA**：收到明确 `401 DEVICE_REVOKED` 或 WS `4401` 时，立即断开 WS、清零内存 `VKEK` / `WasmSyncEngine` / `WasmClipCodec`，并**自动清空 IndexedDB 全部 7 张缓存表**，退回未配对引导页并展示「本设备已被桌面端移除」（手机为纯只读派生视图，清空无丢数风险；安全承诺上仅作淘汰旧机礼貌清理，见 [`threat-model.md`](./threat-model.md) §11）；
+   - **iOS 快捷指令（`clip-write`）**：弹窗提示设备令牌已失效，引导清除 Scriptable Keychain 并重新粘贴配对码。
 
 ---
 

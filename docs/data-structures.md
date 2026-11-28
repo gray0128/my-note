@@ -1,6 +1,6 @@
 # 核心数据结构、存储 Schema 与二进制线格式规范 (`data-structures.md`)
 
-> 2026-11-28 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D10（含 2026-11-27 剪贴板同步拍板 D8 / D1′，以及 2026-11-28 Windows 一等桌面平台 D9 与 `wasmi` 优先双宿主插件体系 D10）更新。
+> 2026-11-28 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 与 [多租户及设备管理专项审查](../review/2026-11-28-controlled-multi-tenant-and-device-review.md) 的决策 D1–D11（含 2026-11-27/28 剪贴板同步拍板 D8 / D8′ / D1′、2026-11-28 Windows 一等桌面平台 D9、`wasmi` 优先双宿主插件体系 D10，以及 M6 受控无账号多租户与设备生命周期管理 D11）更新。
 
 > 本文档是 [总架构设计方案 (`architecture-proposal.md`)](./architecture-proposal.md)、[同步协议规范 (`sync-protocol.md`)](./sync-protocol.md) 与 [威胁模型规范 (`threat-model.md`)](./threat-model.md) 的底层数据结构基准，定义全端统一的标识符编码、`mynote-core` Rust 类型定义、精确到字节偏移的二进制信封格式、**AAD 的唯一权威定义**、密钥表 / 密钥环 / 恢复包结构，以及桌面 SQLite、云端 Durable Object SQLite 与移动端 IndexedDB 的完整 Schema。
 >
@@ -38,6 +38,7 @@
 | `SnapshotId` | 26 字符大写 ULID | `[u8; 16]` | R2 上「手机用当前状态快照」的标识（见 §3.6） |
 | `ClipId` (`clip_id`) | 26 字符大写 ULID | `[u8; 16]` | **（M4，D8）**独立剪贴板条目唯一主键，按字典序兼作时间顺序游标（见 §3.8） |
 | `ClipKid` (`clip_kid`) | 26 字符大写 ULID | `[u8; 16]` | **（M4，D8）**当前独立可轮换剪贴板密钥 `ClipKey` 的标识（见 §3.8） |
+| `SpaceId` (`space_id`) | `sp_<16位小写base32>-<16位hex>`（或保留值 `"primary"`） | UTF-8 `String` | **（M6，D11）**受控多租户空间路由标识（带边缘 HMAC 防伪后缀，每个空间对应独立 `SyncJournalDO` 实例，见 §1.4） |
 | `JournalEpoch` | 标准 36 字符 UUIDv4 | `[u8; 16]` | 云端 DO 日志纪元标识（PITR 回滚或迁移新同步服时变更） |
 
 ### 1.2 混合逻辑时钟（`Hlc`）规范化编码
@@ -69,6 +70,42 @@
 - **生成规则**：在左界 `prev: Option<&str>` 与右界 `next: Option<&str>` 之间计算字典序中点前缀后，追加 **4 字符 CSPRNG 随机 Base62 抖动后缀**（仅在离线/本地新插入时追加，降低多端同时在末尾或同一缝隙插入时的碰撞率至 $62^{-4} \approx 6.7 \times 10^{-8}$）。
 - **确定性全序 SQL / 内存比较器**：`(a.position.as_bytes(), a.id.as_bytes()).cmp(&(b.position.as_bytes(), b.id.as_bytes()))`。
 - **不做重平衡**：索引键允许无限变长。在个人规模下键长增长极慢 [估算]；即使两个键完全相同，也由 `id` 决胜，顺序仍确定。
+
+### 1.4 受控多租户自路由标识、空间定位串与离线邀请码编码规范（M6，D11）
+
+为在不引入中心路由数据库（KV / D1）且保持手机 PWA WASM `0 B` 增量 `[保证]`、iOS 快捷指令 `0` 协议改动 `[保证]` 的前提下实现 O(1) 无状态边缘路由，M6 定义以下唯一线格式（修正 `F-MT-03` / `F-MT-07`）：
+
+1. **单一部署级主密钥 `SPACE_MASTER_SECRET` 域分离派生**：
+   运营者仅在 Cloudflare Worker Secret 与本地运维脚本 `cloud-cf/scripts/issue-invite.ts` 配置同一份高熵密钥 `SPACE_MASTER_SECRET`（至少 32 B），经 `HKDF-SHA256` 派生两把职责严格隔离的子密钥：
+   - **边缘空间路由 MAC 子钥**：`K_route = HKDF-SHA256(ikm = SPACE_MASTER_SECRET, salt = "mynote-space-master-v1", info = "mynote-space-route-v1", len = 32)`；
+   - **离线邀请码签发子钥**：`K_invite = HKDF-SHA256(ikm = SPACE_MASTER_SECRET, salt = "mynote-space-master-v1", info = "mynote-space-invite-v1", len = 32)`。
+2. **自路由标识符精确语法与正则（严禁对含 `sp_` 前缀的字符串做裸 `split("_")`）**：
+
+   | 标识类型 | 文本格式 / 唯一解析正则 | 生成与校验规则 |
+   | --- | --- | --- |
+   | **`space_id`（受邀空间）** | `^sp_([0-9a-hjkmnp-tv-z]{16})-([0-9a-f]{16})$`（定长 36 字符） | 前段 `<rand16>` 为 80-bit CSPRNG 小写 Crockford Base32；后段 `<mac16>` 为 `hex(HMAC-SHA256(K_route, "sp:" \|\| rand16)[0..8])`（64-bit 截断常量时间比对）。运营者既有单租户空间保留字面量 `"primary"` |
+   | **`device_token`（M6 自路由）** | `^mnt_(sp_[0-9a-hjkmnp-tv-z]{16}-[0-9a-f]{16})_([0-9a-f]{64})$`（定长 105 字符） | 仅含 `[a-z0-9_-]`，完全符合 HTTP `Bearer` 与 RFC 6455 WebSocket `Sec-WebSocket-Protocol: bearer.<token>` `tchar` 字符集；后段为 256-bit CSPRNG 随机十六进制。当 `ALLOW_LEGACY_PRIMARY="1"` 时，旧格式 `^mnt_([0-9a-f]{64})$` 回落路由至 `"primary"` |
+   | **`pair_id`（M6 自路由）** | `^pr_(sp_[0-9a-hjkmnp-tv-z]{16}-[0-9a-f]{16})_([0-9a-f]{32})$`（定长 72 字符） | 装入既有 `mynote-pair:v1:` 的 `p` 字段并原样进入 `MNPR` AAD（§3.3）。非 `primary` 空间的 DO 在 `POST /v1/devices` 与 `POST /v1/devices/:id/refresh` 强制校验 `pair_id` 以 `pr_${space_id}_` 开头；`primary` 空间拒绝 `pr_sp_` 前缀（当 `ALLOW_LEGACY_PRIMARY="1"` 时，旧格式 `^[0-9a-f]{32}$` 路由至 `"primary"`） |
+   | **空间定位串（公开非机密）** | `mynote-space:v1:<base64url_nopad(utf8_json({ v: 1, u, space_id }))>` | 不含任何密钥或令牌，随 24 词恢复卡片一并展示供用户离线备份，用于全设备丢失后执行 `mynote space recover` 定位云端 DO |
+   | **离线一次性邀请码** | `mynote-invite:v1:<payload_b64u>.<mac_b64u>` | `mac_b64u = base64url_nopad(HMAC-SHA256(K_invite, "mynote-invite-v1." \|\| payload_b64u))`；**不含任何数据密钥（`SMK`/`VKEK`/`ClipKey`）**，仅授予在指定 `space_id` 一次性初始化空空间的入场权 |
+
+3. **离线邀请码载荷 `InvitePayloadV1`（UTF-8 JSON）与受邀空间默认配额（Q4 拍板值）**：
+   ```json
+   {
+     "v": 1,
+     "u": "https://note.yourdomain.com",
+     "space_id": "sp_k8m2x9p4q7r1w3z5-a1b2c3d4e5f60718",
+     "exp_ms": 1796130000000,
+     "max_devices": 12,
+     "ops_quota_bytes": 268435456,
+     "clip_quota_bytes": 536870912,
+     "clip_max_items": 500,
+     "clip_ttl_ms": 1209600000,
+     "label": "family-alice"
+   }
+   ```
+   - 默认有效期 `exp_ms = issued_at_ms + 72 * 3_600_000`（72 小时）；默认配额为 `max_devices = 12`、`ops_quota_bytes = 256 MiB`（`268,435,456 B`）、`clip_quota_bytes = 512 MiB`（`536,870,912 B`）、`clip_max_items = 500`、`clip_ttl_ms = 14 天`（`1,209,600,000 ms`），`issue-invite.ts` 签发时可按人覆写；
+   - 防重放不建全局黑名单表：每个邀请码绑定唯一随机 `space_id`，目标 DO 一旦置 `space_initialized = '1'`，后续重放同一邀请码固定返回 `409 SPACE_ALREADY_INITIALIZED`。
 
 ---
 
@@ -489,8 +526,10 @@ pub struct ShredMarkRow {
 ```text
 统一恢复包（24 词，BIP39 英文词表，256-bit 熵）
    └─ HKDF-SHA256(ikm = entropy, salt = "mynote-recovery-v1", info = "seed") → Root Seed (32 B)
-        └─ HKDF-SHA256(Root Seed, info = "x25519-recovery") → recovery_sk（X25519 clamp）
-             └─ recovery_pk = X25519(recovery_sk, base)        ← 设备与 DO 只保存这一项
+        ├─ HKDF-SHA256(Root Seed, info = "x25519-recovery") → recovery_sk（X25519 clamp，仅用于密钥封装/解封）
+        │     └─ recovery_pk = X25519(recovery_sk, base)        ← 桌面与 DO 保存此公钥
+        └─ [M6, D11, 仅桌面非 PWA] HKDF-SHA256(Root Seed, info = "ed25519-space-owner-v1") → owner_seed (32 B)
+              └─ (owner_sk, owner_pk) = Ed25519(owner_seed)     ← 建库即存非机密 owner_pk，owner_sk 永不落盘
 恢复密钥环 RecoveryKeyringV1 = [ MNRS(smk_v1), MNRS(smk_v2), …, MNRS(smk_vN) ]（只追加）
 Vault 头部 VaultHeaderV1 = { MNVH(口令派生密钥 → VKEK), MNRS(recovery_pk → VKEK) }
    SMK_i → 解开 MNS1 / MNR1 / MNP1        VKEK → 解开 MNW1（Tier 2 BDEK）
@@ -541,9 +580,19 @@ pub struct KdfParamsV1 {
 | `70..94` | `nonce` | `24 B` | 随机 Nonce |
 | `94..` | `ciphertext` | `32 + 16 B` | AEAD 密钥 = `HKDF-SHA256(ikm = X25519(eph_sk, recovery_pk), salt = eph_pk ‖ recovery_pk, info = "mynote-seal-v1")`（实现必须拒绝全零 X25519 共享秘密以排除低阶点），明文为 32 B 密钥 |
 
-- **日常密钥存放**：桌面 Daemon（OS Keychain / Secret Service）**只持有 Tier 1 的 SMK 代际**与恢复公钥；VKEK 只以 `wrapped_vkek`（口令）与 `sealed_vkek`（恢复公钥）两种形式存在于 Vault 头部，**Daemon 不持有任何能解开 VKEK 的材料**（Tier 2 解密只在解锁后的 Vault 会话内存中进行，信任边界见 [`threat-model.md`](./threat-model.md)）。Root Seed 与 `recovery_sk` 只在恢复或本地解锁新 SMK 代际时由用户输入 24 词临时派生，用后清零。
+- **日常密钥存放**：桌面 Daemon（OS Keychain / Secret Service）**只持有 Tier 1 的 SMK 代际**与恢复公钥；VKEK 只以 `wrapped_vkek`（口令）与 `sealed_vkek`（恢复公钥）两种形式存在于 Vault 头部，**Daemon 不持有任何能解开 VKEK 的材料**（Tier 2 解密只在解锁后的 Vault 会话内存中进行，信任边界见 [`threat-model.md`](./threat-model.md)）。Root Seed、`recovery_sk` 与 M6 空间自救私钥 `owner_sk` 只在恢复或本地解锁新 SMK 代际时由用户输入 24 词临时派生，用后清零。
+- **M6 空间所有权签名密钥对（`ed25519-space-owner-v1`，修正 `F-MT-02`）**：
+  - **加密与签名密钥严格分离**：`recovery_sk`（X25519）仅用于 `MNRS` 封装/解封；`owner_sk`（Ed25519）仅用于无账号受邀空间全设备丢失时向健在的云端 DO 证明空间所有权，且通过 Cargo feature 仅编入桌面 `mynote-core` / `mynote-cli`（手机 `pkg-pwa` WASM 体积增量 **`0 B` `[保证]`**）；
+  - **建库即存公钥，支持先离线使用后绑定云空间**：首次建库派生 `RecoveryKeypair` 时同步计算 32 B 非机密公钥 `owner_pk` 并写入本地 `local_meta('space_owner_pk')`（`owner_sk` 即刻 `zeroize` 丢弃），用户后续任意时刻凭邀请码创建云空间均无需重输 24 词；存量库在下次执行 `mynote keyring unlock` 或 `mynote recovery drill` 时自动回填 `space_owner_pk`；
+  - **域分隔挑战签名原文（UTF-8 字节串）**：
+    ```text
+    msg = "mynote-space-recover-v1\0" || space_id || "\0" || challenge_id || "\0"
+          || challenge_nonce_hex || "\0" || device_id || "\0" || token_sha256_hex
+          || "\0" || (revoke_existing ? "1" : "0")
+    ```
+    服务端使用 Workers 原生 WebCrypto `crypto.subtle.verify("Ed25519", owner_pk, sig, msg)` 验签（0 新增 JS 依赖）。
 - **SMK 代际永久保留**：R2 op 归档永久保留且其中的 `MNS1` 由当时的 SMK 加密，删除旧 SMK 等于让归档不可读，因此 `smk_entries` 只追加，设备 Keychain 中的 SMK 代际也不删除。所谓「旧代际保留 `T_snap`」只适用于**用旧代际封装的历史密钥表快照**（R2 `archives/keys/history/`、本地自动备份）：轮换时全部 `MNR1` 以新 `wrap_gen` 重新封装，旧封装副本随 `T_snap` 生命周期自然淘汰。VKEK 只用于包裹 BDEK，因此退役的 VKEK 可在 `T_snap` 后移除。
-- **轮换与存留设备密钥刷新** = 生成新 SMK（或 VKEK）→ 用恢复公钥封装后追加（VKEK 则写入新 Vault 头部，旧的移入 `retired`）→ `keyring_gen + 1` → 以新代际重新封装全部 `MNR1`（VKEK 轮换需在 Vault 会话内重新包裹 Tier 2 的 `MNW1`）并随 `/v1/keys` 上传更新 `key_material`。**不需要重新抄写 24 词**，轮换后运行 `mynote recovery drill` 确认恢复包有效。其他未吊销的存留设备通过两条低复杂度路径之一获取新 `SMK` 代际（不引入设备级长期公钥树）：(1) 在已轮换桌面上执行 `mynote device refresh <device_id>` 生成复用 `pairing_tickets` 的 10 分钟一次性刷新码，在存留设备上 `claim` 领取；(2) 单机/异地时直接在存留桌面上执行 `mynote keyring unlock` 输入一次 24 词解封 `RecoveryKeyringV1`。
+- **轮换与存留设备密钥刷新** = 生成新 SMK（或 VKEK）→ 用恢复公钥封装后追加（VKEK 则写入新 Vault 头部，旧的移入 `retired`）→ `keyring_gen + 1` → 以新代际重新封装全部 `MNR1`（VKEK 轮换需在 Vault 会话内重新包裹 Tier 2 的 `MNW1`）并随 `/v1/keys` 上传更新 `key_material`。**不需要重新抄写 24 词**，轮换后运行 `mynote recovery drill` 确认恢复包有效。其他未吊销的存留设备通过两条低复杂度路径之一获取新 `SMK` 代际（不引入设备级长期公钥树）：(1) 在已轮换桌面上执行 `mynote device refresh <device_id>` 生成复用 `pairing_tickets` 的 10 分钟一次性刷新码（M6 修正 `F-MT-03`：目标 `scope = read+clip` 时同步携带最新 `SMK` 代际与 `(clip_kid, clip_key)`，目标 `scope = clip-write` 时仅携带最新 `(clip_kid, clip_key)` 且不含 `SMK`），在存留设备上 `claim` 领取；(2) 单机/异地时直接在存留桌面上执行 `mynote keyring unlock` 输入一次 24 词解封 `RecoveryKeyringV1`。
 - **Vault 口令变更**只重新生成 `salt` 与 `wrapped_vkek`，VKEK 不变，不触碰密钥表。Vault 不再有第二套 24 词恢复码：忘记口令时用统一恢复包解开 `sealed_vkek`，再设新口令。
 - KDF 参数只有一套，按最弱设备（iPhone）定，参数和盐存于 Vault 头部；S0-3 iPhone 主屏 PWA 真机已实测定型为 `(m_kib=32768, t=2, p=1)`（中位 `1553 ms` [已测]，稳落 `1–2 s` 目标区间，详见 [`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md)）。
 - 服务端可以截断或替换 `smk_entries` 列表（单条封装本身有 AEAD 认证，伪造的条目只会解封失败）。缓解：每台桌面在本地 `key_material` 保留完整副本并在同步时比对条目数，R2 密钥表快照中也有副本；INV-RECOVERY 演练覆盖。
@@ -621,13 +670,13 @@ pub enum SnapshotLeafBody {
 
 两类对象都由 DO 的每日任务生成。容器本身不再加密（内容已是密文），只做完整性校验。Worker 不对外暴露归档 HTTP 路由。
 
-| 对象 | R2 键 | 内容 | 保留 |
+| 对象 | R2 键（`primary` 单租户 / M6 多租户 `<space_id>` 类别前置路径） | 内容 | 保留 |
 | --- | --- | --- | --- |
-| op 密文归档 `MNA1` | `archives/ops/<journal_epoch>/<from_seq:012>-<to_seq:012>.mna1` | 头 `"MNA1" \|\| ver \|\| msgpack({ journal_epoch, from_seq, to_seq, row_count, created_at_ms })`，体 = `msgpack(Vec<{ seq, op_id, key_id, device_id, created_at, envelope }>)`，尾 = 前文 `blake3 (32B)` | **永久、只追加** |
-| 最新密钥表快照 `MNKS` | `archives/keys/latest.mnks` | 头 `"MNKS" \|\| ver \|\| msgpack({ created_at_ms, keyring_gen, record_count })`，体 = `msgpack({ keyring: RecoveryKeyringV1, vault_header: Option<VaultHeaderV1>, records: Vec<KeyRecordRow>（仅可用密钥）, marks: Vec<ShredMarkRow> })`，尾 = `blake3` | **每日覆写、不挂生命周期删除**（碎纸次日即被覆盖移除，停写超 30 天也不会归零） |
-| 历史密钥表快照 `MNKS` | `archives/keys/history/<yyyy-mm-dd>.mnks` | 同上 | R2 生命周期规则删除，`T_snap` = 30 天 |
+| op 密文归档 `MNA1` | `archives/ops/<journal_epoch>/<from_seq:012>-<to_seq:012>.mna1`<br>M6：`archives/ops/<space_id>/<journal_epoch>/<from_seq:012>-<to_seq:012>.mna1` | 头 `"MNA1" \|\| ver \|\| msgpack({ journal_epoch, from_seq, to_seq, row_count, created_at_ms })`，体 = `msgpack(Vec<{ seq, op_id, key_id, device_id, created_at, envelope }>)`，尾 = 前文 `blake3 (32B)` | **永久、只追加** |
+| 最新密钥表快照 `MNKS` | `archives/keys/latest.mnks`<br>M6：`archives/keys/latest/<space_id>.mnks` | 头 `"MNKS" \|\| ver \|\| msgpack({ created_at_ms, keyring_gen, record_count })`，体 = `msgpack({ keyring: RecoveryKeyringV1, vault_header: Option<VaultHeaderV1>, records: Vec<KeyRecordRow>（仅可用密钥）, marks: Vec<ShredMarkRow> })`，尾 = `blake3` | **按变更覆写、不挂生命周期删除**（碎纸置空后即被覆盖移除，停写超 30 天也不会归零） |
+| 历史密钥表快照 `MNKS` | `archives/keys/history/<yyyy-mm-dd>.mnks`<br>M6：`archives/keys/history/<space_id>/<yyyy-mm-dd>.mnks` | 同上 | 均命中 `archives/keys/history/` R2 静态前缀生命周期规则删除，`T_snap` = 30 天 |
 
-- 极端双重灾难恢复（`mynote restore --from-archive <local-dir>`，契约见 [`interface-contracts.md`](./interface-contracts.md)）= 本地导出的全部 `MNA1` + `latest.mnks` + 统一恢复包。若仅客户端设备全失而 DO 仍健在，直接凭 `BOOTSTRAP_TOKEN` + 24 词从 DO 全量拉回即可。
+- 极端双重灾难恢复（`mynote restore --from-archive <local-dir> [--space-id <space_id>]`，契约见 [`interface-contracts.md`](./interface-contracts.md)）= 本地导出的全部 `MNA1` + `latest.mnks`（或 `latest/<space_id>.mnks`）+ 统一恢复包。若仅客户端设备全失而 DO 仍健在：`primary` 空间凭 `BOOTSTRAP_TOKEN` + 24 词，M6 受邀空间凭 24 词派生的 Ed25519 挑战签名调用 `POST /v1/spaces/recover/*`，直接从 DO 全量拉回。
 - 彻底不可恢复的上界（`T_grace + max(DO PITR 30 天, T_snap)` ≈ 37 天）的推导与承诺见 [`threat-model.md`](./threat-model.md)。
 
 ### 3.8 独立剪贴板通道：`MNC1` 双载荷、`ClipMetaV1` 与 `ClipKey`（M4，D8）
@@ -872,9 +921,11 @@ CREATE INDEX IF NOT EXISTS idx_local_clip_created ON clip_items (created_at_ms D
 
 桌面数据目录（Linux: `~/.local/share/mynote/`；macOS: `~/Library/Application Support/mynote/`；Windows [M5, D9]: `%LOCALAPPDATA%\mynote\`，均支持 `MYNOTE_DATA_DIR` 覆盖，规避 Windows Roaming `%APPDATA%` 漫游膨胀）默认排除出 Time Machine（`tmutil addexclusion`）与 Omarchy 文件系统快照；Unix 文件权限强制 `0600` / 目录 `0700`，Windows 强制经 `SetNamedSecurityInfoW` 设置仅放行当前用户 SID 的 NTFS 专属 DACL。数据目录维护以下受控结构：
 
-- **`local_meta` 强制版本锁键**：
+- **`local_meta` 强制版本锁与空间状态键**：
   - `schema_version`（同步写入 `PRAGMA user_version`）：当前库已应用的最新迁移号；
-  - `min_reader_schema_version`：允许安全读写当前库的最低二进制可识别 Schema 版本号。若旧版二进制（例如经包管理器降级后）发现自身支持的最高 Schema 版本 `< min_reader_schema_version`，立即以退出码 `8`（`INTEGRITY_ERROR: SCHEMA_TOO_NEW`）拒绝写入，防止旧代码误毁新表结构。
+  - `min_reader_schema_version`：允许安全读写当前库的最低二进制可识别 Schema 版本号。若旧版二进制（例如经包管理器降级后）发现自身支持的最高 Schema 版本 `< min_reader_schema_version`，立即以退出码 `8`（`INTEGRITY_ERROR: SCHEMA_TOO_NEW`）拒绝写入，防止旧代码误毁新表结构；
+  - **（M6，D11）空间与移除态键**：`space_id`（当前绑定的空间 ID 或 `"primary"`）、`space_owner_pk`（建库时派生的 64 字符 hex Ed25519 公钥，修正 `F-MT-02`）、`device_revoked_at_ms`（收到 `401 DEVICE_REVOKED` / WS `4401` 时写入毫秒时间戳，使 `sync_state` 持久呈现 `"device_revoked"` 并熔断后台云轮询，修正 `F-MT-04`）；
+  - **（M6，D11）首次启动空白未绑定谓词 `UnclaimedFresh`（修正 `F-MT-01`）**：当且仅当本地库同时满足 `sync_url IS NULL`、`device_revoked_at_ms IS NULL`、`SELECT COUNT(*) FROM blocks == 0`（含 `ACTIVE`/`TRASHED`/`SHREDDED`）、`SELECT COUNT(*) FROM clip_items == 0`，且 `buffers` 表至多只有初始空 `"scratch"` buffer（`sync_ops` 至多 1 条初始 Buffer `CREATE`）时判定为 `true`。仅在 `UnclaimedFresh == true` 时允许桌面 UI 首次启动引导页经 `VACUUM INTO backups/pre-join-<ts>.db` 保底备份后原地热切换为配对加入（`claim`）或 24 词恢复（`recover`）库。
 - **跨 Schema 升级前自动一致性快照（`backups/mynote-pre-schema-v<N>.db`）**：
   - 仅在版本升级触发 `PRAGMA user_version` 递增前自动通过 `VACUUM INTO` 生成单文件快照（Unix `0600` / Windows 当前用户专属 NTFS DACL，最多保留最近 2 代）。
 - **每日自动备份（`backups/auto-<yyyy-mm-dd>.db`）**：`VACUUM INTO` 生成，权限同上，按 `T_snap`（30 天）轮换删除，使碎纸后的残留副本在有界时间内消失。
@@ -892,7 +943,10 @@ CREATE INDEX IF NOT EXISTS idx_local_clip_created ON clip_items (created_at_ms D
 > INV-SYNC-6「每 op 恰好 2 行写入」已放宽：Paid 套餐内含每月 5,000 万行写，本项目约每月 3 万行写 [估算]，占比约 0.06%。`ops` 表仍保持最小列以减少元数据暴露；确有需要时可以加二级索引。批量推送仍须遵守 DO SQL **单语句最多 100 个绑定参数**的平台限制（逐行预编译语句循环执行）。
 
 ```sql
--- 1. DO 全局元数据（journal_epoch, last_archive_seq, last_key_snapshot_day 等）
+-- 1. DO 全局与空间级配额元数据（journal_epoch, last_archive_seq, last_archived_keys_digest；
+--    M6 新增：space_id, space_initialized='1', space_owner_pk, max_devices, ops_quota_bytes,
+--    clip_quota_bytes, clip_max_items, clip_ttl_ms。未激活 DO 不建表、不写行、不设 Alarm；
+--    M6 恢复挑战存于 DO 纯内存有界 Map [<=3 条, TTL 5m]，零新增 SQLite 表）
 CREATE TABLE IF NOT EXISTS journal_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -989,17 +1043,17 @@ CREATE TABLE IF NOT EXISTS phone_snapshots (
     UNIQUE (journal_epoch, covers_seq)
 );
 
--- 9. 独立图文剪贴板云端滚动中继索引表（§3.8，M4，D8 / D8′：最多 1,000 条 / 默认 30 天 TTL / R2 大对象总计 5 GiB 硬护栏；严禁进入 R2 每日 op 归档与手机状态快照）
+-- 9. 独立图文剪贴板云端滚动中继索引表（§3.8，M4，D8 / D8′：`primary` 默认 1,000 条 / 30 天 TTL / 5 GiB；M6 受邀空间默认 500 条 / 14 天 TTL / 512 MiB；严禁进入 R2 每日 op 归档与手机状态快照）
 CREATE TABLE IF NOT EXISTS clip_items (
     clip_id        TEXT PRIMARY KEY,          -- 26B ULID（时间有序）
     clip_kid       TEXT NOT NULL,             -- 26B ULID
     device_id      TEXT NOT NULL,
     kind           TEXT NOT NULL CHECK (kind IN ('text', 'image')),
     created_at_ms  INTEGER NOT NULL,
-    expires_at_ms  INTEGER NOT NULL,          -- 默认 created_at_ms + 30 * 86_400_000 (30 天)
+    expires_at_ms  INTEGER NOT NULL,          -- primary 默认 +30 天；M6 受邀空间按 journal_meta('clip_ttl_ms') 默认 +14 天
     meta_envelope  BLOB NOT NULL,             -- MNC1 (payload_type=0，含小文本或图片元数据+缩略图，<= 96 KiB)
-    r2_key         TEXT,                      -- NULL 表示内联小文本；非 NULL 时为 'clip/blobs/<clip_id>.mnc1'
-    blob_bytes     INTEGER                    -- R2 密文字节数（单条上限 <= 10.5 MiB，全部未过期条目之和上限 5 GiB）
+    r2_key         TEXT,                      -- NULL 表示内联小文本；非 NULL 时 primary 为 'clip/blobs/<clip_id>.mnc1'，M6 空间为 'clip/blobs/<space_id>/<clip_id>.mnc1'
+    blob_bytes     INTEGER                    -- R2 密文字节数（单条上限 <= 10.5 MiB，全部未过期条目之和不超过当前空间 clip_quota_bytes）
 );
 
 CREATE INDEX IF NOT EXISTS idx_clip_items_expires ON clip_items (expires_at_ms);
@@ -1026,7 +1080,8 @@ CREATE INDEX IF NOT EXISTS idx_clip_items_expires ON clip_items (expires_at_ms);
 | `clip_items`（M4，D8 / D8′） | `"clip_id"` | `by_created`: `["created_at_ms", "clip_id"]` | 最近 **200 条**增量缓存的剪贴板轻元数据（同步时按 `clip_id` 增量写入，不清空重写；**`meta_envelope` 保持 `MNC1` 密文**，不落盘明文正文与原图大对象；原图仅点击查看/复制时按需流式拉取并在内存中解密） |
 
 - **VKEK 永不落盘**：口令 → Argon2id（WASM）→ PassKey → 解开 `wrapped_vkek` 得到的 VKEK 只存在于内存，**永不写入 IndexedDB 或 Cache Storage**；`visibilitychange` 或闲置 N 分钟后清零上锁。
-- 恢复密钥环（`RecoveryKeyringV1`）、Root Seed 与 `recovery_sk` 不进入手机。
+- 恢复密钥环（`RecoveryKeyringV1`）、Root Seed、`recovery_sk` 与 M6 `owner_sk` 不进入手机。
+- **（M6，D11 / Q5）被远程移除时的自动清理**：手机只读 PWA 收到服务端明确返回 HTTP `401 DEVICE_REVOKED` 或 WebSocket Close `4401` 时，除清零内存中的 `VKEK`、`WasmSyncEngine` 与 `WasmClipCodec` 外，**自动清空上述全部 7 个 Object Stores**（含包裹的 `SMK`/`ClipKey` 与密文缓存），回到未配对引导页并提示「本设备已被桌面端移除」（此行为属淘汰旧机的礼貌清理，不作为防御已离线设备物理取证的安全承诺，见 [`threat-model.md`](./threat-model.md)）。
 - 由于缓存中的正文都是 `MNB1` 密文，碎纸后即使缓存删除延迟，残留内容也无法解密；但已丢失且一直离线的手机上的缓存属于代码管不到的副本（见 [`threat-model.md`](./threat-model.md)）。门禁要求手机 IndexedDB / Cache Storage 中无明文与 VKEK（SEC 取证，见 [`eval-framework.md`](./eval-framework.md)）。
 
 ---

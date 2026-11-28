@@ -1,6 +1,6 @@
 # 基于 Cloudflare 技术栈的自部署云端架构：深度评估与设计方案
 
-> 2026-11-28 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D10（含 2026-11-27 剪贴板同步拍板 D8 / D1′；2026-11-28 拍板的 M5 Windows 一等桌面平台 D9 与 `wasmi` 优先插件体系 D10 对云端 100% 透明，保持 `cloud-cf/src/` **`0 LOC` 改动 `[保证]`**）更新。
+> 2026-11-28 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 与 [多租户及设备管理专项审查](../review/2026-11-28-controlled-multi-tenant-and-device-review.md) 的决策 D1–D11（含 2026-11-27/28 剪贴板同步拍板 D8 / D8′ / D1′；M5 Windows 一等桌面平台 D9 与 `wasmi` 优先插件体系 D10 保持 `cloud-cf/src/` **`0 LOC` 改动 `[保证]`**；M6 受控无账号多租户与设备生命周期管理 D11 排在 M5 之后，预算 `<= 1,250` 行 TS `[目标]`）更新。
 
 > 本文档是 [总架构设计方案 (`architecture-proposal.md`)](./architecture-proposal.md) 的云端专项设计，并与 [数据结构规范 (`data-structures.md`)](./data-structures.md)、[全链路接口契约 (`interface-contracts.md`)](./interface-contracts.md)、[同步协议规范 (`sync-protocol.md`)](./sync-protocol.md)、[安全与威胁模型规范 (`threat-model.md`)](./threat-model.md) 配套执行。结合已确定的核心取舍——**云端自部署在 Cloudflare 技术栈，且不考虑云端 MCP 与本地 MCP（Agent 统一走本地 CLI + Skill）**——本方案聚焦于构建一个**存储层零知识端到端加密（E2EE，服务端不持有任何解密密钥）、零运维、桌面间亚秒级唤醒、个人成本约 \$5/月（Workers Paid）**的极薄同步中继与只读 PWA 托管架构。
 >
@@ -61,7 +61,7 @@
 
 ## 3. 基于 Cloudflare 的推荐云端架构蓝图与极薄服务端职责
 
-整个云端只需部署 **1 个 Cloudflare Worker（M1 预算 `< 500` 行 TypeScript [目标]，M2 实测 `690` 行 `[已测]` <= `700` 行，M4 初版实测 `929` 行 `[已测]`，D8′ 增补 5 GiB 硬配额与 `/v1/clip/prune` 后实测 `1,025` 行 `[已测]`，单仓库 `wrangler.jsonc`，只由 CI 发布）**，承载全部云端职责：
+整个云端只需部署 **1 个 Cloudflare Worker（M1 预算 `< 500` 行 TypeScript [目标]，M2 实测 `690` 行 `[已测]` <= `700` 行，M4 初版实测 `929` 行 `[已测]`，D8′ 增补 5 GiB 硬配额与 `/v1/clip/prune` 后实测 `1,025` 行 `[已测]` <= `1,050` 行；M5 硬约束 `0 LOC` 改动 `[保证]`；M6 引入受控无账号多租户与设备防自锁后预算 `<= 1,250` 行 `[目标]`，拆分为 `index.ts` / `space.ts` / `wire.ts`，单仓库 `wrangler.jsonc`，只由 CI 发布）**，承载全部云端职责：
 
 ```mermaid
 flowchart TD
@@ -120,14 +120,15 @@ flowchart TD
 | 11 | **每日归档** | 同一 alarm 每日把新增 op 密文追加归档到 R2，并写密钥表快照（`latest.mnks` + `history/<yyyy-mm-dd>.mnks`，见 [§3.3](#33-r2-布局归档快照与生命周期)）。 |
 | 12 | **手机状态快照存储（M2）** | 接收桌面发布的状态快照，在同一 `journal_epoch` 内按 `covers_seq` 单调接受，保留最近 2 份（[§3.3](#33-r2-布局归档快照与生命周期)）。 |
 | 13 | **首台引导与一次性领取配对 / 刷新** | `POST /v1/devices/bootstrap` 凭部署环境变量 `BOOTSTRAP_TOKEN` 注册首台桌面（或全设备丢失后重新接入）；`POST /v1/devices`（`read-write`）与 `POST /v1/devices/:id/refresh` 暂存桌面用 `K_pair` 加密的密文（**服务端不接触明文 `device_token` 或 `K_pair`**，TTL 10 分钟）；`POST /v1/devices/pair-claim` 凭 128 位 `pair_id` **首次领取即删除**，超时未领由 alarm 删除票据并清理未激活的预注册设备。形状见 [`interface-contracts.md`](./interface-contracts.md) §4.2 (5)。 |
-| 14 | **独立图文剪贴板滚动中继与流式 R2（M4，D8 / D8′）** | 维护物理隔离的 `clip_items` 滚动索引（保留最近 **1,000 条** / 默认 **30 天 TTL**，绝不进入每日 op 归档与手机快照）：`POST /v1/clip` 存 `≤ 64 KiB` 小文本（不受 R2 5 GiB 配额阻塞），或对 `ephemeral: true`（`≤ 256 KiB`）执行**零 SQLite / 零 R2 写入**直接广播给在线 `read-write` 桌面 WS（无在线桌面返 `409 NO_ONLINE_DESKTOP`）；`PUT /v1/clip/blob` 执行两段 **`5 GiB` 硬配额校验**（超限返 `507 CLIP_QUOTA_EXCEEDED` 并回滚 R2）后流式写 R2 `clip/blobs/<clip_id>.mnc1`（单条上限 `10.5 MiB`）；`GET /v1/clip` 支持 `has_more` 分页与 `quota` 返回；`GET /v1/clip/:clip_id/blob` 流式直出；`POST /v1/clip/prune` 与 `DELETE /v1/clip[?scope=cloud\|all]` 支持作用域清理；超 1,000 条淘汰、清理与 alarm 到期均分批调用 `R2.delete(keys[])`（单批 ≤ 1,000 键）。 |
+| 14 | **独立图文剪贴板滚动中继与流式 R2（M4，D8 / D8′）** | 维护物理隔离的 `clip_items` 滚动索引（`primary` 默认保留最近 **1,000 条** / **30 天 TTL**，M6 受邀空间默认 **500 条** / **14 天 TTL**，绝不进入每日 op 归档与手机快照）：`POST /v1/clip` 存 `≤ 64 KiB` 小文本（不受 R2 大对象配额阻塞），或对 `ephemeral: true`（`≤ 256 KiB`）执行**零 SQLite / 零 R2 写入**直接广播给在线 `read-write` 桌面 WS（无在线桌面返 `409 NO_ONLINE_DESKTOP`）；`PUT /v1/clip/blob` 执行两段硬配额校验（`primary` `5 GiB`，M6 受邀空间默认 `512 MiB`；超限返 `507 CLIP_QUOTA_EXCEEDED` 并回滚 R2）后流式写 R2；`GET /v1/clip` 支持 `has_more` 分页与 `quota` 返回；`GET /v1/clip/:clip_id/blob` 流式直出；`POST /v1/clip/prune` 与 `DELETE /v1/clip[?scope=cloud\|all]` 支持作用域清理；超条数淘汰、清理与 alarm 到期均分批调用 `R2.delete(keys[])`（单批 ≤ 1,000 键）。 |
+| 15 | **受控无账号多租户路由、惰性 DO 与防自锁设备管理（M6，D11）** | 零 KV / D1，每个空间映射独立 `SyncJournalDO`（`idFromName(space_id)`，运营者存量空间保留 `"primary"`）：① Worker 边缘凭单一 `SPACE_MASTER_SECRET` 派生的 `K_route` / `K_invite` 预校验自路由令牌、配对 ID 与一次性离线邀请码，非法请求在边缘直接 `401/400` 拦截（**0 次 DO 唤醒**）；② `SyncJournalDO` 构造函数执行**惰性只读探测**，未激活空间（`space_initialized != '1'`）除有效 `POST /v1/spaces/create` 外一律返回 `401/404` 且**零建表、零写行、零设 Alarm**；③ 单空间硬配额（默认 `max_devices=12`、`ops_quota_bytes=256 MiB`、`clip=512 MiB / 500 条 / 14 天`）；④ `DELETE /v1/devices/:id` 强制禁止吊销最后一台活跃 `read-write` 桌面（`409 LAST_ADMIN_DEVICE_REFUSED`）；⑤ `POST /v1/spaces/recover/*` 采用 **DO 纯内存有界挑战 Map**（上限 3 条、TTL 5m，0 SQLite 写）+ 原生 WebCrypto `Ed25519` 验签实现全设备丢失自助重连。 |
 
 **参数**（Q7–Q9、D8 / D8′ 已拍板）：`T_grace` = 7 天（客户端默认值）；`T_grace_min` = 24 小时；`N` = 20 块/天；M4 剪贴板 `CLIP_MAX_ITEMS` = 1,000、`CLIP_TTL_MS` = `30 天`（`2,592,000,000 ms`）、`CLIP_QUOTA_BYTES` = `5 GiB`（`5,368,709,120 B`）、`CLIP_MAX_BLOB_BYTES` = `10 MiB`（密文含信封头上限 `10.5 MiB`）。`T_grace_min`、`N`、`CLIP_*` 与 `BOOTSTRAP_TOKEN` 以 Worker 环境变量 / Secret 配置，**只能经 CI 或控制台修改**，持有设备令牌的攻击者无法调低。
 
 > [!NOTE]
 > 服务端看不到内容，**也区分不了请求来自 UI 还是 CLI**（二者用同一台设备的令牌）。「CLI 只能删进回收站、缩短宽限期 / 清空回收站只能在 UI 交互确认」由本地 Daemon 强制（见 [`interface-contracts.md`](./interface-contracts.md)）；服务端能构造性保证的是：任何碎纸请求都至少有 `T_grace_min` 的可撤销窗口，且超出批量阈值的部分在确认前不会计时。
 
-**alarm 复用**：每个 DO 只有一个 alarm。每次处理完毕后重新设定为 `min(下一次每日任务时刻, 最早一个待到期 not_before_ms, 最早一个配对票据过期时刻, 最早一个 clip_items.expires_at_ms)`；DO 启动（含 PITR 回滚后）时也重算一次，保证到期任务不会被漏掉。
+**alarm 复用与空闲空间零空转（M6 `INV-MT-IDLE-ALARM`，修正 `F-MT-06`）**：每个已初始化 DO 只有一个 alarm。每次处理完毕后重新设定为 `min(下一次每日归档时刻, 最早一个待到期 not_before_ms, 最早一个配对票据过期时刻, 最早一个 clip_items.expires_at_ms)`；DO 启动（含 PITR 回滚后）时同样重算。M6 起在 `journal_meta` 记录 `last_archived_keys_digest`：当且仅当 ① `head_seq == last_archive_seq`、② `current_keys_digest == last_archived_keys_digest`（若当次 Alarm 执行了碎纸置空导致 `keys_digest` 变化，必须先覆写 `latest/<space_id>.mnks` 并更新该值）、③ `pairing_tickets` 为空、④ 无 `state = 'scheduled'` 的 `shred_marks` 且 `clip_items` 为空时，**不重复注册下一次日常 Alarm**，直到下一次写请求触发 `rescheduleAlarm` 唤醒，使长期闲置的亲友空间后台费用严格归零且不破坏约 37 天删除上界。
 
 ### 3.2 同步链路的核心设计哲学：「HTTP 为可靠真相，WebSocket 为零成本唤醒」
 
@@ -147,15 +148,17 @@ flowchart TD
 | **桌面 → iOS / Android 只读 PWA（亮屏）** | **300 – 600 ms** [目标] | iOS 锁屏后后台 WS 会被系统挂起，故 PWA 切回前台时立即 HTTP `pull` + WS 重连，打开即见最新块并提供一键「复制」按钮 |
 | **弱网 / 跨境抖动 / 离线恢复** | 断连自动重试 | 顶栏与块头展示诚实状态灯（`✓ 已同步` / `↑ 同步中` / `◌ 离线待同步`），未收到 DO 明确 JSON ack 前不清本地 outbox（仅桌面有 outbox） |
 
-### 3.3 R2 布局、归档、快照与生命周期
+### 3.3 R2 布局、归档、快照与生命周期（含 M6 类别前置多租户隔离）
 
-| R2 前缀 | 内容 | 写入方 | 保留策略 |
+Cloudflare R2 Lifecycle Rules 仅支持**静态前缀匹配**（不支持通配符 `*/clip/blobs/`）。因此 M6 多租户空间强制采用**「类别前缀在前、`<space_id>` 在后」**的对象键布局（运营者 `"primary"` 空间保留原平铺键零迁移兼容）：
+
+| R2 类别前缀 | `"primary"` 单租户键 / M6 多租户键 | 写入方 | 保留策略与生命周期兼容 |
 | --- | --- | --- | --- |
-| `archives/ops/` | 每日新增 op 密文（`MNA1`，按 `epoch` + `seq` 区间确定性命名，键格式见 [`data-structures.md`](./data-structures.md)） | DO alarm | **永久、只追加**。Worker **不暴露任何归档读写 / 删除 / 覆盖路由**；写前检查对象是否已存在，存在则跳过（重试幂等）。可选启用 R2 Bucket Lock 进一步防删 [待 S0 验证] |
-| `archives/keys/latest.mnks` | 最新全量密钥表 + `key_material` 快照（已置空的密钥不含 `key_record`） | DO alarm | **每日覆写、不挂生命周期删除**：碎纸执行次日即被覆盖移除，不延长约 37 天上界；即使停写超过 30 天也永不归零 |
-| `archives/keys/history/` | 按日归档的密钥表快照（`<yyyy-mm-dd>.mnks`） | DO alarm | **R2 生命周期规则：创建 30 天（`T_snap`）后自动删除** |
-| `snapshots/state/` | 手机引导用「当前状态快照」（非 `Shredded` 块的全部叶子版本 + 字段 LWW 结果 + `covers_seq`；正文仍用各自 BDEK 加密） | 任一桌面（`read-write` 令牌） | 同一 `journal_epoch` 内按 `covers_seq` **单调接受**（不大于当前最新则拒绝，无 CAS 链）；**只保留最近 2 份**，由 Worker 在接受新快照后删除更旧的 |
-| `clip/blobs/`（M4，D8 / D8′） | 独立剪贴板图片（PNG/JPEG/WebP/GIF）与 `> 64 KiB` 长文本原始二进制 `MNC1` 密文（键名 `clip/blobs/<clip_id>.mnc1`，单条上限 `10.5 MiB`，总量硬上限 `5 GiB`） | 桌面 / 手机 PWA / 快捷指令（`read-write` / `read+clip` / `clip-write`）经 Worker 流式直写 | **不受 `archives/ops/` Bucket Lock 影响，物理 0 进入 DO 30 天 PITR**；触顶 `5 GiB` 时 `PUT /v1/clip/blob` 返回 `507 CLIP_QUOTA_EXCEEDED`；超 1,000 条淘汰、用户删除、`POST /v1/clip/prune` 与 30 天到期时由 DO 主动分批 `R2.delete(keys[])`，另配置 **R2 31 天前缀生命周期规则（`expire-clip-blobs-31d`）**清理极端异常孤儿对象 |
+| `archives/ops/` | `archives/ops/<epoch>/<from>-<to>.mna1`<br>M6：`archives/ops/<space_id>/<epoch>/<from>-<to>.mna1` | DO alarm | **永久、只追加**。Worker **不暴露任何归档读写 / 删除 / 覆盖路由**；写前检查对象是否已存在，存在则跳过（重试幂等）。与 `archives/ops/` 前缀 R2 Bucket Lock 100% 兼容 |
+| `archives/keys/latest` | `archives/keys/latest.mnks`<br>M6：`archives/keys/latest/<space_id>.mnks` | DO alarm | **按变更覆写、不挂生命周期删除**：碎纸置空使 `keys_digest` 变化后即被覆盖移除（`INV-MT-IDLE-ALARM`），不延长约 37 天上界；即使空间长期闲置免设 Alarm 超过 30 天也永不归零 |
+| `archives/keys/history/` | `archives/keys/history/<yyyy-mm-dd>.mnks`<br>M6：`archives/keys/history/<space_id>/<yyyy-mm-dd>.mnks` | DO alarm | **均命中同一条 R2 静态前缀生命周期规则（`archives/keys/history/` 创建 30 天自动删除）**，保住约 37 天删除上界 `[保证]` |
+| `snapshots/state/` | `snapshots/state/<epoch>/<seq>-<id>.mnp1`<br>M6：`snapshots/state/<space_id>/<epoch>/<seq>-<id>.mnp1` | 任一桌面（`read-write` 令牌） | 同一 `journal_epoch` 内按 `covers_seq` **单调接受**（无 CAS 链）；每个空间只保留最近 **2 份**，由所属 DO 事务主动裁剪删除旧快照 |
+| `clip/blobs/`（M4 / M6） | `clip/blobs/<clip_id>.mnc1`<br>M6：`clip/blobs/<space_id>/<clip_id>.mnc1` | 桌面 / 手机 PWA / 快捷指令经 Worker 流式直写 | **物理 0 进入 DO 30 天 PITR**；触达当前空间 `clip_quota_bytes`（`primary` `5 GiB`，M6 受邀默认 `512 MiB`）返回 `507 CLIP_QUOTA_EXCEEDED`；超条数淘汰、清理或到期（`primary` 30 天，M6 受邀默认 **14 天**）均由各自 DO 主动分批 `R2.delete(keys[])`；桶级静态前缀规则**统一维持 31 天（`expire-clip-blobs-31d`）**清扫崩溃孤儿对象（严禁改回 8 天以免误删 `primary` 活跃原图，修正 `F-MT-05`） |
 
 - 状态快照的发布时机（每日或尾部 op 超过阈值）与手机应用尾部 op 的规则由 [`sync-protocol.md`](./sync-protocol.md) 定义；状态快照**只给手机读**，不参与桌面因果判定，出错的后果只是手机显示不对、重新拉取即可。
 - 历史密钥快照的删除依赖 R2 生命周期规则的异步执行，实际删除可能比 30 天略晚 [待 S0 验证]；彻底删除的时间上界（`T_grace + max(PITR 30 天, T_snap)` ≈ 37 天）的承诺措辞以 [`threat-model.md`](./threat-model.md) 为准。
@@ -166,8 +169,8 @@ flowchart TD
 | --- | --- |
 | **DO 误操作 / 数据损坏（30 天内）** | DO PITR 回滚 → 新 `epoch` → 各桌面按 `op_id` 并集对账，把 DO 缺失的 op 与密钥记录补推回去（[§6 #2](#6-cloudflare-专属工程暗坑与防御清单必看)）。 |
 | **DO 整体丢失 / 迁移** | 新建 DO（新 `epoch`）→ 任一桌面全量补推 op 历史与 `block_keys` / `key_material` / `shred_marks`；手机等待下一份状态快照。 |
-| **客户端设备全失，但云端 DO 仍健在** | 新桌面凭部署级 `BOOTSTRAP_TOKEN` 调用 `POST /v1/devices/bootstrap` 注册新令牌（可同时吊销全部旧设备）→ 输入统一恢复包执行 `mynote keyring unlock` 解封 `/v1/keys` 中的密钥环 → 从 `seq = 0` 常规 `pull` 零丢失恢复全部笔记（含尚未写入 R2 的最近 24 小时尾部）。 |
-| **极端双重灾难（所有桌面与云端 DO 同时损毁）** | 从 Cloudflare 控制台 / `wrangler` / `rclone` 下载 R2 `archives/` 目录到本地 → 新桌面执行纯离线命令 `mynote restore --from-archive <local-dir>`，凭 24 词恢复包从 `MNA1` + `latest.mnks` 重建本地库（临时笔记接受距上次每日归档 `< 24h` 的尾部缺口，Worker 无需维护归档下载或专用恢复鉴权接口）。 |
+| **客户端设备全失，但云端 DO 仍健在** | `"primary"` 空间凭部署级 `BOOTSTRAP_TOKEN` 调用 `POST /v1/devices/bootstrap`；M6 受邀空间凭「公开定位串 `mynote-space:v1:...` + 24 词派生的 Ed25519 挑战签名」调用 `POST /v1/spaces/recover/*` 自助注册新令牌（均可一键吊销全部旧设备）→ 24 词解封 `/v1/keys` 密钥环 → 从 `seq = 0` 常规 `pull` 零丢失恢复全部笔记。 |
+| **极端双重灾难（所有桌面与云端 DO 同时损毁）** | 从 Cloudflare 控制台 / `wrangler` / `rclone` 下载对应前缀（M6 受邀空间由运营者按 `archives/ops/<space_id>/` 与 `archives/keys/latest/<space_id>.mnks` 导出交付）到本地 → 新桌面执行纯离线命令 `mynote restore --from-archive <local-dir> [--space-id <space_id>]`，凭 24 词恢复包重建本地库（Worker 不暴露任何 `/v1/archive/*` 归档下载接口）。 |
 
 INV-RECOVERY（零设备 + 恢复包 + 本地导出的 R2 归档目录 → 恢复全部已归档未删除数据）作为 M1 准出门禁，定义见 [`eval-framework.md`](./eval-framework.md)。
 
@@ -229,6 +232,17 @@ Cloudflare 于 2026-11-13 推出 Spend Management（beta），可分别为 Worke
 - DO 上限不含存储费与订阅费；**R2 不在 Spend Management 覆盖范围内**，需在账单通知或定期用量检查中另行关注（本项目用量极小）。
 - 告警配置本身纳入 S0 的 echo 中继 spike 验证。
 
+### 5.3 M6 受控多租户成本精算与默认单空间硬配额（5–50 名受邀亲友场景，D11）
+
+在 M6 邀请制无账号多租户模式下，每个受邀空间默认写入以下硬配额（签发 `mynote-invite:v1:` 时可按人单独覆写；运营者 `"primary"` 空间保持 `5 GiB / 1,000 条 / 30 天` 且无 `ops` 上限）：`max_devices = 12`（统计未吊销行，含 `pending_claim`）、`ops_quota_bytes = 256 MiB`、`clip_quota_bytes = 512 MiB`、`clip_max_items = 500`、`clip_ttl_ms = 14 天`。按 **20 名轻中度活跃亲友租户**（均值约为重度开发者用量的 50%）测算资源落点：
+
+| 资源项 | 20 受邀空间估算总量 | Workers Paid（\$5/月）套餐内含 | 落点与极值护栏评估 |
+| --- | --- | --- | --- |
+| **DO Requests & Duration** | ~40 万次/月、`~10,000–15,000` GB-s/月 `[估算]`（开启 Hibernation + `INV-MT-IDLE-ALARM` 闲置零唤醒） | 100 万次/月、400,000 GB-s/月 | 约 40% / `< 4%`，稳居套餐内 `[估算]` |
+| **DO SQLite 行读写** | 写 ~45 万行/月、读 ~4.6 亿行/月 `[估算]` | 5,000 万行写、250 亿行读 | `< 1%` / `< 2%`，套餐内 `[估算]` |
+| **DO SQLite 存储** | 20 空间 × ~110 MB/年 ≈ `2.2 GB/年` `[估算]`；每空间受 `ops_quota_bytes = 256 MiB` 硬封顶 | 含 5 GB-月（超出约 \$0.20/GB-月） | 前 2 年套餐内；20 空间全部写满硬顶极限约 `5 GB`（超额 `< \$1/月`） `[估算]` |
+| **R2 存储与请求** | 常规活跃（10–15 人 × 均值 `200–400 MiB`）约 `3–8 GB` `[估算]`；月 Class A `< 3` 万次（3%） | 10 GB-月 + 100 万 Class A + 1,000 万 Class B 免费（超出存储约 \$0.015/GB-月） | 10–15 人常规使用稳落免费层 `[估算]`；即便 20 人同时打满 `512 MiB` 剪贴板极值（约 `10 GiB` + 运营者 `primary`），R2 月超额存储费也仅约 **\$0.10–\$0.20/月 `[估算]`** |
+
 ---
 
 ## 6. Cloudflare 专属工程暗坑与防御清单（必看）
@@ -272,7 +286,10 @@ Cloudflare 于 2026-11-13 推出 Spend Management（beta），可分别为 Worke
    - 拦截触发后 DO SQL 写入、stub、alarm 全部被拒，归档与碎纸都会推迟。因此只开告警或设宽松上限（[§5.2](#52-spend-management支出告警配置建议)）。
 9. **【防 128 MB Worker OOM、子请求上限与大对象污染 #9（M4，D8 / D8′）】大剪贴板图片必须流式直写 R2 并分批删除，严禁 Base64 进 DO SQLite**：
    - Cloudflare Worker 单实例内存硬上限为 **128 MB**、单次请求子请求上限为 **1,000 次**，SQLite DO 单行上限为 **8 MB**；若把图片放进 DO SQLite 并经 JSON Base64 返回，会直接打穿 Worker 与手机 Safari 内存且污染 30 天 DO PITR；若在清空 1,000 条时逐键循环调 `R2.delete(key)`，单次清理将触及 Worker 子请求上限；
-   - *强制防御*：`PUT /v1/clip/blob` 必须在完成两段 `5 GiB` 硬配额校验与 `Content-Length ≤ 10.5 MiB` 校验后直接把 `req.body`（`ReadableStream`）流式写入 R2 `clip/blobs/<clip_id>.mnc1`，`GET /v1/clip/:clip_id/blob` 直接返回 `new Response(obj.body)`，严禁调用 `req.arrayBuffer()` 或把原图 Base64 拼进 JSON；批量清理 R2 时必须分块调用 `ARCHIVE_BUCKET.delete(keys.slice(i, i + 1000))`（最多 1,000 键/次）；DO `clip_items` 仅存轻元数据、≤ `64 KiB` 小文本与 ≤ `16 KiB` 缩略图。
+   - *强制防御*：`PUT /v1/clip/blob` 必须在完成两段硬配额校验与 `Content-Length ≤ 10.5 MiB` 校验后直接把 `req.body`（`ReadableStream`）流式写入 R2，`GET /v1/clip/:clip_id/blob` 直接返回 `new Response(obj.body)`，严禁调用 `req.arrayBuffer()` 或把原图 Base64 拼进 JSON；批量清理 R2 时必须分块调用 `ARCHIVE_BUCKET.delete(keys.slice(i, i + 1000))`（最多 1,000 键/次）；DO `clip_items` 仅存轻元数据、≤ `64 KiB` 小文本与 ≤ `16 KiB` 缩略图。
+10. **【防僵尸 DO 计费放大与跨租户串写 #10（M6，D11）】**：
+    - *平台陷阱*：一旦 Worker 入口将请求动态路由至 `env.SYNC_DO.idFromName(space_id)`，如果 `SyncJournalDO` 构造函数无条件执行 `CREATE TABLE` 或 `setAlarm()`，外部遍历随机 `space_id` 就会创建成千上万个永久计费并每日自唤醒的僵尸 DO！
+    - *强制防御*：① Worker 边缘在调用 `idFromName` 之前必须用 `K_route` 常量时间验签 `space_id` MAC（未通过直接 `401`，零 DO 唤醒）；② `SyncJournalDO` 构造函数严禁无条件建表或设 Alarm，未激活空间（`space_initialized != '1'`）除双重验签通过的 `POST /v1/spaces/create` 外立即短路返回，保持 0 字节持久存储；③ 所有 R2 键必须由服务端强拼接当前 DO 自身的 `this.spaceId`，严禁采用客户端请求传入的路径片段。
 
 ---
 
@@ -303,9 +320,10 @@ Cloudflare 于 2026-11-13 推出 Spend Management（beta），可分别为 Worke
 | `POST /v1/keys/shred`、`/cancel`、`/confirm` | `read-write` | （M2）发起碎纸标记（校验 `T_grace_min`、批量阈值）/ 撤销 / 确认超阈值的待确认项 |
 | `GET / PUT /v1/snapshots/state` | 读：`read`；写：`read-write` | （M2）获取 / 发布手机状态快照（同一 `epoch` 内 `covers_seq` 单调，保留 2 份） |
 | `POST /v1/devices/bootstrap` | `BOOTSTRAP_TOKEN` | 凭部署环境变量注册首台 `read-write` 桌面（或全桌面丢失后重新接入并可选吊销旧设备） |
-| `POST / GET /v1/devices`、`POST /v1/devices/:id/refresh`、`DELETE /v1/devices/:id` | `read-write` | 发起一次性领取配对或密钥刷新（桌面用 `K_pair` 加密，TTL 10 分钟）/ 列出 / 吊销设备 |
-| `POST /v1/devices/pair-claim` | 无需令牌（凭 `pair_id`） | 一次性领取：首次领取即激活设备并删除暂存记录，再次领取或过期返回 404 |
-| `POST /v1/clip`、`PUT /v1/clip/blob`、`GET /v1/clip`、`GET /v1/clip/:id/blob`、`POST /v1/clip/prune`、`DELETE /v1/clip[/:id]` | 写：`read-write` / `read+clip` / `clip-write`；读：`read-write` / `read+clip` / `read`；删/清理：`read-write` / `read+clip` | （M4，D8 / D8′）独立图文剪贴板滚动中继通道（`1,000 条 / 30 天 / 5 GiB` 硬护栏）：小文本写 DO、图片/长文本流式读写 R2 `clip/blobs/`、支持按规则 `prune` 与作用域 `DELETE`、`ephemeral: true` 零写库纯内存 WS 直推 |
+| `POST / GET / PATCH / DELETE /v1/devices[/:id]`、`POST /v1/devices/:id/refresh` | `read-write` | 发起一次性领取配对或密钥刷新（TTL 10 分钟；M6 校验 `max_devices` 与 `pr_${space_id}_` 前缀）/ 列出（含在线态与空间配额）/ 改名 / 吊销设备（`INV-MT-NO-SELF-LOCKOUT` 禁删最后一台活跃 `read-write` 桌面） |
+| `POST /v1/devices/pair-claim` | 无需令牌（凭自路由或 128 位 `pair_id`） | 一次性领取：首次领取即激活设备并删除暂存记录，再次领取或过期返回 404 |
+| `POST /v1/spaces/create`、`POST /v1/spaces/recover/challenge`、`POST /v1/spaces/recover/bootstrap` | 离线邀请码 HMAC / 24 词 Ed25519 挑战签名 | （M6，D11）受控无账号多租户空间一次性激活（写入空间配额与 `space_owner_pk`）及全设备丢失纯内存挑战-应答自助重连 |
+| `POST /v1/clip`、`PUT /v1/clip/blob`、`GET /v1/clip`、`GET /v1/clip/:id/blob`、`POST /v1/clip/prune`、`DELETE /v1/clip[/:id]` | 写：`read-write` / `read+clip` / `clip-write`；读：`read-write` / `read+clip` / `read`；删/清理：`read-write` / `read+clip` | （M4，D8 / D8′）独立图文剪贴板滚动中继通道（`primary` `1,000 条 / 30 天 / 5 GiB`，M6 受邀默认 `500 条 / 14 天 / 512 MiB`）：小文本写 DO、图片/长文本流式读写 R2 `clip/blobs/`、支持按规则 `prune` 与作用域 `DELETE`、`ephemeral: true` 零写库纯内存 WS 直推 |
 
 **随时脱离 Cloudflare 的 3 步逃生路径**：
 1. Mac 和 Omarchy 本机始终存着完整的本地 SQLite 数据库（全量 op 历史、密钥表与物化状态）；
@@ -354,10 +372,15 @@ Cloudflare 于 2026-11-13 推出 Spend Management（beta），可分别为 Worke
   - `S-Clip-5`：在 `workerd` 与真实 CF 账号验证 `PUT /v1/clip/blob` 流式写 `10 MiB` 密文至 R2 `clip/blobs/` 不触发内存超限，并配置 `clip/blobs/` 前缀生命周期规则（初版 8 天，D8′ 随 30 天 TTL 放宽至 **31 天** `expire-clip-blobs-31d`，确认与 `archives/ops/` Bucket Lock 互不干扰）；
   - `M4a` + `D8′`：扩展 `devices.scope`（四态）与 `key_material.kind`（新增 `'clip_key'`），实现 `clip_items` `1,000 条 / 30 天 TTL` 滚动索引、`5 GiB` R2 硬配额护栏（`507 CLIP_QUOTA_EXCEEDED`）、`/v1/clip*` 常规与流式 R2 路由、`POST /v1/clip/prune`、作用域 `DELETE /v1/clip`、`≤ 256 KiB` 零写库 `ephemeral` WS 广播、超限/清理/alarm 分批 `R2.delete(keys[])`、`INV-CLIP-ISOLATION` 与 `SEC-09` `workerd` 契约测试；
   - `M4b`：云端无新增职责（纯桌面客户端后台监听）。
+- **M5 — Windows 一等桌面平台与 `wasmi` 双宿主插件（D9 / D10）**：云端 **`0 LOC` 改动 `[保证]`**（`cloud-cf/src/` 保持 `<= 1,050` 行门禁不变）。
+- **M6 — 受控无账号多租户与设备生命周期管理（D11，预算 `<= 1,250` 行 TS `[目标]`）**：
+  - `Slice 1`：`GET /v1/devices` 增加 `online`/`is_current`/`status`/`space_quota`，`PATCH /v1/devices/:id` 改名，`DELETE /v1/devices/:id` 落实 `INV-MT-NO-SELF-LOCKOUT`（`409 LAST_ADMIN_DEVICE_REFUSED`）、`?confirm_self=true` 与未认领票据物理清理；
+  - `S-MT-1`（限时 Spike）：在 `spikes/` / `workerd` 验证原生 WebCrypto `Ed25519` 与 Rust 签名互通、惰性 DO 零写库零 Alarm 行为与 `INV-MT-IDLE-ALARM`；
+  - `Slice 3`：拆分 `index.ts` / `space.ts` / `wire.ts`，落地单一 `SPACE_MASTER_SECRET` 派生的边缘自路由校验、`ALLOW_LEGACY_PRIMARY` 零停机兼容、惰性 DO 初始化、`POST /v1/spaces/create`、`POST /v1/spaces/recover/*`（纯内存挑战 Map）、R2 类别前置路径隔离、单空间硬配额、`cloud-cf/scripts/issue-invite.ts` 离线签发脚本及 `SEC-MT-01..04` 契约测试。
 
 ---
 
-## 11. 已移除 / 推迟的机制（2026-11-24 / 2026-11-27 修订）
+## 11. 已移除 / 推迟的机制（2026-11-24 / 2026-11-28 修订）
 
 依据 [第一性原理审查](../review/2026-11-24-first-principles-review.md)：
 
@@ -366,7 +389,7 @@ Cloudflare 于 2026-11-13 推出 Spend Management（beta），可分别为 Worke
 - **`purge_op_ids` 原地墓碑擦除**：已移除。op 密文永不删除，删除只通过加密碎纸作用于密钥（§9.3，D2′）。
 - **旧版写入 DO SQLite 且声称零 PITR 的 `ephemeral_clips`（`/v1/sync/ephemeral-clip`）**：已永久废弃（F-06）；2026-11-27 拍板 **D8**（2026-11-28 **D8′** 修订）改为独立图文通道（云端 `1,000 条 / 30 天 / 5 GiB` 硬护栏 + R2 流式大对象 0 DO PITR + 桌面无限归档 + 可轮换 `ClipKey` + 零写库 `--ephemeral` WS 直推，见 §3.1 #14、§3.3、§10）。
 - **`vault_keys` / `vault_key_slots` 同步端点、`MNK1`、`key_seq`**：已移除，由独立密钥表 `block_keys` + `shred_marks`（2P-Set）取代（§9.3，D2′）。
-- **云端 `/v1/archive/*` 下载接口**：已移除。仅设备全失而 DO 健在时直接凭 `BOOTSTRAP_TOKEN` + 24 词从 DO 拉回；极端双重灾难直接从 CF R2 下载目录走纯离线 `restore --from-archive <local-dir>`，不为极端场景增加云端鉴权复杂度。
+- **云端 `/v1/archive/*` 下载接口**：已移除。极端双重灾难直接从 CF R2 下载对应前缀目录走纯离线 `restore --from-archive <local-dir>`；仅设备全失而 DO 健在时，`"primary"` 空间凭 `BOOTSTRAP_TOKEN`、M6 受邀空间凭 24 词 Ed25519 挑战签名 `/v1/spaces/recover/*` 直接从 DO 拉回。
 - **加密图片附件（`blobs/`、`/v1/blobs/:sha256`）**：推迟至按数据触发的待办（届时每附件独立随机 `BlobKey` 存入块正文结构，避免块换钥时损坏存活附件）。
 - **WebSocket 携带 op（≤16 KB 顺风车）**：推迟；WS 只发唤醒通知。触发条件：跨端粘贴 p95 > 1 s 且瓶颈确认在多出的那次 pull（§9.11、F-12）。
 - **手机 Local-First 写路径（outbox、push、冲突合并）**：已移除，手机为只读 PWA（§9.2，D1）。

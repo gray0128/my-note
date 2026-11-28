@@ -1,8 +1,8 @@
 # 轻量级多端可靠同步开发者笔记软件：系统架构与演进方案
 
-> 2026-11-28 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D10（含 D1′、D2′、D5′/D5″ 去 Tauri 壳并增补零依赖纯 Swift 可选薄壳 `apps/macos/`、2026-11-25 真机实测拍板、2026-11-27 剪贴板同步拍板 D8，以及 2026-11-28 Windows 一等桌面平台 D9 与 `wasmi` 优先双宿主插件体系 D10）更新。
+> 2026-11-28 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 与 [多租户及设备管理专项审查](../review/2026-11-28-controlled-multi-tenant-and-device-review.md) 的决策 D1–D11（含 D1′、D2′、D5′/D5″ 去 Tauri 壳并增补零依赖纯 Swift 可选薄壳 `apps/macos/`、2026-11-25 真机实测拍板、2026-11-27/28 剪贴板同步与分层留存拍板 D8 / D8′、2026-11-28 Windows 一等桌面平台 D9、`wasmi` 优先双宿主插件体系 D10，以及 M6 受控无账号多租户与设备生命周期管理 D11）更新。
 
-> **定位**：面向开发者的高频临时记录 / Scratchpad 工具，继承 Heynote「多语言分块 + 一键格式化」的顺手体验，从架构根源消除同步丢数问题，原生适配 **macOS**、**Omarchy（Arch + Hyprland）**、**Windows（M5 升为一等桌面平台，D9）** 与 **移动端（笔记只读 + Vault 解锁 + 独立剪贴板双向图文同步）**，并兼顾**块级加密**、**Markdown/Mermaid 渲染**、**跨端图文剪贴板同步（M4，D8 / D8′：云端 1,000 条/30 天/5 GiB 中继 + 桌面无限归档）**、**`wasmi` 优先跨平台双宿主插件体系（M5，D10）**与 **CLI + Skill（Agent 友好）**。
+> **定位**：面向开发者（及 M6 起 5–50 名受邀亲友独立加密空间，D11）的高频临时记录 / Scratchpad 工具，继承 Heynote「多语言分块 + 一键格式化」的顺手体验，从架构根源消除同步丢数问题，原生适配 **macOS**、**Omarchy（Arch + Hyprland）**、**Windows（M5 升为一等桌面平台，D9）** 与 **移动端（笔记只读 + Vault 解锁 + 独立剪贴板双向图文同步）**，并兼顾**块级加密**、**Markdown/Mermaid 渲染**、**跨端图文剪贴板同步（M4，D8 / D8′：云端 1,000 条/30 天/5 GiB 中继 + 桌面无限归档）**、**`wasmi` 优先跨平台双宿主插件体系（M5，D10）**、**受控无账号多租户与桌面设备生命周期管理（M6，D11）**与 **CLI + Skill（Agent 友好）**。
 >
 > **文档状态**：正式架构方案（SSOT）。本文是总览、ADR 与路线图的单一事实来源；协议、线格式、安全承诺等细节只在下方配套规范中定义，本文仅做概述并链接。前期可行性调研与发散分析独立归档于 [`research/`](../research/README.md)（调研报告严禁直接作为实施依据，仅在明确转化为本目录正式方案正文后方可实施）。
 
@@ -23,19 +23,20 @@
    - [5.5 Agent 友好设计：CLI + Skill 与四级渐进披露帮助体系](#55-agent-友好设计cli--skill-与四级渐进披露帮助体系)
    - [5.6 Markdown 与 Mermaid 图渲染设计（轻量、离线与防 XSS）](#56-markdown-与-mermaid-图渲染设计轻量离线与防-xss)
    - [5.7 跨平台双宿主插件体系与 Windows 一等桌面适配（M5，D9 / D10）](#57-跨平台双宿主插件体系与-windows-一等桌面适配m5d9--d10)
+   - [5.8 受控无账号多租户与设备生命周期管理（M6，D11）](#58-受控无账号多租户与设备生命周期管理m6d11)
 6. [多端形态与技术栈选型对比](#6-多端形态与技术栈选型对比)
-7. [分阶段演进路线图（S0 → M5）](#7-分阶段演进路线图s0--m5)
+7. [分阶段演进路线图（S0 → M6）](#7-分阶段演进路线图s0--m6)
 8. [架构决策记录（ADR 摘要）](#8-架构决策记录adr-摘要)
 9. [已移除 / 推迟的机制（2026-11-24 / 2026-11-28 修订）](#9-已移除--推迟的机制2026-11-24--2026-11-28-修订)
 
 > **配套核心工程规范**（正式方案单一事实来源，完整索引见 [`docs/README.md`](./README.md)）：
-> - [核心数据结构、存储 Schema 与二进制线格式规范 (`data-structures.md`)](./data-structures.md)（ULID/定长 HLC/FractionalIndex、Rust Sans-I/O 类型、M5 插件领域契约与 Core WASM 3-Export ABI、加密信封字节布局与**唯一的 AAD 定义**、独立密钥表、SQLite `STRICT` 完整 DDL 与 PWA IndexedDB Schema）
+> - [核心数据结构、存储 Schema 与二进制线格式规范 (`data-structures.md`)](./data-structures.md)（ULID/定长 HLC/FractionalIndex、M6 自路由标识与离线邀请码、Rust Sans-I/O 类型、M5 插件领域契约与 Core WASM 3-Export ABI、加密信封字节布局与**唯一的 AAD 定义**、独立密钥表、SQLite `STRICT` 完整 DDL 与 PWA IndexedDB Schema）
 > - [全链路接口与跨边界契约规范 (`interface-contracts.md`)](./interface-contracts.md)（统一错误码表、CLI 全子命令 JSON 信封、本地 Daemon REST / WS / 跨平台 `LocalIpc` 契约、云端 Sync API 与 `mynote-wasm` / Tier 2 插件 Worker 边界）
 > - [同步协议与确定性物化规范 (`sync-protocol.md`)](./sync-protocol.md)
 > - [安全架构与威胁模型规范 (`threat-model.md`)](./threat-model.md)
 > - [Cloudflare 技术栈云端架构专项评估 (`cloudflare-cloud-architecture.md`)](./cloudflare-cloud-architecture.md)
 > - [评测与质量门禁规范 (`eval-framework.md`)](./eval-framework.md)
-> - **已转化调研留档（不作为实施依据，仅追溯背景）**：[跨端剪贴板同步调研 (`2026-11-27-clipboard-sync-research.md`)](../research/converted/2026-11-27-clipboard-sync-research.md)（D8）、[插件化可行性与跨平台架构调研 (`2026-11-28-plugin-architecture-analysis.md`)](../research/converted/2026-11-28-plugin-architecture-analysis.md)（D9 / D10）
+> - **已转化调研留档（不作为实施依据，仅追溯背景）**：[跨端剪贴板同步调研 (`2026-11-27-clipboard-sync-research.md`)](../research/converted/2026-11-27-clipboard-sync-research.md)（D8）、[插件化可行性与跨平台架构调研 (`2026-11-28-plugin-architecture-analysis.md`)](../research/converted/2026-11-28-plugin-architecture-analysis.md)（D9 / D10）、[受控无账号多租户与设备生命周期管理调研 (`2026-11-28-controlled-multi-tenant-and-device-management.md`)](../research/converted/2026-11-28-controlled-multi-tenant-and-device-management.md)（D11）
 
 ---
 
@@ -51,12 +52,13 @@
 - **G4 秘密不落明文、不以明文进云端。**
 - **G5 Agent 可读写**（通过 CLI）。
 - **G6 Heynote 式分块与格式化，Markdown / Mermaid 渲染，以及零云端侵入的跨平台双宿主插件扩展（M5，D10）。**
-- **C1 一个人能长期维护**：复杂度预算建议为 M1 结束时云端代码 < 500 行 [目标]（M2 实测 `690` 行 `[已测]` <= `700` 行；M4 实测 `929` 行 `[已测]` <= `950` 行；**M5 Windows 与插件体系对 `cloud-cf/src/` 改动量硬约束为 `0 LOC` `[保证]`，手机 PWA WASM 增量为 `0 B` `[保证]`**）、core 同步部分 < 3k 行 [目标]（剪贴板与插件领域类型分别置于独立 `clip` / `plugin` 模块，不增加 `sync` 状态机复杂度）；任何新机制都需附上触发它的测量数据（F-08）。
-- **C2 成本约 \$5/月**（Cloudflare Workers Paid）[估算]，并配置支出告警（D4）；M4 图文剪贴板复用 R2 `10 GB/月` 免费额度与零出口流量，M5 纯本地执行无云端增量，整体维持约 \$5/月 `[估算]`。
+- **C1 一个人能长期维护**：复杂度预算建议为 M1 结束时云端代码 < 500 行 [目标]（M2 实测 `690` 行 `[已测]` <= `700` 行；M4 初版实测 `929` 行 `[已测]`；D8′ 增补 5 GiB 硬配额与 `/v1/clip/prune` 后实测 `1,025` 行 `[已测]` <= `1,050` 行；**M5 Windows 与插件体系对 `cloud-cf/src/` 改动量硬约束为 `0 LOC` `[保证]`，手机 PWA WASM 增量为 `0 B` `[保证]`**；M6 受控无账号多租户与设备生命周期管理批准将 `cloud-cf/src/` 上限调至 **`<= 1,250` 行 `[目标]`**，拆分为 `index.ts` / `space.ts` / `wire.ts`，手机 PWA WASM 仍保持 **`0 B` 增量 `[保证]`**）、core 同步部分 < 3k 行 [目标]（剪贴板与插件领域类型分别置于独立 `clip` / `plugin` 模块，不增加 `sync` 状态机复杂度）；任何新机制都需附上触发它的测量数据（F-08）。
+- **C2 成本约 \$5/月**（Cloudflare Workers Paid）[估算]，并配置支出告警（D4）；M4 图文剪贴板复用 R2 `10 GB/月` 免费额度与零出口流量，M5 纯本地执行无云端增量，M6 受邀空间通过单空间硬配额（默认 `ops=256 MiB`、`clip=512 MiB / 500 条 / 14 天`）与 `INV-MT-IDLE-ALARM` 空闲零唤醒将 15–20 名轻中度亲友租户维持在约 \$5/月套餐内 `[估算]`。
 
 ### 0.2 非目标（Non-goals）
 
-- 多人协作、共享与权限管理。
+- 跨空间多人协作、笔记共享与细粒度 ACL（M6 仅提供物理隔离的个人独立空间，不做跨空间数据互通，D11）。
+- 公网开放匿名注册、账号密码 / 邮箱找回 / OAuth / 中心租户目录（KV / D1）、运营管理后台、手机 PWA 端设备增删管理，以及在普通用户 `mynote` 二进制中暴露 `admin` 子命令（D11）。
 - 字符级实时协同 / 自动合并：同块并发编辑以多版本并列 + 手动合并呈现，不引入 CRDT 库（D3）。
 - 手机编辑或追加笔记块（按数据触发再议，§7；D8 仅开放与笔记物理隔离的 `/v1/clip*` 剪贴板通道，手机仍不可改写/删除笔记）。
 - 移动端后台静默自动监听剪贴板、替代 Maccy / `cliphist` 的重型富文本/OCR 剪贴板管理器、任意大文件（视频/压缩包/PDF）同步、以及原生 iOS / Android 独立 App（D8）。
@@ -76,7 +78,7 @@
 ### 0.4 数据可移植性
 
 - **只读 Markdown 镜像（M1 默认开启）**：未加密块单向导出为 `~/.local/share/mynote/mirror/<buffer>.md`，加密块只输出占位符；删除（碎纸到期）时同步删文件。它同时服务 G1（独立明文副本）、G5（`rg` / `cat` 直接可用）与反锁定（F-19）。
-- **零设备恢复（双层最简路径）**：若仅客户端全失而云端 DO 健在，凭部署级 `BOOTSTRAP_TOKEN` + 24 词恢复包直接从 DO 零丢失拉回全部笔记；若客户端与 DO 同时损毁，从 CF 控制台 / `wrangler` / `rclone` 下载 R2 `archives/` 到本地执行纯离线 `mynote restore --from-archive <local-dir>` 重建，云端不暴露归档 HTTP 接口（细节见 [`interface-contracts.md`](./interface-contracts.md) 与 [`cloudflare-cloud-architecture.md`](./cloudflare-cloud-architecture.md)）。
+- **零设备恢复（双层最简路径）**：若仅客户端全失而云端 DO 健在，运营者 `"primary"` 空间凭 `BOOTSTRAP_TOKEN` + 24 词恢复包、M6 受邀无账号空间凭「公开定位串 `mynote-space:v1:...` + 24 词派生的 Ed25519 挑战签名」（`mynote space recover`）直接从 DO 零丢失拉回全部笔记；若客户端与 DO 同时损毁，从 CF 控制台 / `wrangler` / `rclone` 下载对应前缀目录到本地执行纯离线 `mynote restore --from-archive <local-dir> [--space-id <space_id>]` 重建，云端不暴露归档 HTTP 接口（细节见 [`interface-contracts.md`](./interface-contracts.md) 与 [`cloudflare-cloud-architecture.md`](./cloudflare-cloud-architecture.md)）。
 - **本地备份**：`VACUUM INTO` 自动备份按 `T_snap` 轮换；SQLite 本身是开放格式。
 - **迁入**：`mynote import heynote <path>` 导入 Heynote 1.x / 2.x 的 `∞∞∞lang` 文本文件。
 
@@ -722,6 +724,15 @@ flowchart TB
    - **数据驱动声明式安全 UI**：插件严禁接触主 DOM 或注入任何 HTML / JS，只能返回 6 种结构化 `PluginResult`（`noop`、`toast`、`replace_content`、`insert_block`、`gutter`、`view[markdown|mermaid|diff|table|kv|code]`），全部由主前端既有 DOMPurify / Pele 纯 SVG / `diff.ts` / 纯文本组件渲染；所有持久化写操作强制经 `LocalIpc` 单写入方提交并标注 `actor = "plugin:<plugin_id>"`，不发明云端或手机不认识的专有底层数据格式。
    - **插件分发物理隔离**：严禁通过 `my-note` 云同步流自动分发并执行插件代码（守住 T2 / T8，防止云端失守升级为全平台桌面 RCE）；插件由用户通过独立 dotfiles / Git 仓库或包管理器手工同步与审计。
 
+### 5.8 受控无账号多租户与设备生命周期管理（M6，D11）
+
+为在不引入账号密码、邮箱或外部目录库（KV / D1）的前提下，支持 5–50 名受邀亲友共用同一套 Cloudflare Workers Paid 部署，同时补齐单/多租户通用的桌面 UI 设备查看与远程移除闭环，M6（排在 M5 之后）采用以下正交设计（审查修正 `F-MT-01`–`F-MT-07` 详见 [`review/2026-11-28-controlled-multi-tenant-and-device-review.md`](../review/2026-11-28-controlled-multi-tenant-and-device-review.md)）：
+
+1. **单空间单 DO 物理隔离 + 边缘 O(1) 无状态自路由**：每个空间映射独立 `SyncJournalDO` 实例（`idFromName(space_id)`，运营者存量空间保留 `"primary"`）。单一部署密钥 `SPACE_MASTER_SECRET` 经 HKDF 派生路由子钥 `K_route` 与邀请签发子钥 `K_invite`；自路由令牌 `mnt_<space_id>_<64hex>` 与配对标识 `pr_<space_id>_<32hex>`（线格式与正则见 [`data-structures.md`](./data-structures.md) §1.4）由 Worker 边缘预校验 MAC，非法请求直接 `401` 拦截（**0 次 DO 唤醒**）；手机 PWA 与 iOS 快捷指令保持 **WASM `0 B` 增量、协议 `0` 改动 `[保证]`**。
+2. **惰性 DO 初始化、离线一次性邀请码与类别前置 R2 路径**：`SyncJournalDO` 构造函数仅做只读探测，未激活空间（`space_initialized != '1'`）零建表、零写行、零设 Alarm；运营者通过独立脚本 `cloud-cf/scripts/issue-invite.ts` 离线签发 `mynote-invite:v1:`（默认 `max_devices=12`、`ops=256 MiB`、`clip=512 MiB / 500 条 / 14 天`，目标 DO 激活后天然防重放）；R2 采用「类别前缀在前、`<space_id>` 在后」（[`cloudflare-cloud-architecture.md`](./cloudflare-cloud-architecture.md) §3.3），同时保住 `archives/keys/history/` 30 天自动删除与共享桶 `clip/blobs/` **31 天**孤儿清理规则（受邀空间 14 天剪贴板到期由 DO Alarm 主动 `R2.delete(keys[])` 回收），并由 `INV-MT-IDLE-ALARM` 保证闲置空间零后台唤醒。
+3. **24 词派生 Ed25519 全设备丢失自救**：桌面首次建库即由 24 词 `root_seed` 同步派生非机密公钥 `space_owner_pk` 存入 `local_meta`（私钥种子即刻 `zeroize` 永不落盘），无论立即或先离线使用数日后再绑定邀请码均无需重输 24 词；全设备丢失且 DO 健在时，凭「公开定位串 `mynote-space:v1:` + 24 词」经 **DO 纯内存有界挑战 Map** + Workers 原生 WebCrypto `Ed25519` 完成两步挑战-应答重连。
+4. **桌面 UI 设备管理、防自锁与首次启动无死锁引导**：本地 Daemon 新增 `/v1/local/devices*` 与 `/v1/local/space/*`（[`interface-contracts.md`](./interface-contracts.md) §3.2），复用绑定 `HttpOnly` 会话的 `confirm_nonce` 渲染纯本地 SVG 配对二维码、在线态设备清单与分场景移除引导；服务端 `DELETE /v1/devices/:id` 强制 `INV-MT-NO-SELF-LOCKOUT`（禁删最后一台活跃 `read-write` 桌面）；首次启动 UI `claim`/`recover` 校验 `UnclaimedFresh` 并先 `VACUUM INTO` 保底快照再进程内热切换；被移除桌面擦除 `device_token` 转入持久 `"device_revoked"` 态并熔断后台 60s 轮询（100% 保留本地 SQLite 与镜像），被移除手机 PWA 自动清空 IndexedDB 7 张表回到未配对引导页（[`sync-protocol.md`](./sync-protocol.md) §10.5、[`threat-model.md`](./threat-model.md) §11）。
+
 ---
 
 ## 6. 多端形态与技术栈选型对比
@@ -748,13 +759,13 @@ my-note/
 │   └── macos/                 # 可选零依赖纯 Swift WKWebView macOS 薄壳 (MyNote.app，仅连 daemon.sock、不碰 Keychain)
 ├── deploy/                    # 各平台守护进程与快捷入口模板 (launchd / systemd / hyprland / ios-shortcuts / M5 windows)
 ├── web/                       # TypeScript 前端：桌面编辑 UI (CM6 + M5 Tier 2 插件 Worker) + Markdown/Pele 预览层 + 手机只读 PWA (IndexedDB 只读缓存)
-├── cloud-cf/                  # Cloudflare Worker (极薄中继 + SQLite DO + WS Hibernation + R2 + Static Assets；M5 硬约束 0 LOC 改动)
+├── cloud-cf/                  # Cloudflare Worker (极薄中继 + SQLite DO + WS Hibernation + R2 + Static Assets + M6 scripts/issue-invite.ts；M5 硬约束 0 LOC 改动)
 ├── skill/
 │   └── SKILL.md               # 随版本同步的极轻 Agent Skill (<250 tokens)
 ├── evals/                     # Plane A 质量门禁资产 (seeds/ DST 回归种子、golden/ CLI 黄金测试、archive/ 推迟的 Plane B 资产)
 ├── docs/                      # 正式方案与工程规范 SSOT (含 docs/README.md 与 docs/spikes/ 限时实测报告)
 ├── research/                  # 独立调研报告目录 (pending/ 未转化禁止实施，converted/ 已转化为 docs/ 追溯留档)
-└── review/                    # 方案审查与决策追溯目录 (2026-11-24 第一性原理审查与 §9 D1–D10 决策台账)
+└── review/                    # 方案审查与决策追溯目录 (2026-11-24 第一性原理审查 §9 D1–D11 及 M6 专项审查记录)
 ```
 
 ### 6.2 桌面端 UI 形态对比（重点考量 macOS + Omarchy）
@@ -774,12 +785,12 @@ my-note/
 
 ---
 
-## 7. 分阶段演进路线图（S0 → M5）
+## 7. 分阶段演进路线图（S0 → M6）
 
 <a id="7-分阶段演进路线图m0--m3"></a>
 
 > [!IMPORTANT]
-> 2026-11-24：本节按 [审查 §9.11](../review/2026-11-24-first-principles-review.md) 重排路线图；2026-11-27 依据 **D8** 追加 `S-Clip → M4a → M4b → M4c`；2026-11-28 依据 **D9 / D10** 追加 `Phase 0 Spike（S-Plugin-1 + S-Win-1）→ M5-W1..W3（Windows 一等桌面平台）→ M5-P1..P4（wasmi 优先双宿主插件体系）`。
+> 2026-11-24：本节按 [审查 §9.11](../review/2026-11-24-first-principles-review.md) 重排路线图；2026-11-27/28 依据 **D8 / D8′** 追加 `S-Clip → M4a → M4b`；2026-11-28 依据 **D9 / D10** 追加 `M5 Phase 0 Spike → M5-W1..W3 → M5-P1..P4`；同日依据 **D11** 在 M5 之后追加 `M6（受控无账号多租户与设备生命周期管理）`。
 
 ```mermaid
 flowchart LR
@@ -790,7 +801,8 @@ flowchart LR
     SC --> SP["M5 Phase 0 Spike<br/>(S-Plugin-1 + S-Win-1)"]
     SP --> M5W["M5-W1..W3<br/>Windows 一等桌面平台"]
     M5W --> M5P["M5-P1..P4<br/>wasmi 优先双宿主插件"]
-    M5P --> T["按数据触发的待办"]
+    M5P --> M6["M6 受控无账号多租户<br/>与设备生命周期管理"]
+    M6 --> T["按数据触发的待办"]
 ```
 
 ### S0：技术 spike（约 1–1.5 周 [估算]，每项限时）
@@ -847,6 +859,15 @@ flowchart LR
   - **`M5-P3`**：新增桌面专属 `web/src/plugins/worker.ts` 与 `renderer.ts`（`pkg-pwa` `0 B` 改动），`Cmd+K` 命令面板与块菜单接入插件动作，解锁态 Tier 2 块走 `'self'` Web Worker 执行 `.wasm`，落地 Playwright `SEC-10` 门禁（6 种声明式视图 XSS 净化 + Daemon 零 Tier 2 明文取证）；
   - **`M5-P4`**：落地 Level 1 `exec` 辅助宿主（兼容 `formatters.toml`、`oneshot` / 长驻 `worker` 双模式、`launcher` 映射、禁 `.bat`/`.cmd`、硬拒 `is_locked == true`、强标 `actor = "plugin:<id>"`、`reactor` 防回环与滚动限流），全门禁绿灯后将 `ADR-13` 升为 `Accepted`。
 
+### M6：受控无账号多租户与设备生命周期管理（D11，2026-11-28 拍板，排在 M5 之后）
+
+> **预算红线**：进入 M6 后 `cloud-cf/src/` 上限调至 **`<= 1,250` 行 TS `[目标]`**（拆分为 `index.ts` / `space.ts` / `wire.ts`）；手机 PWA WASM（`web/src/wasm/pkg-pwa/`）体积增量保持 **`0 B` `[保证]`**；iOS 快捷指令保持 **`0` 协议改动 `[保证]`**。
+
+- [ ] **Slice 1：桌面 UI 设备管理、防自锁与被移除态熔断**：云端 `GET /v1/devices` 增补 `online`/`is_current`/`status`/`space_quota`、`PATCH /v1/devices/:id` 改名、`DELETE /v1/devices/:id` 落实 `INV-MT-NO-SELF-LOCKOUT`（禁删最后一台活跃 `read-write` 桌面）、`?confirm_self=true` 与未认领票据清理；本地 `daemon.rs` 新增 `/v1/local/devices*` + `confirm_nonce`，桌面收到 `DEVICE_REVOKED` 擦除令牌转入 `"device_revoked"` 态并熔断后台 60s 轮询（100% 保留本地库），手机 PWA 收到明确 `DEVICE_REVOKED` 自动清空 IndexedDB 7 张表；桌面 UI 落地「设备与同步」面板与纯本地 SVG 二维码配对向导。
+- [ ] **Slice 2：限时技术 Spike（`S-MT-1`，`docs/spikes/s-mt-1-multi-tenant.md`）**：隔离验证 `workerd` 原生 WebCrypto `Ed25519` ↔ Rust `ed25519-dalek` 签名互通、未初始化 DO 零写库零 Alarm 计费行为，以及 `INV-MT-IDLE-ALARM` 碎纸快照覆写后静默休眠行为。
+- [ ] **Slice 3：云端受控多租户核心与运维签发脚本**：落地单一 `SPACE_MASTER_SECRET` 派生的边缘自路由校验、`ALLOW_LEGACY_PRIMARY` 存量 `"primary"` 空间零停机兼容、惰性 DO 初始化、`POST /v1/spaces/create`、`POST /v1/spaces/recover/*`（纯内存有界挑战 Map）、R2 类别前置路径隔离（保住 30 天密钥历史与共享桶 **31 天** `clip/blobs/` 规则）、受邀空间默认硬配额（`max_devices=12`、`ops=256 MiB`、`clip=512 MiB / 500 条 / 14 天`）、`cloud-cf/scripts/issue-invite.ts` 离线签发脚本，以及 `INV-MT-ISOLATION` / `SEC-MT-01..03`。
+- [ ] **Slice 4：桌面空间引导与 24 词 Ed25519 自救**：桌面 `mynote-core`（非 PWA feature）建库即派生并持久化 `space_owner_pk`；CLI 落地 `mynote space create / recover / info`、`device refresh` 同步带新 `ClipKey`、`restore --from-archive --space-id`；桌面 Daemon 与 UI 落地首次启动无死锁引导页（`/v1/local/space/create | claim | recover`，强制 `UnclaimedFresh` 校验 + `VACUUM INTO backups/pre-join-<ts>.db` 保底热切换）与 `SEC-MT-04`，真机验证通过后将 `ADR-14` 升为 `Accepted`。
+
 ### 按数据触发的待办
 
 | 机制 | 触发条件 |
@@ -886,6 +907,7 @@ flowchart LR
 | ADR-11 | **独立图文剪贴板通道与分层留存** | 与笔记 `ops` 物理隔离；云端 DO SQLite `clip_items` 存最近 1,000 条轻索引（30 天 TTL、≤ `64 KiB` 小文本内联 + ≤ `16 KiB` 缩略图），图片与长文本（单条上限 `10 MiB`）流式存 R2 `clip/blobs/`（**`5 GiB` 硬容量护栏**触顶返 `507 CLIP_QUOTA_EXCEEDED`、31 天前缀生命周期、0 DO PITR、分批 `R2.delete(keys[])`）；桌面本地无限归档 + 单并发后台 Eager Prefetch + 手动 `prune`/`clear`（云端清理与默认 `rotate-key` 均 `scope=cloud` 保留桌面本地归档）；手机 PWA 200 条增量 IndexedDB；四态令牌新增 `read+clip` / `clip-write`（笔记写仍 `403`）；全端统一 `MNC1` + 可轮换 `ClipKey` + 可选 `≤ 256 KiB` 零写库 `--ephemeral` 直推；移动端 → 桌面由 PWA + iOS Shortcuts/Scriptable 分流；macOS 改用原生 `NSPasteboard`（`objc2-app-kit`），Omarchy 改用纯 Rust `wl-clipboard-rs` 多 MIME 与只读 `Watcher`；分 `S-Clip → M4a → M4b` 交付 | D8、D8′、D1′ | Proposed（`S-Clip-3` macOS 真机、`S-Clip-4` Omarchy Hyprland 真机、`S-Clip-5` `workerd` `FixedLengthStream` + 生产 `mynote-archive` 前缀生命周期已全部实测通过 `[已测]`；`S-Clip-1` JS↔Rust 双向互通与 LLInt 基准、`S-Clip-2` `--remove-name-section` 降 WASM 至 `291.31 KiB` gzip -9 与 Playwright WebKit/Chromium 10 MiB + 同步 Promise 写图已实测通过 `[已测]`；D8′ 全链路单测与 `workerd` 契约测试已通过 `[已测]`；待物理 iPhone 补齐 `S-Clip-1`/`S-Clip-2` 真机验证及生产桶前缀生命周期切至 31 天后升级为 `Accepted`） |
 | ADR-12 | **Windows 一等桌面平台** | 将 Windows 升为与 macOS、Omarchy 并列的一等桌面平台：跨平台 `LocalIpc`（Unix `0600` UDS / Windows 用户 SID SDDL Named Pipe，强制 `first_pipe_instance` 与 `reject_remote_clients`）、Credential Manager / DPAPI 与 NTFS 用户专属 ACL、`CONIN$` 无回显口令、Win32 原生剪贴板（`HWND_MESSAGE` + `WM_CLIPBOARDUPDATE` + 隐私格式硬过滤）、加固外部子进程（`SYSTEMROOT` 白名单 + `CREATE_NO_WINDOW` + Job Object + `PYTHONUTF8=1` + 禁 `.bat`/`.cmd`）、`windows-latest` CI 与 Release 预编译包；`cloud-cf` `0 LOC` 改动 | D9、§5.7 | Proposed（待 `S-Win-1` 与 `M5-W1..W3` 在 `windows-latest` / Windows 真机实测并绿灯通过 `SEC-WIN-PIPE`、`SEC-WIN-CLIP` 后升级为 `Accepted`） |
 | ADR-13 | **`wasmi` 优先跨平台双宿主插件体系** | 采用路线 B「协议优先、双层四槽位（`transform`/`command`/`inspector`/`reactor`）」：纯计算插件统一为 Core WASM 零导入 3-Export ABI（加载期硬校验 `module.imports().is_empty()`），同一 `.wasm` 在 Tier 1 / CLI / Daemon 跑 Rust `wasmi`（fuel + `16 MiB` `StoreLimits`）、在桌面解锁态 Tier 2 跑独立 `'self'` Web Worker 原生 `WebAssembly.instantiate(bytes, {})` + `worker.terminate()`；外部工具链 / 网络类 Tier 1 插件走 Level 1 `exec`（`oneshot`/`worker` 双模式，类型级禁止 Tier 2）；前端仅开放 6 种声明式 `PluginResult` 原语（严禁主 DOM/JS 注入与云同步分发插件）；全程 `cloud-cf` `0 LOC`、手机 PWA WASM `0 B` 增量 | D10、§5.7 | Proposed（待 `S-Plugin-1` 实测 `wasmi` 二进制体积与双宿主性能，及 `M5-P1..P4` 通过 `INV-PLUGIN-ZERO-IMPORT`、`INV-PLUGIN-RESOURCE-BOUND`、`SEC-10` 后升级为 `Accepted`） |
+| ADR-14 | **受控无账号多租户与设备生命周期管理（M6）** | 零 KV/D1，每个空间独立 `SyncJournalDO`（`primary` 保留向后兼容）；单一 `SPACE_MASTER_SECRET` 经 HKDF 派生边缘自路由 MAC 与离线邀请码签名（`cloud-cf/scripts/issue-invite.ts`），未激活 DO 零写库零 Alarm；R2 类别前置路径隔离（保住 30 天密钥历史与共享桶 31 天剪贴板孤儿规则），受邀默认配额 `max_devices=12`、`ops=256 MiB`、`clip=512 MiB / 500 条 / 14 天` + `INV-MT-IDLE-ALARM`；桌面建库持久化 `ed25519-space-owner-v1` 公钥 + DO 纯内存挑战 Map 实现无账号全设备丢失自救；桌面 UI `/v1/local/devices*`（`confirm_nonce` + 本地 SVG 二维码）+ `INV-MT-NO-SELF-LOCKOUT` 防删最后桌面 + `UnclaimedFresh` 首次启动 `VACUUM INTO` 热切换；被移除桌面保留本地库并熔断 60s 轮询，被移除手机 PWA 自动清空 IndexedDB；`cloud-cf/src/ <= 1,250` 行 TS `[目标]`、手机 PWA WASM `0 B` 增量 `[保证]` | D11、§5.8 | Proposed（排在 M5 之后；待 `S-MT-1` 与 `M6` 通过 `INV-MT-ISOLATION`、`INV-MT-NO-SELF-LOCKOUT`、`INV-MT-IDLE-ALARM`、`SEC-MT-01..04` 及真机升级验证后升级为 `Accepted`） |
 
 ---
 
@@ -901,7 +923,7 @@ flowchart LR
 - `purge_op_ids`：op 密文永不删除，删除只作用于密钥（§9.3、F-04）。
 - `vault_keys` + `vault_key_slots` + `MNK1` + `key_seq` + INV-SYNC-4：由独立密钥表 `block_keys` + `key_material` + `shred_marks` 取代（§9.3、§9.7）。
 - Vault 第二套 24 词恢复码：并入统一恢复包（F-05）。
-- `/v1/archive/*` 云端归档 HTTP 路由与恢复专用挑战-应答鉴权：移除，改为 `BOOTSTRAP_TOKEN`（DO 健在时）+ 从 R2 下载目录本地执行 `mynote restore --from-archive <local-dir>`（§9.12）。
+- `/v1/archive/*` 云端归档 HTTP 路由：已移除，极端双重灾难统一从 R2 下载对应前缀目录至本地执行 `mynote restore --from-archive <local-dir>`；当 DO 仍健在而客户端全失时，`"primary"` 空间凭 `BOOTSTRAP_TOKEN` 直连，M6 无账号受邀空间通过 `/v1/spaces/recover/*`（24 词 Ed25519 纯内存挑战-应答）自助重连 DO（§9.12、D11）。
 - `/v1/blobs/:sha256` 加密附件：推迟至「按数据触发的待办」（届时每附件独立随机 `BlobKey`，§9.12）。
 - 旧版写入 DO SQLite 且声称零 PITR 的 `ephemeral_clips`（`/v1/sync/ephemeral-clip`）：已永久废弃（F-06）；2026-11-27 拍板 **D8**（2026-11-28 **D8′** 修订）以「物理隔离独立图文通道（云端 `1,000 条 / 30 天 / 5 GiB` 硬护栏 + R2 流式原图 + 桌面无限归档 + 独立可轮换 `ClipKey` + 零写库 `--ephemeral` WS 直推）」重新纳入 M4（见 §5.2、§7、ADR-11）。
 - 移动端编辑器 / outbox / 冲突合并 UI / Layer 3 移动端格式化：手机只读（§9.2）。

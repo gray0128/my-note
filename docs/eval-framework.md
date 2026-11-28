@@ -1,6 +1,6 @@
 # 质量门禁与测试规范 (`eval-framework.md`)
 
-> 2026-11-28 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D10（含 2026-11-27 剪贴板同步拍板 D8 / D1′，以及 2026-11-28 Windows 一等桌面平台 D9 与 `wasmi` 优先双宿主插件体系 D10）更新。
+> 2026-11-28 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 与 [多租户及设备管理专项审查](../review/2026-11-28-controlled-multi-tenant-and-device-review.md) 的决策 D1–D11（含 2026-11-27/28 剪贴板同步拍板 D8 / D8′ / D1′、2026-11-28 Windows 一等桌面平台 D9、`wasmi` 优先双宿主插件体系 D10，以及 M6 受控无账号多租户与设备生命周期管理 D11）更新。
 
 > 本文档是 `my-note` **测试门禁的单一事实来源**。评测与自动爬山不是本项目的研究目标（D6），所以这里只保留**确定性、可在 CI 中零方差复现**的质量手段，用来守护两件不可逆的事：**G1 永不静默丢数**、**G4 安全承诺不被破坏**。所有手段都要在一个人的维护预算内可持续。线格式、同步协议、安全承诺、云端实现与 CLI 契约分别以 [data-structures.md](./data-structures.md)、[sync-protocol.md](./sync-protocol.md)、[threat-model.md](./threat-model.md)、[cloudflare-cloud-architecture.md](./cloudflare-cloud-architecture.md)、[interface-contracts.md](./interface-contracts.md) 为准，本文只定义「怎么测、测到什么程度算过」。
 
@@ -17,7 +17,7 @@
 7. [CLI 黄金测试](#7-cli-黄金测试)
 8. [可选：线格式解析 fuzz](#8-可选线格式解析-fuzz)
 9. [CI 编排、仓库布局与执行纪律](#9-ci-编排仓库布局与执行纪律)
-10. [里程碑门禁矩阵（S0 → M5）](#10-里程碑门禁矩阵s0--m5)
+10. [里程碑门禁矩阵（S0 → M6）](#10-里程碑门禁矩阵s0--m6)
 11. [已移除 / 推迟的机制（2026-11-24 / 2026-11-27 / 2026-11-28 修订）](#11-已移除--推迟的机制2026-11-24--2026-11-27--2026-11-28-修订)
 
 ---
@@ -154,6 +154,12 @@ flowchart TB
 - `PUT /v1/clip/blob` 模拟 DO 登记失败时，刚写入的 R2 临时对象被同步回滚删除；超过 `10.5 MiB` 的上传被拒绝；
 - `ephemeral: true` 在 `workerd` 中实测 **0 次 DO SQLite 写入、0 次 R2 写入**；存在在线 `read-write` 桌面 WS 时收到 `clip_ephemeral` 帧，无在线桌面时返回 `409 NO_ONLINE_DESKTOP`。
 
+**`INV-MT-ISOLATION`、`INV-MT-NO-SELF-LOCKOUT` 与 `INV-MT-IDLE-ALARM`（M6，受控无账号多租户真实 `workerd` 契约测试）**：
+
+- **跨空间物理隔离与向后兼容（`INV-MT-ISOLATION`）**：在同一 `workerd` 实例中同时运行存量 `"primary"` 空间（`ALLOW_LEGACY_PRIMARY="1"`）与两个受邀空间 `space_A`、`space_B`，并发执行笔记 push/pull、密钥轮换、碎纸、手机状态快照、剪贴板上传与 Alarm 归档，断言三空间的 DO SQLite 表与 R2 对象（`archives/ops/`、`archives/keys/latest*`、`archives/keys/history/`、`snapshots/state/`、`clip/blobs/`）零串读、零覆盖；单空间 `ops_quota_bytes`、`clip_quota_bytes` 与 `max_devices`（含 `pending_claim`）各自独立触发 `507` 且不影响其他空间；
+- **防删最后一台活跃桌面（`INV-MT-NO-SELF-LOCKOUT`）**：当空间仅剩 1 台已认领且未吊销的 `read-write` 桌面（无论同时有多少台 `read` / `read+clip` / `clip-write` 手机或未认领桌面票据）时，`DELETE /v1/devices/:id` 必返 `409 LAST_ADMIN_DEVICE_REFUSED`；有 ≥ 2 台活跃桌面但删除本机未带 `?confirm_self=true` 时必返 `400 INVALID_ARGUMENT`；删除未认领票据直接物理清理该预注册行并释放 `max_devices` 名额；
+- **空闲空间零空转与碎纸快照一致性（`INV-MT-IDLE-ALARM`）**：验证当空间执行碎纸到期置空导致 `keys_digest !== last_archived_keys_digest` 时，Alarm 必先覆写 `archives/keys/latest/<space_id>.mnks` 移除已置空密钥，随后在无新 op、无待到期票据/碎纸/剪贴板时 `ctx.storage.getAlarm()` 返回 `null`（严格零后续空转），且下一次写请求立即恢复 Alarm 调度。
+
 ---
 
 ## 4. INV-RECOVERY：零设备端到端恢复
@@ -190,6 +196,10 @@ flowchart TB
 | **`SEC-10`** | 插件声明式渲染零 XSS、Tier 2 零 Daemon 明文、`exec` 禁锁块（D10） | Playwright + 单元取证：① 恶意插件在 6 种 `PluginResult` 视图返回 `<script>` / `<img onerror>` / `<foreignObject>`；② `exec` 插件请求加锁块；③ 解锁态 Tier 2 块在前端 Web Worker 执行 `.wasm` 时抓包 Daemon HTTP 与日志；④ `reactor` 自触发事件循环注入 | ① 渲染 DOM 零危险标签/属性、零外发请求、CSP 零违规；② `exec` 返 `423 BLOCK_LOCKED` 零启动子进程；③ Daemon 载荷与日志零 Tier 2 明文、Worker 零 `VKEK`；④ `reactor` 零自发回环并命中滚动限流 | M5-P3 / P4 |
 | **`SEC-WIN-PIPE`** | Windows Named Pipe 防抢注与用户 SID ACL（D9） | `windows-latest` CI 实测二次抢注同名管道、读取内核 SDDL 与 `reject_remote_clients` 标志，并验证 Job Object 超时击杀孙进程树与中文 UTF-8 管道无乱码 | 二次绑定因 `first_pipe_instance` 失败；SDDL 仅含当前用户 SID 且不含 `Everyone`；子进程树 0 孤儿残留、UTF-8 往返无乱码 | M5-W1 |
 | **`SEC-WIN-CLIP`** | Windows 原生剪贴板隐私过滤与格式安全（D9） | `windows-latest` CI 模拟含 `ExcludeClipboardContentFromMonitorProcessing` 或 `CanIncludeInClipboardHistory = 0` 的剪贴板事件、PNG / `CF_DIBV5` 与 SVG 载荷 | 敏感事件 0 次网络出站；PNG / `CF_DIBV5` / 中文 UTF-8 往返无损；SVG 进图片通道被拒绝 | M5-W2 |
+| **`SEC-MT-01`** | 跨空间越权与 `pair_id` 错路由拦截（D11） | 持 `space_A` 令牌尝试访问 `space_B` 数据、在 `POST /v1/devices` 或 `/refresh` 提交含 `pr_<space_B>_` 或无前缀的 `pair_id`、篡改自路由令牌中的 `space_id` 片段 | 篡改令牌在边缘直接返回 `401`；伪造 `pair_id` 前缀返回 `400 INVALID_ARGUMENT`；跨空间 0 数据泄露 | M6 |
+| **`SEC-MT-02`** | 僵尸 DO / 未认证挑战零写库零 Alarm（D11） | 向 Worker 连续发送 1,000 次伪造/随机 `space_id` 请求、未初始化合法格式 `space_id` 请求，以及对已初始化空间并发调用 `POST /v1/spaces/recover/challenge` | 伪造 MAC 请求 0 次唤醒 DO；未激活 DO 0 字节 SQLite 存储且 `getAlarm() === null`；`recover/challenge` 0 次 SQLite 行写、0 次 `setAlarm` 且超频返回 `429` | M6 |
+| **`SEC-MT-03`** | 离线邀请码验签、过期与一次性防重放（D11） | 提交篡改配额字段、过期（`> exp_ms`）或对同一 `space_id` 第二次重放的 `mynote-invite:v1:` 邀请码 | 篡改/过期在边缘返回 `400/401`（0 唤醒 DO）；二次重放返回 `409 SPACE_ALREADY_INITIALIZED` | M6 |
+| **`SEC-MT-04`** | 24 词 Ed25519 空间自救、首次启动保底与被移除端收敛（D11） | ① 全设备丢失后凭 24 词 + `mynote-space:v1:` 执行挑战-应答（含重放已用 `challenge_id` 负向用例）并拉回全库；② 桌面 Daemon 首次启动后经 `/v1/local/space/claim` 校验 `UnclaimedFresh`（含已有用户块时拒绝覆盖负向用例）与 `backups/pre-join-*.db` 生成；③ 远程移除在线桌面与在线手机 PWA | ① 重放挑战失败，合法签名全量恢复零丢数；② 非空本地库拒绝覆盖，`UnclaimedFresh` 先产出 `VACUUM INTO` 备份再热切换；③ 被移除桌面保留 100% SQLite/镜像且 60s 轮询请求数为 `0`，被移除手机 PWA 自动清空全部 7 张 IndexedDB 表 | M6 |
 
 补充说明：
 
@@ -248,7 +258,7 @@ flowchart TB
 
 - **不可变验证器前置阻断**：`immutable-verifier-guard` 作为所有构建与测试任务的 `needs` 前置依赖运行。非 `[eval-only]` PR 触碰 `evals/` 直接阻断后续任务，且各执行任务在运行前强制执行 `rm -rf evals/ && git checkout <base-sha> -- evals/`；`[eval-only]` PR 仅允许修改 `evals/` 与 `docs/eval-framework.md`。
 - **平台矩阵**：当前 `macos-latest`（aarch64）与 `ubuntu-latest` 同时运行；M5-W1 起扩展为三平台矩阵，新增 `windows-latest`（Rust 构建、`clippy`、`SEC-WIN-PIPE`、`SEC-WIN-CLIP` 与跨平台子进程/CLI 契约测试）；Worker 契约测试与 Playwright Chromium / WebKit 运行时审计在 Linux 上必跑。
-- **静态与架构守卫**：`scripts/check-architecture.py`（含 `--selftest` 变异自检，强制校验 `mynote-core` Sans-I/O 零平台依赖、`spikes/` 物理隔离、`cloud-cf/src/` M2 `<= 700` 行 / M4 初版 `<= 950` 行 / D8′ `<= 1,050` 行与 `mynote-core` 同步核心 `< 3,000` 行预算 [目标]、同步客户端防 `302` 重定向配置、HTML 零内联脚本与三包版本号一致）、`cargo fmt --check`、`cargo clippy -- -D warnings`、TypeScript 类型检查。
+- **静态与架构守卫**：`scripts/check-architecture.py`（含 `--selftest` 变异自检，强制校验 `mynote-core` Sans-I/O 零平台依赖、`spikes/` 物理隔离、`cloud-cf/src/` M2 `<= 700` 行 / M4 初版 `<= 950` 行 / D8′ 与 M5 期间 `<= 1,050` 行 / M6 起 `<= 1,250` 行与 `mynote-core` 同步核心 `< 3,000` 行预算 [目标]、同步客户端防 `302` 重定向配置、HTML 零内联脚本与三包版本号一致）、`cargo fmt --check`、`cargo clippy -- -D warnings`、TypeScript 类型检查。
 - **真实浏览器 CDP 几何与状态等价门禁**：除 `SEC-03`、`SEC-06`、`SEC-08` 外，`tests/e2e/test_ui_cdp_equivalence.py` 在真实 `mynote daemon` 与无头 Chromium / WebKit 下断言零 `console.error` / `pageerror`、桌面（`1440x900`、`900x700`）与移动（`390x844`）视口 `scrollWidth <= innerWidth`、`.sr-only` 包含块隔离、实时 WebSocket 并发新建 Buffer 零重复标签，以及前端 DOM 排序与 SQLite 快照等价。
 
 | 层级 | 标准入口命令 | 触发时机 | 耗时 | 内容 | 失败策略 |
@@ -286,7 +296,7 @@ my-note/
 
 ---
 
-## 10. 里程碑门禁矩阵（S0 → M5）
+## 10. 里程碑门禁矩阵（S0 → M6）
 
 路线图以 [architecture-proposal.md](./architecture-proposal.md) 为准（审查 §9.11、§9.12）。
 
@@ -302,6 +312,8 @@ my-note/
 | **M5 Phase 0 Spike（`S-Plugin-1` + `S-Win-1`）** | 无门禁；隔离于 `spikes/`。产出 `docs/spikes/s-plugin-1-wasmi.md`（`wasmi` Release 体积增量与双宿主 fuel / OOM 延迟）与 `docs/spikes/s-win-1-platform.md`（Named Pipe SDDL / Job Object / Win32 剪贴板实测） | 拿到真实 `[已测]` 体积与 Windows 原语证据后再进入 M5-W1 / M5-P1（启动前待确认） |
 | **M5-W1..W3（Windows 一等桌面平台，D9）** | 新增：`windows-latest` CI 三平台矩阵；`SEC-WIN-PIPE`；`SEC-WIN-CLIP`；预算红线 `cloud-cf/src/` `0 LOC` 改动与 `pkg-pwa` `0 B` 增量；Release 预编译包 SHA-256 校验 | Windows 真机 / `windows-latest` 完成三端 E2EE 同步、剪贴板与后台守护验证后，`ADR-12` 升为 `Accepted` |
 | **M5-P1..P4（`wasmi` 优先双宿主插件体系，D10）** | 新增：`INV-PLUGIN-ZERO-IMPORT`；`INV-PLUGIN-RESOURCE-BOUND`；`SEC-10`（6 种声明式视图 XSS 净化、`exec` 拒锁块 `423`、Tier 2 Worker 零 Daemon 明文、`reactor` 防回环）；无插件启动增量 `< 1 ms` `[目标]`；预算红线 `cloud-cf/src/` `0 LOC` 改动、`pkg-pwa` `0 B` 增量与单二进制 `< 15 MB` `[目标]` | 1–2 个 `< 50 KiB` 参考 `.wasm` 插件在三桌面 + 解锁态 Tier 2 实测通过后，`ADR-13` 升为 `Accepted` |
+| **M6 Phase 0 Spike（`S-MT-1`）** | 无门禁；隔离于 `spikes/`。产出 `docs/spikes/s-mt-1-multi-tenant.md`（验证 `workerd` 原生 WebCrypto `Ed25519` ↔ Rust 签名互通、惰性 DO 0 写库 0 Alarm 与 `INV-MT-IDLE-ALARM`） | 拿到真实 `[已测]` 互通与 DO 存储/Alarm 证据后再进入 M6 云端多租户核心 |
+| **M6 受控无账号多租户与设备管理（D11）** | 新增：`INV-MT-ISOLATION`；`INV-MT-NO-SELF-LOCKOUT`；`INV-MT-IDLE-ALARM`；`SEC-MT-01`..`SEC-MT-04`；Playwright 桌面设备管理 UI（本地 SVG 二维码 CSP 零违规、`confirm_nonce` 拦截、`UnclaimedFresh` 引导与被移除态熔断）+ 手机 PWA 被移除自动清空 IndexedDB；预算红线 `cloud-cf/src/ <= 1,250` 行 TS `[目标]`、`pkg-pwa` `0 B` 增量 `[保证]` | 运营者 `primary` 空间零停机平滑升级 + 至少 1 个受邀空间全流程（邀请码建空间、手机配对、远程移除、24 词自救）真机验证通过后，`ADR-14` 升为 `Accepted` |
 
 ### 10.1 观测指标（不阻断）
 
