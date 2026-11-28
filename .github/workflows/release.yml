@@ -90,7 +90,7 @@ jobs:
     name: Build & Verify (${{ matrix.target }})
     needs: [build-web]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -101,7 +101,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     steps:
+      - name: Preserve LF line endings on Windows checkout
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.build-web.outputs.tag }}
@@ -113,12 +118,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build stripped release binary (mynote)
+        if: runner.os != 'Windows'
+        shell: bash
         run: cargo build --release --locked --bin mynote
       - name: Verify release binary against frozen CLI golden suite (G01-G11)
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
           ./target/release/mynote --version
           ./evals/golden/run_golden.sh --bin ./target/release/mynote
       - name: Package self-contained desktop bundle
+        if: runner.os != 'Windows'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -136,10 +146,98 @@ jobs:
           COPYFILE_DISABLE=1 tar -C dist -czf "dist/mynote-${TARGET}.tar.gz" "mynote-${TARGET}"
           ls -lh "dist/mynote-${TARGET}.tar.gz"
       - name: Upload release tarball
+        if: runner.os != 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.target }}
           path: dist/mynote-${{ matrix.target }}.tar.gz
+          retention-days: 1
+      - name: Build stripped release binary (mynote.exe)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release --locked --bin mynote
+          if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed ($LASTEXITCODE)" }
+          $exe = Get-Item -LiteralPath 'target/release/mynote.exe'
+          Write-Host ("Built target/release/mynote.exe ({0} bytes / {1:N2} MiB)" -f $exe.Length, ($exe.Length / 1MB))
+      - name: Verify release binary offline CLI JSON smoke check (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandArgumentPassing = 'Standard'
+          $bin = (Resolve-Path -LiteralPath 'target/release/mynote.exe').ProviderPath
+          $ver = & $bin --version
+          if ($LASTEXITCODE -ne 0) { throw "mynote.exe --version failed ($LASTEXITCODE)" }
+          Write-Host "Verified version: $ver"
+
+          $tmpData = Join-Path ([System.IO.Path]::GetTempPath()) ("mynote-rel-smoke-" + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $tmpData -Force | Out-Null
+          $prevDataDir = $env:MYNOTE_DATA_DIR
+          try {
+            $env:MYNOTE_DATA_DIR = $tmpData
+
+            $addRaw = & $bin add '{"b":1,"a":2}' --buf scratch --lang json --json
+            if ($LASTEXITCODE -ne 0) { throw "mynote.exe add failed ($LASTEXITCODE)" }
+            $addObj = $addRaw | ConvertFrom-Json
+            if (-not $addObj.ok -or $addObj.meta.sync_state -ne 'pending_offline') {
+              throw "Unexpected add JSON envelope: $addRaw"
+            }
+            $blockId = [string]$addObj.data.block_id
+            $opId = [string]$addObj.data.op_id
+
+            $lsRaw = & $bin ls --json
+            if ($LASTEXITCODE -ne 0) { throw "mynote.exe ls --json failed ($LASTEXITCODE)" }
+            $lsObj = $lsRaw | ConvertFrom-Json
+            if (-not $lsObj.ok -or @($lsObj.data).Count -ne 1) {
+              throw "Unexpected ls JSON envelope: $lsRaw"
+            }
+
+            $fmtRaw = & $bin format $blockId --expected-head $opId --json
+            if ($LASTEXITCODE -ne 0) { throw "mynote.exe format failed ($LASTEXITCODE)" }
+            $fmtObj = $fmtRaw | ConvertFrom-Json
+            if (-not $fmtObj.ok) {
+              throw "Unexpected format JSON envelope: $fmtRaw"
+            }
+
+            $rawText = (& $bin block get $blockId --raw) -join "`n"
+            if ($LASTEXITCODE -ne 0) { throw "mynote.exe block get --raw failed ($LASTEXITCODE)" }
+            if ($rawText -notmatch '"b":\s*1' -or $rawText -notmatch '"a":\s*2') {
+              throw "Unexpected formatted block raw content: $rawText"
+            }
+            Write-Host "Windows offline CLI JSON smoke check PASS (block_id=$blockId)"
+          } finally {
+            $env:MYNOTE_DATA_DIR = $prevDataDir
+            Remove-Item -LiteralPath $tmpData -Recurse -Force -ErrorAction SilentlyContinue
+          }
+      - name: Package self-contained Windows desktop ZIP bundle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = "dist/mynote-$($env:TARGET)"
+          if (Test-Path -LiteralPath 'dist') {
+            Remove-Item -LiteralPath 'dist' -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path "$stage/skill", "$stage/deploy/windows", "$stage/deploy/ios-shortcuts" -Force | Out-Null
+          Copy-Item -LiteralPath 'target/release/mynote.exe' -Destination "$stage/mynote.exe" -Force
+          Copy-Item -LiteralPath 'skill/SKILL.md' -Destination "$stage/skill/SKILL.md" -Force
+          Copy-Item -Path 'deploy/windows/*' -Destination "$stage/deploy/windows/" -Recurse -Force
+          Copy-Item -Path 'deploy/ios-shortcuts/*' -Destination "$stage/deploy/ios-shortcuts/" -Recurse -Force
+          Copy-Item -LiteralPath 'README.md' -Destination "$stage/README.md" -Force
+          $zipPath = "dist/mynote-$($env:TARGET).zip"
+          Compress-Archive -Path $stage -DestinationPath $zipPath -Force
+          $zipItem = Get-Item -LiteralPath $zipPath
+          Write-Host ("Packaged {0} ({1} bytes / {2:N2} MiB)" -f $zipItem.Name, $zipItem.Length, ($zipItem.Length / 1MB))
+      - name: Upload Windows release zip
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.target }}
+          path: dist/mynote-${{ matrix.target }}.zip
           retention-days: 1
       - name: Build, verify & package optional macOS native Swift shell (MyNote.app)
         if: runner.os == 'macOS'
@@ -179,8 +277,8 @@ jobs:
         shell: bash
         run: |
           cd release-assets
-          ls -lh mynote-*.tar.gz MyNote-*.zip
-          sha256sum mynote-*.tar.gz MyNote-*.zip > SHA256SUMS.txt
+          ls -lh mynote-*.tar.gz mynote-*.zip MyNote-*.zip
+          sha256sum mynote-*.tar.gz mynote-*.zip MyNote-*.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
       - name: Create or update GitHub Release
         shell: bash
