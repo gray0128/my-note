@@ -1,6 +1,6 @@
 # 安全架构与威胁模型规范 (`threat-model.md`)
 
-> 2026-11-28 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D10（含 2026-11-27 剪贴板同步拍板 D8 / D1′，以及 2026-11-28 Windows 一等桌面平台 D9 与 `wasmi` 优先双宿主插件体系 D10）更新。
+> 2026-11-28 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 与 [多租户及设备管理专项审查](../review/2026-11-28-controlled-multi-tenant-and-device-review.md) 的决策 D1–D11（含 2026-11-27/28 剪贴板同步拍板 D8 / D8′ / D1′、2026-11-28 Windows 一等桌面平台 D9、`wasmi` 优先双宿主插件体系 D10，以及 M6 受控无账号多租户与设备生命周期管理 D11）更新。
 
 > 本文档是 [总架构设计方案 (`architecture-proposal.md`)](./architecture-proposal.md) 的安全与密码学专项规范，也是本项目**安全承诺的单一事实来源**。它与 [数据结构规范 (`data-structures.md`)](./data-structures.md)、[同步协议 (`sync-protocol.md`)](./sync-protocol.md)、[全链路接口契约 (`interface-contracts.md`)](./interface-contracts.md) 配套执行，界定 `my-note` 在桌面多端同步、块级保险库（Vault）、只读手机 PWA、本地守护进程及同用户 AI Agent 交互场景下的**真实信任边界、密钥存放、删除语义与攻击面防护**。每条承诺都写明「防什么、不防什么」。
 >
@@ -18,9 +18,10 @@
 6. [渲染层防 XSS / 防外带通道与严格 CSP 策略](#6-渲染层防-xss--防外带通道与严格-csp-策略)
 7. [设备配对、令牌范围、吊销与密钥环轮换](#7-设备配对令牌范围吊销与密钥环轮换)
 8. [手机端 Vault 解锁：仅内存会话、剪贴板与代码下发信任边界](#8-手机端-vault-解锁仅内存会话剪贴板与代码下发信任边界)
-9. [独立 100 条图文剪贴板同步安全边界（D8，M4）](#9-独立-100-条图文剪贴板同步安全边界d8m4)
+9. [独立图文剪贴板同步安全边界（D8 / D8′，M4）](#9-独立图文剪贴板同步安全边界d8--d8m4)
 10. [Windows 一等平台与跨平台双宿主插件安全边界（D9 / D10，M5）](#10-windows-一等平台与跨平台双宿主插件安全边界d9--d10m5)
-11. [已移除 / 推迟的机制（2026-11-24 / 2026-11-27 / 2026-11-28 修订）](#11-已移除--推迟的机制2026-11-24--2026-11-27--2026-11-28-修订)
+11. [受控无账号多租户与设备生命周期管理安全边界（D11，M6）](#11-受控无账号多租户与设备生命周期管理安全边界d11m6)
+12. [已移除 / 推迟的机制（2026-11-24 / 2026-11-27 / 2026-11-28 修订）](#12-已移除--推迟的机制2026-11-24--2026-11-27--2026-11-28-修订)
 
 ---
 
@@ -93,6 +94,7 @@ flowchart TD
 | --- | --- | --- | --- | --- | --- |
 | **统一恢复包 / Root Seed / 恢复私钥** | 解封恢复密钥环；灾难恢复 | **不落盘**：恢复包由用户离线保管（纸质 / 密码管理器）；Root Seed 与恢复私钥只在恢复 / 恢复演练流程中由 24 词临时派生 | 不参与 | **❌ 永不持有** | 仅存以恢复公钥封装的恢复密钥环密文 |
 | **恢复公钥**（X25519） | 封装新 `SMK` 代际 / `VKEK` 并追加进恢复密钥环 | 本地存储（公开材料，无需保密，但须防篡改） | 不需要（手机不轮换、不建 Vault） | 持有 | 可存副本 |
+| **空间所有权密钥对**（Ed25519，M6，D11） | 无账号受邀空间全设备丢失时向健在的云端 DO 签名挑战自救（与 X25519 恢复密钥域分离） | 建库即派生并存储非机密公钥 `space_owner_pk`（`F-MT-02`）；**私钥 `owner_sk` 永不落盘**，仅在恢复时由 24 词临时派生并立即 `zeroize` | 不参与（`pkg-pwa` 不编入，`0 B` 增量） | 仅知晓公钥，**❌ 永不持有私钥** | DO `journal_meta` 仅存公钥 `space_owner_pk`（被动泄露无法伪造签名） |
 | **`SMK`（`smk_vN`）**<br>Sync Master Key | 包裹 Tier 1 BDEK；加密 op 外层与状态快照 | OS Keychain（macOS） / Secret Service（Linux，如 GNOME Keyring / KeePassXC） / Windows Credential Manager 或用户态 DPAPI（M5，D9） | 由 IndexedDB 中 `extractable: false` 的 WebCrypto `AES-GCM` `CryptoKey` 包裹存储；运行时解包进 WASM 线性内存 | 持有（后台同步与物化 Tier 1 明文） | **❌ 永不接触明文** |
 | **`VKEK`**<br>Vault Key-Encrypting Key | 包裹 Tier 2 BDEK | **不落盘明文**：只以「口令包裹（Vault 头部）」与「恢复公钥封装（恢复密钥环）」两种密文存在；仅在 UI WASM 会话或单次 CLI 进程解锁期间驻留内存，空闲 5 分钟 / 失焦即 `zeroize` | **仅内存**：永不写 IndexedDB / Cache Storage；`visibilitychange` 或闲置 N 分钟自动上锁（§8） | **❌ 永不接触** | 仅存上述两种包裹密文 |
 | **`BDEK`（`key_id`）**<br>Block Data Encryption Key | 每块（及每 Buffer）一把，加密该实体全部版本 | 被 `SMK` 或 `VKEK` 包裹后存于本地密钥表 `block_keys` | 缓存密钥表副本（仍为包裹形式） | 只能解开 Tier 1 的 BDEK；Tier 2 的只透传包裹密文 | 存包裹密文与碎纸标记；到期由 DO alarm 置空（DO PITR 仍保留 30 天，见 §3.4） |
@@ -321,7 +323,10 @@ $$
 - 丢失设备缓存中所有未碎纸的 Tier 1 内容都可能已被读取，无法召回。
 - 轮换 `SMK` 保护的是此后新建的块与新的包裹；丢失设备已缓存了现存块的 BDEK，若攻击者日后又拿到这些块新版本的密文（例如 T1 / T2），仍能解密。对敏感块，应执行**换钥**（新 BDEK + 碎纸旧钥，§3.2）；大批量换钥会触发批量阈值，需在桌面 UI 确认。对令牌、密码类秘密，轮换秘密本身。
 - Tier 2：`VKEK` 从不落盘，丢失的设备只有 Vault 头部和包裹密文；攻击者可离线暴力破解 Vault 口令（KDF 按 iPhone 定），因此 Vault 口令必须足够强。若怀疑口令已泄露，按 §7.4 处理。
-- 丢失的是桌面时，它还持有 `read-write` 令牌与本地明文库：吊销与轮换同上，本地明文的机密性依赖 `FileVault` / `LUKS`。
+- 丢失的是桌面时，它还持有 `read-write` 令牌与本地明文库：吊销与轮换同上，本地明文的机密性依赖 `FileVault` / `LUKS` / `BitLocker`。
+- **（M6，D11 / Q5）被远程移除设备的客户端本地行为与诚实声明**：
+  - 桌面端收到 `401 DEVICE_REVOKED` / WS `4401` 时，**绝不自动抹除本地 SQLite 或只读镜像**（守住 G1 防误踢丢数），仅擦除失效 `device_token`、转入持久 `"device_revoked"` 状态并熔断全部后台同步轮询（`F-MT-04`）；
+  - 手机只读 PWA 在线收到明确 `DEVICE_REVOKED` / WS `4401` 时，自动清空 IndexedDB 全部 7 张缓存表并退回未配对引导页（Q5）。**诚实边界**：此清理仅对仍在线联网的正常淘汰/借用旧手机生效，**不构成防离线物理取证承诺**——已断网的失窃设备不会收到吊销帧，桌面远程移除弹窗必须固定展示「远程移除只能阻断该设备继续访问云端，无法抹除已离线设备本地缓存的历史内容」。
 
 ### 7.4 修改 Vault 口令 vs 轮换 `VKEK`
 
@@ -411,7 +416,21 @@ $$
 
 ---
 
-## 11. 已移除 / 推迟的机制（2026-11-24 / 2026-11-27 / 2026-11-28 修订）
+## 11. 受控无账号多租户与设备生命周期管理安全边界（D11，M6）
+
+M6 在不引入中心账号库的前提下允许 5–50 名受邀亲友共用同一套 Cloudflare Workers Paid 部署，新增 **T10a–T10e** 威胁边界与硬门禁（详见 [`eval-framework.md`](./eval-framework.md) §3 / §5）：
+
+| 新增威胁 | 风险描述 | 构造性防御机制与诚实边界声明 | 守护门禁 |
+| --- | --- | --- | --- |
+| **T10a：跨空间越权与 R2 串写** | 租户 A 凭自身令牌、伪造其他空间的 `pair_id` 或 `clip_id` 试图读写租户 B 的 DO 或 R2 对象 | 每个空间映射物理独立的 `SyncJournalDO` 实例；所有 R2 键由服务端强拼接当前 DO 自身的 `this.spaceId`（绝不采信客户端路径）；非 `primary` DO 在 `POST /v1/devices` 与 `/refresh` 强校验 `pair_id` 以 `pr_${this.spaceId}_` 开头（`F-MT-03`） | `INV-MT-ISOLATION` / `SEC-MT-01` |
+| **T10b：僵尸 DO 与刷表计费放大** | 外部攻击者遍历随机 `space_id` 或高频请求未认证 `/v1/spaces/recover/challenge` 触发大量空 DO 落盘、行写与永久 Alarm | Worker 边缘先用 `K_route` 验签 `space_id` 64-bit MAC；`SyncJournalDO` 构造惰性只读探测，未激活 DO 零建表、零写行、零设 Alarm；恢复挑战存于 **DO 纯内存有界 Map**（上限 3 条、TTL 5m，0 SQLite 写、0 Alarm，`F-MT-07`） | `SEC-MT-02` |
+| **T10c：离线邀请码泄露与重放** | 邀请码在即时通讯工具中泄露或被重复提交创建多个空间 | 邀请码由单一 `SPACE_MASTER_SECRET` 派生的 `K_invite` HMAC 签名、默认 72 小时短 TTL 且绑定唯一 `space_id`（不含任何数据密钥）；目标 DO 首次激活置 `space_initialized = '1'` 后永久拒绝二次激活（`409 SPACE_ALREADY_INITIALIZED`） | `SEC-MT-03` |
+| **T10d：多租户下的运营者信任边界** | 运营者掌控 Cloudflare 账号与 CI 密钥（T2 在亲友多租户下的延伸） | **诚实告知受邀成员**：三端桌面运行本地二进制内嵌前端，运营者看不到任何空间的笔记/剪贴板明文，也无法向桌面端投毒（且 D10 禁止云下发插件）；但**手机只读 PWA 静态资源由运营者的 Cloudflare Worker 下发**，受邀人若使用手机 PWA，必须信任运营者及其 CI 流水线（与自托管 Vaultwarden 同边界） | 文档与恢复卡片诚实声明 + T2 CI-only 部署 |
+| **T10e：无账号空间自锁、首次引导误覆写与同 UID 静默踢人** | 用户误删最后一台 `read-write` 桌面导致空间只剩只读手机无法管理；UI 首次引导覆盖已有本地笔记；或仅持 CLI 的同 UID Agent 静默发起配对/踢人 | 服务端事务强制 `INV-MT-NO-SELF-LOCKOUT`（禁删最后一台活跃 `read-write` 桌面，返 `409 LAST_ADMIN_DEVICE_REFUSED`；删本机须 `?confirm_self=true`），全设备丢失仍可凭 24 词 Ed25519 挑战自救；UI 首次 `claim`/`recover` 强制校验 `UnclaimedFresh` 并先 `VACUUM INTO` 备份（`F-MT-01`）；本地 `/v1/local/devices/actions/*` 强制消费绑定 `HttpOnly` 会话的 `confirm_nonce`（同 §5.2，不宣称防能篡改环境的 T5 攻击者） | `INV-MT-NO-SELF-LOCKOUT` / `SEC-MT-04` |
+
+---
+
+## 12. 已移除 / 推迟的机制（2026-11-24 / 2026-11-27 / 2026-11-28 修订）
 
 依据 [第一性原理审查](../review/2026-11-24-first-principles-review.md)：
 

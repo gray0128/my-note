@@ -6,7 +6,7 @@
 | 审查日期 | 2026-11-24 |
 | 审查方法 | 从「不可再分的事实」重建需求与优先级 → 对每个机制追问三个问题（服务哪个目标？引入哪些新失败模式？当前规模下是否有更便宜的等价物/能否推迟？）→ 交叉核对各规范之间的一致性 → 联网核验关键外部事实（附录 B） |
 | 严重度定义 | 🔴 **P0**：自相矛盾或正确性缺陷，会直接危及「永不丢数」或安全承诺，编码前必须修正 · 🟠 **P1**：架构取舍/范围问题，显著影响成败与成本 · 🟡 **P2**：文档质量与次要机制问题 |
-| 修订记录 | 2026-11-24 追加 **§9 决策记录与影响**（D1–D7）：手机只读 + 复制、删除优先但不牺牲可靠性（D2′，修订自备份优先）、两版本并列手动合并（γ）、Workers Paid、macOS 热键进 M1、评测只为质量保障、手机可解锁 Vault。**§9 与 §4/§6 冲突时以 §9 为准** |
+| 修订记录 | 2026-11-24 追加 **§9 决策记录与影响**（D1–D7）：手机只读 + 复制、删除优先但不牺牲可靠性（D2′，修订自备份优先）、两版本并列手动合并（γ）、Workers Paid、macOS 热键进 M1、评测只为质量保障、手机可解锁 Vault；2026-11-25～11-28 陆续追加 **D5′/D5″**、**D8/D8′**、**D9**、**D10** 与 **D11**（M6 受控无账号多租户与设备生命周期管理）。**§9 与 §4/§6 冲突时以 §9 为准** |
 
 ---
 
@@ -787,6 +787,14 @@ DO GC、R2 多代快照、瞬态剪贴板、自动爬山已从待办中移除；
       - **桌面本地无限归档 + 后台 Eager Prefetch + 手动清理**：移除桌面 `mynote-store` 与 `clip_cache/` 的自动 100 条裁剪、7 天自动过期与 `256 MiB` 自动 LRU 淘汰，本地永久保留并仅手工清理；Daemon 新增单并发后台 **Eager Prefetch**，在云端 30 天 TTL 到期前主动下载远端图片与大文本落盘；新增游标分页（`before_id`）、文本搜索（`--query`）、本地/云端容量统计（`mynote clip stats`）及按规则预览/清理（`mynote clip prune` / `clear --scope`）；
       - **作用域清理与 `ClipKey` 轮换默认保留本地归档**：单条删除（`DELETE /v1/clip/:id`）全端生效（`scope = "all"`）；云端清空与批量清理（`DELETE /v1/clip` 默认 `?scope=cloud`、`POST /v1/clip/prune`、手机 PWA 清理操作）广播 `scope = "cloud"`，**桌面保留本地归档**；`mynote clip rotate-key` 默认采用 `clear_clips_scope = "cloud"`（轮换 `ClipKey` 并清空云端 `clip_items` + R2 `clip/blobs/*`，立即可证明失效 DO 30 天 PITR 旧密文，**保留已解密的桌面本地归档**），仅在显式传入 `--wipe-local` 时以 `scope = "all"` 同步抹除本地与对端桌面剪贴板；
       - **手机 PWA 增量缓存**：分页循环拉取（`has_more`）、增量写入 IndexedDB（上限 `200 条`，去除全表清空重写）、按批 `40 条` 分页渲染，并展示 5 GiB 云端配额条与云端清理入口。
+11. **2026-11-28 受控无账号多租户（路线 B）与设备生命周期管理拍板（D11，M6）**：
+    - 对 [`research/converted/2026-11-28-controlled-multi-tenant-and-device-management.md`](../research/converted/2026-11-28-controlled-multi-tenant-and-device-management.md) 执行源码级独立审查（详见 [`review/2026-11-28-controlled-multi-tenant-and-device-review.md`](./2026-11-28-controlled-multi-tenant-and-device-review.md)，修正 `F-MT-01`–`F-MT-07` 共 7 项实现死锁与基线失真）后，对 Q1–Q6 做出正式拍板并转化为 `docs/` 全套规范（对应新增 `ADR-14`，状态 `Proposed`）：
+      - **Q1（里程碑排期）**：列为独立里程碑 **`M6`**，排在 **M5（Windows 一等桌面 + `wasmi` 插件）之后**，完整守住 M5 对 `cloud-cf/src/` **`0 LOC` 改动 `[保证]`** 硬约束；M6 内按 `Slice 1（桌面设备管理 UI + 防删最后桌面）→ S-MT-1（限时技术 Spike）→ Slice 3（云端受控多租户核心）→ Slice 4（桌面空间引导与 24 词自救）` 推进；
+      - **Q2（C1 云端预算修正）**：核实 `cloud-cf/src/` 含 `wire.ts`（`94` 行）当前真实基线为 `1,025` 行 `[已测]`；M5 期间维持 `<= 1,050` 行上限不变，进入 **M6** 后批准上调至 **`<= 1,250` 行 TS `[目标]`**（拆分为 `index.ts` / `space.ts` / `wire.ts`）；
+      - **Q3（无账号全设备丢失 24 词自救）**：纳入 `HKDF-Expand(root_seed, "ed25519-space-owner-v1")` 派生 Ed25519 空间所有权密钥对（建库即持久化非机密公钥 `owner_pk`，私钥种子即刻 `zeroize` 永不落盘；DO 采用纯内存有界挑战 Map + 原生 WebCrypto `Ed25519` 验签，0 SQLite 写、0 新表、0 Alarm，手机 PWA WASM `0 B` 增量 `[保证]`）；
+      - **Q4（受邀新空间默认配额与 R2 兼容）**：受邀新空间默认 `max_devices = 12`（统计未吊销行，含 `pending_claim`）、`ops_quota_bytes = 256 MiB`、`clip_quota_bytes = 512 MiB`、`clip_max_items = 500`、`clip_ttl_ms = 14 天`（签发邀请码可按人覆写）；运营者 `primary` 空间保持 D8′ 配额（`5 GiB / 1,000 条 / 30 天`）不变；R2 采用「类别前缀在前、`<space_id>` 在后」布局，共享桶 `clip/blobs/` 孤儿清理前缀生命周期保持 **31 天**不变（受邀空间 14 天到期由 DO Alarm 主动 `R2.delete(keys[])` 回收），空闲空间须满足 `INV-MT-IDLE-ALARM` 方可免设下一次 Alarm；
+      - **Q5（被移除设备本地缓存行为）**：手机只读 PWA 收到服务端明确 `401 DEVICE_REVOKED` 或 WS `4401` 时自动清空 IndexedDB 包裹密钥与离线只读笔记/剪贴板缓存并回到未配对引导页（声明属礼貌清理而非防离线取证承诺）；桌面端**严禁删除本地 SQLite 与镜像**，仅擦除 `device_token`、写入持久 `"device_revoked"` 状态并停止后台 WS / 60s HTTP 轮询；本地首次启动 UI 引导采用 `UnclaimedFresh` 谓词 + `VACUUM INTO` 保底快照热切换，根治 `LocalStore::open` 抢先建库死锁；
+      - **Q6（离线邀请码签发工具）**：置于独立运维脚本 `cloud-cf/scripts/issue-invite.ts`（基于单一 `SPACE_MASTER_SECRET` 经 HKDF 域分离派生路由与邀请子钥），不在普通用户桌面 `mynote` CLI 中暴露 `admin` 子命令。
 
 ---
 
