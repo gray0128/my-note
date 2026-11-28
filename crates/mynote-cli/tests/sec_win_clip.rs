@@ -1040,14 +1040,25 @@ mod windows_live {
         let mock_b_pull = mock_clip_b.to_string_lossy().to_string();
         let ls_b = tokio::task::spawn_blocking(move || {
             let env_b = [("MYNOTE_CLIPBOARD_MOCK_FILE", mock_b_pull.as_str())];
-            let _ = run_cli_with_env(&dir_b_pull, &["clip", "pull", "--json"], None, &env_b);
-            run_cli_with_env(&dir_b_pull, &["clip", "ls", "--json"], None, &env_b)
+            let pull_out = run_cli_with_env(&dir_b_pull, &["clip", "pull", "--json"], None, &env_b);
+            assert_eq!(
+                pull_out.status.code(),
+                Some(0),
+                "clip pull stderr={}",
+                String::from_utf8_lossy(&pull_out.stderr)
+            );
+            run_cli_with_env(&dir_b_pull, &["clip", "history", "--json"], None, &env_b)
         })
         .await
         .unwrap();
-        assert_eq!(ls_b.status.code(), Some(0));
+        assert_eq!(
+            ls_b.status.code(),
+            Some(0),
+            "clip history stderr={}",
+            String::from_utf8_lossy(&ls_b.stderr)
+        );
         let ls_json: Value = serde_json::from_slice(&ls_b.stdout).unwrap();
-        let items = ls_json["data"]["items"].as_array().unwrap();
+        let items = ls_json["data"].as_array().unwrap();
         assert_eq!(items.len(), 3);
 
         // Newest is CF_DIBV5 -> PNG (4x3), middle is 2x2 PNG, oldest is Chinese UTF-8 text
@@ -1060,13 +1071,14 @@ mod windows_live {
         let out_txt = tokio::task::spawn_blocking(move || {
             run_cli_with_env(
                 &dir_b1,
-                &["clip", "pull", "--id", &cid_txt, "--raw"],
+                &["clip", "pull", &cid_txt, "--raw"],
                 None,
                 &[("MYNOTE_CLIPBOARD_MOCK_FILE", mock_b1.as_str())],
             )
         })
         .await
         .unwrap();
+        assert_eq!(out_txt.status.code(), Some(0));
         assert_eq!(String::from_utf8(out_txt.stdout).unwrap(), user_cn);
 
         let dir_b2 = dir_b.clone();
@@ -1074,13 +1086,14 @@ mod windows_live {
         let out_png = tokio::task::spawn_blocking(move || {
             run_cli_with_env(
                 &dir_b2,
-                &["clip", "pull", "--id", &cid_png, "--raw"],
+                &["clip", "pull", &cid_png, "--raw"],
                 None,
                 &[("MYNOTE_CLIPBOARD_MOCK_FILE", mock_b2.as_str())],
             )
         })
         .await
         .unwrap();
+        assert_eq!(out_png.status.code(), Some(0));
         assert_eq!(out_png.stdout, orig_png);
 
         let dir_b3 = dir_b.clone();
@@ -1088,13 +1101,14 @@ mod windows_live {
         let out_dib = tokio::task::spawn_blocking(move || {
             run_cli_with_env(
                 &dir_b3,
-                &["clip", "pull", "--id", &cid_dib, "--raw"],
+                &["clip", "pull", &cid_dib, "--raw"],
                 None,
                 &[("MYNOTE_CLIPBOARD_MOCK_FILE", mock_b3.as_str())],
             )
         })
         .await
         .unwrap();
+        assert_eq!(out_dib.status.code(), Some(0));
         let decoded_dib = ImageReader::with_format(Cursor::new(&out_dib.stdout), ImageFormat::Png)
             .decode()
             .unwrap()
@@ -1139,14 +1153,19 @@ mod windows_live {
         let apply_out = tokio::task::spawn_blocking(move || {
             run_cli_with_env(
                 &dir_a_pull,
-                &["clip", "pull", "--id", &rid_clone, "--apply", "--json"],
+                &["clip", "pull", &rid_clone, "--apply", "--json"],
                 None,
                 &[],
             )
         })
         .await
         .unwrap();
-        assert_eq!(apply_out.status.code(), Some(0));
+        assert_eq!(
+            apply_out.status.code(),
+            Some(0),
+            "clip pull --apply stderr={}",
+            String::from_utf8_lossy(&apply_out.stderr)
+        );
         tokio::time::sleep(Duration::from_millis(380)).await;
         assert_eq!(
             pushes.load(Ordering::SeqCst),
