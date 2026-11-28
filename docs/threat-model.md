@@ -221,8 +221,12 @@ $$
 1. **只监听环回地址，只认一个入口**：仅绑定环回接口（`127.0.0.1` 与 `::1`，不绑 `0.0.0.0`）；本地 UI 的唯一入口是 **`http://localhost:<port>`**。中间件首先检查 `Host` 请求头必须精确等于 `localhost:<port>`，其他任何值（DNS Rebinding 特征、`127.0.0.1:<port>`）一律在解析路由前返回 `403 Forbidden`。不使用 `127.0.0.1` 作为入口，是因为两者的 Cookie 互不相通，且 WebAuthn 的 RP ID 不能是 IP 地址。
 2. **`Origin` 白名单强制校验（含 WebSocket Upgrade）**：所有状态变更请求、API 读取与 `/v1/local/ws` 握手请求必须携带 `Origin` 头，且精确匹配唯一白名单项 `http://localhost:<port>`（详见 [`interface-contracts.md`](./interface-contracts.md) §3.1）。
 3. **一次性启动票据换取 `HttpOnly` 随机 Session Cookie**：
-   - `mynote open` 生成单次短效（10 秒）`ticket`，通过 `http://localhost:<port>/v1/local/auth/exchange?ticket=<ticket>` 换取 `Set-Cookie: mynote_local_session=<token>; HttpOnly; SameSite=Strict; Path=/` 后立即 `303` 重定向至干净根路径 `/`（避免长效凭证残留在浏览器历史记录或命令行参数 `ps aux` 中）；
+   - `mynote open` 与 macOS 可选纯 Swift 薄壳 [`apps/macos/MyNote.app`](../apps/macos/README.md) 均经 `0600 daemon.sock` 申请单次短效（10 秒）`ticket`，通过 `http://localhost:<port>/v1/local/auth/exchange?ticket=<ticket>` 换取 `Set-Cookie: mynote_local_session=<token>; HttpOnly; SameSite=Strict; Path=/` 后立即 `303` 重定向至干净根路径 `/`（避免长效凭证残留在浏览器历史记录或命令行参数 `ps aux` 中）；
    - 所有 `/v1/local/*` HTTP API 与 WebSocket 握手均强制校验该 Cookie。
+4. **macOS 可选纯 Swift `WKWebView` 薄壳边界（D5″，`v0.3.2`）**：
+   - `MyNote.app` 仅作展示层容器，**不访问 Keychain、`SMK` 或本地 SQLite**，亦不持有 `VKEK` 或加密块明文（Tier 2 解密仍全部留在 WebView 内的 `mynote-wasm` 线性内存，`orderOut` 隐藏窗口触发 `visibilitychange` 自动清零上锁）；
+   - `WKNavigationDelegate` 与 `WKUIDelegate` 严格只放行 `http://localhost:<daemon_port>/*`，一切外部 `http(s)/mailto` 链接（含 `target="_blank"`）拦截并转交系统默认浏览器，拒绝其余协议导航；默认关闭 `webView.isInspectable`（仅显式 `--inspect` 开启）；
+   - 因未配备 Apple Developer ID，GitHub Release 产物使用 ad-hoc 签名，首次安装需手动执行 `xattr -dr com.apple.quarantine /Applications/MyNote.app`；同 UID 攻击面与 §5.2 所述操作系统权限模型边界相同（`/Applications` 对 admin 组可写）。
 
 ### 5.2 同用户 UID 下本地 AI Agent 的真实安全边界
 

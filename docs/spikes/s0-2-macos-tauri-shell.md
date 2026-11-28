@@ -27,3 +27,13 @@
 | **Origin 与本地鉴权** | 唯一 `Host`：`localhost:<port>`；唯一 `Origin`：`http://localhost:<port>`；`mynote open` 用 10s 一次性 ticket 换 `HttpOnly; SameSite=Strict` Cookie | 删除原 Scheme B（`tauri://localhost` + CORS + Bearer）分支，本地鉴权面缩到最小。 |
 | **macOS 全局唤出方式** | 不由 `my-note` 内置全局热键；交由外部系统工具（Chrome/Safari Web App + Raycast/Hammerspoon/Karabiner）或终端 `mynote open` / CLI | 明确接受「macOS 不内置全局热键」这一取舍，换取零 GUI 壳维护成本。 |
 | **macOS Keychain 访问** | 全局只有**唯一一个 `mynote` 二进制**访问 Keychain，彻底消除跨二进制 ACL 冲突 | 诚实说明：无正式 Apple Developer 证书的 ad-hoc 签名下，每次 `brew upgrade` 重编覆盖同一 `mynote` 二进制后，macOS login Keychain 仍可能提示一次授权（点一次「始终允许」即可；后续如感不便可按需配置本地自签名证书）。 |
+
+---
+
+## 3. 后续演进注记（2026-11-28，D5″ / `v0.3.2`）
+
+上述「淘汰 Tauri v2 壳（`shell-macos/`）与 Scheme B 鉴权、双桌面底层统一为单一 `mynote` 二进制」的拍板继续有效。2026-11-28 在评估 GPUI 与纯 Swift `WKWebView` 后，项目于 [`apps/macos/`](../../apps/macos/README.md) 落地了**零第三方依赖的纯 Swift 可选薄壳 `MyNote.app`**（`v0.3.2` 随 CI 与 Release 发布 `MyNote-aarch64-apple-darwin.zip`），在不破坏上述底线的前提下补回 macOS 原生菜单栏与全局热键：
+
+- **0 第三方依赖 / 0 Rust crate 增量**：仅调用系统自带 `AppKit` / `WebKit` / `Carbon` / `CryptoKit`，`swiftc -O` 编译耗时 `2.0–2.5 s` `[已测]`，`.app` 包体 `364 KiB` / 压缩后 `140 KiB` `[已测]`；
+- **不碰 Keychain、不改 `SEC-05` 鉴权**：`MyNote.app` 仅经 `0600 daemon.sock` 申请 `ping` 与 `open_ticket` 后由 `WKWebView` 访问唯一入口 `http://localhost:<port>`，`SMK` Keychain 读写仍由 `mynote` 单二进制独占；
+- **原生体验实测 `[已测]`**：Carbon `RegisterEventHotKey` 默认 `⌃⌥Space`（零辅助功能权限），窗口隐显唤出 `5.1–7.9 ms`，`HttpOnly` Cookie、`isSecureContext`、`/v1/local/ws` 与严格 `localhost` 外链拦截均已在本地及 GitHub Actions `macos-latest` 自动化自检通过；因无 Apple Developer ID，首次下载仍需执行一次 `xattr -dr com.apple.quarantine /Applications/MyNote.app`。

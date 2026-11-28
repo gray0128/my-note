@@ -651,9 +651,14 @@ flowchart LR
 
 `purge_op_ids`、`MNK1`、`key_seq`、INV-SYNC-4、Lock-Wins 特例、分数索引重平衡：维持 ❌。`vault_keys` 与碎纸以「通用密钥表 + 受控碎纸」的形式回归（D2′），语义已与归档一致。
 
-### 9.8 D5 → D5′（2026-11-25 修订：移除 macOS Tauri 壳，双桌面统一纯 CLI + Daemon + HTML）
+### 9.8 D5 → D5′ → D5″（2026-11-25 去 Tauri 壳；2026-11-28 增补零依赖纯 Swift 可选薄壳 `apps/macos/`）
 
 > **2026-11-25 真机实测后修订（D5′，取代原 D5）**：在真实 macOS 上构建并运行 Tauri v2 薄壳后，确认仅为了内置一条全局热键引入 Tauri 壳会增加 450+ crate 依赖、remote origin ACL / `AppManifest` 维护、`.app` 打包、Gatekeeper 解除及跨二进制 Keychain ACL 复杂度。最终拍板 **放弃 macOS Tauri 薄壳（移除 `shell-macos/`）**：macOS 与 Omarchy 100% 统一为单一 `mynote` 二进制（CLI + Daemon + 内嵌 HTML），通过本地浏览器 / Web App 访问唯一入口 `http://localhost:<port>`（详见 [`docs/spikes/s0-2-macos-tauri-shell.md`](../docs/spikes/s0-2-macos-tauri-shell.md)）；macOS 切窗热键交由外部桌面工具（Raycast / Hammerspoon / Karabiner）或 `mynote open`。
+>
+> **2026-11-28 补充拍板（D5″，随 `v0.3.2` 落地）**：在对比 GPUI 原生重写与零依赖纯 Swift `WKWebView` 薄壳两条路线后，确认单为 macOS 用 GPUI 重写已交付的约 17,000 行 Web UI 会破坏 `C1`（三套 UI 长期维护），而仅调用系统 `AppKit` / `WebKit` / `Carbon` / `CryptoKit` 的纯 Swift 可选薄壳 [`apps/macos/`](../apps/macos/README.md)（`MyNote.app`）以 **0 第三方依赖、0 Rust crate 增量、编译 `2.0–2.5 s`、`140 KiB` zip 产物 `[已测]`** 规避了当初淘汰 Tauri 的全部根因：
+> - 双桌面核心底座保持 100% 统一（仍为单一 `mynote` 二进制，Tauri 壳永久不回归，浏览器 / Web App 访问继续可用）；
+> - `MyNote.app` 仅作可选展示层容器：通过 `0600 daemon.sock` 申请 `ping` 与 `open_ticket` 加载既有 `http://localhost:<port>`，**不碰 Keychain、不直连 SQLite、不改动 Daemon `SEC-05` 鉴权中间件**；
+> - 通过 Carbon `RegisterEventHotKey`（默认 `⌃⌥Space`，无需辅助功能权限）与菜单栏图标提供 `5.1–7.9 ms` `[已测]` 隐显切窗及焦点还原，并纳入 GitHub CI（`macos-latest`）与 Release（`MyNote-aarch64-apple-darwin.zip`）。
 
 原 2026-11-24 D5 备选记录（已作废，仅留档）：
 - ~~M1 带 macOS Tauri 原生壳 + 全局快捷键插件（目标 < 100 ms）；Omarchy 用 Hyprland 绑定 Chromium webapp。~~
@@ -767,6 +772,8 @@ DO GC、R2 多代快照、瞬态剪贴板、自动爬山已从待办中移除；
      - **Q4（线格式与密钥隔离）**：全端统一对称 `MNC1`（独立可轮换 `ClipKey`，与 `SMK`/`VKEK` 物理隔离、不入恢复包，轮换即刻令 DO PITR 旧剪贴板密文不可解；另提供 `≤ 256 KiB` 零写库 `--ephemeral` 纯内存 WS 直推，彻底规避旧 `ephemeral_clips` 的 F-06 缺陷）；
      - **Q5（桌面落地策略）**：手机与 CLI 显式发送项默认自动写入桌面系统剪贴板（覆盖前保留可撤销槽 `mynote clip undo` 并弹轻通知）；桌面后台自动镜像默认仅入收件箱可配置；
      - **Q6（分期节奏）**：纳入路线图 `S-Clip（3–4 天真机 Spike）→ M4a（100 条图文显式同步 + 移动端 → 桌面）→ M4b（桌面 ↔ 桌面后台自动镜像，默认关闭 opt-in）→ M4c`，各正式规范文档已同步更新（对应新增 `ADR-11`，保持 `Proposed` 直至 S-Clip 产出真机实测证据）。
+8. **2026-11-28 macOS 原生薄壳补充拍板（D5″，`v0.3.2`）**：
+   - 评估 GPUI 与纯 Swift `WKWebView` 两条路线后，淘汰单端 GPUI 重写，采纳零第三方依赖纯 Swift `WKWebView` 可选薄壳 [`apps/macos/`](../apps/macos/README.md)（`MyNote.app`）：不引入 Tauri、不碰 Keychain、不改动 Daemon `SEC-05` 鉴权契约，经 `0600 daemon.sock` 申请 `open_ticket` 自动登录 `http://localhost:<port>`，提供菜单栏与 Carbon 全局热键（默认 `⌃⌥Space`，无需辅助功能权限，隐显唤出 `5.1–7.9 ms` `[已测]`）；已完成 PR #70 合并、GitHub `macos-latest` CI 自检与 `v0.3.2` Release（`MyNote-aarch64-apple-darwin.zip`，`140 KiB` `[已测]`）。
 
 ---
 
