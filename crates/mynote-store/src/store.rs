@@ -6497,4 +6497,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&archive_dir);
         let _ = std::fs::remove_dir_all(&restore_dir);
     }
+
+    #[test]
+    fn rebase_delete_over_retiring_update_mints_new_op_id_and_converges_with_pre_pitr_peer() {
+        use mynote_core::ids::MarkId;
+        use mynote_core::model::ShredMarkRow;
+        use mynote_core::vault::T_GRACE_DEFAULT_MS;
+
+        let dir = temp_dir("reconcile_pitr_delete_rebase");
+        let mut store = LocalStore::open(&dir).unwrap();
+        let blk = store
+            .add_block("scratch", "init", Some("markdown"), None, "human", None)
+            .unwrap();
+        let create_oid = OpId::parse(&blk.head_op_ids[0]).unwrap();
+        let epoch = JournalEpoch::from_random_bytes([0x11; 16]);
+        let init_hlc = store.export_engine_snapshot().unwrap().hlc;
+        store
+            .apply_store_mutations(&[
+                StoreMutation::SetSyncMeta {
+                    bootstrap_completed: true,
+                    journal_epoch: Some(epoch),
+                    last_seq: 1,
+                    reconciling_epoch: None,
+                    hlc: init_hlc,
+                },
+                StoreMutation::MarkOpsSynced {
+                    epoch,
+                    acked: vec![mynote_core::sync::AckedOp {
+                        op_id: create_oid,
+                        seq: 1,
+                    }],
+                },
+            ])
+            .unwrap();
+
+        let upd = store
+            .update_block(&blk.block_id, "pre-pitr-update", &blk.head_op_ids, false, "human")
+            .unwrap();
+        let upd_oid = OpId::parse(&upd.head_op_ids[0]).unwrap();
+        let del = store
+            .delete_block(&blk.block_id, Some(&upd.head_op_ids), "human")
+            .unwrap();
+        let del_oid = OpId::parse(&del.op_id).unwrap();
+
+        // Peer node already pulled `upd` and `del` prior to DO PITR rollback.
+        let mut peer_snap = store.export_engine_snapshot().unwrap();
+
+        let kid = store
+            .collect_entity_unshredded_key_ids(EntityType::Block, &blk.block_id)
+            .unwrap()[0];
+        let summary = store
+            .apply_store_mutations(&[StoreMutation::UpsertShredMark(ShredMarkRow {
+                mark_id: MarkId::from_ulid(Ulid::from_parts(1_710_000_050_000, [0xD2; 10])),
+                key_id: kid,
+                seen_seq: 1,
+                requested_by: DeviceId::from_random_bytes([0xEE; 10]),
+                requested_at_ms: 1_710_000_050_000,
+                grace_ms: T_GRACE_DEFAULT_MS,
+                not_before_ms: Some(1_710_000_050_000 + T_GRACE_DEFAULT_MS),
+                state: ShredMarkState::Scheduled,
+                confirmed_at_ms: None,
+                cancelled_by: None,
+                executed_at_ms: None,
+            })])
+            .unwrap();
+        assert_eq!(summary.rekeyed_tier1_ops, 1);
+
+        let mut local_snap = store.export_engine_snapshot().unwrap();
+        assert!(
+            !local_snap.ops.contains_key(&del_oid),
+            "rebased delete must mint a fresh op_id rather than mutating del_oid in place"
+        );
+
+        // Simulate post-PITR Set-Union convergence where peer also re-pushes `upd` and `del`.
+        let local_ops: Vec<_> = local_snap.ops.values().cloned().collect();
+        let peer_ops: Vec<_> = peer_snap.ops.values().cloned().collect();
+        for op in local_ops {
+            peer_snap.apply_mutations(&[StoreMutation::AppendOp(op)]);
+        }
+        for op in peer_ops {
+            local_snap.apply_mutations(&[StoreMutation::AppendOp(op)]);
+        }
+        peer_snap.keys.merge_from(&local_snap.keys);
+        local_snap.keys.merge_from(&peer_snap.keys);
+
+        let bid = BlockId::parse(&blk.block_id).unwrap();
+        let local_mat = local_snap.materialize_block_view(bid).unwrap();
+        let peer_mat = peer_snap.materialize_block_view(bid).unwrap();
+        assert_eq!(local_mat, peer_mat);
+        assert_eq!(local_mat.state, BlockState::Trashed);
+        assert_eq!(local_mat.leaves.len(), 1);
+        assert_ne!(local_mat.leaves[0].op_id, upd_oid);
+        assert_ne!(local_mat.leaves[0].op_id, del_oid);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

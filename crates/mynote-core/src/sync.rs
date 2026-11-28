@@ -85,6 +85,23 @@ pub enum OutboxKeyAction {
     NeedsRekey { key_shredded: bool },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboxLeafPlan {
+    pub op_id: OpId,
+    pub self_needs_rekey: bool,
+    pub frontier_parents: Vec<OpId>,
+    pub merged_parents: Vec<OpId>,
+    pub collapsed_ancestors: BTreeSet<OpId>,
+    pub collapsed_create: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutboxReconcilePlan {
+    pub leaves: Vec<OutboxLeafPlan>,
+    pub stranded_superseded_ops: BTreeSet<OpId>,
+    pub protected_ancestors: BTreeSet<OpId>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushRequestDto {
     pub expected_epoch: JournalEpoch,
@@ -526,6 +543,157 @@ impl EngineSnapshot {
         OutboxKeyAction::PushNormal
     }
 
+    /// Compute a deterministic causal-closure plan for reconciling unpushed ops against retiring/shredded keys.
+    ///
+    /// Every rekeyed or rebased leaf receives a fresh `op_id` from its caller and sets `parent_op_ids` to
+    /// `merged_parents` (`frontier_parents ∪ collapsed_ancestors ∪ {old_op_id}`), ensuring:
+    /// 1. No `op_id` ever maps to two different `MNS1` envelopes across peers or pre/post-PITR epochs;
+    /// 2. Peers that never saw `collapsed_ancestors` still supersede `frontier_parents`;
+    /// 3. Peers or R2 `MNA1` archives that DID see `collapsed_ancestors` or `old_op_id` still supersede them.
+    pub fn plan_outbox_reconciliation(&self) -> OutboxReconcilePlan {
+        let unpushed: Vec<&LocalOpRecord> = self
+            .ops
+            .values()
+            .filter(|o| o.server_seq.is_none() && o.sync_blocked_reason.is_none())
+            .collect();
+        if unpushed.is_empty() {
+            return OutboxReconcilePlan::default();
+        }
+        let mut unpushed_by_id: BTreeMap<OpId, &LocalOpRecord> = BTreeMap::new();
+        let mut needs_rekey_ids: BTreeSet<OpId> = BTreeSet::new();
+        for o in &unpushed {
+            unpushed_by_id.insert(o.op_id, o);
+            if matches!(self.classify_unpushed_op(o), OutboxKeyAction::NeedsRekey { .. }) {
+                needs_rekey_ids.insert(o.op_id);
+            }
+        }
+        if needs_rekey_ids.is_empty() {
+            return OutboxReconcilePlan::default();
+        }
+
+        let mut referenced_parents: BTreeSet<(EntityType, &str, OpId)> = BTreeSet::new();
+        for cand in self.ops.values() {
+            if cand.op_type.is_dag_op() {
+                for &p in &cand.parent_op_ids {
+                    referenced_parents.insert((cand.entity_type, cand.entity_id.as_str(), p));
+                }
+            }
+        }
+
+        let collapse_retiring_ancestors =
+            |start_parents: &[OpId], allow_collapse_create: bool| -> (Vec<OpId>, BTreeSet<OpId>, bool) {
+                let mut frontier: BTreeSet<OpId> = BTreeSet::new();
+                let mut collapsed: BTreeSet<OpId> = BTreeSet::new();
+                let mut collapsed_create = false;
+                let mut stack: Vec<OpId> = start_parents.to_vec();
+                let mut visited: BTreeSet<OpId> = BTreeSet::new();
+                while let Some(pid) = stack.pop() {
+                    if !visited.insert(pid) {
+                        continue;
+                    }
+                    if needs_rekey_ids.contains(&pid) {
+                        if let Some(anc) = unpushed_by_id.get(&pid) {
+                            if anc.op_type == OpType::Create && !allow_collapse_create {
+                                frontier.insert(pid);
+                                continue;
+                            }
+                            if anc.op_type == OpType::Create {
+                                collapsed_create = true;
+                            }
+                            collapsed.insert(pid);
+                            stack.extend(anc.parent_op_ids.iter().copied());
+                        } else {
+                            frontier.insert(pid);
+                        }
+                    } else {
+                        frontier.insert(pid);
+                    }
+                }
+                (frontier.into_iter().collect(), collapsed, collapsed_create)
+            };
+
+        let mut leaves = Vec::new();
+        let mut protected_roots: Vec<OpId> = Vec::new();
+        for o in &unpushed {
+            if !o.op_type.is_dag_op()
+                || referenced_parents.contains(&(o.entity_type, o.entity_id.as_str(), o.op_id))
+            {
+                continue;
+            }
+            let self_needs_rekey = needs_rekey_ids.contains(&o.op_id);
+            let (frontier_parents, collapsed_ancestors, collapsed_create) =
+                collapse_retiring_ancestors(&o.parent_op_ids, self_needs_rekey);
+            if !self_needs_rekey && collapsed_ancestors.is_empty() {
+                protected_roots.push(o.op_id);
+                continue;
+            }
+            let mut merged: BTreeSet<OpId> = frontier_parents.iter().copied().collect();
+            merged.extend(collapsed_ancestors.iter().copied());
+            merged.insert(o.op_id);
+            leaves.push(OutboxLeafPlan {
+                op_id: o.op_id,
+                self_needs_rekey,
+                frontier_parents,
+                merged_parents: merged.into_iter().collect(),
+                collapsed_ancestors,
+                collapsed_create,
+            });
+        }
+
+        for o in self.ops.values() {
+            if o.server_seq.is_none() && o.sync_blocked_reason.as_deref() == Some("NEEDS_VAULT_REKEY") {
+                protected_roots.extend(o.parent_op_ids.iter().copied());
+            }
+        }
+        let mut protected_ancestors: BTreeSet<OpId> = BTreeSet::new();
+        let mut p_stack = protected_roots;
+        let mut p_visited = BTreeSet::new();
+        while let Some(oid) = p_stack.pop() {
+            if !p_visited.insert(oid) {
+                continue;
+            }
+            if let Some(u) = unpushed_by_id.get(&oid) {
+                protected_ancestors.insert(oid);
+                p_stack.extend(u.parent_op_ids.iter().copied());
+            }
+        }
+
+        let mut stranded_superseded_ops: BTreeSet<OpId> = BTreeSet::new();
+        for o in &unpushed {
+            if !o.op_type.is_dag_op()
+                || o.op_type == OpType::Create
+                || !referenced_parents.contains(&(o.entity_type, o.entity_id.as_str(), o.op_id))
+                || protected_ancestors.contains(&o.op_id)
+            {
+                continue;
+            }
+            let mut stack = vec![o.op_id];
+            let mut visited = BTreeSet::new();
+            let mut hits_rekey = false;
+            while let Some(cur) = stack.pop() {
+                if !visited.insert(cur) {
+                    continue;
+                }
+                if needs_rekey_ids.contains(&cur) {
+                    hits_rekey = true;
+                    break;
+                }
+                if let Some(u) = unpushed_by_id.get(&cur) {
+                    stack.extend(u.parent_op_ids.iter().copied());
+                }
+            }
+            if hits_rekey {
+                stranded_superseded_ops.insert(o.op_id);
+            }
+        }
+
+        OutboxReconcilePlan {
+            leaves,
+            stranded_superseded_ops,
+            protected_ancestors,
+        }
+    }
+
     /// Collect keys currently referenced by live leaves of any `ACTIVE` block or `ACTIVE` buffer.
     pub(crate) fn active_live_keys(&self) -> BTreeSet<KeyId> {
         let mut live = BTreeSet::new();
@@ -604,6 +772,7 @@ impl EngineSnapshot {
                 let parents_ready = o.parent_op_ids.iter().all(|pid| match self.ops.get(pid) {
                     None => true,
                     Some(p) if p.server_seq.is_some() => true,
+                    Some(p) if p.sync_blocked_reason.as_deref() == Some("NEEDS_VAULT_REKEY_ANCESTOR") => true,
                     Some(_) => candidate_ids.contains(pid) && ready_ids.contains(pid),
                 });
                 if parents_ready {
