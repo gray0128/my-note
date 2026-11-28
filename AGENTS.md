@@ -106,6 +106,8 @@ my-note/
 │   ├── mynote-wasm/           # wasm-bindgen 封装（桌面 Tier 2 + 手机只读 PWA）
 │   ├── mynote-store/          # 桌面 SQLite STRICT/WAL/FTS5/镜像/VACUUM INTO 备份
 │   └── mynote-cli/            # 单体二进制入口（CLI + Heynote 导入 + Daemon + 内嵌前端）
+├── apps/
+│   └── macos/                 # 可选零依赖纯 Swift WKWebView macOS 薄壳（MyNote.app，仅连 daemon.sock、不碰 Keychain）
 ├── web/                       # TypeScript 前端（桌面 CM6 + 手机只读 PWA）
 ├── cloud-cf/                  # Cloudflare Worker 极薄盲同步中继（M1 < 500 行 TS）
 ├── skill/SKILL.md             # Agent Skill（严格 < 250 tokens）

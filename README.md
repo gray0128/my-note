@@ -15,10 +15,11 @@
 ### 发布包与启用速查
 
 - **GitHub Release 预编译目标**（由 [`.github/workflows/release.yml`](./.github/workflows/release.yml) 在 `v*` tag 构建并附带 `SHA256SUMS.txt`）：
-  - `mynote-aarch64-apple-darwin.tar.gz`（macOS Apple Silicon）
+  - `mynote-aarch64-apple-darwin.tar.gz`（macOS Apple Silicon CLI + Daemon + 内嵌 Web UI）
+  - `MyNote-aarch64-apple-darwin.zip`（macOS Apple Silicon 可选原生纯 Swift `WKWebView` 薄壳 `MyNote.app`，支持菜单栏与全局热键 `⌃⌥Space`，零第三方依赖、不碰 Keychain；首次运行前执行 `xattr -dr com.apple.quarantine /Applications/MyNote.app`）
   - `mynote-x86_64-unknown-linux-gnu.tar.gz`（Linux x86_64 / Omarchy）
   - `mynote-aarch64-unknown-linux-gnu.tar.gz`（Linux ARM64）
-  - 每个压缩包均内含剥离后的单体 `mynote`（已内嵌桌面 Web UI）、`skill/SKILL.md` 与 `deploy/{launchd,systemd,hyprland}` 模板。
+  - 每个 CLI 压缩包均内含剥离后的单体 `mynote`（已内嵌桌面 Web UI）、`skill/SKILL.md` 与 `deploy/{launchd,systemd,hyprland}` 模板。
 - **源码构建回退**：`./scripts/build-wasm.sh && pnpm --dir web install --frozen-lockfile && pnpm --dir web build && cargo build --release --locked --bin mynote`
 - **全新设备启用顺序（先配对/接入，再拉起守护）**：
   1. **首台桌面接入云端**：`mynote device bootstrap --url <你的-worker-url>`（妥善离线抄录首次输出的 24 词恢复包，或引导会话内运行 `mynote recovery show`）；**第二台桌面配对**：在已接入桌面运行 `mynote device add --name <设备名> --scope read-write`，目标桌面运行 `mynote device claim`（纯离线试用可跳过本步）
