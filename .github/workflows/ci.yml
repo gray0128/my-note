@@ -174,7 +174,10 @@ jobs:
       - name: Run SEC-WIN-PIPE Windows platform security gate with diagnostic output
         if: runner.os == 'Windows'
         run: cargo test -p mynote-cli --test sec_win_pipe -- --nocapture
-      - name: Test workspace (including 500-seed M1/M2 DST + INV-RECOVERY + INV-SHRED-BOUND + SEC-01/04/05 + SEC-WIN-PIPE)
+      - name: Run SEC-WIN-CLIP Windows clipboard & open security gate with diagnostic output
+        if: runner.os == 'Windows'
+        run: cargo test -p mynote-cli --test sec_win_clip -- --nocapture
+      - name: Test workspace (including 500-seed M1/M2 DST + INV-RECOVERY + INV-SHRED-BOUND + SEC-01/04/05 + SEC-WIN-PIPE/CLIP)
         env:
           MYNOTE_DST_SEEDS: "500"
         run: cargo test --workspace

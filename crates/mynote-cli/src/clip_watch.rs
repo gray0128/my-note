@@ -1,10 +1,12 @@
-//! M4b-1 Desktop <-> Desktop background auto-mirror watch engine
-//! (`docs/sync-protocol.md` §11.3, `docs/threat-model.md` §9.2,
-//! `docs/spikes/s-clip-3-macos-pasteboard.md`, `docs/spikes/s-clip-4-hyprland-wayland.md`).
+//! M4b-1 / M5-W2 Desktop <-> Desktop background auto-mirror watch engine
+//! (`docs/sync-protocol.md` §11.3, `docs/threat-model.md` §9.2 & §10.1,
+//! `docs/spikes/s-clip-3-macos-pasteboard.md`, `docs/spikes/s-clip-4-hyprland-wayland.md`,
+//! `docs/spikes/s-win-1-platform.md`).
 //!
 //! Strictly DEFAULT OFF (`watch_enabled = false`, opt-in only):
 //! - Zero background polling/threads while disabled or paused.
-//! - Hard-filters sensitive/remote/echo macOS UTIs and Wayland MIMEs before reading payloads.
+//! - Hard-filters sensitive/remote/echo macOS UTIs, Wayland MIMEs, and Windows clipboard formats
+//!   before reading user payloads.
 //! - Intercepts high-risk credentials via `mynote_core::vault::detect_secret_pattern` with 0
 //!   outbound network pushes and emits `CLIP_SECRET_BLOCKED` WS alert.
 //! - Enforces 250 ms debounce, 10 MiB payload ceiling, rolling 60s rate limit (30 items/min total,
@@ -12,8 +14,9 @@
 
 use crate::clipboard::{
     is_svg_bytes, macos_precheck_sensitive_uti, macos_select_source_uti, wayland_classify_mimes,
+    windows_is_dword_zero_or_malformed, windows_precheck_presence_format, windows_select_source_format,
     ClipboardPayload, EchoGuard, MacosSelectedUti, ReadClipboardResult, WaylandOfferChoice,
-    CLIP_ECHO_WINDOW_MS,
+    WinSelectedFormat, CLIP_ECHO_WINDOW_MS,
 };
 use crate::daemon::{ClipItemDto, ClipWatchConfig, DaemonState};
 use mynote_core::clip::{validate_clip_image_mime, CLIP_BLOB_MAX_BYTES};
@@ -239,6 +242,38 @@ impl ClipWatchFilter {
         }
     }
 
+    /// Pure Windows clipboard format precheck executed BEFORE reading any user text/image payload.
+    pub fn precheck_windows_formats(
+        formats: &[(u32, &str)],
+        can_include_history_raw: Option<&[u8]>,
+        can_upload_cloud_raw: Option<&[u8]>,
+    ) -> Result<WinSelectedFormat, WatchDecision> {
+        if formats.is_empty() {
+            return Err(WatchDecision::SkipEmpty);
+        }
+        let names: Vec<&str> = formats.iter().map(|(_, n)| *n).collect();
+        if let Some(reason) = windows_precheck_presence_format(&names) {
+            return Err(WatchDecision::SkipSensitive(reason.to_string()));
+        }
+        if can_include_history_raw.is_some_and(windows_is_dword_zero_or_malformed) {
+            return Err(WatchDecision::SkipSensitive(
+                "CanIncludeInClipboardHistory == 0".to_string(),
+            ));
+        }
+        if can_upload_cloud_raw.is_some_and(windows_is_dword_zero_or_malformed) {
+            return Err(WatchDecision::SkipSensitive(
+                "CanUploadClipboardDataToCloud == 0".to_string(),
+            ));
+        }
+        match windows_select_source_format(formats) {
+            None => Err(WatchDecision::SkipEmpty),
+            Some(WinSelectedFormat::SvgOnlyRejected) => {
+                Err(WatchDecision::SkipDisallowedImage("image/svg+xml".to_string()))
+            }
+            Some(sel) => Ok(sel),
+        }
+    }
+
     /// Evaluate a `ReadClipboardResult` from `SystemClipboard::read()`.
     pub fn evaluate_read(
         &mut self,
@@ -324,7 +359,7 @@ pub enum WatchCaptureOutcome {
     Dropped(WatchDecision),
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn now_ms_u64() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -334,12 +369,12 @@ fn now_ms_u64() -> u64 {
         .max(1)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn is_watch_active(cfg: &ClipWatchConfig) -> bool {
     cfg.watch_enabled && !cfg.watch_paused
 }
 
-/// Spawn the M4b-1 background clipboard watcher supervisor.
+/// Spawn the M4b-1 / M5-W2 background clipboard watcher supervisor.
 ///
 /// - Does NOTHING (0 timers, 0 OS threads, 0 clipboard reads) when `clipboard.is_native() == false`
 ///   or while `watch_enabled == false` (default) or `watch_paused == true`.
@@ -349,7 +384,7 @@ pub fn spawn_clip_watch_supervisor(state: Arc<DaemonState>, shutdown_rx: watch::
         return;
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
         let mut cfg_rx = state.clip_watch_tx.subscribe();
         let mut shutdown_rx = shutdown_rx;
@@ -380,11 +415,14 @@ pub fn spawn_clip_watch_supervisor(state: Arc<DaemonState>, shutdown_rx: watch::
 
                 #[cfg(target_os = "linux")]
                 run_linux_watch_session(&state, &mut cfg_rx, &mut shutdown_rx).await;
+
+                #[cfg(target_os = "windows")]
+                run_windows_watch_session(&state, &mut cfg_rx, &mut shutdown_rx).await;
             }
         });
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = (state, shutdown_rx);
     }
@@ -673,6 +711,294 @@ async fn run_linux_watch_session(
     drop(rx);
     let _ = tokio::task::spawn_blocking(move || {
         let _ = join_handle.join();
+    })
+    .await;
+}
+
+#[cfg(target_os = "windows")]
+mod win32_watch {
+    use std::cell::RefCell;
+    use std::io;
+    use std::ptr;
+    use std::thread::{self, JoinHandle};
+    use tokio::sync::{mpsc, oneshot};
+    use windows_sys::Win32::Foundation::{
+        GetLastError, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
+    };
+    use windows_sys::Win32::System::DataExchange::{
+        AddClipboardFormatListener, GetClipboardSequenceNumber, RemoveClipboardFormatListener,
+    };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
+        PostQuitMessage, PostThreadMessageW, RegisterClassExW, TranslateMessage, HWND_MESSAGE, MSG,
+        WM_CLIPBOARDUPDATE, WM_QUIT, WM_USER, WNDCLASSEXW,
+    };
+
+    const WM_APP_SHUTDOWN: u32 = WM_USER + 0x4D;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ClipboardUpdateEvent {
+        pub sequence_number: u32,
+    }
+
+    struct WatcherThreadState {
+        last_seq: u32,
+        tx: mpsc::UnboundedSender<ClipboardUpdateEvent>,
+    }
+
+    thread_local! {
+        static THREAD_WATCHER_STATE: RefCell<Option<WatcherThreadState>> = const { RefCell::new(None) };
+    }
+
+    unsafe extern "system" fn watcher_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            WM_CLIPBOARDUPDATE => {
+                let seq = unsafe { GetClipboardSequenceNumber() };
+                THREAD_WATCHER_STATE.with(|slot| {
+                    if let Some(st) = slot.borrow_mut().as_mut() {
+                        if seq == 0 || seq != st.last_seq {
+                            st.last_seq = seq;
+                            let _ = st.tx.send(ClipboardUpdateEvent { sequence_number: seq });
+                        }
+                    }
+                });
+                0
+            }
+            WM_APP_SHUTDOWN => {
+                unsafe {
+                    PostQuitMessage(0);
+                }
+                0
+            }
+            _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        }
+    }
+
+    /// Event-driven zero-polling Win32 clipboard watcher backed by a dedicated OS thread with a
+    /// message-only window (`HWND_MESSAGE`) + `AddClipboardFormatListener` (`WM_CLIPBOARDUPDATE`).
+    pub struct Win32ClipboardWatcher {
+        thread_id: u32,
+        hwnd_raw: usize,
+        rx: mpsc::UnboundedReceiver<ClipboardUpdateEvent>,
+        join: Option<JoinHandle<()>>,
+    }
+
+    impl Win32ClipboardWatcher {
+        pub async fn start() -> io::Result<Self> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let (ready_tx, ready_rx) = oneshot::channel::<io::Result<(u32, usize)>>();
+
+            let join = thread::Builder::new()
+                .name("mynote-win32-clip-watch".to_string())
+                .spawn(move || {
+                    let thread_id = unsafe { GetCurrentThreadId() };
+                    let hinstance: HINSTANCE = unsafe { GetModuleHandleW(ptr::null()) };
+                    let class_name: Vec<u16> = "MyNoteWin32ClipWatcherWindow\0".encode_utf16().collect();
+
+                    let wc = WNDCLASSEXW {
+                        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                        lpfnWndProc: Some(watcher_wndproc),
+                        hInstance: hinstance,
+                        lpszClassName: class_name.as_ptr(),
+                        ..Default::default()
+                    };
+                    let atom = unsafe { RegisterClassExW(&wc) };
+                    if atom == 0 {
+                        let err = unsafe { GetLastError() };
+                        if err != ERROR_CLASS_ALREADY_EXISTS {
+                            let _ = ready_tx.send(Err(io::Error::from_raw_os_error(err as i32)));
+                            return;
+                        }
+                    }
+
+                    let initial_seq = unsafe { GetClipboardSequenceNumber() };
+                    THREAD_WATCHER_STATE.with(|slot| {
+                        *slot.borrow_mut() = Some(WatcherThreadState {
+                            last_seq: initial_seq,
+                            tx,
+                        });
+                    });
+
+                    let hwnd = unsafe {
+                        CreateWindowExW(
+                            0,
+                            class_name.as_ptr(),
+                            ptr::null(),
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            HWND_MESSAGE,
+                            ptr::null_mut(),
+                            hinstance,
+                            ptr::null(),
+                        )
+                    };
+                    if hwnd.is_null() {
+                        THREAD_WATCHER_STATE.with(|slot| {
+                            *slot.borrow_mut() = None;
+                        });
+                        let _ = ready_tx.send(Err(io::Error::last_os_error()));
+                        return;
+                    }
+
+                    if unsafe { AddClipboardFormatListener(hwnd) } == 0 {
+                        let err = io::Error::last_os_error();
+                        unsafe {
+                            let _ = DestroyWindow(hwnd);
+                        }
+                        THREAD_WATCHER_STATE.with(|slot| {
+                            *slot.borrow_mut() = None;
+                        });
+                        let _ = ready_tx.send(Err(err));
+                        return;
+                    }
+
+                    // `CreateWindowExW` initialized this thread's User32 message queue, so
+                    // `PostThreadMessageW(thread_id, WM_QUIT, 0, 0)` is guaranteed valid after ready.
+                    if ready_tx.send(Ok((thread_id, hwnd as usize))).is_err() {
+                        unsafe {
+                            let _ = RemoveClipboardFormatListener(hwnd);
+                            let _ = DestroyWindow(hwnd);
+                        }
+                        THREAD_WATCHER_STATE.with(|slot| {
+                            *slot.borrow_mut() = None;
+                        });
+                        return;
+                    }
+
+                    let mut msg: MSG = unsafe { std::mem::zeroed() };
+                    loop {
+                        let ret = unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) };
+                        if ret <= 0 {
+                            break;
+                        }
+                        unsafe {
+                            let _ = TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                    }
+
+                    unsafe {
+                        let _ = RemoveClipboardFormatListener(hwnd);
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    THREAD_WATCHER_STATE.with(|slot| {
+                        *slot.borrow_mut() = None;
+                    });
+                })?;
+
+            let (thread_id, hwnd_raw) = ready_rx
+                .await
+                .map_err(|_| io::Error::other("Win32 clipboard watcher thread exited before ready"))??;
+
+            Ok(Self {
+                thread_id,
+                hwnd_raw,
+                rx,
+                join: Some(join),
+            })
+        }
+
+        pub async fn next_event(&mut self) -> Option<ClipboardUpdateEvent> {
+            self.rx.recv().await
+        }
+
+        pub fn stop(&mut self) {
+            if let Some(join) = self.join.take() {
+                let posted = unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0) };
+                if posted == 0 {
+                    unsafe {
+                        let _ = PostMessageW(self.hwnd_raw as HWND, WM_APP_SHUTDOWN, 0, 0);
+                    }
+                }
+                let _ = join.join();
+            }
+        }
+    }
+
+    impl Drop for Win32ClipboardWatcher {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub use win32_watch::{ClipboardUpdateEvent, Win32ClipboardWatcher};
+
+#[cfg(target_os = "windows")]
+async fn run_windows_watch_session(
+    state: &Arc<DaemonState>,
+    cfg_rx: &mut watch::Receiver<ClipWatchConfig>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
+    use std::time::Duration;
+
+    let mut watcher = match Win32ClipboardWatcher::start().await {
+        Ok(w) => w,
+        Err(_) => {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {}
+                _ = cfg_rx.changed() => {}
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            }
+            return;
+        }
+    };
+
+    let mut pending_update = false;
+    let debounce_sleep = tokio::time::sleep(Duration::from_millis(CLIP_WATCH_DEBOUNCE_MS));
+    tokio::pin!(debounce_sleep);
+
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            changed = cfg_rx.changed() => {
+                if changed.is_err() || !is_watch_active(&cfg_rx.borrow_and_update()) {
+                    break;
+                }
+            }
+            ev = watcher.next_event() => {
+                match ev {
+                    Some(_) => {
+                        pending_update = true;
+                        debounce_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + Duration::from_millis(CLIP_WATCH_DEBOUNCE_MS));
+                    }
+                    None => break,
+                }
+            }
+            _ = &mut debounce_sleep, if pending_update => {
+                pending_update = false;
+                if *shutdown_rx.borrow() || !is_watch_active(&cfg_rx.borrow()) {
+                    break;
+                }
+                let clip = Arc::clone(&state.clipboard);
+                let read_res = match tokio::task::spawn_blocking(move || clip.read()).await {
+                    Ok(Ok(r)) => r,
+                    _ => continue,
+                };
+                let _ = state.handle_auto_captured_read(read_res, now_ms_u64()).await;
+            }
+        }
+    }
+
+    let _ = tokio::task::spawn_blocking(move || {
+        watcher.stop();
     })
     .await;
 }

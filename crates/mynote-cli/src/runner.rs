@@ -702,10 +702,7 @@ fn handle_open(data_dir: &Path, mode: OutputMode, started: Instant, quiet: bool)
             let url = resp.url.unwrap_or_default();
             let port = resp.port.unwrap_or(19876);
             if mode == OutputMode::Human && std::env::var("MYNOTE_NO_BROWSER").is_err() {
-                #[cfg(target_os = "macos")]
-                let _ = std::process::Command::new("open").arg(&url).spawn();
-                #[cfg(target_os = "linux")]
-                let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                let _ = open_local_browser_url(&url);
             }
             match mode {
                 OutputMode::Json | OutputMode::Jsonl => emit_json(
@@ -726,6 +723,84 @@ fn handle_open(data_dir: &Path, mode: OutputMode, started: Instant, quiet: bool)
             emit_error(&err, mode, empty_meta(started), quiet)
         }
         Err(err) => emit_error(&err, mode, empty_meta(started), quiet),
+    }
+}
+
+/// Validate a `mynote open` ticket URL (`http://localhost:<port>...`, `SEC-05`) and encode it as
+/// NUL-terminated UTF-16LE for Win32 `ShellExecuteW`. Rejects non-localhost hosts, non-`http`
+/// schemes (`file:`, `cmd:`, UNC paths), NULs, and control characters so query parameters (`&`)
+/// are passed literally to the registered HTTP handler without shell expansion.
+pub fn validate_local_open_url(url: &str) -> Result<Vec<u16>, CoreError> {
+    if url.is_empty() || url.chars().any(|c| c == '\0' || c.is_control()) {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            "refusing empty or control-character URL for browser launch",
+            "Inspect local daemon open_ticket response",
+        ));
+    }
+    let parsed = url::Url::parse(url).map_err(|e| {
+        CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!("invalid local UI URL '{url}': {e}"),
+            "Expected http://localhost:<port>/...",
+        )
+    })?;
+    if parsed.scheme() != "http" || parsed.host_str() != Some("localhost") || parsed.port().is_none() {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!("refusing non-localhost UI URL '{url}'"),
+            "mynote open only launches http://localhost:<port>",
+        ));
+    }
+    Ok(url.encode_utf16().chain(std::iter::once(0)).collect())
+}
+
+#[cfg(target_os = "windows")]
+pub fn open_browser_win32(url: &str) -> Result<(), CoreError> {
+    let url_utf16 = validate_local_open_url(url)?;
+    let verb_open: [u16; 5] = [b'o' as u16, b'p' as u16, b'e' as u16, b'n' as u16, 0];
+    let ret = unsafe {
+        windows_sys::Win32::UI::Shell::ShellExecuteW(
+            std::ptr::null_mut(),
+            verb_open.as_ptr(),
+            url_utf16.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        )
+    };
+    if (ret as isize) <= 32 {
+        return Err(CoreError::new(
+            ErrorCode::IntegrityError,
+            format!(
+                "ShellExecuteW failed to launch default browser (code={})",
+                ret as isize
+            ),
+            "Open the printed http://localhost:<port> URL manually in your browser",
+        ));
+    }
+    Ok(())
+}
+
+fn open_local_browser_url(url: &str) -> Result<(), CoreError> {
+    let _ = validate_local_open_url(url)?;
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+        Ok(())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        open_browser_win32(url)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Ok(())
     }
 }
 
