@@ -171,7 +171,7 @@ interface CliEnvelope<T> {
 
 ### 2.5 分发、升级与 Schema 迁移
 
-- **分发交给包管理器与 GitHub Releases（F-14，D9）**：Homebrew tap（macOS）、AUR（Omarchy）、GitHub Releases 预编译包（含 M5-W3 新增的 Windows `x86_64-pc-windows-msvc` ZIP 包，是否同步打 `aarch64-pc-windows-msvc` 待确认；附 `SHA256SUMS.txt`、`skill/SKILL.md` 与 `deploy/` 模板），开发期可用 `cargo install`。`mynote` **不内置自升级**，也**绝不在后台联网检查更新或上报遥测**。
+- **分发交给包管理器与 GitHub Releases（F-14，D9）**：Homebrew tap（macOS）、AUR（Omarchy）、GitHub Releases 预编译包（含 M5-W3 新增的 Windows `x86_64-pc-windows-msvc` ZIP 包，`aarch64-pc-windows-msvc` 推迟至需求触发；附 `SHA256SUMS.txt`、`skill/SKILL.md` 与 `deploy/` 模板），开发期可用 `cargo install`。`mynote` **不内置自升级**，也**绝不在后台联网检查更新或上报遥测**。
 - **安装位置与 F-07**：Linux 经 AUR 安装到用户不可写的 `/usr/bin`；Windows 推荐由管理员安装至 `Program Files` 或受控目录。Tier 2 对同 UID 攻击者的真实边界见 [`threat-model.md`](./threat-model.md)。
 - **Schema 迁移前自动备份（保留）**：新版本首次打开数据库、需要升级 `PRAGMA user_version` 时，必须在独占写事务**之前**通过 `VACUUM INTO` 生成单文件快照（Unix `0600` / Windows 当前用户专属 NTFS DACL，路径 `<data_dir>/backups/mynote-pre-schema-v<old>.db`），再执行迁移。
 - **降级**：旧二进制打开较新的库时返回 `INTEGRITY_ERROR`（`SCHEMA_TOO_NEW`，退出码 `8`），不做任何写入。回退步骤是用包管理器装回旧版本，再手动换回上面的迁移前备份（步骤写进 `mynote help upgrade`）。

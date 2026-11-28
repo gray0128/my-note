@@ -20,7 +20,7 @@
 8. [逃生舱设计（反厂商锁定）](#8-逃生舱设计反厂商锁定)
 9. [测试：真实 Worker 契约测试与 DST 共用场景](#9-测试真实-worker-契约测试与-dst-共用场景)
 10. [分阶段落地路线（云端切片）](#10-分阶段落地路线云端切片)
-11. [已移除 / 推迟的机制（2026-11-24 / 2026-11-27 修订）](#11-已移除--推迟的机制2026-11-24--2026-11-27-修订)
+11. [已移除 / 推迟的机制（2026-11-24 / 2026-11-28 修订）](#11-已移除--推迟的机制2026-11-24--2026-11-28-修订)
 
 ---
 
@@ -117,8 +117,8 @@ flowchart TD
 | 9 | **批量阈值（M2）** | 滚动 24 小时内新建碎纸标记超过 `N` 个时，超出部分 `state = pending_confirm`（`not_before_ms = null`，**不开始计时**）；收到确认请求后转为 `scheduled`，记录 `confirmed_at_ms`，`not_before_ms = confirmed_at_ms + max(grace_ms, T_grace_min)`。 |
 | 9a | **密钥竞态校验（M1 验 `KEY_UNKNOWN`，M2 全套）** | push 中需 BDEK 的 op（`BlockContent` / `BufferMeta`）携带明文 `key_id`，其余 op 为 `null`，DO 存入 `ops.key_id`（建部分索引 `idx_ops_key`）。同一批按 **「密钥记录 → 撤销 → op → 新建碎纸标记」** 顺序在一个事务内校验并原子提交：(a) op 引用 `executed` 或不存在的 `key_id` → `KEY_SHREDDED` / `KEY_UNKNOWN`；(b)（M2）op 引用已有 `pending_confirm` / `scheduled` 标记的 `key_id`，且同批未先撤销 → `KEY_PENDING_SHRED`；(c)（M2）新建标记的 `key_id` 在本批事务之前已存在 `seq > seen_seq` 的远端 op → `SHRED_STALE`。任一失败整批回滚，不分配 `seq`。语义见 [`sync-protocol.md`](./sync-protocol.md) §5.6。 |
 | 10 | **DO alarm 到期置空密钥（M2）** | alarm 触发时，对所有 `state = scheduled` 且 `not_before_ms ≤ now` 的标记，把对应 `block_keys.key_record` 置空、标记置为 `executed` 并记录时间；处理须幂等。 |
-| 11 | **每日归档** | 同一 alarm 每日把新增 op 密文追加归档到 R2，并写密钥表快照（`latest.mnks` + `history/<yyyy-mm-dd>.mnks`，见 [§3.3](#33-r2-布局归档快照与生命周期)）。 |
-| 12 | **手机状态快照存储（M2）** | 接收桌面发布的状态快照，在同一 `journal_epoch` 内按 `covers_seq` 单调接受，保留最近 2 份（[§3.3](#33-r2-布局归档快照与生命周期)）。 |
+| 11 | **每日归档** | 同一 alarm 每日把新增 op 密文追加归档到 R2，并写密钥表快照（`latest.mnks` + `history/<yyyy-mm-dd>.mnks`，见 [§3.3](#33-r2-布局归档快照与生命周期含-m6-类别前置多租户隔离)）。 |
+| 12 | **手机状态快照存储（M2）** | 接收桌面发布的状态快照，在同一 `journal_epoch` 内按 `covers_seq` 单调接受，保留最近 2 份（[§3.3](#33-r2-布局归档快照与生命周期含-m6-类别前置多租户隔离)）。 |
 | 13 | **首台引导与一次性领取配对 / 刷新** | `POST /v1/devices/bootstrap` 凭部署环境变量 `BOOTSTRAP_TOKEN` 注册首台桌面（或全设备丢失后重新接入）；`POST /v1/devices`（`read-write`）与 `POST /v1/devices/:id/refresh` 暂存桌面用 `K_pair` 加密的密文（**服务端不接触明文 `device_token` 或 `K_pair`**，TTL 10 分钟）；`POST /v1/devices/pair-claim` 凭 128 位 `pair_id` **首次领取即删除**，超时未领由 alarm 删除票据并清理未激活的预注册设备。形状见 [`interface-contracts.md`](./interface-contracts.md) §4.2 (5)。 |
 | 14 | **独立图文剪贴板滚动中继与流式 R2（M4，D8 / D8′）** | 维护物理隔离的 `clip_items` 滚动索引（`primary` 默认保留最近 **1,000 条** / **30 天 TTL**，M6 受邀空间默认 **500 条** / **14 天 TTL**，绝不进入每日 op 归档与手机快照）：`POST /v1/clip` 存 `≤ 64 KiB` 小文本（不受 R2 大对象配额阻塞），或对 `ephemeral: true`（`≤ 256 KiB`）执行**零 SQLite / 零 R2 写入**直接广播给在线 `read-write` 桌面 WS（无在线桌面返 `409 NO_ONLINE_DESKTOP`）；`PUT /v1/clip/blob` 执行两段硬配额校验（`primary` `5 GiB`，M6 受邀空间默认 `512 MiB`；超限返 `507 CLIP_QUOTA_EXCEEDED` 并回滚 R2）后流式写 R2；`GET /v1/clip` 支持 `has_more` 分页与 `quota` 返回；`GET /v1/clip/:clip_id/blob` 流式直出；`POST /v1/clip/prune` 与 `DELETE /v1/clip[?scope=cloud\|all]` 支持作用域清理；超条数淘汰、清理与 alarm 到期均分批调用 `R2.delete(keys[])`（单批 ≤ 1,000 键）。 |
 | 15 | **受控无账号多租户路由、惰性 DO 与防自锁设备管理（M6，D11）** | 零 KV / D1，每个空间映射独立 `SyncJournalDO`（`idFromName(space_id)`，运营者存量空间保留 `"primary"`）：① Worker 边缘凭单一 `SPACE_MASTER_SECRET` 派生的 `K_route` / `K_invite` 预校验自路由令牌、配对 ID 与一次性离线邀请码，非法请求在边缘直接 `401/400` 拦截（**0 次 DO 唤醒**）；② `SyncJournalDO` 构造函数执行**惰性只读探测**，未激活空间（`space_initialized != '1'`）除有效 `POST /v1/spaces/create` 外一律返回 `401/404` 且**零建表、零写行、零设 Alarm**；③ 单空间硬配额（默认 `max_devices=12`、`ops_quota_bytes=256 MiB`、`clip=512 MiB / 500 条 / 14 天`）；④ `DELETE /v1/devices/:id` 强制禁止吊销最后一台活跃 `read-write` 桌面（`409 LAST_ADMIN_DEVICE_REFUSED`）；⑤ `POST /v1/spaces/recover/*` 采用 **DO 纯内存有界挑战 Map**（上限 3 条、TTL 5m，0 SQLite 写）+ 原生 WebCrypto `Ed25519` 验签实现全设备丢失自助重连。 |
@@ -140,7 +140,7 @@ flowchart TD
 2. **唤醒通道（DO WebSocket Hibernation）—— 桌面间亚秒级**：
    - 客户端在线时保持一条极轻的 Hibernatable WebSocket（开启 `ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"))`，心跳在边缘直接回复，不唤醒 DO）。
    - **差异化刷盘策略**（桌面）：普通连续打字防抖 `400–500 ms` 并在本地 outbox 合并同一块连续编辑；检测到 **粘贴事件（`paste`）/ 窗口失焦（`blur`）/ CLI 写入** 时走**快车道（`0–100 ms` 立即触发 HTTP `push`）**。
-   - **只发唤醒通知**：DO 提交后只广播 `{ type: "wake", epoch, head_seq }`；接收端发现 `head_seq > local_seq` 即走 HTTP `pull`。相比「WS 携带 op」多一次 pull 往返，但服务端更薄、只有一条数据路径；是否改为携带 op 由数据触发（[§11](#11-已移除--推迟的机制2026-11-24)）。
+   - **只发唤醒通知**：DO 提交后只广播 `{ type: "wake", epoch, head_seq }`；接收端发现 `head_seq > local_seq` 即走 HTTP `pull`。相比「WS 携带 op」多一次 pull 往返，但服务端更薄、只有一条数据路径；是否改为携带 op 由数据触发（[§11](#11-已移除--推迟的机制2026-11-24--2026-11-28-修订)）。
 
 | 跨设备复制粘贴链路 | 目标 P95 端到端延迟 | 体验与保障机制 |
 | --- | :---: | --- |
@@ -219,7 +219,7 @@ INV-RECOVERY（零设备 + 恢复包 + 本地导出的 R2 归档目录 → 恢�
 
 - 日上行：500 ops × 1.2 KB ≈ 0.6 MB/日 ≈ 220 MB/年 [估算]；10 GB ÷ 220 MB/年 ≈ 45 年 [估算]。
 - 大块成本：300 KB JSON 经 zstd 压缩后约 30–60 KB；每天对大块做 50 次全量推送约 1.5–3 MB/日 [估算]，仍在量级之内，因此不需要 `SPAN_PATCH`。
-- 新桌面全量 pull（第 1 年末）约 220 MB [估算]，桌面可接受；手机改用状态快照引导（[§3.3](#33-r2-布局归档快照与生命周期)）。
+- 新桌面全量 pull（第 1 年末）约 220 MB [估算]，桌面可接受；手机改用状态快照引导（[§3.3](#33-r2-布局归档快照与生命周期含-m6-类别前置多租户隔离)）。
 
 ### 5.2 Spend Management（支出告警）配置建议
 
