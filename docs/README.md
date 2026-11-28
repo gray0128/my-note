@@ -27,5 +27,5 @@
 
 - S0 阶段：[`s0-1-editor-architecture.md`](./spikes/s0-1-editor-architecture.md)、[`s0-2-macos-tauri-shell.md`](./spikes/s0-2-macos-tauri-shell.md)、[`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md)、[`s0-4-cloudflare-relay.md`](./spikes/s0-4-cloudflare-relay.md)
 - S-Clip 阶段：[`s-clip-1-ios-shortcuts.md`](./spikes/s-clip-1-ios-shortcuts.md)、[`s-clip-2-pwa-wasm-image.md`](./spikes/s-clip-2-pwa-wasm-image.md)、[`s-clip-3-macos-pasteboard.md`](./spikes/s-clip-3-macos-pasteboard.md)、[`s-clip-4-hyprland-wayland.md`](./spikes/s-clip-4-hyprland-wayland.md)、[`s-clip-5-cf-r2-streaming.md`](./spikes/s-clip-5-cf-r2-streaming.md)
-- M5 规划阶段（待执行）：`s-plugin-1-wasmi.md`（`wasmi` 体积与双宿主门禁实测）、`s-win-1-platform.md`（Windows 原语 `windows-latest` 实测）
+- M5 阶段：[`s-plugin-1-wasmi.md`](./spikes/s-plugin-1-wasmi.md)（`wasmi` 2.0.3 体积与双宿主门禁实测）、`s-win-1-platform.md`（Windows 原语 `windows-latest` 实测，待执行）
 - M6 规划阶段（待执行）：`s-mt-1-multi-tenant.md`（`workerd` 原生 `Ed25519` ↔ Rust 互通与惰性 DO 零写库零 Alarm 实测）
