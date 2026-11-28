@@ -12,8 +12,11 @@ import type {
   ClipKind,
   ClipListResponse,
   ClipPromoteResponse,
+  ClipPruneInput,
+  ClipPruneResponse,
   ClipPushImageInput,
   ClipPushResponse,
+  ClipScope,
   ClipUndoResponse,
   ClipWatchResponse,
   LocalWsFrame,
@@ -194,12 +197,13 @@ export interface LocalApiClient {
   ): Promise<BlockDto>;
   formatSnippet(input: { content: string; lang: string; action?: string; block_id?: string }): Promise<{ formatted: string }>;
   syncNow(): Promise<SyncStatusDto>;
-  listClips?(opts?: { limit?: number; kind?: ClipKind }): Promise<ClipListResponse>;
+  listClips?(opts?: { limit?: number; before_id?: string; kind?: ClipKind; q?: string }): Promise<ClipListResponse>;
   pushClipText?(input: { text: string; ephemeral?: boolean }): Promise<ClipPushResponse>;
   pushClipImage?(input: Omit<ClipPushImageInput, "kind">): Promise<ClipPushResponse>;
   getClipBlob?(clipId: string): Promise<{ blob: Blob; contentType: string }>;
   deleteClip?(clipId: string): Promise<ClipDeleteResponse>;
-  clearClips?(): Promise<ClipDeleteResponse>;
+  clearClips?(scope?: ClipScope): Promise<ClipDeleteResponse>;
+  pruneClips?(input: ClipPruneInput): Promise<ClipPruneResponse>;
   applyClip?(clipId: string): Promise<ClipApplyResponse>;
   promoteClip?(clipId: string, opts?: { buffer_id?: string; lang?: string }): Promise<ClipPromoteResponse>;
   undoClip?(): Promise<ClipUndoResponse>;
@@ -275,8 +279,10 @@ export function createLocalApiClient(): LocalApiClient {
     syncNow: () => reqJson<SyncStatusDto>("/v1/local/sync/now", { method: "POST" }),
     listClips: (opts) => {
       const params = new URLSearchParams();
-      params.set("limit", String(opts?.limit ?? 100));
+      params.set("limit", String(opts?.limit ?? 50));
+      if (opts?.before_id) params.set("before_id", opts.before_id);
       if (opts?.kind) params.set("kind", opts.kind);
+      if (opts?.q && opts.q.trim()) params.set("q", opts.q.trim());
       return reqJson<ClipListResponse>(`/v1/local/clip?${params.toString()}`);
     },
     pushClipText: (input) =>
@@ -295,7 +301,15 @@ export function createLocalApiClient(): LocalApiClient {
       }),
     getClipBlob: (clipId) => reqBlob(`/v1/local/clip/${encodeURIComponent(clipId)}/blob`),
     deleteClip: (clipId) => reqJson<ClipDeleteResponse>(`/v1/local/clip/${encodeURIComponent(clipId)}`, { method: "DELETE" }),
-    clearClips: () => reqJson<ClipDeleteResponse>("/v1/local/clip", { method: "DELETE" }),
+    clearClips: (scope) => {
+      const qs = scope ? `?scope=${encodeURIComponent(scope)}` : "";
+      return reqJson<ClipDeleteResponse>(`/v1/local/clip${qs}`, { method: "DELETE" });
+    },
+    pruneClips: (input) =>
+      reqJson<ClipPruneResponse>("/v1/local/clip/prune", {
+        method: "POST",
+        body: JSON.stringify(input),
+      }),
     applyClip: (clipId) => reqJson<ClipApplyResponse>(`/v1/local/clip/${encodeURIComponent(clipId)}/apply`, { method: "POST" }),
     promoteClip: (clipId, opts) =>
       reqJson<ClipPromoteResponse>(`/v1/local/clip/${encodeURIComponent(clipId)}/promote`, {

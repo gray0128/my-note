@@ -1,4 +1,8 @@
-//! Independent 100-item text & bitmap clipboard channel (`MNC1` dual-payload codec + `ClipKey`).
+//! Independent text & bitmap clipboard channel (`MNC1` dual-payload codec + `ClipKey`).
+//!
+//! Tiered retention (D8′):
+//! - Cloud relay window: up to `1,000` items, `30 days` TTL, `5 GiB` R2 blob hard quota guard.
+//! - Desktop local store: unbounded archive with manual prune/delete (no automatic eviction).
 //!
 //! SSOT references:
 //! - Wire layout, AAD & `ClipMetaV1` / `ClipKeyMaterialV1`: `docs/data-structures.md` §3.2, §3.3, §3.8
@@ -40,10 +44,20 @@ pub const CLIP_BLOB_ENVELOPE_MAX_BYTES: usize = 10 * 1024 * 1024 + 512 * 1024;
 pub const CLIP_EPHEMERAL_MAX_BYTES: usize = 256 * 1024;
 /// Maximum decoded thumbnail size (`16 KiB`).
 pub const CLIP_THUMB_MAX_BYTES: usize = 16 * 1024;
-/// Maximum number of retained items in the ring queue (`100`).
-pub const CLIP_MAX_ITEMS: usize = 100;
-/// Default clipboard retention TTL (`7 days` in milliseconds).
-pub const CLIP_DEFAULT_TTL_MS: i64 = 7 * 86_400_000;
+/// Maximum number of retained items in the cloud relay rolling window (`1,000`).
+pub const CLIP_CLOUD_MAX_ITEMS: usize = 1000;
+/// Alias for the cloud relay rolling window size (`1,000`).
+pub const CLIP_MAX_ITEMS: usize = CLIP_CLOUD_MAX_ITEMS;
+/// Maximum items returned per single cloud `GET /v1/clip` page (`100`, bounds Worker memory).
+pub const CLIP_PAGE_MAX_ITEMS: usize = 100;
+/// Default cloud clipboard retention TTL (`30 days` in milliseconds).
+pub const CLIP_CLOUD_TTL_MS: i64 = 30 * 86_400_000;
+/// Alias for default cloud clipboard retention TTL (`30 days` in milliseconds).
+pub const CLIP_DEFAULT_TTL_MS: i64 = CLIP_CLOUD_TTL_MS;
+/// Hard cloud R2 blob storage quota guard (`5 GiB` = `5,368,709,120` bytes).
+pub const CLIP_CLOUD_QUOTA_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+/// Warning threshold for cloud R2 blob storage (`4 GiB` = 80% of 5 GiB).
+pub const CLIP_CLOUD_QUOTA_WARN_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Maximum UTF-8 JSON length for regular DO-stored `ClipMetaV1` (`96 KiB`).
 pub const CLIP_META_JSON_MAX_BYTES: usize = 96 * 1024;

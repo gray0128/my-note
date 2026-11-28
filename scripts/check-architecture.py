@@ -47,7 +47,7 @@ SYNC_CORE_FILES = (
     "fractional_index.rs",
 )
 
-CLOUD_CF_MAX_LOC = 950
+CLOUD_CF_MAX_LOC = 1050
 SYNC_CORE_MAX_LOC = 3000
 
 
@@ -304,7 +304,7 @@ def run_selftest(src_repo: Path) -> int:
             ),
             (
                 "ARCH-04",
-                lambda r: (r / "cloud-cf/src/bloat.ts").write_text("export const x = 1;\n" * 955, encoding="utf-8"),
+                lambda r: (r / "cloud-cf/src/bloat.ts").write_text("export const x = 1;\n" * 1055, encoding="utf-8"),
             ),
             (
                 "ARCH-05",

@@ -4,9 +4,12 @@ import { b64ToBytes, bytesEqual, bytesToB64, computeKeysDigest, encodeMna1, enco
 export interface Env {
   SYNC_DO: DurableObjectNamespace<SyncJournalDO>; ARCHIVE_BUCKET: R2Bucket; BOOTSTRAP_TOKEN: string; ASSETS?: Fetcher;
   DAILY_ARCHIVE_INTERVAL_MS?: string; PAIRING_TTL_MS?: string; T_GRACE_MIN_MS?: string; SHRED_BATCH_LIMIT_24H?: string; ALLOW_TEST_HOOKS?: string;
+  CLIP_MAX_ITEMS?: string; CLIP_TTL_MS?: string; CLIP_QUOTA_BYTES?: string;
 }
 type Scope = "read" | "read+clip" | "clip-write" | "read-write";
 type ClipKind = "text" | "image";
+type ClipClearScope = "cloud" | "all";
+interface ClipQuotaOut { used_bytes: number; limit_bytes: number; item_count: number; item_limit: number; }
 interface WsMeta { deviceId: string; scope: Scope; }
 interface KeyRecIn { key_id: string; wrap_gen: number; key_record_b64: string; }
 interface ShredMarkIn { mark_id: string; key_id: string; grace_ms: number; requested_by?: string; }
@@ -17,9 +20,11 @@ const cancelBody = async (req: Request): Promise<void> => { if (req.body && !req
 const VALID_SCOPES = new Set<string>(["read", "read+clip", "clip-write", "read-write"]);
 const isScope = (v: unknown): v is Scope => typeof v === "string" && VALID_SCOPES.has(v);
 const isClipKind = (v: unknown): v is ClipKind => v === "text" || v === "image";
+const isClearScope = (v: unknown): v is ClipClearScope => v === "cloud" || v === "all";
 const MAX_PUSH_OPS = 500, MAX_PUSH_BYTES = 4 * 1024 * 1024, MAX_ARCHIVE_BYTES = 8 * 1024 * 1024, MAX_SNAP_BYTES = 16 * 1024 * 1024;
-const CLIP_MAX_ITEMS = 100, CLIP_MAX_META_BYTES = 96 * 1024, CLIP_MAX_BLOB_META_BYTES = 32 * 1024, CLIP_MAX_BLOB_BYTES = 11_010_048, CLIP_MAX_EPHEMERAL_BYTES = 256 * 1024, MAX_CLIP_JSON_BYTES = 512 * 1024;
-const HEX64 = /^[0-9a-f]{64}$/i, DEV_ID_RE = /^dev_[a-z0-9_]{4,44}$/, SNAP_ID_RE = /^[0-9A-Za-z_-]{1,64}$/, ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/, INT_RE = /^\d+$/, DAY_MS = 86_400_000, WEEK_MS = 7 * DAY_MS, CLIP_TTL_MS = WEEK_MS;
+const CLIP_MAX_ITEMS_DEFAULT = 1000, CLIP_LIST_PAGE_MAX = 100, CLIP_QUOTA_BYTES_DEFAULT = 5 * 1024 * 1024 * 1024;
+const CLIP_MAX_META_BYTES = 96 * 1024, CLIP_MAX_BLOB_META_BYTES = 32 * 1024, CLIP_MAX_BLOB_BYTES = 11_010_048, CLIP_MAX_EPHEMERAL_BYTES = 256 * 1024, MAX_CLIP_JSON_BYTES = 512 * 1024;
+const HEX64 = /^[0-9a-f]{64}$/i, DEV_ID_RE = /^dev_[a-z0-9_]{4,44}$/, SNAP_ID_RE = /^[0-9A-Za-z_-]{1,64}$/, ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/, INT_RE = /^\d+$/, DAY_MS = 86_400_000, WEEK_MS = 7 * DAY_MS, CLIP_TTL_MS_DEFAULT = 30 * DAY_MS;
 const posInt = (raw: string | undefined, def: number): number => { const n = Number(raw); return Number.isSafeInteger(n) && n > 0 ? n : def; };
 const buildPwaCsp = (u: URL): string => `default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data: blob:; font-src 'self'; manifest-src 'self'; worker-src 'self'; connect-src 'self' ${u.protocol === "http:" ? "ws:" : "wss:"}//${u.host}; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`;
 
@@ -28,6 +33,9 @@ export class SyncJournalDO extends DurableObject<Env> {
   private epoch = "";
   private clockOffsetMs = 0;
   private failNextClipBlobRegister = false;
+  private clipMaxItemsOverride: number | null = null;
+  private clipTtlMsOverride: number | null = null;
+  private clipQuotaBytesOverride: number | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -41,13 +49,29 @@ export class SyncJournalDO extends DurableObject<Env> {
   private tGraceMinMs(): number { return posInt(this.env.T_GRACE_MIN_MS, DAY_MS); }
   private shredBatchLimit24h(): number { return posInt(this.env.SHRED_BATCH_LIMIT_24H, 20); }
   private pairingTtlMs(): number { return posInt(this.env.PAIRING_TTL_MS, 600_000); }
+  private clipMaxItems(): number { return this.clipMaxItemsOverride ?? posInt(this.env.CLIP_MAX_ITEMS, CLIP_MAX_ITEMS_DEFAULT); }
+  private clipTtlMs(): number { return this.clipTtlMsOverride ?? posInt(this.env.CLIP_TTL_MS, CLIP_TTL_MS_DEFAULT); }
+  private clipQuotaBytes(): number { return this.clipQuotaBytesOverride ?? posInt(this.env.CLIP_QUOTA_BYTES, CLIP_QUOTA_BYTES_DEFAULT); }
   private nowMs(): number { return Date.now() + this.clockOffsetMs; }
   private headSeq(): number { return Number(this.sql.exec(`SELECT COALESCE(MAX(seq), 0) AS h FROM ops`).toArray()[0]?.h ?? 0); }
   private metaGet(key: string): string | null { const r = this.sql.exec(`SELECT value FROM journal_meta WHERE key = ?`, key).toArray()[0]; return r ? String(r.value) : null; }
   private metaSet(key: string, val: string): void { this.sql.exec(`INSERT OR REPLACE INTO journal_meta (key, value) VALUES (?, ?)`, key, val); }
+  private clipQuota(now: number): ClipQuotaOut {
+    const r = this.sql.exec(
+      `SELECT COUNT(*) AS cnt, COALESCE(SUM(CASE WHEN r2_key IS NOT NULL THEN COALESCE(blob_bytes, 0) ELSE 0 END), 0) AS bytes FROM clip_items WHERE expires_at_ms > ?`,
+      now,
+    ).toArray()[0];
+    return { used_bytes: Number(r?.bytes ?? 0), limit_bytes: this.clipQuotaBytes(), item_count: Number(r?.cnt ?? 0), item_limit: this.clipMaxItems() };
+  }
 
   setClockOffsetMs(offsetMs: number): number { this.assertTestHook(); this.clockOffsetMs = offsetMs; return this.nowMs(); }
   setFailNextClipBlobRegister(fail: boolean): void { this.assertTestHook(); this.failNextClipBlobRegister = fail; }
+  setClipLimitsForTest(opts: { maxItems?: number | null; ttlMs?: number | null; quotaBytes?: number | null }): void {
+    this.assertTestHook();
+    if (opts.maxItems !== undefined) this.clipMaxItemsOverride = opts.maxItems;
+    if (opts.ttlMs !== undefined) this.clipTtlMsOverride = opts.ttlMs;
+    if (opts.quotaBytes !== undefined) this.clipQuotaBytesOverride = opts.quotaBytes;
+  }
   runInitSchemaForTest(): void { this.assertTestHook(); this.initSchema(); }
   async simulateWakeupReschedule(): Promise<number | null> { this.assertTestHook(); await this.rescheduleAlarm(this.nowMs()); return this.ctx.storage.getAlarm(); }
   simulatePitrRollback(keepSeq: number, newEpoch?: string): string {
@@ -252,12 +276,15 @@ export class SyncJournalDO extends DurableObject<Env> {
   }
 
   private async deleteR2Keys(keys: string[]): Promise<void> {
-    for (const k of keys) { try { await this.env.ARCHIVE_BUCKET.delete(k); } catch { /* best-effort R2 cleanup */ } }
+    for (let i = 0; i < keys.length; i += 1000) {
+      const chunk = keys.slice(i, i + 1000);
+      try { await this.env.ARCHIVE_BUCKET.delete(chunk); } catch { /* best-effort R2 cleanup */ }
+    }
   }
 
   private pruneClipOverflow(): string[] {
     const evicted: string[] = [];
-    for (const r of this.sql.exec(`SELECT clip_id, r2_key FROM clip_items ORDER BY clip_id DESC LIMIT -1 OFFSET ?`, CLIP_MAX_ITEMS).toArray()) {
+    for (const r of this.sql.exec(`SELECT clip_id, r2_key FROM clip_items ORDER BY clip_id DESC LIMIT -1 OFFSET ?`, this.clipMaxItems()).toArray()) {
       this.sql.exec(`DELETE FROM clip_items WHERE clip_id = ?`, r.clip_id);
       if (r.r2_key !== null) evicted.push(String(r.r2_key));
     }
@@ -322,7 +349,7 @@ export class SyncJournalDO extends DurableObject<Env> {
       return jsonRes({ ok: true, clip_id: b.clip_id, delivered_to: deliveredTo });
     }
     if (envBytes.byteLength > CLIP_MAX_META_BYTES) throw new RelayError(413, "PAYLOAD_TOO_LARGE", "clip meta envelope exceeds 96 KiB");
-    let createdAtMs = now, expiresAtMs = now + CLIP_TTL_MS, inserted = false, evictedR2Keys: string[] = [];
+    let createdAtMs = now, expiresAtMs = now + this.clipTtlMs(), inserted = false, evictedR2Keys: string[] = [];
     this.ctx.storage.transactionSync(() => {
       this.sql.exec(`UPDATE devices SET last_seen_at_ms = ? WHERE device_id = ?`, now, auth.deviceId);
       const existing = this.sql.exec(`SELECT created_at_ms, expires_at_ms FROM clip_items WHERE clip_id = ?`, b.clip_id as string).toArray()[0];
@@ -333,7 +360,7 @@ export class SyncJournalDO extends DurableObject<Env> {
     });
     if (evictedR2Keys.length > 0) await this.deleteR2Keys(evictedR2Keys);
     if (inserted) { await this.rescheduleAlarm(now); this.broadcastClip(auth.deviceId, { type: "clip_wake", clip_id: b.clip_id, kind: "text", created_at_ms: createdAtMs }); }
-    return jsonRes({ ok: true, clip_id: b.clip_id, created_at_ms: createdAtMs, expires_at_ms: expiresAtMs });
+    return jsonRes({ ok: true, clip_id: b.clip_id, created_at_ms: createdAtMs, expires_at_ms: expiresAtMs, quota: this.clipQuota(now) });
   }
 
   private async handleClipBlobPut(req: Request, auth: WsMeta, now: number): Promise<Response> {
@@ -349,7 +376,14 @@ export class SyncJournalDO extends DurableObject<Env> {
     const existing0 = this.sql.exec(`SELECT created_at_ms, expires_at_ms, blob_bytes FROM clip_items WHERE clip_id = ?`, clipId).toArray()[0];
     if (existing0) {
       await cancelBody(req);
-      return jsonRes({ ok: true, clip_id: clipId, blob_bytes: Number(existing0.blob_bytes ?? contentLength), created_at_ms: Number(existing0.created_at_ms), expires_at_ms: Number(existing0.expires_at_ms) });
+      return jsonRes({ ok: true, clip_id: clipId, blob_bytes: Number(existing0.blob_bytes ?? contentLength), created_at_ms: Number(existing0.created_at_ms), expires_at_ms: Number(existing0.expires_at_ms), quota: this.clipQuota(now) });
+    }
+    const preQuota = this.clipQuota(now);
+    if (preQuota.used_bytes + contentLength > preQuota.limit_bytes) {
+      await cancelBody(req);
+      throw new RelayError(507, "CLIP_QUOTA_EXCEEDED", `cloud clip storage quota exceeded (${preQuota.used_bytes} + ${contentLength} > ${preQuota.limit_bytes} bytes)`, false, {
+        used_bytes: preQuota.used_bytes, limit_bytes: preQuota.limit_bytes, incoming_bytes: contentLength,
+      });
     }
     const r2Key = `clip/blobs/${clipId}.mnc1`;
     const fixed = new FixedLengthStream(contentLength);
@@ -362,12 +396,18 @@ export class SyncJournalDO extends DurableObject<Env> {
       const reason = pipeRes.status === "rejected" ? String(pipeRes.reason) : putRes.status === "rejected" ? String(putRes.reason) : "R2 put returned null";
       throw new RelayError(400, "INVALID_ARGUMENT", `CONTENT_LENGTH_MISMATCH: ${reason}`);
     }
-    let createdAtMs = now, expiresAtMs = now + CLIP_TTL_MS, blobBytes = contentLength, inserted = false, evictedR2Keys: string[] = [];
+    let createdAtMs = now, expiresAtMs = now + this.clipTtlMs(), blobBytes = contentLength, inserted = false, evictedR2Keys: string[] = [];
     try {
       this.ctx.storage.transactionSync(() => {
         if (this.failNextClipBlobRegister) { this.failNextClipBlobRegister = false; throw new RelayError(503, "SYNC_OFFLINE", "injected DO clip registration failure", true); }
         const existing = this.sql.exec(`SELECT created_at_ms, expires_at_ms, blob_bytes FROM clip_items WHERE clip_id = ?`, clipId).toArray()[0];
         if (existing) { createdAtMs = Number(existing.created_at_ms); expiresAtMs = Number(existing.expires_at_ms); blobBytes = Number(existing.blob_bytes ?? contentLength); return; }
+        const txQuota = this.clipQuota(now);
+        if (txQuota.used_bytes + contentLength > txQuota.limit_bytes) {
+          throw new RelayError(507, "CLIP_QUOTA_EXCEEDED", `cloud clip storage quota exceeded (${txQuota.used_bytes} + ${contentLength} > ${txQuota.limit_bytes} bytes)`, false, {
+            used_bytes: txQuota.used_bytes, limit_bytes: txQuota.limit_bytes, incoming_bytes: contentLength,
+          });
+        }
         this.sql.exec(`INSERT INTO clip_items (clip_id, clip_kid, device_id, kind, created_at_ms, expires_at_ms, meta_envelope, r2_key, blob_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, clipId, clipKid, auth.deviceId, kind, createdAtMs, expiresAtMs, metaBytes, r2Key, contentLength);
         evictedR2Keys = this.pruneClipOverflow();
         inserted = true;
@@ -378,7 +418,7 @@ export class SyncJournalDO extends DurableObject<Env> {
     }
     if (evictedR2Keys.length > 0) await this.deleteR2Keys(evictedR2Keys);
     if (inserted) { await this.rescheduleAlarm(now); this.broadcastClip(auth.deviceId, { type: "clip_wake", clip_id: clipId, kind, created_at_ms: createdAtMs }); }
-    return jsonRes({ ok: true, clip_id: clipId, blob_bytes: blobBytes, created_at_ms: createdAtMs, expires_at_ms: expiresAtMs });
+    return jsonRes({ ok: true, clip_id: clipId, blob_bytes: blobBytes, created_at_ms: createdAtMs, expires_at_ms: expiresAtMs, quota: this.clipQuota(now) });
   }
 
   async fetch(req: Request): Promise<Response> {
@@ -457,16 +497,63 @@ export class SyncJournalDO extends DurableObject<Env> {
     if (req.method === "GET" && path === "/v1/clip") {
       const sinceId = url.searchParams.get("since_id") ?? "";
       if (sinceId && !ULID_RE.test(sinceId)) throw new RelayError(400, "INVALID_ARGUMENT", "invalid since_id");
-      const limit = Math.min(CLIP_MAX_ITEMS, Math.max(1, Number.parseInt(url.searchParams.get("limit") ?? String(CLIP_MAX_ITEMS), 10) || CLIP_MAX_ITEMS));
-      const rows = this.sql.exec(`SELECT clip_id, clip_kid, device_id, kind, created_at_ms, expires_at_ms, meta_envelope, r2_key, blob_bytes FROM clip_items WHERE expires_at_ms > ? AND clip_id > ? ORDER BY clip_id ASC LIMIT ?`, now, sinceId, limit).toArray();
+      const limit = Math.min(CLIP_LIST_PAGE_MAX, Math.max(1, Number.parseInt(url.searchParams.get("limit") ?? String(CLIP_LIST_PAGE_MAX), 10) || CLIP_LIST_PAGE_MAX));
+      const rows = this.sql.exec(`SELECT clip_id, clip_kid, device_id, kind, created_at_ms, expires_at_ms, meta_envelope, r2_key, blob_bytes FROM clip_items WHERE expires_at_ms > ? AND clip_id > ? ORDER BY clip_id ASC LIMIT ?`, now, sinceId, limit + 1).toArray();
+      const hasMore = rows.length > limit;
+      const page = rows.slice(0, limit);
+      const nextSinceId = page.length > 0 ? String(page[page.length - 1].clip_id) : (sinceId || null);
       return jsonRes({
         ok: true,
-        items: rows.map((r) => ({
+        items: page.map((r) => ({
           clip_id: String(r.clip_id), clip_kid: String(r.clip_kid), device_id: String(r.device_id), kind: String(r.kind),
           created_at_ms: Number(r.created_at_ms), expires_at_ms: Number(r.expires_at_ms), meta_envelope_b64: bytesToB64(toU8(r.meta_envelope)),
           has_blob: r.r2_key !== null, blob_bytes: r.blob_bytes === null ? null : Number(r.blob_bytes),
         })),
+        has_more: hasMore,
+        next_since_id: nextSinceId,
+        quota: this.clipQuota(now),
       });
+    }
+
+    if (req.method === "POST" && path === "/v1/clip/prune") {
+      if (auth.scope === "read") throw new RelayError(403, "TOKEN_SCOPE_FORBIDDEN", "read-only token cannot prune clip items");
+      const b = (await req.json()) as { before_ms?: unknown; keep_latest?: unknown; kind?: unknown; dry_run?: unknown };
+      const beforeMs = b.before_ms === undefined || b.before_ms === null ? null : Number(b.before_ms);
+      const keepLatest = b.keep_latest === undefined || b.keep_latest === null ? null : Number(b.keep_latest);
+      const kind = b.kind === undefined || b.kind === null ? null : b.kind;
+      const dryRun = Boolean(b.dry_run);
+      if (beforeMs !== null && (!Number.isSafeInteger(beforeMs) || beforeMs < 0)) throw new RelayError(400, "INVALID_ARGUMENT", "before_ms must be a non-negative integer");
+      if (keepLatest !== null && (!Number.isSafeInteger(keepLatest) || keepLatest < 0)) throw new RelayError(400, "INVALID_ARGUMENT", "keep_latest must be a non-negative integer");
+      if (kind !== null && !isClipKind(kind)) throw new RelayError(400, "INVALID_ARGUMENT", "kind must be 'text' or 'image'");
+      if (beforeMs === null && keepLatest === null && kind === null) throw new RelayError(400, "INVALID_ARGUMENT", "at least one of before_ms, keep_latest, or kind is required");
+      let matchedCount = 0, freedBytes = 0;
+      const r2Keys: string[] = [];
+      this.ctx.storage.transactionSync(() => {
+        const rows = kind !== null
+          ? this.sql.exec(`SELECT clip_id, created_at_ms, r2_key, blob_bytes FROM clip_items WHERE kind = ? ORDER BY created_at_ms DESC, clip_id DESC`, kind).toArray()
+          : this.sql.exec(`SELECT clip_id, created_at_ms, r2_key, blob_bytes FROM clip_items ORDER BY created_at_ms DESC, clip_id DESC`).toArray();
+        const toDelete: string[] = [];
+        for (let idx = 0; idx < rows.length; idx++) {
+          const r = rows[idx];
+          if (keepLatest !== null && idx < keepLatest) continue;
+          if (beforeMs !== null && Number(r.created_at_ms) >= beforeMs) continue;
+          toDelete.push(String(r.clip_id));
+          if (r.r2_key !== null) {
+            r2Keys.push(String(r.r2_key));
+            freedBytes += Number(r.blob_bytes ?? 0);
+          }
+        }
+        matchedCount = toDelete.length;
+        if (!dryRun && toDelete.length > 0) {
+          for (const cid of toDelete) this.sql.exec(`DELETE FROM clip_items WHERE clip_id = ?`, cid);
+        }
+      });
+      if (!dryRun && matchedCount > 0) {
+        if (r2Keys.length > 0) await this.deleteR2Keys(r2Keys);
+        await this.rescheduleAlarm(now);
+        this.broadcastClip(auth.deviceId, { type: "clip_cleared", clip_id: null, scope: "cloud", pruned: true });
+      }
+      return jsonRes({ ok: true, dry_run: dryRun, matched_count: matchedCount, deleted_count: dryRun ? 0 : matchedCount, freed_bytes: freedBytes, quota: this.clipQuota(now) });
     }
 
     const clipBlobMatch = path.match(/^\/v1\/clip\/([^/]+)\/blob$/);
@@ -491,14 +578,21 @@ export class SyncJournalDO extends DurableObject<Env> {
       if (auth.scope === "read") throw new RelayError(403, "TOKEN_SCOPE_FORBIDDEN", "read-only token cannot delete clip items");
       const targetId = clipDelMatch[1] ? decodeURIComponent(clipDelMatch[1]) : null;
       if (targetId !== null && !ULID_RE.test(targetId)) throw new RelayError(400, "INVALID_ARGUMENT", "invalid clip_id");
-      let deletedCount = 0;
+      const rawScope = url.searchParams.get("scope");
+      const clearScope: ClipClearScope = targetId !== null ? "all" : (rawScope === null ? "cloud" : (isClearScope(rawScope) ? rawScope : (() => { throw new RelayError(400, "INVALID_ARGUMENT", "scope must be 'cloud' or 'all'"); })()));
+      let deletedCount = 0, freedBytes = 0;
       const r2Keys: string[] = [];
       this.ctx.storage.transactionSync(() => {
         const rows = targetId !== null
-          ? this.sql.exec(`SELECT clip_id, r2_key FROM clip_items WHERE clip_id = ?`, targetId).toArray()
-          : this.sql.exec(`SELECT clip_id, r2_key FROM clip_items`).toArray();
+          ? this.sql.exec(`SELECT clip_id, r2_key, blob_bytes FROM clip_items WHERE clip_id = ?`, targetId).toArray()
+          : this.sql.exec(`SELECT clip_id, r2_key, blob_bytes FROM clip_items`).toArray();
         deletedCount = rows.length;
-        for (const r of rows) if (r.r2_key !== null) r2Keys.push(String(r.r2_key));
+        for (const r of rows) {
+          if (r.r2_key !== null) {
+            r2Keys.push(String(r.r2_key));
+            freedBytes += Number(r.blob_bytes ?? 0);
+          }
+        }
         if (deletedCount > 0) {
           if (targetId !== null) this.sql.exec(`DELETE FROM clip_items WHERE clip_id = ?`, targetId);
           else this.sql.exec(`DELETE FROM clip_items`);
@@ -506,8 +600,8 @@ export class SyncJournalDO extends DurableObject<Env> {
       });
       if (r2Keys.length > 0) await this.deleteR2Keys(r2Keys);
       await this.rescheduleAlarm(now);
-      this.broadcastClip(auth.deviceId, { type: "clip_cleared", clip_id: targetId });
-      return jsonRes({ ok: true, deleted_count: deletedCount });
+      this.broadcastClip(auth.deviceId, { type: "clip_cleared", clip_id: targetId, scope: clearScope });
+      return jsonRes({ ok: true, deleted_count: deletedCount, freed_bytes: freedBytes, ...(targetId === null ? { scope: clearScope } : {}), quota: this.clipQuota(now) });
     }
 
     if (req.method === "GET" && path === "/v1/sync/ws" && req.headers.get("upgrade")?.toLowerCase() === "websocket") {
@@ -607,7 +701,9 @@ export class SyncJournalDO extends DurableObject<Env> {
         key_records?: KeyRecIn[];
         key_material?: { keyring?: { gen: number; blob_b64: string }; vault_header?: { gen: number; blob_b64: string }; clip_key?: { gen: number; blob_b64: string } };
         clear_clips?: boolean;
+        clear_clips_scope?: unknown;
       };
+      const clearClipsScope: ClipClearScope = b.clear_clips_scope === undefined ? "cloud" : (isClearScope(b.clear_clips_scope) ? b.clear_clips_scope : (() => { throw new RelayError(400, "INVALID_ARGUMENT", "clear_clips_scope must be 'cloud' or 'all'"); })());
       const ackedKeyIds: string[] = [], matGens: { keyring?: number; vault_header?: number; clip_key?: number } = {}, clearedR2Keys: string[] = [];
       this.ctx.storage.transactionSync(() => {
         for (const rec of b.key_records ?? []) { this.upsertKeyRecord(rec, auth.deviceId, now); ackedKeyIds.push(rec.key_id); }
@@ -622,7 +718,7 @@ export class SyncJournalDO extends DurableObject<Env> {
       if (b.clear_clips === true) {
         if (clearedR2Keys.length > 0) await this.deleteR2Keys(clearedR2Keys);
         await this.rescheduleAlarm(now);
-        this.broadcastClip(auth.deviceId, { type: "clip_cleared", clip_id: null });
+        this.broadcastClip(auth.deviceId, { type: "clip_cleared", clip_id: null, scope: clearClipsScope, key_rotated: true });
       }
       if (ackedKeyIds.length > 0 || Object.keys(matGens).length > 0) this.broadcastWake(auth.deviceId, this.headSeq());
       return jsonRes({ ok: true, acked_key_ids: ackedKeyIds, key_material_gens: matGens });

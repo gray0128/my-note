@@ -5,8 +5,9 @@ pub mod schema;
 pub mod store;
 
 pub use clip_store::{
-    ClipCache, ClipItemRow, GeneratedClipKey, StoredClipKeyMaterial, UnwrappedClipKey, CLIP_CACHE_MAX_BYTES,
-    CLIP_CACHE_MAX_FILES, CLIP_LOCAL_MAX_ITEMS,
+    ClipCache, ClipItemRow, ClipListPage, ClipListQuery, ClipPruneFilter, ClipPruneResult, GeneratedClipKey,
+    LocalClipStats, StoredClipKeyMaterial, UnwrappedClipKey, CLIP_CACHE_MAX_BYTES, CLIP_CACHE_MAX_FILES,
+    CLIP_LOCAL_DEFAULT_PAGE_LIMIT, CLIP_LOCAL_MAX_ITEMS, CLIP_LOCAL_MAX_PAGE_LIMIT,
 };
 pub use credentials::DeviceCredentials;
 pub use store::{

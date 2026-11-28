@@ -159,9 +159,17 @@ export interface ApiErrorBody {
 }
 
 export type ClipKind = "text" | "image";
+export type ClipScope = "local" | "cloud" | "all";
 export type ClipSourceMode = "explicit" | "auto";
 export type ClipAutoApplyMirrorMode = "inbox-only" | "auto-apply";
 export type AllowedClipImageMime = "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+
+export interface CloudClipQuotaDto {
+  used_bytes: number;
+  limit_bytes: number;
+  item_count: number;
+  item_limit: number;
+}
 
 export interface ClipItemDto {
   clip_id: string;
@@ -185,10 +193,34 @@ export interface ClipItemDto {
 
 export interface ClipListResponse {
   items: ClipItemDto[];
+  has_more?: boolean;
+  total_count?: number;
+  local_blob_bytes?: number;
+  local_blob_files?: number;
+  uncached_blob_items?: number;
+  cloud_quota?: CloudClipQuotaDto | null;
   has_undo: boolean;
   watch_enabled: boolean;
   watch_paused: boolean;
   auto_apply_mirror: ClipAutoApplyMirrorMode;
+}
+
+export interface ClipPruneInput {
+  scope: ClipScope;
+  before_days?: number;
+  before_ms?: number;
+  keep_latest?: number;
+  kind?: ClipKind;
+  dry_run?: boolean;
+}
+
+export interface ClipPruneResponse {
+  dry_run: boolean;
+  scope: ClipScope;
+  matched_count: number;
+  deleted_count: number;
+  freed_bytes: number;
+  cloud_quota?: CloudClipQuotaDto | null;
 }
 
 export interface ClipPushTextInput {
@@ -216,6 +248,11 @@ export interface ClipPushResponse {
 
 export interface ClipDeleteResponse {
   deleted_count: number;
+  scope?: ClipScope;
+  local_deleted?: number;
+  cloud_deleted?: number;
+  freed_bytes?: number;
+  cloud_quota?: CloudClipQuotaDto | null;
 }
 
 export interface ClipApplyResponse {
@@ -267,6 +304,7 @@ export type LocalWsFrame =
       watch_enabled?: boolean;
       watch_paused: boolean;
       auto_apply_mirror?: ClipAutoApplyMirrorMode;
+      cloud_quota?: CloudClipQuotaDto | null;
     }
   | AlertFrame;
 

@@ -1,8 +1,9 @@
-import type { LocalApiClient } from "../api";
+import { LocalApiError, type LocalApiClient } from "../api";
 import {
   bytesToBase64Chunked,
+  CLIP_CLOUD_QUOTA_WARN_RATIO,
   CLIP_EPHEMERAL_MAX_BYTES,
-  CLIP_MAX_ITEMS,
+  CLIP_PAGE_LIMIT,
   extForClipMime,
   formatClipBytes,
   generateBitmapThumbnail,
@@ -12,7 +13,15 @@ import {
 import { formatDeviceName, formatHistoryTimestamp, t } from "../i18n";
 import { createIcon } from "../icons";
 import { formatShortcutTitle, SHORTCUT_NEW_BLOCK } from "../shortcuts";
-import type { BlockDto, ClipAutoApplyMirrorMode, ClipItemDto, ClipKind } from "../types";
+import type {
+  BlockDto,
+  ClipAutoApplyMirrorMode,
+  ClipItemDto,
+  ClipKind,
+  ClipPruneInput,
+  ClipScope,
+  CloudClipQuotaDto,
+} from "../types";
 
 export interface ClipDrawerCallbacks {
   getActiveBufferId: () => string | null;
@@ -30,15 +39,16 @@ export interface ClipWsChangeFrame {
   watch_enabled?: boolean;
   watch_paused: boolean;
   auto_apply_mirror?: ClipAutoApplyMirrorMode;
+  cloud_quota?: CloudClipQuotaDto | null;
 }
 
+type CleanupRuleKey = "30d" | "7d" | "keep200" | "images" | "all";
+
 function sortClipsDesc(items: readonly ClipItemDto[]): ClipItemDto[] {
-  return [...items]
-    .sort((a, b) => {
-      if (b.created_at_ms !== a.created_at_ms) return b.created_at_ms - a.created_at_ms;
-      return b.clip_id < a.clip_id ? -1 : b.clip_id > a.clip_id ? 1 : 0;
-    })
-    .slice(0, CLIP_MAX_ITEMS);
+  return [...items].sort((a, b) => {
+    if (b.created_at_ms !== a.created_at_ms) return b.created_at_ms - a.created_at_ms;
+    return b.clip_id < a.clip_id ? -1 : b.clip_id > a.clip_id ? 1 : 0;
+  });
 }
 
 export class ClipDrawerController {
@@ -47,7 +57,19 @@ export class ClipDrawerController {
 
   private openState = false;
   private items: ClipItemDto[] = [];
+  private totalCount = 0;
+  private hasMore = false;
+  private loadingMore = false;
+  private localBlobBytes = 0;
+  private cloudQuota: CloudClipQuotaDto | null = null;
   private filterKind: "all" | ClipKind = "all";
+  private searchQuery = "";
+  private searchTimer: number | null = null;
+  private cleanupOpen = false;
+  private cleanupScope: ClipScope = "local";
+  private cleanupRule: CleanupRuleKey = "30d";
+  private cleanupPreviewText = "";
+  private cleanupBusy = false;
   private hasUndo = false;
   private watchEnabled = false;
   private watchPaused = false;
@@ -61,10 +83,18 @@ export class ClipDrawerController {
   private countPillEl!: HTMLSpanElement;
   private closeBtnEl!: HTMLButtonElement;
   private undoBtnEl!: HTMLButtonElement;
+  private cleanupToggleBtnEl!: HTMLButtonElement;
   private clearBtnEl!: HTMLButtonElement;
   private watchBtnEl!: HTMLButtonElement;
   private watchPauseBtnEl!: HTMLButtonElement;
   private watchModeBtnEl!: HTMLButtonElement;
+  private storageBarEl!: HTMLElement;
+  private cleanupPanelEl!: HTMLElement;
+  private cleanupScopeSelEl!: HTMLSelectElement;
+  private cleanupRuleSelEl!: HTMLSelectElement;
+  private cleanupPreviewBtnEl!: HTMLButtonElement;
+  private cleanupRunBtnEl!: HTMLButtonElement;
+  private cleanupPreviewEl!: HTMLElement;
   private composerInputEl!: HTMLTextAreaElement;
   private ephemeralCheckEl!: HTMLInputElement;
   private ephemeralTextEl!: HTMLSpanElement;
@@ -74,6 +104,8 @@ export class ClipDrawerController {
   private sendBtnEl!: HTMLButtonElement;
   private errorEl!: HTMLElement;
   private filterBarEl!: HTMLElement;
+  private searchInputEl!: HTMLInputElement;
+  private filterSegEl!: HTMLElement;
   private listEl!: HTMLElement;
   private previewModalEl!: HTMLElement;
   private previewTitleEl!: HTMLSpanElement;
@@ -125,6 +157,10 @@ export class ClipDrawerController {
   }
 
   destroy(): void {
+    if (this.searchTimer !== null) {
+      window.clearTimeout(this.searchTimer);
+      this.searchTimer = null;
+    }
     this.closeImagePreview();
   }
 
@@ -132,7 +168,7 @@ export class ClipDrawerController {
     return this.items;
   }
 
-  async refresh(opts: { silent?: boolean } = {}): Promise<void> {
+  async refresh(opts: { silent?: boolean; append?: boolean } = {}): Promise<void> {
     if (!this.api.listClips) {
       if (!opts.silent) {
         this.setError(t("clip.errApiUnavailable"));
@@ -140,21 +176,56 @@ export class ClipDrawerController {
       }
       return;
     }
+    const append = Boolean(opts.append);
+    const beforeId = append ? this.items[this.items.length - 1]?.clip_id : undefined;
+    if (append) {
+      if (this.loadingMore || !this.hasMore || !beforeId) return;
+      this.loadingMore = true;
+      this.renderList();
+    }
     try {
-      const res = await this.api.listClips({ limit: CLIP_MAX_ITEMS });
-      this.items = sortClipsDesc(res.items);
+      const res = await this.api.listClips({
+        limit: CLIP_PAGE_LIMIT,
+        ...(beforeId ? { before_id: beforeId } : {}),
+        ...(this.filterKind !== "all" ? { kind: this.filterKind } : {}),
+        ...(this.searchQuery.trim() ? { q: this.searchQuery.trim() } : {}),
+      });
+      if (append) {
+        const byId = new Map<string, ClipItemDto>();
+        for (const it of this.items) byId.set(it.clip_id, it);
+        for (const it of res.items) byId.set(it.clip_id, it);
+        this.items = sortClipsDesc([...byId.values()]);
+      } else {
+        this.items = sortClipsDesc(res.items);
+      }
+      this.hasMore = Boolean(res.has_more);
+      this.totalCount = res.total_count ?? this.items.length;
+      if (res.local_blob_bytes !== undefined) {
+        this.localBlobBytes = res.local_blob_bytes;
+      }
+      if (res.cloud_quota !== undefined) {
+        this.cloudQuota = res.cloud_quota;
+      }
       this.hasUndo = res.has_undo;
       this.watchEnabled = res.watch_enabled;
       this.watchPaused = res.watch_paused;
       this.autoApplyMirror = res.auto_apply_mirror;
-      this.cb.onCountChange?.(this.items.length);
+      if (this.filterKind === "all" && !this.searchQuery.trim()) {
+        this.cb.onCountChange?.(this.totalCount);
+      }
       this.renderHeaderState();
+      this.renderStorageBar();
       if (this.openState) {
         this.renderList();
       }
     } catch (e) {
       if (!opts.silent) {
         this.cb.onError(e);
+      }
+    } finally {
+      if (append) {
+        this.loadingMore = false;
+        if (this.openState) this.renderList();
       }
     }
   }
@@ -167,21 +238,38 @@ export class ClipDrawerController {
     if (frame.auto_apply_mirror !== undefined) {
       this.autoApplyMirror = frame.auto_apply_mirror;
     }
+    if (frame.cloud_quota !== undefined) {
+      this.cloudQuota = frame.cloud_quota;
+    }
+    const prevIds = new Set(this.items.map((x) => x.clip_id));
     const byId = new Map<string, ClipItemDto>();
     if (!frame.cleared) {
       for (const item of this.items) {
         byId.set(item.clip_id, item);
       }
+    } else {
+      this.totalCount = 0;
+      this.hasMore = false;
+      this.localBlobBytes = 0;
     }
+    let removedExisting = 0;
     for (const delId of frame.deleted_ids) {
-      byId.delete(delId);
+      if (byId.delete(delId)) removedExisting++;
     }
+    let addedNew = 0;
     for (const up of frame.upserted) {
+      if (!prevIds.has(up.clip_id) || frame.cleared) addedNew++;
       byId.set(up.clip_id, up);
     }
     this.items = sortClipsDesc([...byId.values()]);
-    this.cb.onCountChange?.(this.items.length);
+    if (frame.cleared) {
+      this.totalCount = this.items.length;
+    } else {
+      this.totalCount = Math.max(this.items.length, this.totalCount - removedExisting + addedNew);
+    }
+    this.cb.onCountChange?.(this.totalCount);
     this.renderHeaderState();
+    this.renderStorageBar();
     if (this.openState) {
       this.renderList();
     }
@@ -198,11 +286,14 @@ export class ClipDrawerController {
     this.ephemeralTextEl.textContent = t("clip.ephemeral");
     this.fileLabelTextEl.textContent = t("clip.pickImage");
     this.fileLabelEl.title = t("clip.pickImageTitle");
+    this.searchInputEl.placeholder = t("clip.searchPlaceholder");
     this.previewTitleEl.textContent = t("clip.previewModalTitle");
     this.previewCloseBtnEl.setAttribute("aria-label", t("topbar.close"));
     this.previewCloseBtnEl.title = t("topbar.close");
 
     this.renderHeaderState();
+    this.renderStorageBar();
+    this.renderCleanupPanel();
     this.renderFilterBar();
     this.renderList();
   }
@@ -243,7 +334,7 @@ export class ClipDrawerController {
     this.closeBtnEl.addEventListener("click", () => this.close());
     hdr.append(titleGroup, this.closeBtnEl);
 
-    // Header actions row: Undo Overwrite & Clear All
+    // Header actions row: Undo Overwrite, Cleanup, & Clear All
     const actionsRow = document.createElement("div");
     actionsRow.className = "drawer-actions clip-header-actions";
 
@@ -253,13 +344,27 @@ export class ClipDrawerController {
     this.undoBtnEl.dataset.testid = "clip-undo-btn";
     this.undoBtnEl.addEventListener("click", () => void this.handleUndo());
 
+    const rightActions = document.createElement("div");
+    rightActions.className = "clip-composer-buttons";
+
+    this.cleanupToggleBtnEl = document.createElement("button");
+    this.cleanupToggleBtnEl.type = "button";
+    this.cleanupToggleBtnEl.className = "btn btn-ghost btn-icon";
+    this.cleanupToggleBtnEl.dataset.testid = "clip-cleanup-btn";
+    this.cleanupToggleBtnEl.addEventListener("click", () => {
+      this.cleanupOpen = !this.cleanupOpen;
+      this.cleanupPreviewText = "";
+      this.renderCleanupPanel();
+    });
+
     this.clearBtnEl = document.createElement("button");
     this.clearBtnEl.type = "button";
     this.clearBtnEl.className = "btn btn-ghost btn-danger btn-icon";
     this.clearBtnEl.dataset.testid = "clip-clear-btn";
     this.clearBtnEl.addEventListener("click", () => void this.handleClearAll());
 
-    actionsRow.append(this.undoBtnEl, this.clearBtnEl);
+    rightActions.append(this.cleanupToggleBtnEl, this.clearBtnEl);
+    actionsRow.append(this.undoBtnEl, rightActions);
 
     // Compact Auto-Watch control strip (honest enabled/paused/receive-mode state)
     const watchBar = document.createElement("div");
@@ -285,6 +390,58 @@ export class ClipDrawerController {
     this.watchModeBtnEl.addEventListener("click", () => void this.handleToggleWatchMode());
 
     watchBar.append(this.watchBtnEl, this.watchPauseBtnEl, this.watchModeBtnEl);
+
+    // Local archive & cloud 5 GiB quota bar
+    this.storageBarEl = document.createElement("div");
+    this.storageBarEl.className = "clip-storage-bar";
+    this.storageBarEl.dataset.testid = "clip-storage-bar";
+
+    // Collapsible manual cleanup panel
+    this.cleanupPanelEl = document.createElement("div");
+    this.cleanupPanelEl.className = "clip-cleanup-panel hidden";
+    this.cleanupPanelEl.dataset.testid = "clip-cleanup-panel";
+
+    const cleanupRow1 = document.createElement("div");
+    cleanupRow1.className = "clip-cleanup-row";
+    this.cleanupScopeSelEl = document.createElement("select");
+    this.cleanupScopeSelEl.className = "input clip-cleanup-select";
+    this.cleanupScopeSelEl.dataset.testid = "clip-cleanup-scope";
+    this.cleanupScopeSelEl.addEventListener("change", () => {
+      this.cleanupScope = this.cleanupScopeSelEl.value as ClipScope;
+      this.cleanupPreviewText = "";
+      this.renderCleanupPanel();
+    });
+    this.cleanupRuleSelEl = document.createElement("select");
+    this.cleanupRuleSelEl.className = "input clip-cleanup-select";
+    this.cleanupRuleSelEl.dataset.testid = "clip-cleanup-rule";
+    this.cleanupRuleSelEl.addEventListener("change", () => {
+      this.cleanupRule = this.cleanupRuleSelEl.value as CleanupRuleKey;
+      this.cleanupPreviewText = "";
+      this.renderCleanupPanel();
+    });
+    cleanupRow1.append(this.cleanupScopeSelEl, this.cleanupRuleSelEl);
+
+    const cleanupRow2 = document.createElement("div");
+    cleanupRow2.className = "clip-cleanup-row";
+    this.cleanupPreviewBtnEl = document.createElement("button");
+    this.cleanupPreviewBtnEl.type = "button";
+    this.cleanupPreviewBtnEl.className = "btn btn-ghost btn-icon";
+    this.cleanupPreviewBtnEl.dataset.testid = "clip-cleanup-preview-btn";
+    this.cleanupPreviewBtnEl.addEventListener("click", () => void this.handleCleanup(true));
+
+    this.cleanupRunBtnEl = document.createElement("button");
+    this.cleanupRunBtnEl.type = "button";
+    this.cleanupRunBtnEl.className = "btn btn-danger btn-icon";
+    this.cleanupRunBtnEl.dataset.testid = "clip-cleanup-run-btn";
+    this.cleanupRunBtnEl.addEventListener("click", () => void this.handleCleanup(false));
+
+    cleanupRow2.append(this.cleanupPreviewBtnEl, this.cleanupRunBtnEl);
+
+    this.cleanupPreviewEl = document.createElement("div");
+    this.cleanupPreviewEl.className = "clip-cleanup-preview hidden";
+    this.cleanupPreviewEl.dataset.testid = "clip-cleanup-preview";
+
+    this.cleanupPanelEl.append(cleanupRow1, cleanupRow2, this.cleanupPreviewEl);
 
     // Composer
     const composer = document.createElement("div");
@@ -364,16 +521,43 @@ export class ClipDrawerController {
 
     composer.append(this.composerInputEl, controlsRow, this.errorEl);
 
-    // Kind filter bar
+    // Kind filter & search bar
     this.filterBarEl = document.createElement("div");
     this.filterBarEl.className = "clip-filter-bar";
 
-    // 100-item list
+    this.searchInputEl = document.createElement("input");
+    this.searchInputEl.type = "search";
+    this.searchInputEl.className = "input clip-search-input";
+    this.searchInputEl.placeholder = t("clip.searchPlaceholder");
+    this.searchInputEl.dataset.testid = "clip-search-input";
+    this.searchInputEl.addEventListener("input", () => {
+      this.searchQuery = this.searchInputEl.value;
+      if (this.searchTimer !== null) window.clearTimeout(this.searchTimer);
+      this.searchTimer = window.setTimeout(() => {
+        this.searchTimer = null;
+        void this.refresh({ silent: true });
+      }, 180);
+    });
+
+    this.filterSegEl = document.createElement("div");
+    this.filterSegEl.className = "mode-seg clip-filter-seg";
+    this.filterBarEl.append(this.searchInputEl, this.filterSegEl);
+
+    // Paginated archive list
     this.listEl = document.createElement("div");
     this.listEl.className = "drawer-list clip-list";
     this.listEl.dataset.testid = "clip-list";
 
-    this.element.append(hdr, actionsRow, watchBar, composer, this.filterBarEl, this.listEl);
+    this.element.append(
+      hdr,
+      actionsRow,
+      watchBar,
+      this.storageBarEl,
+      this.cleanupPanelEl,
+      composer,
+      this.filterBarEl,
+      this.listEl,
+    );
 
     // Image Preview Modal
     this.previewModalEl = document.createElement("div");
@@ -404,6 +588,8 @@ export class ClipDrawerController {
     this.previewBackdropEl.appendChild(this.previewModalEl);
 
     this.renderHeaderState();
+    this.renderStorageBar();
+    this.renderCleanupPanel();
     this.renderFilterBar();
     this.renderList();
   }
@@ -441,13 +627,17 @@ export class ClipDrawerController {
   }
 
   private renderHeaderState(): void {
-    this.countPillEl.textContent = t("clip.count", { count: this.items.length });
+    const shownCount = Math.max(this.totalCount, this.items.length);
+    this.countPillEl.textContent = t("clip.count", { count: shownCount });
 
     this.undoBtnEl.disabled = !this.hasUndo;
     this.undoBtnEl.title = t("clip.undoTitle");
     const undoLbl = document.createElement("span");
     undoLbl.textContent = t("clip.undo");
     this.undoBtnEl.replaceChildren(createIcon("rotate-ccw", "xs"), undoLbl);
+
+    this.cleanupToggleBtnEl.setAttribute("aria-expanded", String(this.cleanupOpen));
+    this.cleanupToggleBtnEl.textContent = t("clip.cleanup");
 
     this.watchBtnEl.setAttribute("aria-pressed", String(this.watchEnabled));
     this.watchBtnEl.className = `btn btn-icon btn-has-icon${
@@ -483,7 +673,7 @@ export class ClipDrawerController {
       ? t("clip.watchModeAutoApplyTitle")
       : t("clip.watchModeInboxTitle");
 
-    this.clearBtnEl.disabled = this.items.length === 0;
+    this.clearBtnEl.disabled = this.items.length === 0 && this.totalCount === 0;
     this.clearBtnEl.textContent = t("clip.clearAll");
 
     this.sendBtnEl.disabled = this.sending;
@@ -493,15 +683,106 @@ export class ClipDrawerController {
     this.sendBtnEl.replaceChildren(createIcon("send", "xs"), sendLbl);
   }
 
+  private renderStorageBar(): void {
+    this.storageBarEl.replaceChildren();
+    const row = document.createElement("div");
+    row.className = "clip-storage-row";
+
+    const localSpan = document.createElement("span");
+    localSpan.textContent = t("clip.storageLocal", {
+      count: Math.max(this.totalCount, this.items.length),
+      bytes: formatClipBytes(this.localBlobBytes) || "0 B",
+    });
+    row.appendChild(localSpan);
+
+    if (this.cloudQuota) {
+      const q = this.cloudQuota;
+      const cloudSpan = document.createElement("span");
+      cloudSpan.textContent = t("clip.storageCloud", {
+        used: formatClipBytes(q.used_bytes) || "0 B",
+        limit: formatClipBytes(q.limit_bytes) || "5.00 GiB",
+        items: q.item_count,
+        max: q.item_limit,
+      });
+      row.appendChild(cloudSpan);
+    }
+    this.storageBarEl.appendChild(row);
+
+    if (this.cloudQuota && this.cloudQuota.limit_bytes > 0) {
+      const ratio = this.cloudQuota.used_bytes / this.cloudQuota.limit_bytes;
+      const pct = Math.min(100, Math.round(ratio * 100));
+      const meter = document.createElement("progress");
+      meter.className = `clip-quota-meter${ratio >= 1 ? " is-full" : ratio >= CLIP_CLOUD_QUOTA_WARN_RATIO ? " is-warn" : ""}`;
+      meter.max = 100;
+      meter.value = pct;
+      meter.dataset.testid = "clip-quota-meter";
+      this.storageBarEl.appendChild(meter);
+
+      if (ratio >= CLIP_CLOUD_QUOTA_WARN_RATIO) {
+        const warn = document.createElement("div");
+        warn.className = `clip-quota-warn${ratio >= 1 ? " is-full" : ""}`;
+        warn.dataset.testid = "clip-quota-warn";
+        warn.textContent = ratio >= 1 ? t("clip.quotaFull") : t("clip.quotaWarn");
+        this.storageBarEl.appendChild(warn);
+      }
+    }
+  }
+
+  private renderCleanupPanel(): void {
+    this.cleanupPanelEl.classList.toggle("hidden", !this.cleanupOpen);
+    this.cleanupToggleBtnEl.setAttribute("aria-expanded", String(this.cleanupOpen));
+
+    const scopes: readonly { value: ClipScope; label: string }[] = [
+      { value: "local", label: t("clip.cleanupScopeLocal") },
+      { value: "cloud", label: t("clip.cleanupScopeCloud") },
+      { value: "all", label: t("clip.cleanupScopeAll") },
+    ];
+    this.cleanupScopeSelEl.replaceChildren();
+    for (const sc of scopes) {
+      const opt = document.createElement("option");
+      opt.value = sc.value;
+      opt.textContent = sc.label;
+      opt.selected = sc.value === this.cleanupScope;
+      this.cleanupScopeSelEl.appendChild(opt);
+    }
+
+    const rules: readonly { value: CleanupRuleKey; label: string }[] = [
+      { value: "30d", label: t("clip.cleanupRule30d") },
+      { value: "7d", label: t("clip.cleanupRule7d") },
+      { value: "keep200", label: t("clip.cleanupRuleKeep200") },
+      { value: "images", label: t("clip.cleanupRuleImages") },
+      { value: "all", label: t("clip.cleanupRuleAll") },
+    ];
+    this.cleanupRuleSelEl.replaceChildren();
+    for (const r of rules) {
+      const opt = document.createElement("option");
+      opt.value = r.value;
+      opt.textContent = r.label;
+      opt.selected = r.value === this.cleanupRule;
+      this.cleanupRuleSelEl.appendChild(opt);
+    }
+
+    this.cleanupPreviewBtnEl.textContent = t("clip.cleanupPreview");
+    this.cleanupPreviewBtnEl.disabled = this.cleanupBusy || this.cleanupRule === "all";
+    this.cleanupRunBtnEl.textContent = t("clip.cleanupExecute");
+    this.cleanupRunBtnEl.disabled = this.cleanupBusy;
+
+    if (this.cleanupPreviewText) {
+      this.cleanupPreviewEl.textContent = this.cleanupPreviewText;
+      this.cleanupPreviewEl.classList.remove("hidden");
+    } else {
+      this.cleanupPreviewEl.textContent = "";
+      this.cleanupPreviewEl.classList.add("hidden");
+    }
+  }
+
   private renderFilterBar(): void {
-    this.filterBarEl.replaceChildren();
+    this.filterSegEl.replaceChildren();
     const modes: readonly { key: "all" | ClipKind; label: string }[] = [
       { key: "all", label: t("clip.filterAll") },
       { key: "text", label: t("clip.filterText") },
       { key: "image", label: t("clip.filterImage") },
     ];
-    const seg = document.createElement("div");
-    seg.className = "mode-seg clip-filter-seg";
     for (const m of modes) {
       const btn = document.createElement("button");
       btn.type = "button";
@@ -512,11 +793,14 @@ export class ClipDrawerController {
       btn.addEventListener("click", () => {
         this.filterKind = m.key;
         this.renderFilterBar();
-        this.renderList();
+        if (this.searchQuery.trim() || this.hasMore) {
+          void this.refresh({ silent: true });
+        } else {
+          this.renderList();
+        }
       });
-      seg.appendChild(btn);
+      this.filterSegEl.appendChild(btn);
     }
-    this.filterBarEl.appendChild(seg);
   }
 
   private renderList(): void {
@@ -533,6 +817,17 @@ export class ClipDrawerController {
 
     for (const item of visible) {
       this.listEl.appendChild(this.renderClipCard(item));
+    }
+
+    if (this.hasMore) {
+      const moreBtn = document.createElement("button");
+      moreBtn.type = "button";
+      moreBtn.className = "btn btn-ghost clip-load-more";
+      moreBtn.dataset.testid = "clip-load-more";
+      moreBtn.disabled = this.loadingMore;
+      moreBtn.textContent = this.loadingMore ? t("clip.loadingMore") : t("clip.loadMore");
+      moreBtn.addEventListener("click", () => void this.refresh({ append: true }));
+      this.listEl.appendChild(moreBtn);
     }
   }
 
@@ -717,11 +1012,23 @@ export class ClipDrawerController {
         this.cb.onFeedback(t("clip.toastSent"));
       }
     } catch (e) {
-      this.cb.onError(e);
+      this.handleUploadError(e);
     } finally {
       this.sending = false;
       this.renderHeaderState();
     }
+  }
+
+  private handleUploadError(e: unknown): void {
+    if (e instanceof LocalApiError && e.body.code === "CLIP_QUOTA_EXCEEDED") {
+      this.setError(t("clip.quotaFull"));
+      this.cleanupOpen = true;
+      this.cleanupScope = "cloud";
+      this.cleanupRule = "images";
+      this.cleanupPreviewText = "";
+      this.renderCleanupPanel();
+    }
+    this.cb.onError(e);
   }
 
   private async handleSendImageFile(file: File): Promise<void> {
@@ -765,7 +1072,7 @@ export class ClipDrawerController {
       }
       this.cb.onFeedback(t("clip.toastSent"));
     } catch (e) {
-      this.cb.onError(e);
+      this.handleUploadError(e);
     } finally {
       this.sending = false;
       this.renderHeaderState();
@@ -773,11 +1080,16 @@ export class ClipDrawerController {
   }
 
   private upsertItemLocal(item: ClipItemDto): void {
+    const existed = this.items.some((x) => x.clip_id === item.clip_id);
     const next = this.items.filter((x) => x.clip_id !== item.clip_id);
     next.unshift(item);
     this.items = sortClipsDesc(next);
-    this.cb.onCountChange?.(this.items.length);
+    if (!existed) {
+      this.totalCount = Math.max(this.items.length, this.totalCount + 1);
+    }
+    this.cb.onCountChange?.(this.totalCount);
     this.renderHeaderState();
+    this.renderStorageBar();
     this.renderList();
   }
 
@@ -866,10 +1178,18 @@ export class ClipDrawerController {
   private async handleDelete(item: ClipItemDto): Promise<void> {
     if (!this.api.deleteClip) return;
     try {
-      await this.api.deleteClip(item.clip_id);
+      const res = await this.api.deleteClip(item.clip_id);
+      const beforeLen = this.items.length;
       this.items = this.items.filter((x) => x.clip_id !== item.clip_id);
-      this.cb.onCountChange?.(this.items.length);
+      if (this.items.length < beforeLen) {
+        this.totalCount = Math.max(this.items.length, this.totalCount - 1);
+      }
+      if (res.cloud_quota !== undefined) {
+        this.cloudQuota = res.cloud_quota;
+      }
+      this.cb.onCountChange?.(this.totalCount);
       this.renderHeaderState();
+      this.renderStorageBar();
       this.renderList();
       this.cb.onFeedback(t("clip.toastDeleted"));
     } catch (e) {
@@ -894,14 +1214,105 @@ export class ClipDrawerController {
   private async handleClearAll(): Promise<void> {
     if (!this.api.clearClips) return;
     try {
-      await this.api.clearClips();
+      const res = await this.api.clearClips();
       this.items = [];
+      this.totalCount = 0;
+      this.hasMore = false;
+      this.localBlobBytes = 0;
+      if (res.cloud_quota !== undefined) {
+        this.cloudQuota = res.cloud_quota;
+      }
       this.cb.onCountChange?.(0);
       this.renderHeaderState();
+      this.renderStorageBar();
       this.renderList();
       this.cb.onFeedback(t("clip.toastCleared"));
     } catch (e) {
       this.cb.onError(e);
+    }
+  }
+
+  private buildPruneInput(dryRun: boolean): ClipPruneInput {
+    const base: ClipPruneInput = { scope: this.cleanupScope, dry_run: dryRun };
+    switch (this.cleanupRule) {
+      case "30d":
+        return { ...base, before_days: 30 };
+      case "7d":
+        return { ...base, before_days: 7 };
+      case "keep200":
+        return { ...base, keep_latest: 200 };
+      case "images":
+        return { ...base, kind: "image" };
+      case "all":
+        return base;
+    }
+  }
+
+  private async handleCleanup(dryRun: boolean): Promise<void> {
+    if (this.cleanupBusy) return;
+    this.cleanupBusy = true;
+    this.renderCleanupPanel();
+    try {
+      if (this.cleanupRule === "all") {
+        if (!this.api.clearClips) return;
+        const res = await this.api.clearClips(this.cleanupScope);
+        if (res.cloud_quota !== undefined) {
+          this.cloudQuota = res.cloud_quota;
+        }
+        if (this.cleanupScope !== "cloud") {
+          this.items = [];
+          this.totalCount = 0;
+          this.hasMore = false;
+          this.localBlobBytes = 0;
+          this.cb.onCountChange?.(0);
+        }
+        this.cleanupPreviewText = "";
+        this.setError(null);
+        this.renderHeaderState();
+        this.renderStorageBar();
+        this.renderList();
+        this.cb.onFeedback(
+          t("clip.toastPruned", {
+            count: res.deleted_count,
+            bytes: formatClipBytes(res.freed_bytes ?? 0) || "0 B",
+          }),
+        );
+        return;
+      }
+
+      if (!this.api.pruneClips) {
+        this.setError(t("clip.errApiUnavailable"));
+        return;
+      }
+      const res = await this.api.pruneClips(this.buildPruneInput(dryRun));
+      if (res.cloud_quota !== undefined) {
+        this.cloudQuota = res.cloud_quota;
+      }
+      if (dryRun) {
+        this.cleanupPreviewText =
+          res.matched_count > 0
+            ? t("clip.cleanupPreviewResult", {
+                count: res.matched_count,
+                bytes: formatClipBytes(res.freed_bytes) || "0 B",
+              })
+            : t("clip.cleanupPreviewNone");
+      } else {
+        this.cleanupPreviewText = "";
+        this.setError(null);
+        await this.refresh({ silent: true });
+        this.cb.onFeedback(
+          t("clip.toastPruned", {
+            count: res.deleted_count,
+            bytes: formatClipBytes(res.freed_bytes) || "0 B",
+          }),
+        );
+      }
+      this.renderStorageBar();
+    } catch (e) {
+      this.cb.onError(e);
+    } finally {
+      this.cleanupBusy = false;
+      this.renderCleanupPanel();
     }
   }
 

@@ -12,7 +12,8 @@ use crate::clipboard::{
     send_clip_notification, ClipboardPayload, ClipboardWriteOpts, ReadClipboardResult,
 };
 use crate::sync_client::{
-    ensure_clip_key_with_mutex, refresh_clip_key_from_remote_with_mutex, CloudWsEvent, RemoteClipItem,
+    ensure_clip_key_with_mutex, refresh_clip_key_from_remote_with_mutex, CloudClipQuota, CloudWsEvent,
+    RemoteClipItem,
 };
 use axum::http::header::CONTENT_TYPE as HTTP_CONTENT_TYPE;
 use mynote_core::clip::{
@@ -22,7 +23,7 @@ use mynote_core::clip::{
     CLIP_PREVIEW_MAX_CHARS, CLIP_THUMB_MAX_BYTES,
 };
 use mynote_core::ids::{ClipId, ClipKid, DeviceId};
-use mynote_store::{ClipItemRow, CLIP_LOCAL_MAX_ITEMS};
+use mynote_store::{ClipItemRow, ClipListQuery, ClipPruneFilter, CLIP_LOCAL_DEFAULT_PAGE_LIMIT};
 use serde::Serialize;
 
 /// Frozen Desktop Web UI <-> Local Daemon DTO (`M4a-3` & `M4a-4` shared contract).
@@ -163,6 +164,16 @@ impl DaemonState {
         self.clip_watch_state.lock().unwrap().clone()
     }
 
+    pub fn cloud_clip_quota_snapshot(&self) -> Option<CloudClipQuota> {
+        self.cloud_clip_quota.lock().unwrap().clone()
+    }
+
+    pub fn update_cloud_clip_quota(&self, quota: Option<CloudClipQuota>) {
+        if let Some(q) = quota {
+            *self.cloud_clip_quota.lock().unwrap() = Some(q);
+        }
+    }
+
     pub fn broadcast_clip_changed(
         &self,
         upserted: Vec<ClipItemDto>,
@@ -170,6 +181,7 @@ impl DaemonState {
         cleared: bool,
     ) {
         let watch = self.clip_watch_snapshot();
+        let quota = self.cloud_clip_quota_snapshot();
         self.broadcast_json(serde_json::json!({
             "type": "clip_changed",
             "upserted": upserted,
@@ -178,7 +190,52 @@ impl DaemonState {
             "watch_enabled": watch.watch_enabled,
             "watch_paused": watch.watch_paused,
             "auto_apply_mirror": watch.auto_apply_mirror,
+            "cloud_quota": quota,
         }));
+    }
+
+    /// Spawn a single-concurrency background task to eagerly fetch and persist remote blobs
+    /// into desktop `clip_cache/` before cloud 30-day TTL expires (D8′).
+    pub fn spawn_clip_blob_prefetch(self: &Arc<Self>) {
+        let st = Arc::clone(self);
+        tokio::spawn(async move {
+            st.prefetch_uncached_clip_blobs().await;
+        });
+    }
+
+    pub async fn prefetch_uncached_clip_blobs(&self) {
+        let Ok(_guard) = self.clip_prefetch_lock.try_lock() else {
+            return;
+        };
+        let rows = {
+            let store = self.store.lock().unwrap();
+            if store.load_credentials().ok().flatten().is_none() {
+                return;
+            }
+            store
+                .list_uncached_remote_blobs(now_ms_daemon(), 50)
+                .unwrap_or_default()
+        };
+        for row in rows {
+            match self.resolve_clip_payload_bytes(&row).await {
+                Ok(_) => {
+                    let dto_opt = {
+                        let store = self.store.lock().unwrap();
+                        let cache = store.clip_cache();
+                        store
+                            .get_clip_item(&row.clip_id)
+                            .ok()
+                            .flatten()
+                            .map(|r| clip_row_to_dto(&r, &cache))
+                    };
+                    if let Some(dto) = dto_opt {
+                        self.broadcast_clip_changed(vec![dto], Vec::new(), false);
+                    }
+                }
+                Err(e) if e.code() == ErrorCode::SyncOffline => break,
+                Err(_) => continue,
+            }
+        }
     }
 
     /// Dispatch a Cloud WS frame into the local Daemon state machine.
@@ -198,6 +255,7 @@ impl DaemonState {
                 let st = Arc::clone(self);
                 tokio::spawn(async move {
                     let _ = st.pull_cloud_clips(true).await;
+                    st.spawn_clip_blob_prefetch();
                 });
             }
             CloudWsEvent::ClipEphemeral {
@@ -213,17 +271,18 @@ impl DaemonState {
                         .await;
                 });
             }
-            CloudWsEvent::ClipCleared { clip_id } => {
+            CloudWsEvent::ClipCleared { clip_id, scope } => {
                 let st = Arc::clone(self);
                 tokio::spawn(async move {
-                    let _ = st.handle_cloud_clip_cleared(clip_id).await;
+                    let _ = st.handle_cloud_clip_cleared(clip_id, scope).await;
                 });
             }
         }
     }
 
-    /// Incrementally pull new clips from the relay, decrypt `MNC1` metadata, upsert into local
-    /// `clip_items` (capped at 100), broadcast `clip_changed`, and optionally auto-apply to OS clipboard.
+    /// Incrementally pull all new clips from the relay's rolling window, decrypt `MNC1` metadata,
+    /// upsert into the unbounded local desktop `clip_items` archive, broadcast `clip_changed`,
+    /// and optionally auto-apply to OS clipboard.
     pub async fn pull_cloud_clips(&self, auto_apply: bool) -> Result<Vec<ClipItemDto>, CoreError> {
         let _guard = self.clip_sync_lock.lock().await;
         let (creds_opt, local_device_id, cursor) = {
@@ -240,8 +299,9 @@ impl DaemonState {
         let client = RelayClient::from_credentials(&creds)?;
         let (mut clip_kid, mut clip_key, _gen) = ensure_clip_key_with_mutex(&self.store, &client).await?;
 
-        let mut remote_items: Vec<RemoteClipItem> =
-            client.clip_list(cursor.as_deref(), CLIP_LOCAL_MAX_ITEMS).await?;
+        let (mut remote_items, quota_opt): (Vec<RemoteClipItem>, Option<CloudClipQuota>) =
+            client.clip_list_all_since(cursor.as_deref()).await?;
+        self.update_cloud_clip_quota(quota_opt);
         if remote_items.is_empty() {
             return Ok(Vec::new());
         }
@@ -319,16 +379,6 @@ impl DaemonState {
             }
             if let Some(ref cur) = max_clip_id {
                 let _ = store.set_clip_cursor(Some(cur));
-            }
-            if let Ok(evicted) = store.trim_clip_items(CLIP_LOCAL_MAX_ITEMS) {
-                for rel in evicted {
-                    let _ = cache.delete(&rel);
-                }
-            }
-            if let Ok(expired) = store.prune_expired_clip_items(now_ms_daemon()) {
-                for rel in expired {
-                    let _ = cache.delete(&rel);
-                }
             }
             let dtos: Vec<ClipItemDto> = upserted_rows
                 .iter()
@@ -478,7 +528,11 @@ impl DaemonState {
         Ok(true)
     }
 
-    pub async fn handle_cloud_clip_cleared(&self, clip_id: Option<String>) -> Result<(), CoreError> {
+    pub async fn handle_cloud_clip_cleared(
+        &self,
+        clip_id: Option<String>,
+        scope: Option<String>,
+    ) -> Result<(), CoreError> {
         if let Some(cid) = clip_id {
             let existed = {
                 let store = self.store.lock().unwrap();
@@ -491,20 +545,40 @@ impl DaemonState {
             if existed {
                 self.broadcast_clip_changed(Vec::new(), vec![cid], false);
             }
-        } else {
+        } else if scope.as_deref() == Some("all") {
             {
                 let store = self.store.lock().unwrap();
                 let _ = store.clear_clip_items()?;
                 let _ = store.clip_cache().clear();
             }
-            self.broadcast_clip_changed(Vec::new(), Vec::new(), true);
-            // Refresh newly rotated ClipKey from relay if configured.
+            // Refresh newly rotated ClipKey and latest cloud quota from relay if configured.
             let creds_opt = self.store.lock().unwrap().load_credentials().ok().flatten();
             if let Some(creds) = creds_opt {
                 if let Ok(client) = RelayClient::from_credentials(&creds) {
                     let _ = refresh_clip_key_from_remote_with_mutex(&self.store, &client).await;
+                    if let Ok(page) = client.clip_list_page(None, 1).await {
+                        self.update_cloud_clip_quota(page.quota);
+                    }
                 }
             }
+            self.broadcast_clip_changed(Vec::new(), Vec::new(), true);
+        } else {
+            // Cloud-only clear/prune or key rotation (default scope="cloud"):
+            // Preserve the desktop local archive untouched; only reset sync cursor, refresh ClipKey & quota.
+            {
+                let store = self.store.lock().unwrap();
+                let _ = store.set_clip_cursor(None);
+            }
+            let creds_opt = self.store.lock().unwrap().load_credentials().ok().flatten();
+            if let Some(creds) = creds_opt {
+                if let Ok(client) = RelayClient::from_credentials(&creds) {
+                    let _ = refresh_clip_key_from_remote_with_mutex(&self.store, &client).await;
+                    if let Ok(page) = client.clip_list_page(None, 1).await {
+                        self.update_cloud_clip_quota(page.quota);
+                    }
+                }
+            }
+            self.broadcast_clip_changed(Vec::new(), Vec::new(), false);
         }
         Ok(())
     }
@@ -798,35 +872,50 @@ impl DaemonState {
 #[derive(Deserialize)]
 pub(super) struct ListClipQuery {
     limit: Option<usize>,
+    before_id: Option<String>,
     kind: Option<String>,
+    q: Option<String>,
 }
 
-/// 1. `GET /v1/local/clip?limit=100&kind=text|image`
+/// 1. `GET /v1/local/clip?limit=50&before_id=&kind=text|image&q=`
 pub(super) async fn handle_list_clips(
     State(state): State<Arc<DaemonState>>,
     Query(q): Query<ListClipQuery>,
 ) -> Response {
-    let limit = q.limit.unwrap_or(CLIP_LOCAL_MAX_ITEMS);
+    let limit = q.limit.unwrap_or(CLIP_LOCAL_DEFAULT_PAGE_LIMIT);
     let res = {
         let store = state.store.lock().unwrap();
         let cache = store.clip_cache();
-        if let Ok(expired) = store.prune_expired_clip_items(now_ms_daemon()) {
-            for rel in expired {
-                let _ = cache.delete(&rel);
-            }
-        }
-        store.list_clip_items(limit, q.kind.as_deref()).map(|rows| {
-            rows.iter()
+        let stats = store.clip_storage_stats();
+        let page = store.list_clip_items_page(&ClipListQuery {
+            limit,
+            before_id: q.before_id.as_deref(),
+            kind: q.kind.as_deref(),
+            query: q.q.as_deref(),
+        });
+        page.and_then(|p| {
+            let st = stats?;
+            let dtos = p
+                .items
+                .iter()
                 .map(|r| clip_row_to_dto(r, &cache))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            Ok((dtos, p.has_more, p.total_count, st))
         })
     };
     match res {
-        Ok(items) => {
+        Ok((items, has_more, total_count, stats)) => {
             let has_undo = state.clip_undo.lock().unwrap().has_undo();
             let watch = state.clip_watch_snapshot();
+            let cloud_quota = state.cloud_clip_quota_snapshot();
             ok_json(serde_json::json!({
                 "items": items,
+                "has_more": has_more,
+                "total_count": total_count,
+                "local_blob_bytes": stats.cached_blob_bytes,
+                "local_blob_files": stats.cached_blob_files,
+                "uncached_blob_items": stats.uncached_blob_items,
+                "cloud_quota": cloud_quota,
                 "has_undo": has_undo,
                 "watch_enabled": watch.watch_enabled,
                 "watch_paused": watch.watch_paused,
@@ -954,6 +1043,7 @@ async fn push_text_clip_persisted(
             if rec.expires_at_ms > 0 {
                 expires_at_ms = rec.expires_at_ms;
             }
+            state.update_cloud_clip_quota(rec.quota);
         } else {
             let rec = client
                 .clip_push_meta(
@@ -970,6 +1060,7 @@ async fn push_text_clip_persisted(
             if let Some(e) = rec.expires_at_ms {
                 expires_at_ms = e;
             }
+            state.update_cloud_clip_quota(rec.quota);
         }
     }
 
@@ -1101,6 +1192,7 @@ async fn push_image_clip_persisted(
         if rec.expires_at_ms > 0 {
             expires_at_ms = rec.expires_at_ms;
         }
+        state.update_cloud_clip_quota(rec.quota);
     }
 
     persist_and_broadcast_local_clip(
@@ -1325,10 +1417,6 @@ fn persist_and_broadcast_local_clip(
         if cur.as_deref().is_none_or(|c| row.clip_id.as_str() > c) {
             let _ = store.set_clip_cursor(Some(&row.clip_id));
         }
-        let evicted = store.trim_clip_items(CLIP_LOCAL_MAX_ITEMS)?;
-        for rel in evicted {
-            let _ = cache.delete(&rel);
-        }
         clip_row_to_dto(&row, &cache)
     };
     state.broadcast_clip_changed(vec![dto.clone()], Vec::new(), false);
@@ -1367,36 +1455,217 @@ pub(super) async fn handle_get_clip_blob(
     }
 }
 
-/// 4a. `DELETE /v1/local/clip`
-pub(super) async fn handle_clear_clips(State(state): State<Arc<DaemonState>>) -> Response {
-    let creds_opt = match state.store.lock().unwrap().load_credentials() {
-        Ok(c) => c,
-        Err(e) => return core_err_to_response(e),
-    };
+#[derive(Deserialize, Default)]
+pub(super) struct ClearClipQuery {
+    scope: Option<String>,
+}
+
+/// 4a. `DELETE /v1/local/clip?scope=local|cloud|all` (defaults to `"all"` when omitted for backwards compatibility)
+pub(super) async fn handle_clear_clips(
+    State(state): State<Arc<DaemonState>>,
+    Query(q): Query<ClearClipQuery>,
+) -> Response {
+    let scope = q.scope.as_deref().unwrap_or("all");
+    if scope != "local" && scope != "cloud" && scope != "all" {
+        return core_err_to_response(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!("invalid clip clear scope '{scope}'"),
+            "Use scope 'local', 'cloud', or 'all'",
+        ));
+    }
+
     let mut cloud_deleted = 0usize;
-    if let Some(creds) = creds_opt {
-        let client = match RelayClient::from_credentials(&creds) {
+    let mut cloud_freed = 0u64;
+    if scope == "cloud" || scope == "all" {
+        let creds_opt = match state.store.lock().unwrap().load_credentials() {
             Ok(c) => c,
             Err(e) => return core_err_to_response(e),
         };
-        match client.clip_delete(None).await {
-            Ok(n) => cloud_deleted = n,
-            Err(e) => return core_err_to_response(e),
+        if let Some(creds) = creds_opt {
+            let client = match RelayClient::from_credentials(&creds) {
+                Ok(c) => c,
+                Err(e) => return core_err_to_response(e),
+            };
+            let relay_scope = if scope == "all" { "all" } else { "cloud" };
+            match client.clip_delete_scoped(None, Some(relay_scope)).await {
+                Ok(rec) => {
+                    cloud_deleted = rec.deleted_count;
+                    cloud_freed = rec.freed_bytes;
+                    state.update_cloud_clip_quota(rec.quota);
+                }
+                Err(e) => return core_err_to_response(e),
+            }
+            if scope == "cloud" {
+                let _ = state.store.lock().unwrap().set_clip_cursor(None);
+            }
         }
     }
-    let local_deleted = {
+
+    let mut local_deleted = 0usize;
+    let mut local_freed = 0u64;
+    if scope == "local" || scope == "all" {
         let store = state.store.lock().unwrap();
+        let (_, bytes_before) = store.clip_cache().stats();
         match store.clear_clip_items() {
             Ok((n, _)) => {
                 let _ = store.clip_cache().clear();
-                n
+                local_deleted = n;
+                local_freed = bytes_before;
             }
             Err(e) => return core_err_to_response(e),
         }
-    };
-    state.broadcast_clip_changed(Vec::new(), Vec::new(), true);
+    }
+
+    state.broadcast_clip_changed(Vec::new(), Vec::new(), scope != "cloud");
     ok_json(serde_json::json!({
+        "scope": scope,
         "deleted_count": cloud_deleted.max(local_deleted),
+        "local_deleted": local_deleted,
+        "cloud_deleted": cloud_deleted,
+        "freed_bytes": local_freed.max(cloud_freed),
+        "cloud_quota": state.cloud_clip_quota_snapshot(),
+    }))
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct PruneClipsBody {
+    scope: Option<String>,
+    before_days: Option<u64>,
+    before_ms: Option<i64>,
+    keep_latest: Option<usize>,
+    kind: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// 4c. `POST /v1/local/clip/prune`
+pub(super) async fn handle_prune_clips(
+    State(state): State<Arc<DaemonState>>,
+    Json(body): Json<PruneClipsBody>,
+) -> Response {
+    let scope = body.scope.as_deref().unwrap_or("local");
+    if scope != "local" && scope != "cloud" && scope != "all" {
+        return core_err_to_response(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!("invalid prune scope '{scope}'"),
+            "Use scope 'local', 'cloud', or 'all'",
+        ));
+    }
+    if let Some(ref k) = body.kind {
+        if k != "text" && k != "image" {
+            return core_err_to_response(CoreError::new(
+                ErrorCode::InvalidArgument,
+                format!("invalid prune kind '{k}'"),
+                "Use kind 'text' or 'image'",
+            ));
+        }
+    }
+    let effective_before_ms = match (body.before_ms, body.before_days) {
+        (Some(ms), _) => Some(ms),
+        (None, Some(days)) => {
+            if days == 0 {
+                return core_err_to_response(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    "before_days must be >= 1",
+                    "Pass before_days >= 1 or use DELETE /v1/local/clip to clear all",
+                ));
+            }
+            Some(now_ms_daemon().saturating_sub((days as i64).saturating_mul(86_400_000)))
+        }
+        (None, None) => None,
+    };
+    if effective_before_ms.is_none() && body.keep_latest.is_none() && body.kind.is_none() {
+        return core_err_to_response(CoreError::new(
+            ErrorCode::InvalidArgument,
+            "at least one of before_days, before_ms, keep_latest, or kind is required",
+            "Specify a prune criterion or use DELETE /v1/local/clip to clear all",
+        ));
+    }
+
+    let mut local_res = None;
+    let mut local_deleted_ids = Vec::new();
+    if scope == "local" || scope == "all" {
+        let filter = ClipPruneFilter {
+            before_ms: effective_before_ms,
+            keep_latest: body.keep_latest,
+            kind: body.kind.clone(),
+            dry_run: body.dry_run,
+        };
+        match state.store.lock().unwrap().prune_clip_items(&filter) {
+            Ok(r) => {
+                local_deleted_ids = r.deleted_ids.clone();
+                local_res = Some(r);
+            }
+            Err(e) => return core_err_to_response(e),
+        }
+    }
+
+    let mut cloud_res = None;
+    if scope == "cloud" || scope == "all" {
+        let creds_opt = match state.store.lock().unwrap().load_credentials() {
+            Ok(c) => c,
+            Err(e) => return core_err_to_response(e),
+        };
+        if let Some(creds) = creds_opt {
+            let client = match RelayClient::from_credentials(&creds) {
+                Ok(c) => c,
+                Err(e) => return core_err_to_response(e),
+            };
+            match client
+                .clip_prune(
+                    effective_before_ms,
+                    body.keep_latest,
+                    body.kind.as_deref(),
+                    body.dry_run,
+                )
+                .await
+            {
+                Ok(rec) => {
+                    state.update_cloud_clip_quota(rec.quota.clone());
+                    cloud_res = Some(rec);
+                }
+                Err(e) => return core_err_to_response(e),
+            }
+        } else if scope == "cloud" {
+            return core_err_to_response(CoreError::new(
+                ErrorCode::SyncOffline,
+                "cloud sync relay is not configured",
+                "Configure cloud sync or prune local scope instead",
+            ));
+        }
+    }
+
+    if !body.dry_run
+        && (!local_deleted_ids.is_empty() || cloud_res.as_ref().is_some_and(|c| c.deleted_count > 0))
+    {
+        state.broadcast_clip_changed(Vec::new(), local_deleted_ids, false);
+    }
+
+    let matched_count = local_res
+        .as_ref()
+        .map(|r| r.matched_count)
+        .unwrap_or(0)
+        .max(cloud_res.as_ref().map(|r| r.matched_count).unwrap_or(0));
+    let deleted_count = local_res
+        .as_ref()
+        .map(|r| r.deleted_count)
+        .unwrap_or(0)
+        .max(cloud_res.as_ref().map(|r| r.deleted_count).unwrap_or(0));
+    let freed_bytes = local_res
+        .as_ref()
+        .map(|r| r.freed_bytes)
+        .unwrap_or(0)
+        .max(cloud_res.as_ref().map(|r| r.freed_bytes).unwrap_or(0));
+
+    ok_json(serde_json::json!({
+        "dry_run": body.dry_run,
+        "scope": scope,
+        "matched_count": matched_count,
+        "deleted_count": deleted_count,
+        "freed_bytes": freed_bytes,
+        "local": local_res,
+        "cloud": cloud_res,
+        "cloud_quota": state.cloud_clip_quota_snapshot(),
     }))
 }
 
@@ -1415,8 +1684,11 @@ pub(super) async fn handle_delete_clip(
             Ok(c) => c,
             Err(e) => return core_err_to_response(e),
         };
-        match client.clip_delete(Some(&clip_id)).await {
-            Ok(n) => cloud_deleted = n,
+        match client.clip_delete_scoped(Some(&clip_id), None).await {
+            Ok(rec) => {
+                cloud_deleted = rec.deleted_count;
+                state.update_cloud_clip_quota(rec.quota);
+            }
             Err(e) => return core_err_to_response(e),
         }
     }
@@ -1618,6 +1890,7 @@ pub(super) async fn dispatch_uds_clip_poke(
         let st = Arc::clone(state);
         tokio::spawn(async move {
             let _ = st.pull_cloud_clips(false).await;
+            st.spawn_clip_blob_prefetch();
         });
     }
     UdsResponse {

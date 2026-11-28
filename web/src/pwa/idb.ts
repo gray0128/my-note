@@ -15,7 +15,8 @@
 const DB_NAME = "mynote_pwa_v1";
 const DB_VERSION = 2;
 const WRAP_KEY_ID = "device_wrap_key";
-const CLIP_MAX_ITEMS = 100;
+export const CLIP_PWA_MAX_ITEMS = 200;
+const CLIP_MAX_ITEMS = CLIP_PWA_MAX_ITEMS;
 
 export const PWA_ALL_STORES = [
   "device_keystore",
@@ -298,7 +299,8 @@ export async function saveEngineState(stateObj: CiphertextStateMirror, keysDiges
 }
 
 /**
- * Save ciphertext-only clipboard items into `clip_items` (pruned to latest 100 unexpired items).
+ * Incrementally save ciphertext-only clipboard items into `clip_items` (pruned to latest 200
+ * unexpired items without wiping the store on every sync).
  * Strictly strips any extra properties so plaintext/thumbnails/blobs NEVER enter IndexedDB.
  */
 export async function saveClipItems(
@@ -308,27 +310,48 @@ export async function saveClipItems(
   const now = Date.now();
   const db = await openPwaDb();
   try {
-    let mergedMap = new Map<string, CiphertextClipItem>();
+    const rtx = db.transaction("clip_items", "readonly");
+    const existing = await reqPromise<CiphertextClipItem[]>(rtx.objectStore("clip_items").getAll());
+    const existingIds = new Set(existing.map((r) => r.clip_id));
+
+    const mergedMap = new Map<string, CiphertextClipItem>();
     if (!opts.replaceAll) {
-      const rtx = db.transaction("clip_items", "readonly");
-      const existing = await reqPromise<CiphertextClipItem[]>(rtx.objectStore("clip_items").getAll());
       for (const row of existing) {
         if (row.expires_at_ms > now) {
           mergedMap.set(row.clip_id, toStrictCiphertextClipRecord(row));
         }
       }
     }
+    const incomingSanitized: CiphertextClipItem[] = [];
     for (const item of items) {
       if (item.expires_at_ms > now) {
-        mergedMap.set(item.clip_id, toStrictCiphertextClipRecord(item));
+        const clean = toStrictCiphertextClipRecord(item);
+        mergedMap.set(clean.clip_id, clean);
+        incomingSanitized.push(clean);
       }
     }
+
     const retained = sortClipsDesc([...mergedMap.values()]).slice(0, CLIP_MAX_ITEMS);
+    const retainedIds = new Set(retained.map((r) => r.clip_id));
+
     const tx = db.transaction("clip_items", "readwrite");
     const store = tx.objectStore("clip_items");
-    store.clear();
-    for (const row of retained) {
-      store.put(row);
+    // Delete only expired, overflowed, or (when replaceAll) absent keys — never clear() whole store
+    for (const oldId of existingIds) {
+      if (!retainedIds.has(oldId)) {
+        store.delete(oldId);
+      }
+    }
+    if (opts.replaceAll) {
+      for (const row of retained) {
+        store.put(row);
+      }
+    } else {
+      for (const row of incomingSanitized) {
+        if (retainedIds.has(row.clip_id)) {
+          store.put(row);
+        }
+      }
     }
     await txDone(tx);
     return retained;

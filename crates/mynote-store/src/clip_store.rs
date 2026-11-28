@@ -1,18 +1,19 @@
-//! Desktop local storage for the independent 100-item text & bitmap clipboard channel
-//! (`docs/data-structures.md` §4 & §4.1, `docs/sync-protocol.md` §11, `INV-CLIP-ISOLATION`).
+//! Desktop local storage for the independent text & bitmap clipboard archive
+//! (`docs/data-structures.md` §4 & §4.1, `docs/sync-protocol.md` §11, `INV-CLIP-ISOLATION`, D8′).
 //!
 //! Hard invariants:
 //! - Strictly isolated from `sync_ops`, `blocks`, `buffers`, `block_keys`, `shred_marks`,
 //!   `blocks_fts`, `mirror/`, and `backups/`.
-//! - Large images and `> 64 KiB` long-text payloads are NEVER stored in `mynote.db`;
-//!   they live as `0600` files inside `<data_dir>/clip_cache/` (`0700`) bounded by LRU
-//!   eviction (max 100 files AND max 256 MiB).
+//! - Desktop local `clip_items` and `<data_dir>/clip_cache/` (`0700` dir, `0600` files) retain
+//!   synced items indefinitely until the user explicitly deletes or prunes them (no automatic
+//!   ring-buffer trim, TTL expiry, or LRU eviction on desktop writes).
+//! - Large images and `> 64 KiB` long-text payloads are NEVER stored inside `mynote.db`.
 
 use crate::credentials::write_atomic_0600;
 use crate::store::{ensure_private_dir, rand_bytes, LocalStore};
 use mynote_core::clip::{
     decode_clip_key_material, encode_clip_key_material, unwrap_clip_key_material_with_keyring,
-    validate_clip_image_mime, wrap_clip_key_material, CLIP_MAX_ITEMS,
+    validate_clip_image_mime, wrap_clip_key_material, CLIP_CLOUD_MAX_ITEMS,
 };
 use mynote_core::error::{CoreError, ErrorCode};
 use mynote_core::ids::{ClipId, ClipKid};
@@ -22,14 +23,68 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
-/// Maximum retained clipboard entries in local SQLite `clip_items`.
-pub const CLIP_LOCAL_MAX_ITEMS: usize = CLIP_MAX_ITEMS;
-/// Maximum number of cached blob files inside `<data_dir>/clip_cache/`.
+/// Cloud rolling window size (`1,000`), retained as a reference constant.
+pub const CLIP_LOCAL_MAX_ITEMS: usize = CLIP_CLOUD_MAX_ITEMS;
+/// Default page size for local clipboard history queries.
+pub const CLIP_LOCAL_DEFAULT_PAGE_LIMIT: usize = 50;
+/// Maximum page size for a single local clipboard query.
+pub const CLIP_LOCAL_MAX_PAGE_LIMIT: usize = 1000;
+/// Legacy optional LRU file count cap (used only when calling `enforce_lru` / `write_with_limits` explicitly).
 pub const CLIP_CACHE_MAX_FILES: usize = 100;
-/// Maximum aggregate byte budget of `<data_dir>/clip_cache/` (`256 MiB`).
+/// Legacy optional LRU byte cap (`256 MiB`, used only when calling `enforce_lru` / `write_with_limits` explicitly).
 pub const CLIP_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 const META_CLIP_LAST_ID: &str = "clip_last_id";
+
+/// Query options for paginated/searchable local clipboard archive listing.
+#[derive(Clone, Debug, Default)]
+pub struct ClipListQuery<'a> {
+    pub limit: usize,
+    pub before_id: Option<&'a str>,
+    pub kind: Option<&'a str>,
+    pub query: Option<&'a str>,
+}
+
+/// Paginated local clipboard listing response.
+#[derive(Clone, Debug)]
+pub struct ClipListPage {
+    pub items: Vec<ClipItemRow>,
+    pub has_more: bool,
+    pub total_count: usize,
+}
+
+/// Filter for explicit manual clipboard pruning (`dry_run = true` previews without mutating).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ClipPruneFilter {
+    pub before_ms: Option<i64>,
+    pub keep_latest: Option<usize>,
+    pub kind: Option<String>,
+    pub dry_run: bool,
+}
+
+/// Result summary for a manual clipboard prune operation.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ClipPruneResult {
+    pub dry_run: bool,
+    pub matched_count: usize,
+    pub deleted_count: usize,
+    pub freed_bytes: u64,
+    pub deleted_ids: Vec<String>,
+}
+
+/// Aggregate local desktop clipboard storage statistics.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LocalClipStats {
+    pub total_items: usize,
+    pub text_items: usize,
+    pub image_items: usize,
+    pub blob_items: usize,
+    pub cached_blob_files: usize,
+    pub cached_blob_bytes: u64,
+    pub uncached_blob_items: usize,
+    pub oldest_created_at_ms: Option<i64>,
+    pub newest_created_at_ms: Option<i64>,
+}
 
 /// Local SQLite `clip_items` row (`docs/data-structures.md` §4).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,10 +160,23 @@ impl ClipCache {
         Ok(self.root.join(clean))
     }
 
-    /// Atomically persist decrypted blob bytes (`0600` temp + rename) and enforce default
-    /// LRU caps (`100` files / `256 MiB`).
+    /// Atomically persist decrypted blob bytes (`0600` temp + rename) without automatic LRU eviction.
+    /// Desktop local blobs are retained until explicitly deleted or pruned by the user (D8′).
     pub fn write(&self, rel_name: &str, bytes: &[u8]) -> Result<PathBuf, CoreError> {
-        self.write_with_limits(rel_name, bytes, CLIP_CACHE_MAX_FILES, CLIP_CACHE_MAX_BYTES)
+        ensure_private_dir(&self.root)?;
+        let path = self.path_for(rel_name)?;
+        write_atomic_0600(&path, bytes)?;
+        Ok(path)
+    }
+
+    /// File byte size if present on disk (returns `0` when absent).
+    pub fn file_size(&self, rel_name: &str) -> u64 {
+        self.path_for(rel_name)
+            .ok()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .unwrap_or(0)
     }
 
     /// Atomically persist decrypted blob bytes and enforce explicit `(max_files, max_bytes)` LRU caps.
@@ -387,7 +455,18 @@ impl LocalStore {
         limit: usize,
         kind_filter: Option<&str>,
     ) -> Result<Vec<ClipItemRow>, CoreError> {
-        if let Some(k) = kind_filter {
+        let page = self.list_clip_items_page(&ClipListQuery {
+            limit,
+            before_id: None,
+            kind: kind_filter,
+            query: None,
+        })?;
+        Ok(page.items)
+    }
+
+    /// Paginated, searchable query over the unbounded local desktop clipboard archive.
+    pub fn list_clip_items_page(&self, q: &ClipListQuery<'_>) -> Result<ClipListPage, CoreError> {
+        if let Some(k) = q.kind {
             if k != "text" && k != "image" {
                 return Err(CoreError::new(
                     ErrorCode::InvalidArgument,
@@ -396,44 +475,106 @@ impl LocalStore {
                 ));
             }
         }
-        let lim = limit.clamp(1, CLIP_LOCAL_MAX_ITEMS) as i64;
-        let mut out = Vec::new();
-        if let Some(k) = kind_filter {
-            let sql = format!(
-                "SELECT {CLIP_SELECT_COLS} FROM clip_items WHERE kind = ?1 \
-                 ORDER BY created_at_ms DESC, clip_id DESC LIMIT ?2"
-            );
-            let mut stmt = self
-                .conn
-                .prepare(&sql)
-                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "query clip_items"))?;
-            let rows = stmt
-                .query_map(params![k, lim], map_clip_row)
-                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "map clip_items"))?;
-            for r in rows {
-                out.push(r.map_err(|e| {
-                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "row clip_items")
-                })?);
-            }
+        let lim = q.limit.clamp(1, CLIP_LOCAL_MAX_PAGE_LIMIT);
+        let like_pattern = q.query.map(str::trim).filter(|s| !s.is_empty()).map(|raw| {
+            let escaped = raw.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            format!("%{escaped}%")
+        });
+
+        let mut base_clauses: Vec<String> = Vec::new();
+        let mut base_vals: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(k) = q.kind {
+            base_clauses.push(format!("kind = ?{}", base_vals.len() + 1));
+            base_vals.push(rusqlite::types::Value::Text(k.to_string()));
+        }
+        if let Some(ref pat) = like_pattern {
+            let p_idx = base_vals.len() + 1;
+            base_clauses.push(format!(
+                "(LOWER(COALESCE(text_preview, '')) LIKE LOWER(?{p_idx}) ESCAPE '\\' \
+                 OR LOWER(mime) LIKE LOWER(?{p_idx}) ESCAPE '\\' \
+                 OR LOWER(clip_id) LIKE LOWER(?{p_idx}) ESCAPE '\\')"
+            ));
+            base_vals.push(rusqlite::types::Value::Text(pat.clone()));
+        }
+
+        let base_where = if base_clauses.is_empty() {
+            String::new()
         } else {
-            let sql = format!(
-                "SELECT {CLIP_SELECT_COLS} FROM clip_items \
-                 ORDER BY created_at_ms DESC, clip_id DESC LIMIT ?1"
-            );
-            let mut stmt = self
+            format!(" WHERE {}", base_clauses.join(" AND "))
+        };
+
+        let count_sql = format!("SELECT COUNT(*) FROM clip_items{base_where}");
+        let total_count: usize = self
+            .conn
+            .query_row(&count_sql, rusqlite::params_from_iter(base_vals.iter()), |r| {
+                r.get::<_, i64>(0)
+            })
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "count clip_items"))?
+            .max(0) as usize;
+
+        let mut page_clauses = base_clauses;
+        let mut page_vals = base_vals;
+        if let Some(bid) = q.before_id.map(str::trim).filter(|s| !s.is_empty()) {
+            let cursor_ts: Option<i64> = self
                 .conn
-                .prepare(&sql)
-                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "query clip_items"))?;
-            let rows = stmt
-                .query_map([lim], map_clip_row)
-                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "map clip_items"))?;
-            for r in rows {
-                out.push(r.map_err(|e| {
-                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "row clip_items")
-                })?);
+                .query_row(
+                    "SELECT created_at_ms FROM clip_items WHERE clip_id = ?1",
+                    [bid],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| {
+                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "lookup clip cursor")
+                })?;
+            if let Some(b_ts) = cursor_ts {
+                let ts_idx = page_vals.len() + 1;
+                let id_idx = page_vals.len() + 2;
+                page_clauses.push(format!(
+                    "(created_at_ms < ?{ts_idx} OR (created_at_ms = ?{ts_idx} AND clip_id < ?{id_idx}))"
+                ));
+                page_vals.push(rusqlite::types::Value::Integer(b_ts));
+                page_vals.push(rusqlite::types::Value::Text(bid.to_string()));
+            } else {
+                let id_idx = page_vals.len() + 1;
+                page_clauses.push(format!("clip_id < ?{id_idx}"));
+                page_vals.push(rusqlite::types::Value::Text(bid.to_string()));
             }
         }
-        Ok(out)
+
+        let page_where = if page_clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", page_clauses.join(" AND "))
+        };
+        let lim_idx = page_vals.len() + 1;
+        page_vals.push(rusqlite::types::Value::Integer((lim + 1) as i64));
+
+        let page_sql = format!(
+            "SELECT {CLIP_SELECT_COLS} FROM clip_items{page_where} \
+             ORDER BY created_at_ms DESC, clip_id DESC LIMIT ?{lim_idx}"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&page_sql)
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "query clip_items"))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(page_vals.iter()), map_clip_row)
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "map clip_items"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(
+                r.map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "row clip_items"))?,
+            );
+        }
+        let has_more = out.len() > lim;
+        if has_more {
+            out.truncate(lim);
+        }
+        Ok(ClipListPage {
+            items: out,
+            has_more,
+            total_count,
+        })
     }
 
     pub fn get_clip_item(&self, clip_id: &str) -> Result<Option<ClipItemRow>, CoreError> {
@@ -442,6 +583,15 @@ impl LocalStore {
             .query_row(&sql, [clip_id], map_clip_row)
             .optional()
             .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "get clip_item"))
+    }
+
+    /// Count all locally retained desktop clipboard items (ignores cloud `expires_at_ms`).
+    pub fn count_all_clip_items(&self) -> Result<usize, CoreError> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM clip_items", [], |r| r.get(0))
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "count clip_items"))?;
+        Ok(count.max(0) as usize)
     }
 
     pub fn count_active_clip_items(&self, now_ms: i64) -> Result<usize, CoreError> {
@@ -454,6 +604,187 @@ impl LocalStore {
             )
             .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "count clip_items"))?;
         Ok(count.max(0) as usize)
+    }
+
+    /// Return aggregate local desktop clipboard archive stats (SQLite + `clip_cache/`).
+    pub fn clip_storage_stats(&self) -> Result<LocalClipStats, CoreError> {
+        let cache = self.clip_cache();
+        let (cached_blob_files, cached_blob_bytes) = cache.stats();
+        let (total_items, text_items, image_items, blob_items, oldest, newest): (
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+        ) = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*), \
+                 COALESCE(SUM(CASE WHEN kind = 'text' THEN 1 ELSE 0 END), 0), \
+                 COALESCE(SUM(CASE WHEN kind = 'image' THEN 1 ELSE 0 END), 0), \
+                 COALESCE(SUM(CASE WHEN has_blob != 0 THEN 1 ELSE 0 END), 0), \
+                 MIN(created_at_ms), MAX(created_at_ms) \
+                 FROM clip_items",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "clip stats"))?;
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT local_blob_path FROM clip_items WHERE has_blob != 0")
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "scan clip blobs"))?;
+        let mut uncached_blob_items = 0usize;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, Option<String>>(0))
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "map clip blobs"))?;
+        for r in rows.flatten() {
+            if !r.as_deref().is_some_and(|p| cache.exists(p)) {
+                uncached_blob_items += 1;
+            }
+        }
+
+        Ok(LocalClipStats {
+            total_items: total_items.max(0) as usize,
+            text_items: text_items.max(0) as usize,
+            image_items: image_items.max(0) as usize,
+            blob_items: blob_items.max(0) as usize,
+            cached_blob_files,
+            cached_blob_bytes,
+            uncached_blob_items,
+            oldest_created_at_ms: oldest,
+            newest_created_at_ms: newest,
+        })
+    }
+
+    /// List newest-first clip items whose remote R2 blob has not yet expired and is missing locally,
+    /// so the desktop Daemon can eagerly persist them to `clip_cache/` before cloud TTL expires.
+    pub fn list_uncached_remote_blobs(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<ClipItemRow>, CoreError> {
+        let cache = self.clip_cache();
+        let sql = format!(
+            "SELECT {CLIP_SELECT_COLS} FROM clip_items \
+             WHERE has_blob != 0 AND expires_at_ms > ?1 \
+             ORDER BY created_at_ms DESC, clip_id DESC"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "query uncached blobs"))?;
+        let rows = stmt
+            .query_map([now_ms], map_clip_row)
+            .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "map uncached blobs"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let row =
+                r.map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "row uncached blob"))?;
+            let is_cached = row.local_blob_path.as_deref().is_some_and(|p| cache.exists(p));
+            if !is_cached {
+                out.push(row);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Manually prune local clipboard items matching `filter` (matches cloud `POST /v1/clip/prune` semantics).
+    pub fn prune_clip_items(&self, filter: &ClipPruneFilter) -> Result<ClipPruneResult, CoreError> {
+        if let Some(ref k) = filter.kind {
+            if k != "text" && k != "image" {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("invalid clip kind filter '{k}'"),
+                    "Use kind 'text' or 'image'",
+                ));
+            }
+        }
+        if filter.before_ms.is_none() && filter.keep_latest.is_none() && filter.kind.is_none() {
+            return Err(CoreError::new(
+                ErrorCode::InvalidArgument,
+                "at least one of before_ms, keep_latest, or kind is required for clip prune",
+                "Specify --before, --keep, or --kind (or use 'clip clear' to wipe all)",
+            ));
+        }
+
+        let candidates: Vec<(String, i64, Option<String>)> = if let Some(ref k) = filter.kind {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT clip_id, created_at_ms, local_blob_path FROM clip_items \
+                     WHERE kind = ?1 ORDER BY created_at_ms DESC, clip_id DESC",
+                )
+                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "prune scan"))?;
+            let rows = stmt
+                .query_map([k], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "prune map"))?;
+            rows.filter_map(Result::ok).collect()
+        } else {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT clip_id, created_at_ms, local_blob_path FROM clip_items \
+                     ORDER BY created_at_ms DESC, clip_id DESC",
+                )
+                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "prune scan"))?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "prune map"))?;
+            rows.filter_map(Result::ok).collect()
+        };
+
+        let cache = self.clip_cache();
+        let mut matched: Vec<(String, Option<String>)> = Vec::new();
+        let mut freed_bytes = 0u64;
+        for (idx, (cid, created_at_ms, local_path)) in candidates.into_iter().enumerate() {
+            if filter.keep_latest.is_some_and(|k| idx < k) {
+                continue;
+            }
+            if filter.before_ms.is_some_and(|b| created_at_ms >= b) {
+                continue;
+            }
+            if let Some(ref rel) = local_path {
+                freed_bytes = freed_bytes.saturating_add(cache.file_size(rel));
+            }
+            matched.push((cid, local_path));
+        }
+
+        let matched_count = matched.len();
+        if filter.dry_run {
+            return Ok(ClipPruneResult {
+                dry_run: true,
+                matched_count,
+                deleted_count: 0,
+                freed_bytes,
+                deleted_ids: Vec::new(),
+            });
+        }
+
+        let mut deleted_ids = Vec::with_capacity(matched_count);
+        for (cid, local_path) in matched {
+            self.conn
+                .execute("DELETE FROM clip_items WHERE clip_id = ?1", [&cid])
+                .map_err(|e| {
+                    CoreError::new(ErrorCode::IntegrityError, e.to_string(), "delete pruned clip")
+                })?;
+            if let Some(rel) = local_path {
+                let _ = cache.delete(&rel);
+            }
+            deleted_ids.push(cid);
+        }
+
+        Ok(ClipPruneResult {
+            dry_run: false,
+            matched_count,
+            deleted_count: deleted_ids.len(),
+            freed_bytes,
+            deleted_ids,
+        })
     }
 
     pub fn latest_clip_item(&self) -> Result<Option<ClipItemRow>, CoreError> {

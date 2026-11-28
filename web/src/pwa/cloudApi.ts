@@ -73,6 +73,13 @@ export interface CloudSnapshotResponse {
   snapshot_id: string;
 }
 
+export interface CloudClipQuotaWire {
+  used_bytes: number;
+  limit_bytes: number;
+  item_count: number;
+  item_limit: number;
+}
+
 export interface CloudClipItemWire {
   clip_id: string;
   clip_kid: string;
@@ -88,6 +95,9 @@ export interface CloudClipItemWire {
 export interface CloudClipListResponse {
   ok: true;
   items: CloudClipItemWire[];
+  has_more?: boolean;
+  next_since_id?: string | null;
+  quota?: CloudClipQuotaWire;
 }
 
 export interface CloudClipPostPayload {
@@ -104,6 +114,7 @@ export interface CloudClipPostResponse {
   created_at_ms?: number;
   expires_at_ms?: number;
   delivered_to?: number;
+  quota?: CloudClipQuotaWire;
 }
 
 export interface CloudClipBlobPutHeaders {
@@ -119,6 +130,7 @@ export interface CloudClipBlobPutResponse {
   blob_bytes: number;
   created_at_ms: number;
   expires_at_ms: number;
+  quota?: CloudClipQuotaWire;
 }
 
 export interface CloudClipBlobGetResponse {
@@ -131,6 +143,18 @@ export interface CloudClipBlobGetResponse {
 export interface CloudClipDeleteResponse {
   ok: true;
   deleted_count: number;
+  freed_bytes?: number;
+  scope?: "cloud" | "all";
+  quota?: CloudClipQuotaWire;
+}
+
+export interface CloudClipPruneResponse {
+  ok: true;
+  dry_run: boolean;
+  matched_count: number;
+  deleted_count: number;
+  freed_bytes: number;
+  quota?: CloudClipQuotaWire;
 }
 
 function baseUrl(syncUrl: string): string {
@@ -250,13 +274,35 @@ export async function listCloudClips(
   signal?: AbortSignal,
 ): Promise<CloudClipListResponse> {
   const params = new URLSearchParams();
-  params.set("limit", String(limit));
+  params.set("limit", String(Math.min(100, Math.max(1, limit))));
   if (sinceId) params.set("since_id", sinceId);
   return reqCloudJson<CloudClipListResponse>(
     `${baseUrl(syncUrl)}/v1/clip?${params.toString()}`,
     { method: "GET", signal },
     token,
   );
+}
+
+/** Drain all incremental pages from `GET /v1/clip` (up to 20 pages safety cap). */
+export async function listAllCloudClipsSince(
+  syncUrl: string,
+  token: string,
+  sinceId?: string,
+  signal?: AbortSignal,
+): Promise<{ items: CloudClipItemWire[]; quota: CloudClipQuotaWire | null }> {
+  const collected: CloudClipItemWire[] = [];
+  let cursor = sinceId || undefined;
+  let latestQuota: CloudClipQuotaWire | null = null;
+  for (let pageIdx = 0; pageIdx < 20; pageIdx++) {
+    const res = await listCloudClips(syncUrl, token, cursor, 100, signal);
+    if (res.quota) latestQuota = res.quota;
+    collected.push(...res.items);
+    if (!res.has_more || res.items.length === 0) break;
+    const nextCursor = res.next_since_id ?? res.items[res.items.length - 1]?.clip_id;
+    if (!nextCursor || nextCursor === cursor) break;
+    cursor = nextCursor;
+  }
+  return { items: collected, quota: latestQuota };
 }
 
 export async function postCloudClip(
@@ -347,9 +393,31 @@ export async function deleteCloudClip(
   token: string,
   clipId?: string,
   signal?: AbortSignal,
+  scope: "cloud" | "all" = "cloud",
 ): Promise<CloudClipDeleteResponse> {
-  const path = clipId ? `/v1/clip/${encodeURIComponent(clipId)}` : "/v1/clip";
+  const path = clipId
+    ? `/v1/clip/${encodeURIComponent(clipId)}`
+    : scope === "all"
+      ? "/v1/clip?scope=all"
+      : "/v1/clip";
   return reqCloudJson<CloudClipDeleteResponse>(`${baseUrl(syncUrl)}${path}`, { method: "DELETE", signal }, token);
+}
+
+export async function pruneCloudClips(
+  syncUrl: string,
+  token: string,
+  input: { before_ms?: number; keep_latest?: number; kind?: "text" | "image"; dry_run?: boolean },
+  signal?: AbortSignal,
+): Promise<CloudClipPruneResponse> {
+  return reqCloudJson<CloudClipPruneResponse>(
+    `${baseUrl(syncUrl)}/v1/clip/prune`,
+    {
+      method: "POST",
+      body: JSON.stringify(input),
+      signal,
+    },
+    token,
+  );
 }
 
 export function connectCloudWs(

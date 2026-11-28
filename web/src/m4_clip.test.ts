@@ -478,10 +478,34 @@ function makeDesktopClipMockApi(initialClips: ClipItemDto[] = []) {
       return blocks.find((b) => b.id === id)!;
     },
     async listClips(params) {
-      const limit = params?.limit ?? 100;
-      const filtered = params?.kind ? clips.filter((c) => c.kind === params.kind) : clips;
+      const limit = params?.limit ?? 50;
+      let filtered = params?.kind ? clips.filter((c) => c.kind === params.kind) : clips;
+      if (params?.q && params.q.trim()) {
+        const needle = params.q.trim().toLowerCase();
+        filtered = filtered.filter(
+          (c) =>
+            (c.text_preview ?? "").toLowerCase().includes(needle) ||
+            c.mime.toLowerCase().includes(needle) ||
+            c.clip_id.toLowerCase().includes(needle),
+        );
+      }
+      const total_count = filtered.length;
+      if (params?.before_id) {
+        const idx = filtered.findIndex((c) => c.clip_id === params.before_id);
+        filtered = idx >= 0 ? filtered.slice(idx + 1) : [];
+      }
+      const page = filtered.slice(0, limit);
       return {
-        items: filtered.slice(0, limit),
+        items: page,
+        has_more: filtered.length > limit,
+        total_count,
+        local_blob_bytes: 1024,
+        cloud_quota: {
+          used_bytes: 4_300_000_000,
+          limit_bytes: 5 * 1024 * 1024 * 1024,
+          item_count: total_count,
+          item_limit: 1000,
+        },
         has_undo: hasUndo,
         watch_enabled: watchEnabled,
         watch_paused: watchPaused,
@@ -554,11 +578,32 @@ function makeDesktopClipMockApi(initialClips: ClipItemDto[] = []) {
       clips = clips.filter((c) => c.clip_id !== clipId);
       return { deleted_count: before - clips.length };
     },
-    async clearClips() {
+    async clearClips(scope) {
       calls.clear++;
       const count = clips.length;
-      clips = [];
-      return { deleted_count: count };
+      if (scope !== "cloud") {
+        clips = [];
+      }
+      return {
+        deleted_count: count,
+        scope: scope ?? "all",
+        freed_bytes: 1024,
+        cloud_quota: { used_bytes: 0, limit_bytes: 5 * 1024 * 1024 * 1024, item_count: 0, item_limit: 1000 },
+      };
+    },
+    async pruneClips(input) {
+      const matched = input.kind ? clips.filter((c) => c.kind === input.kind) : clips;
+      if (!input.dry_run && input.scope !== "cloud") {
+        clips = clips.filter((c) => !matched.includes(c));
+      }
+      return {
+        dry_run: Boolean(input.dry_run),
+        scope: input.scope,
+        matched_count: matched.length,
+        deleted_count: input.dry_run ? 0 : matched.length,
+        freed_bytes: matched.length * 1024,
+        cloud_quota: { used_bytes: 0, limit_bytes: 5 * 1024 * 1024 * 1024, item_count: clips.length, item_limit: 1000 },
+      };
     },
     async applyClip(clipId) {
       calls.apply.push(clipId);
@@ -1021,7 +1066,7 @@ describe("M4a-4: Desktop Clipboard UI, Mobile PWA Clipboard/IDB v2/ShareTarget, 
     await new Promise((r) => setTimeout(r, 20));
     expect(calls.del).toEqual(["01CLIP00000000000000000003"]);
 
-    // WS clip_changed live update with 105 items caps display cleanly at 100 items
+    // WS clip_changed live update with 105 items retains ALL 105 items (unbounded desktop archive, D8′)
     const manyItems: ClipItemDto[] = Array.from({ length: 105 }, (_, idx) => ({
       clip_id: `01CLIPBULK${String(idx).padStart(16, "0")}`,
       clip_kid: "01CKID00000000000000000001",
@@ -1048,7 +1093,21 @@ describe("M4a-4: Desktop Clipboard UI, Mobile PWA Clipboard/IDB v2/ShareTarget, 
       cleared: true,
       watch_paused: false,
     });
-    expect(drawer.querySelectorAll('[data-testid="clip-list"] > .clip-item').length).toBe(100);
+    expect(drawer.querySelectorAll('[data-testid="clip-list"] > .clip-item').length).toBe(105);
+
+    // D8′ storage & 5 GiB cloud quota bar (>= 80% shows warning, ZERO inline style attributes)
+    const quotaMeter = drawer.querySelector<HTMLProgressElement>('[data-testid="clip-quota-meter"]');
+    expect(quotaMeter).not.toBeNull();
+    expect(quotaMeter!.classList.contains("is-warn")).toBe(true);
+    expect(drawer.querySelector('[data-testid="clip-quota-warn"]')).not.toBeNull();
+
+    // D8′ manual cleanup panel: open -> preview -> run
+    drawer.querySelector<HTMLButtonElement>('[data-testid="clip-cleanup-btn"]')!.click();
+    const cleanupPanel = drawer.querySelector<HTMLElement>('[data-testid="clip-cleanup-panel"]')!;
+    expect(cleanupPanel.classList.contains("hidden")).toBe(false);
+    drawer.querySelector<HTMLButtonElement>('[data-testid="clip-cleanup-preview-btn"]')!.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(drawer.querySelector<HTMLElement>('[data-testid="clip-cleanup-preview"]')!.classList.contains("hidden")).toBe(false);
 
     // Clear All button
     drawer.querySelector<HTMLButtonElement>('[data-testid="clip-clear-btn"]')!.click();
@@ -1116,9 +1175,9 @@ describe("M4a-4: Desktop Clipboard UI, Mobile PWA Clipboard/IDB v2/ShareTarget, 
       expect(rawMetaDump).not.toContain("SECRET_DEVICE_TOKEN_NEVER_PLAINTEXT");
       expect(rawMetaDump).not.toContain("SECRET_CLIP_KEY_NEVER_PLAINTEXT");
 
-      // 3c. saveClipItems strips any tainted plaintext/thumbnail/blob fields (`SEC-08`) and prunes to 100 unexpired items
+      // 3c. saveClipItems strips any tainted plaintext/thumbnail/blob fields (`SEC-08`) and incrementally retains up to 200 unexpired items
       const future = Date.now() + 86_400_000;
-      const taintedBatch = Array.from({ length: 105 }, (_, i) => ({
+      const taintedBatch = Array.from({ length: 205 }, (_, i) => ({
         clip_id: `01CLIPIDB${String(i).padStart(17, "0")}`,
         clip_kid: "01CKID1",
         device_id: "dev_mac",
@@ -1136,11 +1195,11 @@ describe("M4a-4: Desktop Clipboard UI, Mobile PWA Clipboard/IDB v2/ShareTarget, 
       })) as unknown as CiphertextClipItem[];
 
       const saved = await saveClipItems(taintedBatch);
-      expect(saved.length).toBe(100);
+      expect(saved.length).toBe(200);
       const loaded = await loadClipItems();
-      expect(loaded.length).toBe(100);
+      expect(loaded.length).toBe(200);
       // Sorted newest first
-      expect(loaded[0].created_at_ms).toBe(1764200000104);
+      expect(loaded[0].created_at_ms).toBe(1764200000204);
       const clipDump = JSON.stringify([...rawDb.stores.get("clip_items")!.records.values()]);
       expect(clipDump).not.toContain("LEAKED_PLAINTEXT");
       expect(clipDump).not.toContain("LEAKED_PREVIEW");
@@ -1149,7 +1208,7 @@ describe("M4a-4: Desktop Clipboard UI, Mobile PWA Clipboard/IDB v2/ShareTarget, 
 
       // Delete single clip, last_clip_id cursor, clearClipItemsIdb, and clearAllPwaStorage
       await deleteClipItemIdb(loaded[0].clip_id);
-      expect((await loadClipItems()).length).toBe(99);
+      expect((await loadClipItems()).length).toBe(199);
       await setLastClipId(loaded[1].clip_id);
       expect(await getLastClipId()).toBe(loaded[1].clip_id);
       await clearClipItemsIdb();
