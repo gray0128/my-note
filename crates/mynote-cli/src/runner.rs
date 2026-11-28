@@ -8,9 +8,9 @@ use crate::cli::{
 use crate::daemon::{run_daemon_foreground, DaemonConfig};
 use crate::formatters::format_content;
 use crate::help::render_topic;
+use crate::local_ipc::{try_send_ipc, ApplyMeta, ApplyRequest, LocalIpcRequest, LocalIpcResponse};
 use crate::output::{emit_error, emit_json, emit_jsonl, CliMeta, OutputMode};
 use crate::sync_client::{ensure_clip_key, render_terminal_qr, RelayClient};
-use crate::uds::{try_send_uds, ApplyMeta, ApplyRequest, UdsRequest, UdsResponse};
 
 #[path = "runner_clip.rs"]
 mod runner_clip;
@@ -28,7 +28,7 @@ use mynote_core::vault::{
 use mynote_store::store::{DeleteReceipt, LocalStore, WriteReceipt};
 use mynote_store::Tier2OpInput;
 use std::collections::BTreeSet;
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
@@ -49,10 +49,10 @@ fn try_daemon_apply(
     meta: ApplyMeta,
     request: ApplyRequest,
     quiet: bool,
-) -> Result<Option<UdsResponse>, CoreError> {
-    let resp = try_send_uds(
+) -> Result<Option<LocalIpcResponse>, CoreError> {
+    let resp = try_send_ipc(
         data_dir,
-        &UdsRequest::Apply { meta, request },
+        &LocalIpcRequest::Apply { meta, request },
         Duration::from_secs(10),
     )?;
     let Some(r) = resp else {
@@ -140,7 +140,7 @@ fn store_meta(store: &LocalStore, started: Instant, redacted_override: Option<us
     }
 }
 
-fn resolve_data_dir(cli_override: Option<PathBuf>) -> PathBuf {
+pub fn resolve_data_dir(cli_override: Option<PathBuf>) -> PathBuf {
     if let Some(p) = cli_override {
         return p;
     }
@@ -149,15 +149,35 @@ fn resolve_data_dir(cli_override: Option<PathBuf>) -> PathBuf {
             return PathBuf::from(env_dir);
         }
     }
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        if !xdg.trim().is_empty() {
-            return PathBuf::from(xdg).join("mynote");
+    #[cfg(windows)]
+    {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            if !local_app_data.trim().is_empty() {
+                return PathBuf::from(local_app_data).join("mynote");
+            }
         }
+        if let Ok(user_profile) = std::env::var("USERPROFILE") {
+            if !user_profile.trim().is_empty() {
+                return PathBuf::from(user_profile)
+                    .join("AppData")
+                    .join("Local")
+                    .join("mynote");
+            }
+        }
+        PathBuf::from(".mynote")
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".local").join("share").join("mynote");
+    #[cfg(not(windows))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            if !xdg.trim().is_empty() {
+                return PathBuf::from(xdg).join("mynote");
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(".local").join("share").join("mynote");
+        }
+        PathBuf::from(".mynote")
     }
-    PathBuf::from(".mynote")
 }
 
 fn resolve_actor(cli_override: Option<String>) -> String {
@@ -230,28 +250,21 @@ fn now_ms_cli() -> u64 {
         .max(1)
 }
 
-#[cfg(not(unix))]
-fn read_tty_line(prompt: &str) -> Result<String, CoreError> {
-    let mut stderr = io::stderr().lock();
-    let _ = write!(stderr, "{prompt}");
-    let _ = stderr.flush();
-    let mut line = String::new();
-    io::stdin().read_line(&mut line).map_err(|e| {
-        CoreError::new(
-            ErrorCode::InteractionRequired,
-            format!("failed reading interactive input: {e}"),
-            "Retry in an interactive terminal",
-        )
-    })?;
-    Ok(line.trim().to_string())
+/// Compute the echo-suppressed Windows console input mode (`(mode | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT) & !ENABLE_ECHO_INPUT`).
+pub const fn suppress_console_echo_mode(orig_mode: u32) -> u32 {
+    const LINE_INPUT: u32 = 2;
+    const PROCESSED_INPUT: u32 = 1;
+    const ECHO_INPUT: u32 = 4;
+    (orig_mode | LINE_INPUT | PROCESSED_INPUT) & !ECHO_INPUT
 }
 
-/// Read a secret passphrase interactively from `/dev/tty` (falling back to TTY stdin inside
-/// isolated PTY harnesses) with terminal echo suppressed and guaranteed restoration on drop.
-/// Fails closed if `stty -echo` cannot disable terminal echo (H15).
+/// Read a secret passphrase interactively from `/dev/tty` on Unix or `CONIN$` on Windows,
+/// with terminal echo suppressed and guaranteed restoration on drop (`docs/interface-contracts.md` §3.0,
+/// `docs/threat-model.md` §10.1, H15).
 fn read_tty_secret(prompt: &str) -> Result<Zeroizing<String>, CoreError> {
     #[cfg(unix)]
     {
+        use std::io::BufRead;
         struct EchoRestore(Option<std::fs::File>);
         impl Drop for EchoRestore {
             fn drop(&mut self) {
@@ -352,9 +365,179 @@ fn read_tty_secret(prompt: &str) -> Result<Zeroizing<String>, CoreError> {
         let trimmed = line.trim_end_matches(&['\r', '\n'][..]).to_string();
         Ok(Zeroizing::new(trimmed))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        Ok(Zeroizing::new(read_tty_line(prompt)?))
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use std::ptr;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, ReadConsoleW, SetConsoleMode, WriteConsoleW, ENABLE_ECHO_INPUT,
+            ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+        };
+
+        struct ConsoleModeRestore {
+            handle: HANDLE,
+            orig_mode: u32,
+        }
+
+        impl Drop for ConsoleModeRestore {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = SetConsoleMode(self.handle, self.orig_mode);
+                }
+            }
+        }
+
+        let conin_name: Vec<u16> = "CONIN$".encode_utf16().chain(core::iter::once(0)).collect();
+        let raw_in = unsafe {
+            CreateFileW(
+                conin_name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null(),
+                OPEN_EXISTING,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        if raw_in.is_null() || raw_in == INVALID_HANDLE_VALUE {
+            return Err(CoreError::new(
+                ErrorCode::InteractionRequired,
+                format!(
+                    "cannot open Windows console input CONIN$: {}",
+                    io::Error::last_os_error()
+                ),
+                "Run inside an interactive Windows Terminal / PowerShell / Console session",
+            ));
+        }
+        // `conin` MUST be bound BEFORE `_mode_guard` so `_mode_guard::drop` restores console mode BEFORE closing `conin`.
+        let conin = unsafe { OwnedHandle::from_raw_handle(raw_in) };
+        let in_handle = conin.as_raw_handle() as HANDLE;
+
+        let mut orig_mode = 0u32;
+        if unsafe { GetConsoleMode(in_handle, &mut orig_mode) } == 0 {
+            return Err(CoreError::new(
+                ErrorCode::InteractionRequired,
+                "CONIN$ does not support GetConsoleMode",
+                "Run inside an interactive Windows console session",
+            ));
+        }
+
+        let no_echo = (orig_mode | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT) & !ENABLE_ECHO_INPUT;
+        debug_assert_eq!(no_echo, suppress_console_echo_mode(orig_mode));
+        if unsafe { SetConsoleMode(in_handle, no_echo) } == 0 {
+            return Err(CoreError::new(
+                ErrorCode::InteractionRequired,
+                "refusing to read secret because SetConsoleMode could not disable ENABLE_ECHO_INPUT",
+                "Run inside an interactive Windows console session",
+            ));
+        }
+        let _mode_guard = ConsoleModeRestore {
+            handle: in_handle,
+            orig_mode,
+        };
+
+        let conout_name: Vec<u16> = "CONOUT$".encode_utf16().chain(core::iter::once(0)).collect();
+        let raw_out = unsafe {
+            CreateFileW(
+                conout_name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null(),
+                OPEN_EXISTING,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        let conout = if !raw_out.is_null() && raw_out != INVALID_HANDLE_VALUE {
+            Some(unsafe { OwnedHandle::from_raw_handle(raw_out) })
+        } else {
+            None
+        };
+
+        if let Some(ref out_h) = conout {
+            let prompt_w: Vec<u16> = prompt.encode_utf16().collect();
+            let mut written = 0u32;
+            let _ = unsafe {
+                WriteConsoleW(
+                    out_h.as_raw_handle() as HANDLE,
+                    prompt_w.as_ptr(),
+                    prompt_w.len() as u32,
+                    &mut written,
+                    ptr::null(),
+                )
+            };
+        } else {
+            let mut stderr = io::stderr().lock();
+            let _ = write!(stderr, "{prompt}");
+            let _ = stderr.flush();
+        }
+
+        let mut accum = Zeroizing::new(Vec::<u16>::with_capacity(128));
+        let mut chunk = Zeroizing::new(vec![0u16; 256]);
+        loop {
+            let mut chars_read = 0u32;
+            let ok = unsafe {
+                ReadConsoleW(
+                    in_handle,
+                    chunk.as_mut_ptr().cast(),
+                    chunk.len() as u32,
+                    &mut chars_read,
+                    ptr::null(),
+                )
+            };
+            if ok == 0 {
+                return Err(CoreError::new(
+                    ErrorCode::InteractionRequired,
+                    format!("ReadConsoleW(CONIN$) failed: {}", io::Error::last_os_error()),
+                    "Retry in an interactive Windows console",
+                ));
+            }
+            if chars_read == 0 {
+                break;
+            }
+            let slice = &chunk[..chars_read as usize];
+            if let Some(nl_pos) = slice.iter().position(|&c| c == b'\n' as u16 || c == b'\r' as u16) {
+                accum.extend_from_slice(&slice[..nl_pos]);
+                break;
+            }
+            accum.extend_from_slice(slice);
+        }
+
+        if let Some(ref out_h) = conout {
+            let crlf: [u16; 2] = [b'\r' as u16, b'\n' as u16];
+            let mut written = 0u32;
+            let _ = unsafe {
+                WriteConsoleW(
+                    out_h.as_raw_handle() as HANDLE,
+                    crlf.as_ptr(),
+                    crlf.len() as u32,
+                    &mut written,
+                    ptr::null(),
+                )
+            };
+        } else {
+            let mut stderr = io::stderr().lock();
+            let _ = writeln!(stderr);
+        }
+
+        let mut decoded = Zeroizing::new(String::from_utf16_lossy(&accum));
+        while decoded.ends_with('\r') || decoded.ends_with('\n') {
+            decoded.pop();
+        }
+        Ok(decoded)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = prompt;
+        Err(CoreError::new(
+            ErrorCode::InteractionRequired,
+            "interactive terminal passphrase input is unsupported on this platform",
+            "Run on macOS, Linux, or Windows",
+        ))
     }
 }
 
@@ -514,7 +697,7 @@ fn handle_daemon(
 }
 
 fn handle_open(data_dir: &Path, mode: OutputMode, started: Instant, quiet: bool) -> i32 {
-    match try_send_uds(data_dir, &UdsRequest::OpenTicket, Duration::from_secs(3)) {
+    match try_send_ipc(data_dir, &LocalIpcRequest::OpenTicket, Duration::from_secs(3)) {
         Ok(Some(resp)) if resp.ok => {
             let url = resp.url.unwrap_or_default();
             let port = resp.port.unwrap_or(19876);
@@ -598,9 +781,9 @@ fn handle_device_bootstrap(
                 let _ = run_async(client.run_sync_round(&mut store, false));
             }
         }
-        let _ = try_send_uds(
+        let _ = try_send_ipc(
             store.data_dir(),
-            &UdsRequest::Poke { fast_flush: true },
+            &LocalIpcRequest::Poke { fast_flush: true },
             Duration::from_secs(2),
         );
         match mode {
@@ -682,9 +865,9 @@ fn handle_device_bootstrap(
         (s, false)
     };
 
-    let _ = try_send_uds(
+    let _ = try_send_ipc(
         store.data_dir(),
-        &UdsRequest::Poke { fast_flush: true },
+        &LocalIpcRequest::Poke { fast_flush: true },
         Duration::from_secs(2),
     );
     match mode {
@@ -742,9 +925,9 @@ fn handle_device_claim(
         }
     }
     // Notify any already-running local daemon to hot-reload SMKs, credentials, and WS loop
-    let _ = try_send_uds(
+    let _ = try_send_ipc(
         data_dir,
-        &UdsRequest::Poke { fast_flush: true },
+        &LocalIpcRequest::Poke { fast_flush: true },
         Duration::from_secs(2),
     );
     match mode {
@@ -1962,9 +2145,9 @@ fn handle_sync(
         }
         SyncCommand::Push | SyncCommand::Pull => {
             // If Daemon is running, trigger Single-Flight sync through Daemon so SQLite keeps one writer.
-            if let Some(resp) = try_send_uds(
+            if let Some(resp) = try_send_ipc(
                 store.data_dir(),
-                &UdsRequest::SyncNow { wait: true },
+                &LocalIpcRequest::SyncNow { wait: true },
                 Duration::from_secs(30),
             )? {
                 if !resp.ok {
@@ -2612,9 +2795,9 @@ fn handle_keyring(
             let (new_gen, new_kid) = store.rotate_smk()?;
             // Push updated block_keys + RecoveryKeyringV1 immediately to the relay
             let report = run_async(client.run_sync_round(store, false))?;
-            let _ = try_send_uds(
+            let _ = try_send_ipc(
                 store.data_dir(),
-                &UdsRequest::Poke { fast_flush: true },
+                &LocalIpcRequest::Poke { fast_flush: true },
                 Duration::from_secs(2),
             );
             let data = serde_json::json!({
@@ -2664,9 +2847,9 @@ fn handle_keyring(
                     let _ = run_async(client.run_sync_round(store, creds.scope != "read-write"));
                 }
             }
-            let _ = try_send_uds(
+            let _ = try_send_ipc(
                 store.data_dir(),
-                &UdsRequest::Poke { fast_flush: true },
+                &LocalIpcRequest::Poke { fast_flush: true },
                 Duration::from_secs(2),
             );
             let data = serde_json::json!({ "ok": true, "unsealed_generations": gens });

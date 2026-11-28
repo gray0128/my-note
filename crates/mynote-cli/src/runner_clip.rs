@@ -449,9 +449,9 @@ pub(super) fn handle_clip(
             if cur.as_deref().is_none_or(|c| stored_row.clip_id.as_str() > c) {
                 let _ = store.set_clip_cursor(Some(&stored_row.clip_id));
             }
-            let _ = try_send_uds(
+            let _ = try_send_ipc(
                 store.data_dir(),
-                &UdsRequest::ClipPoke {
+                &LocalIpcRequest::ClipPoke {
                     clip_id: Some(stored_row.clip_id.clone()),
                     cleared: false,
                 },
@@ -534,9 +534,9 @@ pub(super) fn handle_clip(
 
             if apply {
                 let mut applied_via_daemon = false;
-                if let Some(resp) = try_send_uds(
+                if let Some(resp) = try_send_ipc(
                     store.data_dir(),
-                    &UdsRequest::ClipApply {
+                    &LocalIpcRequest::ClipApply {
                         clip_id: row.clip_id.clone(),
                     },
                     Duration::from_secs(5),
@@ -807,9 +807,9 @@ pub(super) fn handle_clip(
                 && (local_res.as_ref().is_some_and(|r| r.deleted_count > 0)
                     || cloud_res.as_ref().is_some_and(|r| r.deleted_count > 0))
             {
-                let _ = try_send_uds(
+                let _ = try_send_ipc(
                     store.data_dir(),
-                    &UdsRequest::ClipPoke {
+                    &LocalIpcRequest::ClipPoke {
                         clip_id: None,
                         cleared: scope != "cloud",
                     },
@@ -858,9 +858,9 @@ pub(super) fn handle_clip(
                 local_deleted = n;
                 local_freed = bytes_before;
             }
-            let _ = try_send_uds(
+            let _ = try_send_ipc(
                 store.data_dir(),
-                &UdsRequest::ClipPoke {
+                &LocalIpcRequest::ClipPoke {
                     clip_id: None,
                     cleared: scope != "cloud",
                 },
@@ -1006,9 +1006,11 @@ pub(super) fn handle_clip(
         }
 
         ClipCommand::Undo => {
-            let restored = if let Some(resp) =
-                try_send_uds(store.data_dir(), &UdsRequest::ClipUndo, Duration::from_secs(3))?
-            {
+            let restored = if let Some(resp) = try_send_ipc(
+                store.data_dir(),
+                &LocalIpcRequest::ClipUndo,
+                Duration::from_secs(3),
+            )? {
                 if !resp.ok {
                     return Err(resp.into_core_error());
                 }
@@ -1049,9 +1051,9 @@ pub(super) fn handle_clip(
             };
             let client = RelayClient::from_credentials(&creds)?;
             let (new_kid, new_gen) = run_async(rotate_clip_key_with_options(store, &client, wipe_local))?;
-            let _ = try_send_uds(
+            let _ = try_send_ipc(
                 store.data_dir(),
-                &UdsRequest::ClipPoke {
+                &LocalIpcRequest::ClipPoke {
                     clip_id: None,
                     cleared: wipe_local,
                 },
@@ -1108,9 +1110,9 @@ pub(super) fn handle_clip(
                 None
             };
 
-            let (cfg, daemon_notified) = if let Some(resp) = try_send_uds(
+            let (cfg, daemon_notified) = if let Some(resp) = try_send_ipc(
                 store.data_dir(),
-                &UdsRequest::ClipWatchSet {
+                &LocalIpcRequest::ClipWatchSet {
                     paused: paused_opt,
                     enabled: enabled_opt,
                     auto_apply_mirror: auto_apply.clone(),

@@ -10,8 +10,8 @@ use axum::{Json, Router};
 use base64::Engine;
 use futures_util::StreamExt;
 use mynote_cli::daemon::{start_daemon, DaemonConfig};
+use mynote_cli::local_ipc::{try_send_ipc, ApplyMeta, ApplyRequest, LocalIpcRequest};
 use mynote_cli::sync_client::{sha256_hex, RelayClient};
-use mynote_cli::uds::{try_send_uds, ApplyMeta, ApplyRequest, UdsRequest};
 use mynote_core::error::ErrorCode;
 use mynote_core::ids::{DeviceId, JournalEpoch, KeyId, OpId};
 use mynote_core::model::KeyRecordRow;
@@ -113,7 +113,7 @@ async fn sec05_host_origin_cookie_and_ticket_enforcement() {
     // 3. Issue one-time ticket over 0600 UDS, exchange -> 303 + HttpOnly SameSite=Strict cookie
     let dir_uds = dir.clone();
     let ticket_resp = tokio::task::spawn_blocking(move || {
-        try_send_uds(&dir_uds, &UdsRequest::OpenTicket, Duration::from_secs(3))
+        try_send_ipc(&dir_uds, &LocalIpcRequest::OpenTicket, Duration::from_secs(3))
     })
     .await
     .unwrap()
@@ -293,7 +293,7 @@ async fn cli_daemon_uds_live_ws_refresh_and_offline_fallback() {
     // Authenticate session cookie via UDS one-time ticket
     let dir_uds = dir.clone();
     let ticket_url = tokio::task::spawn_blocking(move || {
-        try_send_uds(&dir_uds, &UdsRequest::OpenTicket, Duration::from_secs(3))
+        try_send_ipc(&dir_uds, &LocalIpcRequest::OpenTicket, Duration::from_secs(3))
     })
     .await
     .unwrap()
@@ -1214,7 +1214,7 @@ async fn full_dual_desktop_sync_conflict_rotation_refresh_revoke_and_pitr_e2e() 
 ///   -> `open_for_recovery_bootstrap` -> `unlock_keyring_with_words` -> full multi-generation restore).
 /// - HIGH #2: `sync_key_table` GET-before-POST strictly-newer diff when peer holds older `keyring_gen`.
 /// - HIGH #4: `build_pending_push` 4 MiB JSON byte-budget batching across multi-hundred-KiB blocks.
-/// - HIGH #8: Live daemon hot-reloads rotated SMKs on `UdsRequest::Poke` so subsequent writes use new SMK.
+/// - HIGH #8: Live daemon hot-reloads rotated SMKs on `LocalIpcRequest::Poke` so subsequent writes use new SMK.
 /// - HIGH #9: `run_cloud_sync_now` failure always clears `"syncing"` WS state & emits `DEVICE_REVOKED`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn regression_recovery_bootstrap_key_table_diff_large_batch_and_daemon_smk_reload() {
@@ -1453,27 +1453,27 @@ async fn regression_recovery_bootstrap_key_table_diff_large_batch_and_daemon_smk
         new_kid
     };
 
-    // Send UdsRequest::Poke -> daemon MUST hot-reload SMKs from disk
+    // Send LocalIpcRequest::Poke -> daemon MUST hot-reload SMKs from disk
     let dir_d_poke = dir_daemon.clone();
     let poke_resp = tokio::task::spawn_blocking(move || {
-        try_send_uds(
+        try_send_ipc(
             &dir_d_poke,
-            &UdsRequest::Poke { fast_flush: false },
+            &LocalIpcRequest::Poke { fast_flush: false },
             Duration::from_secs(3),
         )
     })
     .await
     .unwrap()
     .unwrap()
-    .expect("daemon UDS reachable");
+    .expect("daemon IPC reachable");
     assert!(poke_resp.ok);
 
-    // Add a block via daemon UDS Apply -> new op MUST be encrypted with rotated_kid!
+    // Add a block via daemon LocalIpc Apply -> new op MUST be encrypted with rotated_kid!
     let dir_d_apply = dir_daemon.clone();
     let apply_resp = tokio::task::spawn_blocking(move || {
-        try_send_uds(
+        try_send_ipc(
             &dir_d_apply,
-            &UdsRequest::Apply {
+            &LocalIpcRequest::Apply {
                 meta: ApplyMeta {
                     actor: "human".into(),
                     idempotency_key: None,
@@ -1505,7 +1505,7 @@ async fn regression_recovery_bootstrap_key_table_diff_large_batch_and_daemon_smk
     };
     assert_eq!(
         last_op_smk, rotated_kid,
-        "daemon must encrypt new ops under the hot-reloaded SMK after UdsRequest::Poke"
+        "daemon must encrypt new ops under the hot-reloaded SMK after LocalIpcRequest::Poke"
     );
 
     // HIGH #9: Revoke daemon's device on relay, subscribe to daemon WS broadcast, invoke
@@ -1690,7 +1690,7 @@ async fn pr38_cli_daemon_regressions_c1_c8_h16_h17() {
     for _ in 0..2 {
         let dd = dir_d.clone();
         let t = tokio::task::spawn_blocking(move || {
-            try_send_uds(&dd, &UdsRequest::OpenTicket, Duration::from_secs(3))
+            try_send_ipc(&dd, &LocalIpcRequest::OpenTicket, Duration::from_secs(3))
         })
         .await
         .unwrap()
@@ -1924,7 +1924,7 @@ async fn m3_daemon_time_travel_tier2_history_revert_and_format_sec03_isolation()
     // Acquire authenticated local session cookie
     let dir_uds = dir.clone();
     let ticket = tokio::task::spawn_blocking(move || {
-        try_send_uds(&dir_uds, &UdsRequest::OpenTicket, Duration::from_secs(3))
+        try_send_ipc(&dir_uds, &LocalIpcRequest::OpenTicket, Duration::from_secs(3))
     })
     .await
     .unwrap()
@@ -2133,14 +2133,14 @@ async fn m3_daemon_time_travel_tier2_history_revert_and_format_sec03_isolation()
         "KEY_SHREDDED"
     );
 
-    // UDS ApplyRequest::RevertBlock shares resolve_revert_target and returns KEY_SHREDDED
+    // LocalIpc ApplyRequest::RevertBlock shares resolve_revert_target and returns KEY_SHREDDED
     let dir_uds2 = dir.clone();
     let blk_for_uds = blk_id.clone();
     let op1_for_uds = op1.clone();
     let uds_resp = tokio::task::spawn_blocking(move || {
-        try_send_uds(
+        try_send_ipc(
             &dir_uds2,
-            &UdsRequest::Apply {
+            &LocalIpcRequest::Apply {
                 meta: ApplyMeta {
                     actor: "human".into(),
                     idempotency_key: None,
@@ -2369,18 +2369,27 @@ async fn m3_daemon_time_travel_tier2_history_revert_and_format_sec03_isolation()
     // 5. Daemon POST /v1/local/format SEC-03 locked-block zero-subprocess guarantee!
     let marker = dir.join("daemon_locked_fmt_spy.marker");
     let cfg_path = dir.join("daemon_formatters.toml");
-    std::fs::write(
-        &cfg_path,
-        format!(
-            r#"
+    #[cfg(not(windows))]
+    let spy_toml = format!(
+        r#"
 [formatters.spy_daemon_sec03]
 cmd = ["sh", "-c", "touch '{}'; printf 'FMT:%s' \"$(cat)\""]
 timeout_ms = 500
 "#,
-            marker.display()
-        ),
-    )
-    .unwrap();
+        marker.display()
+    );
+    #[cfg(windows)]
+    let spy_toml = {
+        let marker_posix = marker.to_string_lossy().replace('\\', "/");
+        format!(
+            r#"
+[formatters.spy_daemon_sec03]
+cmd = ["python", "-c", "import pathlib, sys; pathlib.Path('{marker_posix}').write_text('x'); sys.stdout.write('FMT:' + sys.stdin.read())"]
+timeout_ms = 3000
+"#
+        )
+    };
+    std::fs::write(&cfg_path, spy_toml).unwrap();
     let _env_guard = EnvGuard {
         key: "MYNOTE_FORMATTERS_CONFIG",
         prev: std::env::var("MYNOTE_FORMATTERS_CONFIG").ok(),

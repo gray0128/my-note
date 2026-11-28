@@ -301,6 +301,8 @@ pub fn init_connection(conn: &Connection, backups_dir: Option<&Path>) -> Result<
                         "Cannot create backups directory",
                     )
                 })?;
+                #[cfg(windows)]
+                crate::credentials::apply_windows_private_acl(dir, true)?;
                 let snap = dir.join(format!("mynote-pre-schema-v{existing_ver}.db"));
                 vacuum_into(conn, &snap)?;
                 prune_pre_schema_backups(dir, 2);
@@ -341,7 +343,8 @@ pub fn init_connection(conn: &Connection, backups_dir: Option<&Path>) -> Result<
     Ok(())
 }
 
-/// Generate a consistent single-file SQLite backup via `VACUUM INTO` (`0600` on Unix).
+/// Generate a consistent single-file SQLite backup via `VACUUM INTO` (`0600` on Unix,
+/// current-user-only protected NTFS DACL on Windows).
 pub fn vacuum_into(conn: &Connection, dest: &Path) -> Result<(), CoreError> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
@@ -361,6 +364,10 @@ pub fn vacuum_into(conn: &Connection, dest: &Path) -> Result<(), CoreError> {
                     "Verify backup directory ownership and permissions",
                 )
             })?;
+        }
+        #[cfg(windows)]
+        {
+            crate::credentials::apply_windows_private_acl(parent, true)?;
         }
     }
     if dest.exists() {
@@ -385,6 +392,10 @@ pub fn vacuum_into(conn: &Connection, dest: &Path) -> Result<(), CoreError> {
                 "Verify backup directory ownership and permissions",
             )
         })?;
+    }
+    #[cfg(windows)]
+    {
+        crate::credentials::apply_windows_private_acl(dest, false)?;
     }
     Ok(())
 }

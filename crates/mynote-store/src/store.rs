@@ -406,6 +406,45 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), CoreError> {
             )
         })?;
     }
+    #[cfg(windows)]
+    {
+        crate::credentials::apply_windows_private_acl(path, true)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_private_sqlite_files(db_path: &Path) -> Result<(), CoreError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if db_path.exists() {
+            std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+                CoreError::new(
+                    ErrorCode::IntegrityError,
+                    format!("cannot set 0600 on '{}': {e}", db_path.display()),
+                    "Check SQLite file ownership and permissions",
+                )
+            })?;
+        }
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = PathBuf::from(format!("{}{suffix}", db_path.display()));
+            if sidecar.exists() {
+                let _ = std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if db_path.exists() {
+            crate::credentials::apply_windows_private_acl(db_path, false)?;
+        }
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = PathBuf::from(format!("{}{suffix}", db_path.display()));
+            if sidecar.exists() {
+                let _ = crate::credentials::apply_windows_private_acl(&sidecar, false);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -434,6 +473,7 @@ impl LocalStore {
             )
         })?;
         init_connection(&conn, Some(&backups_dir))?;
+        ensure_private_sqlite_files(&db_path)?;
 
         let smk_file_path = data_dir.join("smk_keyring.local.json");
         let mut ulid_gen = MonotonicUlidGen::new();
@@ -3741,17 +3781,14 @@ impl LocalStore {
         if !dry_run {
             let backups_dir = target_dir.join("backups");
             let mirror_dir = target_dir.join("mirror");
-            std::fs::create_dir_all(&backups_dir).map_err(|e| {
-                CoreError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("cannot create target dir: {e}"),
-                    "Check permissions",
-                )
-            })?;
-            std::fs::create_dir_all(&mirror_dir).ok();
-            let conn = Connection::open(target_dir.join("mynote.db"))
+            ensure_private_dir(target_dir)?;
+            ensure_private_dir(&backups_dir)?;
+            let _ = ensure_private_dir(&mirror_dir);
+            let db_path = target_dir.join("mynote.db");
+            let conn = Connection::open(&db_path)
                 .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "open restored db"))?;
             init_connection(&conn, Some(&backups_dir))?;
+            ensure_private_sqlite_files(&db_path)?;
 
             let dev = DeviceId::from_random_bytes(rand_bytes::<10>()?);
             conn.execute(
@@ -3970,7 +4007,8 @@ impl LocalStore {
         ensure_private_dir(&mirror_dir)?;
         exclude_from_os_backups(&data_dir);
 
-        let conn = Connection::open(data_dir.join("mynote.db")).map_err(|e| {
+        let db_path = data_dir.join("mynote.db");
+        let conn = Connection::open(&db_path).map_err(|e| {
             CoreError::new(
                 ErrorCode::IntegrityError,
                 format!("cannot open SQLite: {e}"),
@@ -3978,6 +4016,7 @@ impl LocalStore {
             )
         })?;
         init_connection(&conn, Some(&backups_dir))?;
+        ensure_private_sqlite_files(&db_path)?;
 
         let mut map = BTreeMap::new();
         let mut latest_kid = smks_in[0].smk_kid;
@@ -4060,7 +4099,8 @@ impl LocalStore {
         ensure_private_dir(&mirror_dir)?;
         exclude_from_os_backups(&data_dir);
 
-        let conn = Connection::open(data_dir.join("mynote.db")).map_err(|e| {
+        let db_path = data_dir.join("mynote.db");
+        let conn = Connection::open(&db_path).map_err(|e| {
             CoreError::new(
                 ErrorCode::IntegrityError,
                 format!("cannot open SQLite: {e}"),
@@ -4068,6 +4108,7 @@ impl LocalStore {
             )
         })?;
         init_connection(&conn, Some(&backups_dir))?;
+        ensure_private_sqlite_files(&db_path)?;
 
         let now = now_ms() as i64;
         conn.execute(

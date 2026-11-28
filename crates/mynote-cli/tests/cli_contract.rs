@@ -624,9 +624,8 @@ fn g11_broken_format_and_layer2_external_formatter_fuses_exit_7_with_zero_side_e
 
     // Layer 2 external formatter fuses: (1) 0-byte stdout, (2) non-zero exit, (3) timeout
     let cfg_path = dir.join("formatters.toml");
-    std::fs::write(
-        &cfg_path,
-        r#"
+    #[cfg(not(windows))]
+    let fuse_toml = r#"
 [formatters.emptyfuse]
 cmd = "true"
 args = []
@@ -641,9 +640,25 @@ timeout_ms = 500
 cmd = "sleep"
 args = ["2"]
 timeout_ms = 100
-"#,
-    )
-    .unwrap();
+"#;
+    #[cfg(windows)]
+    let fuse_toml = r#"
+[formatters.emptyfuse]
+cmd = "python"
+args = ["-c", "pass"]
+timeout_ms = 3000
+
+[formatters.failfuse]
+cmd = "python"
+args = ["-c", "import sys; sys.stdout.write('partial'); sys.exit(1)"]
+timeout_ms = 3000
+
+[formatters.slowfuse]
+cmd = "python"
+args = ["-c", "import time; time.sleep(5)"]
+timeout_ms = 200
+"#;
+    std::fs::write(&cfg_path, fuse_toml).unwrap();
     let cfg_str = cfg_path.to_str().unwrap();
 
     for lang in ["emptyfuse", "failfuse", "slowfuse"] {
@@ -729,10 +744,9 @@ fn layer2_all_five_fault_injection_fuses_array_cmd_and_locked_block_zero_subproc
     let dir = temp_dir("layer2_m3");
     let marker = dir.join("locked_spy_was_executed.marker");
     let cfg_path = dir.join("formatters.toml");
-    std::fs::write(
-        &cfg_path,
-        format!(
-            r#"
+    #[cfg(not(windows))]
+    let layer2_toml = format!(
+        r#"
 [formatters.nonzero_partial]
 cmd = ["sh", "-c", "printf 'partial_garbage'; exit 1"]
 timeout_ms = 500
@@ -769,10 +783,52 @@ timeout_ms = 500
 cmd = ["sh", "-c", "touch '{}'; cat"]
 timeout_ms = 500
 "#,
-            marker.display()
-        ),
-    )
-    .unwrap();
+        marker.display()
+    );
+    #[cfg(windows)]
+    let layer2_toml = {
+        let marker_posix = marker.to_string_lossy().replace('\\', "/");
+        format!(
+            r#"
+[formatters.nonzero_partial]
+cmd = ["python", "-c", "import sys; sys.stdout.write('partial_garbage'); sys.exit(1)"]
+timeout_ms = 3000
+
+[formatters.zero_byte]
+cmd = ["python", "-c", "pass"]
+timeout_ms = 3000
+
+[formatters.bad_utf8]
+cmd = ["python", "-c", "import sys; sys.stdout.buffer.write(b'\\xff\\xfe\\xfd')"]
+timeout_ms = 3000
+
+[formatters.timeout_kill]
+cmd = ["python", "-c", "import time; time.sleep(5)"]
+timeout_ms = 200
+
+[formatters.env_secret_probe]
+cmd = ["python", "-c", "import os, sys; s = os.environ.get('AWS_SECRET_ACCESS_KEY','') + os.environ.get('MYNOTE_BOOTSTRAP_TOKEN','') + os.environ.get('OPENAI_API_KEY',''); print('LEAKED') if s else sys.exit(1)"]
+timeout_ms = 3000
+
+[formatters.env_clean_array]
+cmd = ["python", "-c", "import os, sys; sys.stdout.write(':'.join(['CLEAN', os.environ.get('AWS_SECRET_ACCESS_KEY',''), os.environ.get('MYNOTE_BOOTSTRAP_TOKEN',''), os.environ.get('OPENAI_API_KEY',''), os.environ.get('PYTHONUTF8','')]))"]
+timeout_ms = 3000
+
+[formatters.empty_array]
+cmd = []
+timeout_ms = 3000
+
+[formatters.blank_cmd]
+cmd = "   "
+timeout_ms = 3000
+
+[formatters.spyfmt]
+cmd = ["python", "-c", "import pathlib, sys; pathlib.Path('{marker_posix}').write_text('x'); sys.stdout.write(sys.stdin.read())"]
+timeout_ms = 3000
+"#
+        )
+    };
+    std::fs::write(&cfg_path, layer2_toml).unwrap();
     let cfg_str = cfg_path.to_str().unwrap();
 
     let secret_env = [
@@ -855,7 +911,10 @@ timeout_ms = 500
     );
     assert_eq!(clean_out.status.code(), Some(0));
     let clean_j = parse_single_json_stdout(&clean_out);
+    #[cfg(not(windows))]
     assert_eq!(clean_j["data"]["formatted"], "CLEAN::::C.UTF-8");
+    #[cfg(windows)]
+    assert_eq!(clean_j["data"]["formatted"], "CLEAN::::1");
     let raw_stdout = String::from_utf8_lossy(&clean_out.stdout);
     assert!(!raw_stdout.contains("AKIA_CANARY_SECRET_999"));
     assert!(!raw_stdout.contains("BOOT_CANARY_SECRET_888"));
