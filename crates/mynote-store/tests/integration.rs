@@ -294,11 +294,26 @@ fn time_travel_history_undo_actor_shred_and_tier2_daemon_contracts() {
         .purge_block_history(&blk_id, None, None, T_GRACE_DEFAULT_MS, "agent:claude-code")
         .unwrap();
     assert!(!old_keys.is_empty());
-    let muts: Vec<StoreMutation> = old_keys
-        .iter()
-        .copied()
-        .map(|key_id| StoreMutation::ExecuteShred { key_id })
+    store.set_local_meta("bootstrap_completed", "1").unwrap();
+    let epoch = mynote_core::ids::JournalEpoch::from_random_bytes([0x99; 16]);
+    let acked: Vec<mynote_core::sync::AckedOp> = store
+        .export_engine_snapshot()
+        .unwrap()
+        .ops
+        .keys()
+        .enumerate()
+        .map(|(i, &op_id)| mynote_core::sync::AckedOp {
+            op_id,
+            seq: (i + 1) as i64,
+        })
         .collect();
+    let mut muts = vec![StoreMutation::MarkOpsSynced { epoch, acked }];
+    muts.extend(
+        old_keys
+            .iter()
+            .copied()
+            .map(|key_id| StoreMutation::ExecuteShred { key_id }),
+    );
     store.apply_store_mutations(&muts).unwrap();
 
     let hist_after_shred = store.block_history(&blk_id, 50).unwrap();

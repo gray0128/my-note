@@ -1218,11 +1218,15 @@ impl SimCluster {
             return false;
         }
         let plan = self.nodes[node_idx].engine.plan_outbox_reconciliation();
-        if plan.leaves.is_empty() && plan.stranded_superseded_ops.is_empty() {
+        if plan.leaves.is_empty()
+            && plan.stranded_superseded_ops.is_empty()
+            && plan.blocked_rekey_ancestors.is_empty()
+        {
             return false;
         }
 
         let mut to_delete: BTreeSet<OpId> = plan.stranded_superseded_ops.clone();
+        let to_block_ancestor: BTreeSet<OpId> = plan.blocked_rekey_ancestors.clone();
         let mut to_keep: BTreeSet<OpId> = plan.protected_ancestors.clone();
         let mut changed = false;
 
@@ -1251,6 +1255,11 @@ impl SimCluster {
             if !leaf_plan.self_needs_rekey {
                 let now = self.node_now(node_idx);
                 let new_op_id = OpId::from_ulid(self.nodes[node_idx].ulid_gen.next(now, self.rng.bytes_10()));
+                let rebased_op_type = if leaf_plan.collapsed_create && leaf_plan.frontier_parents.is_empty() {
+                    OpType::Create
+                } else {
+                    inner.op_type
+                };
                 let rebased_body = match inner.body {
                     OpBodyV1::Tombstone { deleted_at_ms } => Some(OpBodyV1::Tombstone { deleted_at_ms }),
                     OpBodyV1::BlockMeta {
@@ -1280,6 +1289,13 @@ impl SimCluster {
                         let pt =
                             crate::crypto::decrypt_mnb1(blk_id.as_bytes(), op.op_id, key_id, &bdek, &mnb1)
                                 .ok()?;
+                        let mat_meta = leaf_plan
+                            .collapsed_create
+                            .then(|| self.nodes[node_idx].engine.materialize_block_view(blk_id))
+                            .flatten();
+                        let fill_buf = buffer_id.or_else(|| mat_meta.as_ref().map(|m| m.buffer_id));
+                        let fill_pos = position.or_else(|| mat_meta.as_ref().map(|m| m.position.clone()));
+                        let fill_lang = lang.or_else(|| mat_meta.as_ref().map(|m| m.lang.clone()));
                         let new_mnb1 = encrypt_mnb1(
                             blk_id.as_bytes(),
                             new_op_id,
@@ -1290,9 +1306,9 @@ impl SimCluster {
                         )
                         .ok()?;
                         Some(OpBodyV1::BlockContent {
-                            buffer_id,
-                            position,
-                            lang,
+                            buffer_id: fill_buf,
+                            position: fill_pos,
+                            lang: fill_lang,
                             public_hint,
                             tier: 1,
                             key_id,
@@ -1304,8 +1320,32 @@ impl SimCluster {
                         name_mnb1,
                         position,
                     } => BufferId::parse(&inner.entity_id).ok().and_then(|buf_id| {
+                        let mat_buf = leaf_plan
+                            .collapsed_create
+                            .then(|| self.nodes[node_idx].engine.materialize_buffer_view(buf_id))
+                            .flatten();
+                        let fill_pos = position.or_else(|| mat_buf.as_ref().map(|m| m.position.clone()));
                         let new_name_mnb1 = match name_mnb1 {
-                            None => None,
+                            None => match mat_buf.as_ref() {
+                                Some(m) => {
+                                    let kr = self.nodes[node_idx].engine.unwrap_key_record(key_id)?;
+                                    (kr.bdek.len() == 32).then_some(())?;
+                                    let mut bdek = [0u8; 32];
+                                    bdek.copy_from_slice(&kr.bdek);
+                                    Some(
+                                        encrypt_mnb1(
+                                            buf_id.as_bytes(),
+                                            new_op_id,
+                                            key_id,
+                                            &bdek,
+                                            &m.name,
+                                            self.rng.bytes_24(),
+                                        )
+                                        .ok()?,
+                                    )
+                                }
+                                None => None,
+                            },
                             Some(old_mnb1) => {
                                 let kr = self.nodes[node_idx].engine.unwrap_key_record(key_id)?;
                                 (kr.bdek.len() == 32).then_some(())?;
@@ -1335,7 +1375,7 @@ impl SimCluster {
                         Some(OpBodyV1::BufferMeta {
                             key_id,
                             name_mnb1: new_name_mnb1,
-                            position,
+                            position: fill_pos,
                         })
                     }),
                     OpBodyV1::BlockContent { .. } => None,
@@ -1350,7 +1390,7 @@ impl SimCluster {
                     v: inner.v,
                     entity_type: inner.entity_type,
                     entity_id: inner.entity_id.clone(),
-                    op_type: inner.op_type,
+                    op_type: rebased_op_type,
                     parent_op_ids: leaf_plan.merged_parents.clone(),
                     hlc: inner.hlc.clone(),
                     actor: inner.actor.clone(),
@@ -1375,7 +1415,7 @@ impl SimCluster {
                         entity_type: inner.entity_type,
                         entity_id: inner.entity_id,
                         parent_op_ids: leaf_plan.merged_parents.clone(),
-                        op_type: inner.op_type,
+                        op_type: rebased_op_type,
                         hlc: inner.hlc,
                         actor: inner.actor,
                         key_id: op.key_id,
@@ -1551,7 +1591,18 @@ impl SimCluster {
             }
         }
 
-        for oid in to_delete.difference(&to_keep) {
+        for anc in to_block_ancestor.difference(&to_keep) {
+            if let Some(op) = self.nodes[node_idx].engine.ops.get_mut(anc) {
+                if op.server_seq.is_none() && op.sync_blocked_reason.is_none() {
+                    op.sync_blocked_reason = Some("NEEDS_VAULT_REKEY_ANCESTOR".into());
+                    changed = true;
+                }
+            }
+        }
+        for oid in &to_delete {
+            if to_keep.contains(oid) || to_block_ancestor.contains(oid) {
+                continue;
+            }
             if self.nodes[node_idx]
                 .engine
                 .ops

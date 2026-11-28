@@ -2010,12 +2010,15 @@ impl LocalStore {
         let mut needs_vault_rekey_ops = Vec::new();
         let mut rekeyed_tier1_count = 0usize;
         let plan = snap.plan_outbox_reconciliation();
-        if plan.leaves.is_empty() && plan.stranded_superseded_ops.is_empty() {
+        if plan.leaves.is_empty()
+            && plan.stranded_superseded_ops.is_empty()
+            && plan.blocked_rekey_ancestors.is_empty()
+        {
             return Ok((needs_vault_rekey_ops, 0));
         }
 
         let mut to_delete: BTreeSet<OpId> = plan.stranded_superseded_ops.clone();
-        let mut to_block_ancestor: BTreeSet<OpId> = BTreeSet::new();
+        let mut to_block_ancestor: BTreeSet<OpId> = plan.blocked_rekey_ancestors.clone();
         let mut to_keep: BTreeSet<OpId> = plan.protected_ancestors.clone();
         let mut touched_blocks: BTreeSet<BlockId> = BTreeSet::new();
         let mut touched_buffers: BTreeSet<BufferId> = BTreeSet::new();
@@ -2077,6 +2080,11 @@ impl LocalStore {
 
                 let now = now_ms();
                 let new_op_id = OpId::from_ulid(self.ulid_gen.next(now, rand_bytes::<10>()?));
+                let rebased_op_type = if leaf_plan.collapsed_create && leaf_plan.frontier_parents.is_empty() {
+                    OpType::Create
+                } else {
+                    inner.op_type
+                };
                 let rebased_body = match &inner.body {
                     OpBodyV1::Tombstone { deleted_at_ms } => Some(OpBodyV1::Tombstone {
                         deleted_at_ms: *deleted_at_ms,
@@ -2105,6 +2113,27 @@ impl LocalStore {
                         if let Ok(bdek) = self.unwrap_tier1_bdek(*key_id) {
                             let pt = decrypt_mnb1(blk_id.as_bytes(), op.op_id, *key_id, &bdek, mnb1).ok();
                             if let Some(text) = pt {
+                                let (fill_buf, fill_pos, fill_lang) = if leaf_plan.collapsed_create {
+                                    let existing_meta: Option<(String, String, String)> = self
+                                        .conn
+                                        .query_row(
+                                            "SELECT buffer_id, position, lang FROM blocks WHERE id = ?1",
+                                            [blk_id.to_string()],
+                                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                                        )
+                                        .optional()
+                                        .unwrap_or(None);
+                                    match existing_meta {
+                                        Some((b, p, l)) => (
+                                            buffer_id.or_else(|| BufferId::parse(&b).ok()),
+                                            position.clone().or(Some(p)),
+                                            lang.clone().or(Some(l)),
+                                        ),
+                                        None => (*buffer_id, position.clone(), lang.clone()),
+                                    }
+                                } else {
+                                    (*buffer_id, position.clone(), lang.clone())
+                                };
                                 let new_mnb1 = encrypt_mnb1(
                                     blk_id.as_bytes(),
                                     new_op_id,
@@ -2114,9 +2143,9 @@ impl LocalStore {
                                     rand_bytes::<24>()?,
                                 )?;
                                 Some(OpBodyV1::BlockContent {
-                                    buffer_id: *buffer_id,
-                                    position: position.clone(),
-                                    lang: lang.clone(),
+                                    buffer_id: fill_buf,
+                                    position: fill_pos,
+                                    lang: fill_lang,
                                     public_hint: public_hint.clone(),
                                     tier: 1,
                                     key_id: *key_id,
@@ -2135,12 +2164,48 @@ impl LocalStore {
                         position,
                     } => {
                         let buf_id = BufferId::parse(&inner.entity_id)?;
+                        let existing_buf: Option<(String, String)> = if leaf_plan.collapsed_create {
+                            self.conn
+                                .query_row(
+                                    "SELECT name, position FROM buffers WHERE id = ?1",
+                                    [buf_id.to_string()],
+                                    |r| Ok((r.get(0)?, r.get(1)?)),
+                                )
+                                .optional()
+                                .unwrap_or(None)
+                        } else {
+                            None
+                        };
+                        let fill_pos = position
+                            .clone()
+                            .or_else(|| existing_buf.as_ref().map(|(_, p)| p.clone()));
                         match name_mnb1 {
-                            None => Some(OpBodyV1::BufferMeta {
-                                key_id: *key_id,
-                                name_mnb1: None,
-                                position: position.clone(),
-                            }),
+                            None => match existing_buf.as_ref() {
+                                Some((existing_name, _)) => {
+                                    if let Ok(bdek) = self.unwrap_tier1_bdek(*key_id) {
+                                        let new_mnb1 = encrypt_mnb1(
+                                            buf_id.as_bytes(),
+                                            new_op_id,
+                                            *key_id,
+                                            &bdek,
+                                            existing_name,
+                                            rand_bytes::<24>()?,
+                                        )?;
+                                        Some(OpBodyV1::BufferMeta {
+                                            key_id: *key_id,
+                                            name_mnb1: Some(new_mnb1),
+                                            position: fill_pos,
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                }
+                                None => Some(OpBodyV1::BufferMeta {
+                                    key_id: *key_id,
+                                    name_mnb1: None,
+                                    position: fill_pos,
+                                }),
+                            },
                             Some(old_mnb1) => {
                                 if let Ok(bdek) = self.unwrap_tier1_bdek(*key_id) {
                                     if let Ok(name_str) =
@@ -2157,7 +2222,7 @@ impl LocalStore {
                                         Some(OpBodyV1::BufferMeta {
                                             key_id: *key_id,
                                             name_mnb1: Some(new_mnb1),
-                                            position: position.clone(),
+                                            position: fill_pos,
                                         })
                                     } else {
                                         None
@@ -2180,7 +2245,7 @@ impl LocalStore {
                     v: inner.v,
                     entity_type: inner.entity_type,
                     entity_id: inner.entity_id.clone(),
-                    op_type: inner.op_type,
+                    op_type: rebased_op_type,
                     parent_op_ids: leaf_plan.merged_parents.clone(),
                     hlc: inner.hlc.clone(),
                     actor: inner.actor.clone(),
@@ -2205,7 +2270,7 @@ impl LocalStore {
                     EntityType::Buffer => "buffer",
                     EntityType::Block => "block",
                 };
-                let ot = match inner.op_type {
+                let ot = match rebased_op_type {
                     OpType::Create => "CREATE",
                     OpType::Update => "UPDATE",
                     OpType::SetMeta => "SET_META",
@@ -2403,22 +2468,35 @@ impl LocalStore {
                     }
                 }
                 OpBodyV1::BufferMeta {
-                    name_mnb1: Some(old_name_mnb1),
-                    position,
-                    ..
+                    name_mnb1, position, ..
                 } => {
                     let buf_id = BufferId::parse(&inner.entity_id)?;
-                    let name_pt = if let Ok(old_bdek) = self.unwrap_tier1_bdek(old_kid) {
-                        decrypt_mnb1(buf_id.as_bytes(), op.op_id, old_kid, &old_bdek, old_name_mnb1).ok()
+                    let existing_buf: Option<(String, String)> = self
+                        .conn
+                        .query_row(
+                            "SELECT name, position FROM buffers WHERE id = ?1",
+                            [buf_id.to_string()],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()
+                        .unwrap_or(None);
+                    let name_pt = match name_mnb1 {
+                        Some(old_name_mnb1) => {
+                            if let Ok(old_bdek) = self.unwrap_tier1_bdek(old_kid) {
+                                decrypt_mnb1(buf_id.as_bytes(), op.op_id, old_kid, &old_bdek, old_name_mnb1)
+                                    .ok()
+                            } else {
+                                existing_buf.as_ref().map(|(n, _)| n.clone())
+                            }
+                        }
+                        None => existing_buf.as_ref().map(|(n, _)| n.clone()),
+                    };
+                    let fill_pos = if leaf_plan.collapsed_create {
+                        position
+                            .clone()
+                            .or_else(|| existing_buf.as_ref().map(|(_, p)| p.clone()))
                     } else {
-                        self.conn
-                            .query_row(
-                                "SELECT name FROM buffers WHERE id = ?1",
-                                [buf_id.to_string()],
-                                |r| r.get::<_, String>(0),
-                            )
-                            .optional()
-                            .unwrap_or(None)
+                        position.clone()
                     };
                     if let Some(name_str) = name_pt {
                         let now = now_ms();
@@ -2460,7 +2538,7 @@ impl LocalStore {
                             body: OpBodyV1::BufferMeta {
                                 key_id: new_kid,
                                 name_mnb1: Some(new_name_mnb1),
-                                position: position.clone(),
+                                position: fill_pos,
                             },
                         };
                         let new_mns1 = encrypt_mns1(
@@ -2795,10 +2873,13 @@ impl LocalStore {
                     CoreError::new(ErrorCode::IntegrityError, e.to_string(), "delete blocked mnw1 slot")
                 })?;
 
-            let mut parent_set: BTreeSet<OpId> = this
-                .current_entity_leaves(EntityType::Block, &entity_id)?
-                .into_iter()
-                .collect();
+            let live_leaves = this.current_entity_leaves(EntityType::Block, &entity_id)?;
+            let rekey_op_type = if live_leaves.is_empty() {
+                OpType::Create
+            } else {
+                OpType::Update
+            };
+            let mut parent_set: BTreeSet<OpId> = live_leaves.into_iter().collect();
             parent_set.extend(removed_ids);
             let parents: Vec<OpId> = parent_set.into_iter().collect();
             let now = now_ms();
@@ -2838,7 +2919,7 @@ impl LocalStore {
                 v: 1,
                 entity_type: EntityType::Block,
                 entity_id: entity_id.clone(),
-                op_type: OpType::Update,
+                op_type: rekey_op_type,
                 parent_op_ids: parents.clone(),
                 hlc: hlc.clone(),
                 actor: actor.to_string(),
@@ -2882,7 +2963,7 @@ impl LocalStore {
                 EntityType::Block,
                 &entity_id,
                 &parents,
-                OpType::Update,
+                rekey_op_type,
                 &hlc,
                 actor,
                 Some(new_kid),

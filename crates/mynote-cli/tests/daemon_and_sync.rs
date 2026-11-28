@@ -2092,16 +2092,31 @@ async fn m3_daemon_time_travel_tier2_history_revert_and_format_sec03_isolation()
     }
     assert!(saw_ws_revert, "WS must broadcast blocks_changed on POST /revert");
 
-    // 2. Purge history + ExecuteShred -> HTTP 410 KEY_SHREDDED on history op, REST revert, and UDS revert!
+    // 2. Purge history + sync push + ExecuteShred -> HTTP 410 KEY_SHREDDED on history op, REST revert, and UDS revert!
     {
         let mut g = daemon.state.store.lock().unwrap();
         let (_rec, old_keys) = g
             .purge_block_history(&blk_id, None, None, T_GRACE_DEFAULT_MS, "human")
             .unwrap();
-        let muts: Vec<StoreMutation> = old_keys
-            .into_iter()
-            .map(|key_id| StoreMutation::ExecuteShred { key_id })
+        g.set_local_meta("bootstrap_completed", "1").unwrap();
+        let epoch = JournalEpoch::from_random_bytes([0x99; 16]);
+        let acked: Vec<mynote_core::sync::AckedOp> = g
+            .export_engine_snapshot()
+            .unwrap()
+            .ops
+            .keys()
+            .enumerate()
+            .map(|(i, &op_id)| mynote_core::sync::AckedOp {
+                op_id,
+                seq: (i + 1) as i64,
+            })
             .collect();
+        let mut muts = vec![StoreMutation::MarkOpsSynced { epoch, acked }];
+        muts.extend(
+            old_keys
+                .into_iter()
+                .map(|key_id| StoreMutation::ExecuteShred { key_id }),
+        );
         g.apply_store_mutations(&muts).unwrap();
     }
 
