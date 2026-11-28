@@ -175,6 +175,11 @@ jobs:
         run: |
           cargo build --bin mynote
           ./evals/golden/run_golden.sh
+      - name: Build & verify optional macOS Swift shell (apps/macos)
+        if: runner.os == 'macOS'
+        run: |
+          ./apps/macos/build.sh
+          MYNOTE_BIN=./target/debug/mynote ./apps/macos/verify.sh --no-build
       - name: Verify wasm32-unknown-unknown compilation (core + desktop & pwa WASM features)
         run: |
           cargo check -p mynote-core --target wasm32-unknown-unknown

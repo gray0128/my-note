@@ -141,6 +141,25 @@ jobs:
           name: bundle-${{ matrix.target }}
           path: dist/mynote-${{ matrix.target }}.tar.gz
           retention-days: 1
+      - name: Build, verify & package optional macOS native Swift shell (MyNote.app)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ needs.build-web.outputs.tag }}
+        run: |
+          TAG_VER="${TAG#v}"
+          ./apps/macos/build.sh --version "$TAG_VER" --arch arm64 --out dist/macos-app
+          MYNOTE_BIN=./target/release/mynote ./apps/macos/verify.sh --no-build --app dist/macos-app/MyNote.app
+          ditto -c -k --sequesterRsrc --keepParent dist/macos-app/MyNote.app "dist/MyNote-${TARGET}.zip"
+          ls -lh "dist/MyNote-${TARGET}.zip"
+      - name: Upload macOS MyNote.app zip
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-macos-app-${{ matrix.target }}
+          path: dist/MyNote-${{ matrix.target }}.zip
+          retention-days: 1
 
   publish-release:
     name: Publish GitHub Release & SHA256SUMS
@@ -150,7 +169,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download built release tarballs
+      - name: Download built release archives
         uses: actions/download-artifact@v4
         with:
           pattern: bundle-*
@@ -160,8 +179,8 @@ jobs:
         shell: bash
         run: |
           cd release-assets
-          ls -lh mynote-*.tar.gz
-          sha256sum mynote-*.tar.gz > SHA256SUMS.txt
+          ls -lh mynote-*.tar.gz MyNote-*.zip
+          sha256sum mynote-*.tar.gz MyNote-*.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
       - name: Create or update GitHub Release
         shell: bash
