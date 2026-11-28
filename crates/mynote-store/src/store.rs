@@ -6497,4 +6497,813 @@ mod tests {
         let _ = std::fs::remove_dir_all(&archive_dir);
         let _ = std::fs::remove_dir_all(&restore_dir);
     }
+
+    #[test]
+    fn rebase_delete_over_retiring_update_mints_new_op_id_and_converges_with_pre_pitr_peer() {
+        use mynote_core::ids::MarkId;
+        use mynote_core::model::ShredMarkRow;
+        use mynote_core::vault::T_GRACE_DEFAULT_MS;
+
+        let dir = temp_dir("reconcile_pitr_delete_rebase");
+        let mut store = LocalStore::open(&dir).unwrap();
+        let blk = store
+            .add_block("scratch", "init", Some("markdown"), None, "human", None)
+            .unwrap();
+        let create_oid = OpId::parse(&blk.head_op_ids[0]).unwrap();
+        let epoch = JournalEpoch::from_random_bytes([0x11; 16]);
+        let init_hlc = store.export_engine_snapshot().unwrap().hlc;
+        store
+            .apply_store_mutations(&[
+                StoreMutation::SetSyncMeta {
+                    bootstrap_completed: true,
+                    journal_epoch: Some(epoch),
+                    last_seq: 1,
+                    reconciling_epoch: None,
+                    hlc: init_hlc,
+                },
+                StoreMutation::MarkOpsSynced {
+                    epoch,
+                    acked: vec![mynote_core::sync::AckedOp {
+                        op_id: create_oid,
+                        seq: 1,
+                    }],
+                },
+            ])
+            .unwrap();
+
+        let upd = store
+            .update_block(&blk.block_id, "pre-pitr-update", &blk.head_op_ids, false, "human")
+            .unwrap();
+        let upd_oid = OpId::parse(&upd.head_op_ids[0]).unwrap();
+        let del = store
+            .delete_block(&blk.block_id, Some(&upd.head_op_ids), "human")
+            .unwrap();
+        let del_oid = OpId::parse(&del.op_id).unwrap();
+
+        // Peer node already pulled `upd` and `del` prior to DO PITR rollback.
+        let mut peer_snap = store.export_engine_snapshot().unwrap();
+
+        let kid = store
+            .collect_entity_unshredded_key_ids(EntityType::Block, &blk.block_id)
+            .unwrap()[0];
+        let summary = store
+            .apply_store_mutations(&[StoreMutation::UpsertShredMark(ShredMarkRow {
+                mark_id: MarkId::from_ulid(Ulid::from_parts(1_710_000_050_000, [0xD2; 10])),
+                key_id: kid,
+                seen_seq: 1,
+                requested_by: DeviceId::from_random_bytes([0xEE; 10]),
+                requested_at_ms: 1_710_000_050_000,
+                grace_ms: T_GRACE_DEFAULT_MS,
+                not_before_ms: Some(1_710_000_050_000 + T_GRACE_DEFAULT_MS),
+                state: ShredMarkState::Scheduled,
+                confirmed_at_ms: None,
+                cancelled_by: None,
+                executed_at_ms: None,
+            })])
+            .unwrap();
+        assert_eq!(summary.rekeyed_tier1_ops, 1);
+
+        let mut local_snap = store.export_engine_snapshot().unwrap();
+        assert!(
+            !local_snap.ops.contains_key(&del_oid),
+            "rebased delete must mint a fresh op_id rather than mutating del_oid in place"
+        );
+
+        // Simulate post-PITR Set-Union convergence where peer also re-pushes `upd` and `del`.
+        let local_ops: Vec<_> = local_snap.ops.values().cloned().collect();
+        let peer_ops: Vec<_> = peer_snap.ops.values().cloned().collect();
+        for op in local_ops {
+            peer_snap.apply_mutations(&[StoreMutation::AppendOp(op)]);
+        }
+        for op in peer_ops {
+            local_snap.apply_mutations(&[StoreMutation::AppendOp(op)]);
+        }
+        peer_snap.keys.merge_from(&local_snap.keys);
+        local_snap.keys.merge_from(&peer_snap.keys);
+
+        let bid = BlockId::parse(&blk.block_id).unwrap();
+        let local_mat = local_snap.materialize_block_view(bid).unwrap();
+        let peer_mat = peer_snap.materialize_block_view(bid).unwrap();
+        assert_eq!(local_mat, peer_mat);
+        assert_eq!(local_mat.state, BlockState::Trashed);
+        assert_eq!(local_mat.leaves.len(), 1);
+        assert_ne!(local_mat.leaves[0].op_id, upd_oid);
+        assert_ne!(local_mat.leaves[0].op_id, del_oid);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_outbox_tainted_delete_between_retiring_updates_preserves_frontier_and_converges() {
+        use mynote_core::ids::MarkId;
+        use mynote_core::model::ShredMarkRow;
+        use mynote_core::vault::T_GRACE_DEFAULT_MS;
+
+        let dir = temp_dir("reconcile_tainted_delete_intermediate");
+        let peer_dir = temp_dir("reconcile_tainted_delete_peer");
+        let mut store = LocalStore::open(&dir).unwrap();
+        let blk = store
+            .add_block("scratch", "v0", Some("markdown"), None, "human", None)
+            .unwrap();
+
+        // Build two concurrent synced branches (`f_a_oid` and `f_conflict_oid`) off `blk.head_op_ids`
+        // so omitting either frontier parent during outbox rebase resurrects a stale conflict leaf!
+        let mut peer = LocalStore::open(&peer_dir).unwrap();
+        let base_snap = store.export_engine_snapshot().unwrap();
+        let epoch = JournalEpoch::from_random_bytes([0x22; 16]);
+        peer.smks = base_snap.smks.clone();
+        peer.current_smk_kid = store.current_smk_kid;
+        for kr in base_snap.keys.records.values() {
+            peer.apply_store_mutations(&[StoreMutation::UpsertBlockKey(kr.clone())])
+                .unwrap();
+        }
+        for op in base_snap.ops.values() {
+            peer.apply_store_mutations(&[StoreMutation::AppendOp(op.clone())])
+                .unwrap();
+        }
+        peer.apply_store_mutations(&[StoreMutation::SetSyncMeta {
+            bootstrap_completed: true,
+            journal_epoch: Some(epoch),
+            last_seq: 2,
+            reconciling_epoch: None,
+            hlc: base_snap.hlc.clone(),
+        }])
+        .unwrap();
+        peer.rematerialize_all().unwrap();
+        let f_a = store
+            .update_block(&blk.block_id, "branch-a", &blk.head_op_ids, false, "human")
+            .unwrap();
+        let f_a_oid = OpId::parse(&f_a.head_op_ids[0]).unwrap();
+        let peer_conflict = peer
+            .update_block(&blk.block_id, "conflict-branch", &blk.head_op_ids, false, "human")
+            .unwrap();
+        let f_conflict_oid = OpId::parse(&peer_conflict.head_op_ids[0]).unwrap();
+        let peer_snap_init = peer.export_engine_snapshot().unwrap();
+        for kr in peer_snap_init.keys.records.values() {
+            store
+                .apply_store_mutations(&[StoreMutation::UpsertBlockKey(kr.clone())])
+                .unwrap();
+        }
+        store
+            .apply_store_mutations(&[StoreMutation::AppendOp(
+                peer_snap_init.ops.get(&f_conflict_oid).unwrap().clone(),
+            )])
+            .unwrap();
+        store.rematerialize_all().unwrap();
+
+        let pre_snap = store.export_engine_snapshot().unwrap();
+        let acked_base: Vec<mynote_core::sync::AckedOp> = pre_snap
+            .ops
+            .keys()
+            .enumerate()
+            .map(|(i, &op_id)| mynote_core::sync::AckedOp {
+                op_id,
+                seq: (i + 1) as i64,
+            })
+            .collect();
+        store
+            .apply_store_mutations(&[
+                StoreMutation::SetSyncMeta {
+                    bootstrap_completed: true,
+                    journal_epoch: Some(epoch),
+                    last_seq: acked_base.len() as i64,
+                    reconciling_epoch: None,
+                    hlc: pre_snap.hlc,
+                },
+                StoreMutation::MarkOpsSynced {
+                    epoch,
+                    acked: acked_base,
+                },
+            ])
+            .unwrap();
+
+        let u1_heads = vec![f_a_oid.to_string(), f_conflict_oid.to_string()];
+        let u1 = store
+            .update_block(&blk.block_id, "merged-v1", &u1_heads, false, "human")
+            .unwrap();
+        let u1_oid = OpId::parse(&u1.head_op_ids[0]).unwrap();
+        let k1 = store
+            .export_engine_snapshot()
+            .unwrap()
+            .ops
+            .get(&u1_oid)
+            .unwrap()
+            .key_id
+            .unwrap();
+
+        // Snapshot a pre-PITR peer / archive that observed [f_a_oid, f_conflict_oid, u1] BEFORE `d`.
+        let mut peer_with_u1 = store.export_engine_snapshot().unwrap();
+
+        let del = store
+            .delete_block(&blk.block_id, Some(&u1.head_op_ids), "human")
+            .unwrap();
+        let del_oid = OpId::parse(&del.op_id).unwrap();
+        let restored = store.restore_trash(&blk.block_id, "human").unwrap();
+        let leaf_oid = OpId::parse(&restored.head_op_ids[0]).unwrap();
+
+        let summary = store
+            .apply_store_mutations(&[StoreMutation::UpsertShredMark(ShredMarkRow {
+                mark_id: MarkId::from_ulid(Ulid::from_parts(1_710_000_060_000, [0xD3; 10])),
+                key_id: k1,
+                seen_seq: 2,
+                requested_by: DeviceId::from_random_bytes([0xEE; 10]),
+                requested_at_ms: 1_710_000_060_000,
+                grace_ms: T_GRACE_DEFAULT_MS,
+                not_before_ms: Some(1_710_000_060_000 + T_GRACE_DEFAULT_MS),
+                state: ShredMarkState::Scheduled,
+                confirmed_at_ms: None,
+                cancelled_by: None,
+                executed_at_ms: None,
+            })])
+            .unwrap();
+        assert_eq!(summary.rekeyed_tier1_ops, 1);
+
+        let mut local_snap = store.export_engine_snapshot().unwrap();
+        assert!(!local_snap.ops.contains_key(&u1_oid));
+        assert!(!local_snap.ops.contains_key(&del_oid));
+        assert!(!local_snap.ops.contains_key(&leaf_oid));
+
+        let push = local_snap.build_pending_push().expect("rekeyed leaf must push");
+        assert_eq!(push.ops.len(), 1);
+        let new_leaf_oid = push.ops[0].op_id;
+        let new_leaf_rec = local_snap.ops.get(&new_leaf_oid).unwrap();
+        let expected_parents: BTreeSet<OpId> =
+            BTreeSet::from([f_a_oid, f_conflict_oid, u1_oid, del_oid, leaf_oid]);
+        let actual_parents: BTreeSet<OpId> = new_leaf_rec.parent_op_ids.iter().copied().collect();
+        assert_eq!(actual_parents, expected_parents);
+
+        let bid = BlockId::parse(&blk.block_id).unwrap();
+        let local_mat = local_snap.materialize_block_view(bid).unwrap();
+        assert_eq!(
+            local_mat.leaves.len(),
+            1,
+            "synced conflict branch F_conflict must NOT resurrect locally"
+        );
+        assert_eq!(local_mat.leaves[0].op_id, new_leaf_oid);
+
+        // Merge with pre-PITR peer holding u1 (without d): u1 must NOT resurrect!
+        for op in local_snap.ops.values().cloned().collect::<Vec<_>>() {
+            peer_with_u1.apply_mutations(&[StoreMutation::AppendOp(op)]);
+        }
+        for op in peer_with_u1.ops.values().cloned().collect::<Vec<_>>() {
+            local_snap.apply_mutations(&[StoreMutation::AppendOp(op)]);
+        }
+        peer_with_u1.keys.merge_from(&local_snap.keys);
+        local_snap.keys.merge_from(&peer_with_u1.keys);
+
+        let peer_mat = peer_with_u1.materialize_block_view(bid).unwrap();
+        let local_mat_after = local_snap.materialize_block_view(bid).unwrap();
+        assert_eq!(local_mat_after, peer_mat);
+        assert_eq!(peer_mat.leaves.len(), 1);
+        assert_eq!(peer_mat.leaves[0].op_id, new_leaf_oid);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&peer_dir);
+    }
+
+    #[test]
+    fn reconcile_outbox_non_rekey_chain_over_retiring_ancestor_unblocks_push_and_shred_marks() {
+        use mynote_core::ids::{MarkId, VkekKid};
+        use mynote_core::model::ShredMarkRow;
+        use mynote_core::vault::{create_vault_header, unlock_vault_with_passphrase, T_GRACE_DEFAULT_MS};
+
+        let dir = temp_dir("reconcile_non_rekey_chain_over_retiring");
+        let mut store = LocalStore::open(&dir).unwrap();
+        let blk = store
+            .add_block("scratch", "init", Some("markdown"), None, "human", None)
+            .unwrap();
+        let create_oid = OpId::parse(&blk.head_op_ids[0]).unwrap();
+        let epoch = JournalEpoch::from_random_bytes([0x33; 16]);
+        let init_snap = store.export_engine_snapshot().unwrap();
+        let init_acked: Vec<mynote_core::sync::AckedOp> = init_snap
+            .ops
+            .keys()
+            .enumerate()
+            .map(|(i, &op_id)| mynote_core::sync::AckedOp {
+                op_id,
+                seq: (i + 1) as i64,
+            })
+            .collect();
+        store
+            .apply_store_mutations(&[
+                StoreMutation::SetSyncMeta {
+                    bootstrap_completed: true,
+                    journal_epoch: Some(epoch),
+                    last_seq: init_acked.len() as i64,
+                    reconciling_epoch: None,
+                    hlc: init_snap.hlc,
+                },
+                StoreMutation::MarkOpsSynced {
+                    epoch,
+                    acked: init_acked,
+                },
+            ])
+            .unwrap();
+
+        // Build F_synced -> u1(K1) -> Lock(t2) -> Unlock u2(K2_fresh) -> L(Delete)
+        let u1 = store
+            .update_block(&blk.block_id, "u1-on-k1", &blk.head_op_ids, false, "human")
+            .unwrap();
+        let u1_oid = OpId::parse(&u1.head_op_ids[0]).unwrap();
+        let k1 = store
+            .export_engine_snapshot()
+            .unwrap()
+            .ops
+            .get(&u1_oid)
+            .unwrap()
+            .key_id
+            .unwrap();
+
+        let rpk = store.recovery_pk().unwrap();
+        let vkek_kid = VkekKid::from_ulid(Ulid::from_parts(1_710_000_000_000, [0x40; 10]));
+        let vh = create_vault_header(
+            b"correct-horse-battery-staple",
+            &rpk,
+            vkek_kid,
+            &[0x41; 32],
+            [0x42; 16],
+            [0x43; 24],
+            [0x44; 32],
+            [0x45; 24],
+            1_710_000_000_000,
+        )
+        .unwrap();
+        store
+            .put_vault_header(1, &rmp_serde::to_vec_named(&vh).unwrap())
+            .unwrap();
+        let vault = unlock_vault_with_passphrase(b"correct-horse-battery-staple", &vh).unwrap();
+        let bid = BlockId::parse(&blk.block_id).unwrap();
+        let t2_oid = OpId::from_ulid(Ulid::from_parts(1_710_000_010_000, [0x51; 10]));
+        let t2_kid = KeyId::from_ulid(Ulid::from_parts(1_710_000_010_001, [0x52; 10]));
+        let t2_bdek = [0x53u8; 32];
+        let t2_mnw1 = vault.wrap_bdek(t2_kid, bid, &t2_bdek, [0x54; 24]).unwrap();
+        let t2_mnb1 = encrypt_mnb1(bid.as_bytes(), t2_oid, t2_kid, &t2_bdek, "locked", [0x55; 24]).unwrap();
+        let locked_rcpt = store
+            .lock_block_tier2(
+                &blk.block_id,
+                Tier2OpInput {
+                    op_id: &t2_oid.to_string(),
+                    key_id: &t2_kid.to_string(),
+                    mnb1: &t2_mnb1,
+                    mnw1: Some(&t2_mnw1),
+                },
+                &u1.head_op_ids,
+                None,
+                Some("hint"),
+                T_GRACE_DEFAULT_MS,
+                "human",
+            )
+            .unwrap();
+        let u2 = store
+            .unlock_block_tier1(
+                &blk.block_id,
+                &locked_rcpt.head_op_ids,
+                "unlocked-k2",
+                None,
+                true,
+                "human",
+            )
+            .unwrap();
+        let u2_oid = OpId::parse(&u2.head_op_ids[0]).unwrap();
+        let del = store
+            .delete_block(&blk.block_id, Some(&u2.head_op_ids), "human")
+            .unwrap();
+        let del_oid = OpId::parse(&del.op_id).unwrap();
+
+        let mut peer_snap = store.export_engine_snapshot().unwrap();
+
+        let summary = store
+            .apply_store_mutations(&[StoreMutation::UpsertShredMark(ShredMarkRow {
+                mark_id: MarkId::from_ulid(Ulid::from_parts(1_710_000_070_000, [0xD4; 10])),
+                key_id: k1,
+                seen_seq: 1,
+                requested_by: DeviceId::from_random_bytes([0xEE; 10]),
+                requested_at_ms: 1_710_000_070_000,
+                grace_ms: T_GRACE_DEFAULT_MS,
+                not_before_ms: Some(1_710_000_070_000 + T_GRACE_DEFAULT_MS),
+                state: ShredMarkState::Scheduled,
+                confirmed_at_ms: None,
+                cancelled_by: None,
+                executed_at_ms: None,
+            })])
+            .unwrap();
+        assert_eq!(summary.rekeyed_tier1_ops, 1);
+
+        let mut local_snap = store.export_engine_snapshot().unwrap();
+        assert!(!local_snap.ops.contains_key(&u1_oid));
+        assert!(!local_snap.ops.contains_key(&t2_oid));
+        assert!(!local_snap.ops.contains_key(&u2_oid));
+        assert!(!local_snap.ops.contains_key(&del_oid));
+
+        let push = local_snap
+            .build_pending_push()
+            .expect("rebased delete over retiring chain must push without deadlock");
+        assert_eq!(push.ops.len(), 1);
+        assert!(
+            !push.shred_marks.is_empty(),
+            "entity shred marks must not deadlock"
+        );
+        let new_del_oid = push.ops[0].op_id;
+        let actual_parents: BTreeSet<OpId> = local_snap
+            .ops
+            .get(&new_del_oid)
+            .unwrap()
+            .parent_op_ids
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            actual_parents,
+            BTreeSet::from([create_oid, u1_oid, t2_oid, u2_oid, del_oid])
+        );
+
+        for op in local_snap.ops.values().cloned().collect::<Vec<_>>() {
+            peer_snap.apply_mutations(&[StoreMutation::AppendOp(op)]);
+        }
+        for op in peer_snap.ops.values().cloned().collect::<Vec<_>>() {
+            local_snap.apply_mutations(&[StoreMutation::AppendOp(op)]);
+        }
+        assert_eq!(
+            local_snap.materialize_block_view(bid).unwrap(),
+            peer_snap.materialize_block_view(bid).unwrap()
+        );
+        assert_eq!(
+            local_snap.materialize_block_view(bid).unwrap().state,
+            BlockState::Trashed
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_outbox_marks_retiring_ancestor_of_blocked_tier2_op_without_blocking_sibling_push() {
+        use mynote_core::ids::{MarkId, VkekKid};
+        use mynote_core::model::ShredMarkRow;
+        use mynote_core::vault::{create_vault_header, unlock_vault_with_passphrase, T_GRACE_DEFAULT_MS};
+
+        let dir = temp_dir("reconcile_blocked_t2_ancestor_liveness");
+        let mut store = LocalStore::open(&dir).unwrap();
+        let blk = store
+            .add_block("scratch", "v0", Some("markdown"), None, "human", None)
+            .unwrap();
+        let create_oid = OpId::parse(&blk.head_op_ids[0]).unwrap();
+        let k0 = store
+            .export_engine_snapshot()
+            .unwrap()
+            .ops
+            .get(&create_oid)
+            .unwrap()
+            .key_id
+            .unwrap();
+
+        let rpk = store.recovery_pk().unwrap();
+        let vkek_kid = VkekKid::from_ulid(Ulid::from_parts(1_710_000_000_000, [0x60; 10]));
+        let vh = create_vault_header(
+            b"correct-horse-battery-staple",
+            &rpk,
+            vkek_kid,
+            &[0x61; 32],
+            [0x62; 16],
+            [0x63; 24],
+            [0x64; 32],
+            [0x65; 24],
+            1_710_000_000_000,
+        )
+        .unwrap();
+        store
+            .put_vault_header(1, &rmp_serde::to_vec_named(&vh).unwrap())
+            .unwrap();
+        let vault = unlock_vault_with_passphrase(b"correct-horse-battery-staple", &vh).unwrap();
+        let bid = BlockId::parse(&blk.block_id).unwrap();
+
+        let tmp_lock_oid = OpId::from_ulid(Ulid::from_parts(1_710_000_011_000, [0x71; 10]));
+        let tmp_lock_kid = KeyId::from_ulid(Ulid::from_parts(1_710_000_011_001, [0x72; 10]));
+        let tmp_bdek = [0x73u8; 32];
+        let tmp_mnw1 = vault.wrap_bdek(tmp_lock_kid, bid, &tmp_bdek, [0x74; 24]).unwrap();
+        let tmp_mnb1 = encrypt_mnb1(
+            bid.as_bytes(),
+            tmp_lock_oid,
+            tmp_lock_kid,
+            &tmp_bdek,
+            "tmp-lock",
+            [0x75; 24],
+        )
+        .unwrap();
+        let tmp_lock = store
+            .lock_block_tier2(
+                &blk.block_id,
+                Tier2OpInput {
+                    op_id: &tmp_lock_oid.to_string(),
+                    key_id: &tmp_lock_kid.to_string(),
+                    mnb1: &tmp_mnb1,
+                    mnw1: Some(&tmp_mnw1),
+                },
+                &blk.head_op_ids,
+                None,
+                None,
+                T_GRACE_DEFAULT_MS,
+                "human",
+            )
+            .unwrap();
+        let anc_a = store
+            .unlock_block_tier1(
+                &blk.block_id,
+                &tmp_lock.head_op_ids,
+                "ancestor-a",
+                None,
+                true,
+                "human",
+            )
+            .unwrap();
+        let anc_a_oid = OpId::parse(&anc_a.head_op_ids[0]).unwrap();
+        let k_a = store
+            .export_engine_snapshot()
+            .unwrap()
+            .ops
+            .get(&anc_a_oid)
+            .unwrap()
+            .key_id
+            .unwrap();
+        assert_ne!(k0, k_a);
+
+        // Mark all initial ops ([buf_create, create_oid, tmp_lock_oid, anc_a_oid]) synced before PITR
+        let epoch1 = JournalEpoch::from_random_bytes([0x44; 16]);
+        let pre_pitr_snap = store.export_engine_snapshot().unwrap();
+        let buf_create_oid = *pre_pitr_snap
+            .ops
+            .values()
+            .find(|o| o.entity_type == EntityType::Buffer)
+            .map(|o| &o.op_id)
+            .unwrap();
+        store
+            .apply_store_mutations(&[
+                StoreMutation::SetSyncMeta {
+                    bootstrap_completed: true,
+                    journal_epoch: Some(epoch1),
+                    last_seq: 4,
+                    reconciling_epoch: None,
+                    hlc: pre_pitr_snap.hlc,
+                },
+                StoreMutation::MarkOpsSynced {
+                    epoch: epoch1,
+                    acked: vec![
+                        mynote_core::sync::AckedOp {
+                            op_id: buf_create_oid,
+                            seq: 1,
+                        },
+                        mynote_core::sync::AckedOp {
+                            op_id: create_oid,
+                            seq: 2,
+                        },
+                        mynote_core::sync::AckedOp {
+                            op_id: tmp_lock_oid,
+                            seq: 3,
+                        },
+                        mynote_core::sync::AckedOp {
+                            op_id: anc_a_oid,
+                            seq: 4,
+                        },
+                    ],
+                },
+            ])
+            .unwrap();
+
+        // Create two sibling leaves off `anc_a`:
+        // 1) `sib_l1`: Tier 1 concurrent edit on K_A
+        let sib_l1 = store
+            .update_block(&blk.block_id, "sibling-tier1", &anc_a.head_op_ids, false, "human")
+            .unwrap();
+        let sib_l1_oid = OpId::parse(&sib_l1.head_op_ids[0]).unwrap();
+
+        // 2) `l2_oid`: concurrent Tier 2 lock edit on K_t2_old directly off `anc_a`, then retire K_t2_old -> NEEDS_VAULT_REKEY!
+        let l2_oid = OpId::from_ulid(Ulid::from_parts(1_710_000_020_000, [0x81; 10]));
+        let k_t2_old = KeyId::from_ulid(Ulid::from_parts(1_710_000_020_001, [0x82; 10]));
+        let l2_bdek = [0x83u8; 32];
+        let l2_mnw1 = vault.wrap_bdek(k_t2_old, bid, &l2_bdek, [0x84; 24]).unwrap();
+        let l2_mnb1 = encrypt_mnb1(
+            bid.as_bytes(),
+            l2_oid,
+            k_t2_old,
+            &l2_bdek,
+            "secret-l2",
+            [0x85; 24],
+        )
+        .unwrap();
+        let cur_smk_kid = store.current_smk_kid;
+        let cur_smk = store.current_smk().unwrap().clone();
+        let kgen = store.current_keyring().unwrap().keyring_gen;
+        let l2_hlc = store.hlc_clock.tick(1_710_000_020_002);
+        let l2_krec = KeyRecordV1 {
+            v: 1,
+            key_id: k_t2_old,
+            block_id: bid.0,
+            tier: 2,
+            created_hlc: l2_hlc.canonical_string(),
+            created_by: store.device_id.clone(),
+            bdek: l2_mnw1,
+        };
+        let l2_mnr1 = encrypt_mnr1(cur_smk_kid, &cur_smk, kgen, &l2_krec, [0x86; 24]).unwrap();
+        let l2_inner = InnerOpV1 {
+            v: 1,
+            entity_type: EntityType::Block,
+            entity_id: blk.block_id.clone(),
+            op_type: OpType::Lock,
+            parent_op_ids: vec![anc_a_oid],
+            hlc: l2_hlc.clone(),
+            actor: "human".into(),
+            body: OpBodyV1::BlockContent {
+                buffer_id: None,
+                position: None,
+                lang: None,
+                public_hint: Some(Some("vault-hint".into())),
+                tier: 2,
+                key_id: k_t2_old,
+                mnb1: l2_mnb1,
+            },
+        };
+        let l2_mns1 = encrypt_mns1(
+            cur_smk_kid,
+            &cur_smk,
+            l2_oid,
+            &store.device_id,
+            &l2_inner,
+            [0x87; 24],
+        )
+        .unwrap();
+        store
+            .apply_store_mutations(&[
+                StoreMutation::UpsertBlockKey(KeyRecordRow {
+                    key_id: k_t2_old,
+                    wrap_gen: kgen,
+                    key_record: Some(l2_mnr1),
+                    created_at_ms: 1_710_000_020_002,
+                }),
+                StoreMutation::AppendOp(LocalOpRecord {
+                    op_id: l2_oid,
+                    server_seq: None,
+                    sync_blocked_reason: None,
+                    device_id: store.device_id.clone(),
+                    entity_type: EntityType::Block,
+                    entity_id: blk.block_id.clone(),
+                    parent_op_ids: vec![anc_a_oid],
+                    op_type: OpType::Lock,
+                    hlc: l2_hlc,
+                    actor: "human".into(),
+                    key_id: Some(k_t2_old),
+                    smk_kid: cur_smk_kid,
+                    envelope: l2_mns1,
+                    created_at_ms: 1_710_000_020_002,
+                }),
+            ])
+            .unwrap();
+        store.rematerialize_all().unwrap();
+        let mark_t2 = store
+            .apply_store_mutations(&[StoreMutation::UpsertShredMark(ShredMarkRow {
+                mark_id: MarkId::from_ulid(Ulid::from_parts(1_710_000_025_000, [0xD5; 10])),
+                key_id: k_t2_old,
+                seen_seq: 3,
+                requested_by: DeviceId::from_random_bytes([0xEE; 10]),
+                requested_at_ms: 1_710_000_025_000,
+                grace_ms: T_GRACE_DEFAULT_MS,
+                not_before_ms: Some(1_710_000_025_000 + T_GRACE_DEFAULT_MS),
+                state: ShredMarkState::Scheduled,
+                confirmed_at_ms: None,
+                cancelled_by: None,
+                executed_at_ms: None,
+            })])
+            .unwrap();
+        assert_eq!(mark_t2.needs_vault_rekey, vec![l2_oid.to_string()]);
+
+        // Simulate DO PITR rollback to seq=3 (clearing `anc_a.server_seq = None`, keeping buf_create, create & tmp_lock synced)
+        // followed by a scheduled shred mark on `k_a` so `anc_a` and `sib_l1` both enter `NeedsRekey`!
+        let epoch2 = JournalEpoch::from_random_bytes([0x55; 16]);
+        let hlc2 = store.export_engine_snapshot().unwrap().hlc;
+        store
+            .apply_store_mutations(&[
+                StoreMutation::ClearServerSeqsForReconcile { new_epoch: epoch2 },
+                StoreMutation::MarkOpsSynced {
+                    epoch: epoch2,
+                    acked: vec![
+                        mynote_core::sync::AckedOp {
+                            op_id: buf_create_oid,
+                            seq: 1,
+                        },
+                        mynote_core::sync::AckedOp {
+                            op_id: create_oid,
+                            seq: 2,
+                        },
+                        mynote_core::sync::AckedOp {
+                            op_id: tmp_lock_oid,
+                            seq: 3,
+                        },
+                    ],
+                },
+                StoreMutation::SetSyncMeta {
+                    bootstrap_completed: true,
+                    journal_epoch: Some(epoch2),
+                    last_seq: 3,
+                    reconciling_epoch: None,
+                    hlc: hlc2,
+                },
+                StoreMutation::UpsertShredMark(ShredMarkRow {
+                    mark_id: MarkId::from_ulid(Ulid::from_parts(1_710_000_080_000, [0xD6; 10])),
+                    key_id: k_a,
+                    seen_seq: 3,
+                    requested_by: DeviceId::from_random_bytes([0xEF; 10]),
+                    requested_at_ms: 1_710_000_080_000,
+                    grace_ms: T_GRACE_DEFAULT_MS,
+                    not_before_ms: Some(1_710_000_080_000 + T_GRACE_DEFAULT_MS),
+                    state: ShredMarkState::Scheduled,
+                    confirmed_at_ms: None,
+                    cancelled_by: None,
+                    executed_at_ms: None,
+                }),
+            ])
+            .unwrap();
+
+        let snap_after = store.export_engine_snapshot().unwrap();
+        assert_eq!(
+            snap_after
+                .ops
+                .get(&anc_a_oid)
+                .unwrap()
+                .sync_blocked_reason
+                .as_deref(),
+            Some("NEEDS_VAULT_REKEY_ANCESTOR"),
+            "tainted ancestor of already-blocked NEEDS_VAULT_REKEY op must be marked NEEDS_VAULT_REKEY_ANCESTOR"
+        );
+        assert!(!snap_after.ops.contains_key(&sib_l1_oid));
+
+        let push1 = snap_after
+            .build_pending_push()
+            .expect("rebased sibling new_L1 must push immediately past NEEDS_VAULT_REKEY_ANCESTOR");
+        assert_eq!(push1.ops.len(), 1);
+        let new_l1_oid = push1.ops[0].op_id;
+        assert!(snap_after
+            .ops
+            .get(&new_l1_oid)
+            .unwrap()
+            .parent_op_ids
+            .contains(&anc_a_oid));
+
+        store
+            .apply_store_mutations(&[StoreMutation::MarkOpsSynced {
+                epoch: epoch2,
+                acked: vec![mynote_core::sync::AckedOp {
+                    op_id: new_l1_oid,
+                    seq: 3,
+                }],
+            }])
+            .unwrap();
+
+        let new_l2_oid = OpId::from_ulid(Ulid::from_parts(1_710_000_090_000, [0x91; 10]));
+        let new_l2_kid = KeyId::from_ulid(Ulid::from_parts(1_710_000_090_001, [0x92; 10]));
+        let new_l2_bdek = [0x93u8; 32];
+        let new_l2_mnw1 = vault
+            .wrap_bdek(new_l2_kid, bid, &new_l2_bdek, [0x94; 24])
+            .unwrap();
+        let new_l2_mnb1 = encrypt_mnb1(
+            bid.as_bytes(),
+            new_l2_oid,
+            new_l2_kid,
+            &new_l2_bdek,
+            "secret-l2",
+            [0x95; 24],
+        )
+        .unwrap();
+        store
+            .rekey_blocked_tier2_op(
+                &l2_oid.to_string(),
+                Tier2OpInput {
+                    op_id: &new_l2_oid.to_string(),
+                    key_id: &new_l2_kid.to_string(),
+                    mnb1: &new_l2_mnb1,
+                    mnw1: Some(&new_l2_mnw1),
+                },
+                "human",
+            )
+            .unwrap();
+
+        let snap_final = store.export_engine_snapshot().unwrap();
+        assert!(!snap_final.ops.contains_key(&anc_a_oid));
+        assert!(!snap_final.ops.contains_key(&l2_oid));
+        let push2 = snap_final
+            .build_pending_push()
+            .expect("rekeyed Tier 2 op must push cleanly after ancestor cleanup");
+        assert_eq!(push2.ops.len(), 1);
+        assert_eq!(push2.ops[0].op_id, new_l2_oid);
+        let new_l2_parents: BTreeSet<OpId> = snap_final
+            .ops
+            .get(&new_l2_oid)
+            .unwrap()
+            .parent_op_ids
+            .iter()
+            .copied()
+            .collect();
+        assert!(new_l2_parents.contains(&anc_a_oid));
+        assert!(new_l2_parents.contains(&l2_oid));
+        assert!(new_l2_parents.contains(&new_l1_oid));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

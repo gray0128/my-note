@@ -8,7 +8,7 @@ use mynote_core::crypto::{VaultHeaderV1, MAGIC_MNB1, MAGIC_MNW1};
 use mynote_core::ids::{MarkId, SnapshotId};
 use mynote_core::model::{ShredMarkRow, ShredMarkState};
 use mynote_core::snapshot::{pack_state_snapshot, SnapshotHeaderV1};
-use mynote_core::sync::{OutboxKeyAction, ShredResultDto};
+use mynote_core::sync::ShredResultDto;
 use mynote_core::vault::{T_GRACE_DEFAULT_MS, T_GRACE_MIN_MS};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2009,163 +2009,329 @@ impl LocalStore {
         }
         let mut needs_vault_rekey_ops = Vec::new();
         let mut rekeyed_tier1_count = 0usize;
-        let unpushed: Vec<LocalOpRecord> = snap
-            .ops
-            .values()
-            .filter(|o| o.server_seq.is_none() && o.sync_blocked_reason.is_none())
-            .cloned()
-            .collect();
-
-        let mut unpushed_by_id: BTreeMap<OpId, &LocalOpRecord> = BTreeMap::new();
-        let mut needs_rekey_ids: BTreeSet<OpId> = BTreeSet::new();
-        for o in &unpushed {
-            unpushed_by_id.insert(o.op_id, o);
-            if matches!(snap.classify_unpushed_op(o), OutboxKeyAction::NeedsRekey { .. }) {
-                needs_rekey_ids.insert(o.op_id);
-            }
-        }
-        if needs_rekey_ids.is_empty() {
+        let plan = snap.plan_outbox_reconciliation();
+        if plan.leaves.is_empty()
+            && plan.stranded_superseded_ops.is_empty()
+            && plan.blocked_rekey_ancestors.is_empty()
+        {
             return Ok((needs_vault_rekey_ops, 0));
         }
 
-        // Helper: walk backwards from `start_parents` through any unpushed ops in `needs_rekey_ids`,
-        // returning `(rebased_parents, collapsed_ancestors)` so multi-op offline chains on a retiring
-        // key collapse cleanly without leaving orphaned ancestors stuck on `KEY_PENDING_SHRED` (H8).
-        // When `allow_collapse_create` is false (e.g. a non-content leaf like DELETE), an unpushed
-        // `OpType::Create` ancestor is NEVER collapsed so the block's initial metadata is preserved.
-        let collapse_retiring_ancestors =
-            |start_parents: &[OpId], allow_collapse_create: bool| -> (Vec<OpId>, BTreeSet<OpId>, bool) {
-                let mut frontier: BTreeSet<OpId> = BTreeSet::new();
-                let mut collapsed: BTreeSet<OpId> = BTreeSet::new();
-                let mut collapsed_create = false;
-                let mut stack: Vec<OpId> = start_parents.to_vec();
-                let mut visited: BTreeSet<OpId> = BTreeSet::new();
-                while let Some(pid) = stack.pop() {
-                    if !visited.insert(pid) {
-                        continue;
-                    }
-                    if needs_rekey_ids.contains(&pid) {
-                        if let Some(anc) = unpushed_by_id.get(&pid) {
-                            if anc.op_type == OpType::Create && !allow_collapse_create {
-                                frontier.insert(pid);
-                                continue;
-                            }
-                            if anc.op_type == OpType::Create {
-                                collapsed_create = true;
-                            }
-                            collapsed.insert(pid);
-                            for &gp in &anc.parent_op_ids {
-                                stack.push(gp);
-                            }
-                        } else {
-                            frontier.insert(pid);
+        let mut to_delete: BTreeSet<OpId> = plan.stranded_superseded_ops.clone();
+        let mut to_block_ancestor: BTreeSet<OpId> = plan.blocked_rekey_ancestors.clone();
+        let mut to_keep: BTreeSet<OpId> = plan.protected_ancestors.clone();
+        let mut touched_blocks: BTreeSet<BlockId> = BTreeSet::new();
+        let mut touched_buffers: BTreeSet<BufferId> = BTreeSet::new();
+        for oid in &plan.stranded_superseded_ops {
+            if let Some(o) = snap.ops.get(oid) {
+                match o.entity_type {
+                    EntityType::Block => {
+                        if let Ok(id) = BlockId::parse(&o.entity_id) {
+                            touched_blocks.insert(id);
                         }
-                    } else {
-                        frontier.insert(pid);
+                    }
+                    EntityType::Buffer => {
+                        if let Ok(id) = BufferId::parse(&o.entity_id) {
+                            touched_buffers.insert(id);
+                        }
                     }
                 }
-                (frontier.into_iter().collect(), collapsed, collapsed_create)
+            }
+        }
+
+        for leaf_plan in &plan.leaves {
+            let Some(op) = snap.ops.get(&leaf_plan.op_id) else {
+                continue;
             };
-
-        // Helper: only delete/block an ancestor if no other surviving op references it as a parent.
-        let safe_ancestors_to_drop = |leaf_op_id: OpId, collapsed: &BTreeSet<OpId>| -> Vec<OpId> {
-            collapsed
-                .iter()
-                .copied()
-                .filter(|anc| {
-                    !snap.ops.values().any(|other| {
-                        other.op_id != leaf_op_id
-                            && !collapsed.contains(&other.op_id)
-                            && other.parent_op_ids.contains(anc)
-                    })
-                })
-                .collect()
-        };
-
-        for op in &unpushed {
-            // NEVER resurrect a superseded ancestor or locally deleted block!
-            let live_leaves = self
-                .current_entity_leaves(op.entity_type, &op.entity_id)
-                .unwrap_or_default();
-            if !live_leaves.contains(&op.op_id) {
-                continue;
-            }
-            let self_needs_rekey = needs_rekey_ids.contains(&op.op_id);
-            let (rebased_parents, collapsed_ancestors, collapsed_create) =
-                collapse_retiring_ancestors(&op.parent_op_ids, self_needs_rekey);
-            if !self_needs_rekey && collapsed_ancestors.is_empty() {
-                continue;
-            }
-
             let Some(smk) = self.smks.get(&op.smk_kid).cloned() else {
+                to_keep.insert(op.op_id);
+                to_keep.extend(leaf_plan.collapsed_ancestors.iter().copied());
                 continue;
             };
             let Ok(inner) = decrypt_mns1(op.smk_kid, &smk, op.op_id, &op.device_id, op.key_id, &op.envelope)
             else {
+                to_keep.insert(op.op_id);
+                to_keep.extend(leaf_plan.collapsed_ancestors.iter().copied());
                 continue;
             };
 
-            // Case 1: Live leaf itself is NOT on a retiring key (e.g. local DELETE or LOCK on a fresh key),
-            // but has unpushed non-Create ancestor(s) on a retiring key. Rebase its `parent_op_ids` with a
-            // fresh MNS1 nonce and drop the superseded unpushed retiring ancestor(s) (H8).
-            if !self_needs_rekey {
-                let mut rebased_inner = inner.clone();
-                rebased_inner.parent_op_ids = rebased_parents.clone();
+            if !leaf_plan.self_needs_rekey {
+                if let OpBodyV1::BlockContent { tier: 2, key_id, .. } = &inner.body {
+                    if let Ok((2, mnw1)) = self.unwrap_bdek(*key_id) {
+                        let slot_key = format!("blocked_t2_mnw1:{}", op.op_id);
+                        self.set_local_meta(&slot_key, &B64.encode(mnw1))?;
+                    }
+                    self.conn
+                        .execute(
+                            "UPDATE sync_ops SET sync_blocked_reason = 'NEEDS_VAULT_REKEY' WHERE op_id = ?1",
+                            [op.op_id.to_string()],
+                        )
+                        .map_err(|e| {
+                            CoreError::new(
+                                ErrorCode::IntegrityError,
+                                e.to_string(),
+                                "mark tier2 op NEEDS_VAULT_REKEY",
+                            )
+                        })?;
+                    to_block_ancestor.extend(leaf_plan.collapsed_ancestors.iter().copied());
+                    needs_vault_rekey_ops.push(op.op_id.to_string());
+                    continue;
+                }
+
+                let now = now_ms();
+                let new_op_id = OpId::from_ulid(self.ulid_gen.next(now, rand_bytes::<10>()?));
+                let rebased_op_type = if leaf_plan.collapsed_create && leaf_plan.frontier_parents.is_empty() {
+                    OpType::Create
+                } else {
+                    inner.op_type
+                };
+                let rebased_body = match &inner.body {
+                    OpBodyV1::Tombstone { deleted_at_ms } => Some(OpBodyV1::Tombstone {
+                        deleted_at_ms: *deleted_at_ms,
+                    }),
+                    OpBodyV1::BlockMeta {
+                        buffer_id,
+                        position,
+                        lang,
+                        public_hint,
+                    } => Some(OpBodyV1::BlockMeta {
+                        buffer_id: *buffer_id,
+                        position: position.clone(),
+                        lang: lang.clone(),
+                        public_hint: public_hint.clone(),
+                    }),
+                    OpBodyV1::BlockContent {
+                        tier: 1,
+                        key_id,
+                        mnb1,
+                        buffer_id,
+                        position,
+                        lang,
+                        public_hint,
+                    } => {
+                        let blk_id = BlockId::parse(&inner.entity_id)?;
+                        if let Ok(bdek) = self.unwrap_tier1_bdek(*key_id) {
+                            let pt = decrypt_mnb1(blk_id.as_bytes(), op.op_id, *key_id, &bdek, mnb1).ok();
+                            if let Some(text) = pt {
+                                let (fill_buf, fill_pos, fill_lang) = if leaf_plan.collapsed_create {
+                                    let existing_meta: Option<(String, String, String)> = self
+                                        .conn
+                                        .query_row(
+                                            "SELECT buffer_id, position, lang FROM blocks WHERE id = ?1",
+                                            [blk_id.to_string()],
+                                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                                        )
+                                        .optional()
+                                        .unwrap_or(None);
+                                    match existing_meta {
+                                        Some((b, p, l)) => (
+                                            buffer_id.or_else(|| BufferId::parse(&b).ok()),
+                                            position.clone().or(Some(p)),
+                                            lang.clone().or(Some(l)),
+                                        ),
+                                        None => (*buffer_id, position.clone(), lang.clone()),
+                                    }
+                                } else {
+                                    (*buffer_id, position.clone(), lang.clone())
+                                };
+                                let new_mnb1 = encrypt_mnb1(
+                                    blk_id.as_bytes(),
+                                    new_op_id,
+                                    *key_id,
+                                    &bdek,
+                                    &text,
+                                    rand_bytes::<24>()?,
+                                )?;
+                                Some(OpBodyV1::BlockContent {
+                                    buffer_id: fill_buf,
+                                    position: fill_pos,
+                                    lang: fill_lang,
+                                    public_hint: public_hint.clone(),
+                                    tier: 1,
+                                    key_id: *key_id,
+                                    mnb1: new_mnb1,
+                                })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    OpBodyV1::BufferMeta {
+                        key_id,
+                        name_mnb1,
+                        position,
+                    } => {
+                        let buf_id = BufferId::parse(&inner.entity_id)?;
+                        let existing_buf: Option<(String, String)> = if leaf_plan.collapsed_create {
+                            self.conn
+                                .query_row(
+                                    "SELECT name, position FROM buffers WHERE id = ?1",
+                                    [buf_id.to_string()],
+                                    |r| Ok((r.get(0)?, r.get(1)?)),
+                                )
+                                .optional()
+                                .unwrap_or(None)
+                        } else {
+                            None
+                        };
+                        let fill_pos = position
+                            .clone()
+                            .or_else(|| existing_buf.as_ref().map(|(_, p)| p.clone()));
+                        match name_mnb1 {
+                            None => match existing_buf.as_ref() {
+                                Some((existing_name, _)) => {
+                                    if let Ok(bdek) = self.unwrap_tier1_bdek(*key_id) {
+                                        let new_mnb1 = encrypt_mnb1(
+                                            buf_id.as_bytes(),
+                                            new_op_id,
+                                            *key_id,
+                                            &bdek,
+                                            existing_name,
+                                            rand_bytes::<24>()?,
+                                        )?;
+                                        Some(OpBodyV1::BufferMeta {
+                                            key_id: *key_id,
+                                            name_mnb1: Some(new_mnb1),
+                                            position: fill_pos,
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                }
+                                None => Some(OpBodyV1::BufferMeta {
+                                    key_id: *key_id,
+                                    name_mnb1: None,
+                                    position: fill_pos,
+                                }),
+                            },
+                            Some(old_mnb1) => {
+                                if let Ok(bdek) = self.unwrap_tier1_bdek(*key_id) {
+                                    if let Ok(name_str) =
+                                        decrypt_mnb1(buf_id.as_bytes(), op.op_id, *key_id, &bdek, old_mnb1)
+                                    {
+                                        let new_mnb1 = encrypt_mnb1(
+                                            buf_id.as_bytes(),
+                                            new_op_id,
+                                            *key_id,
+                                            &bdek,
+                                            &name_str,
+                                            rand_bytes::<24>()?,
+                                        )?;
+                                        Some(OpBodyV1::BufferMeta {
+                                            key_id: *key_id,
+                                            name_mnb1: Some(new_mnb1),
+                                            position: fill_pos,
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                        }
+                    }
+                    OpBodyV1::BlockContent { .. } => None,
+                };
+
+                let Some(new_body) = rebased_body else {
+                    to_keep.insert(op.op_id);
+                    to_keep.extend(leaf_plan.collapsed_ancestors.iter().copied());
+                    continue;
+                };
+                let new_inner = InnerOpV1 {
+                    v: inner.v,
+                    entity_type: inner.entity_type,
+                    entity_id: inner.entity_id.clone(),
+                    op_type: rebased_op_type,
+                    parent_op_ids: leaf_plan.merged_parents.clone(),
+                    hlc: inner.hlc.clone(),
+                    actor: inner.actor.clone(),
+                    body: new_body,
+                };
                 let new_mns1 = encrypt_mns1(
                     op.smk_kid,
                     &smk,
-                    op.op_id,
+                    new_op_id,
                     &op.device_id,
-                    &rebased_inner,
+                    &new_inner,
                     rand_bytes::<24>()?,
                 )?;
-                let parent_json =
-                    serde_json::to_string(&rebased_parents.iter().map(|p| p.to_string()).collect::<Vec<_>>())
-                        .map_err(|e| {
-                            CoreError::new(ErrorCode::IntegrityError, e.to_string(), "serialize parents")
-                        })?;
-                for anc in safe_ancestors_to_drop(op.op_id, &collapsed_ancestors) {
-                    self.conn
-                        .execute(
-                            "DELETE FROM sync_ops WHERE op_id = ?1 AND server_seq IS NULL",
-                            [anc.to_string()],
-                        )
-                        .map_err(|e| {
-                            CoreError::new(ErrorCode::IntegrityError, e.to_string(), "drop retiring ancestor")
-                        })?;
-                }
+                let parent_json = serde_json::to_string(&leaf_plan.merged_parents).map_err(|e| {
+                    CoreError::new(
+                        ErrorCode::IntegrityError,
+                        e.to_string(),
+                        "serialize rebased parents",
+                    )
+                })?;
+                let et = match op.entity_type {
+                    EntityType::Buffer => "buffer",
+                    EntityType::Block => "block",
+                };
+                let ot = match rebased_op_type {
+                    OpType::Create => "CREATE",
+                    OpType::Update => "UPDATE",
+                    OpType::SetMeta => "SET_META",
+                    OpType::Lock => "LOCK",
+                    OpType::Unlock => "UNLOCK",
+                    OpType::Resolve => "RESOLVE",
+                    OpType::Delete => "DELETE",
+                };
                 self.conn
                     .execute(
-                        "UPDATE sync_ops SET parent_op_ids = ?1, envelope = ?2
-                         WHERE op_id = ?3 AND server_seq IS NULL",
-                        params![parent_json, new_mns1, op.op_id.to_string()],
+                        "INSERT INTO sync_ops
+                         (op_id, server_seq, sync_blocked_reason, device_id, entity_type, entity_id,
+                          parent_op_ids, op_type, hlc, actor, key_id, smk_kid, envelope, created_at_ms)
+                         VALUES (?1, NULL, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        params![
+                            new_op_id.to_string(),
+                            op.device_id.as_str(),
+                            et,
+                            op.entity_id,
+                            parent_json,
+                            ot,
+                            inner.hlc.canonical_string(),
+                            inner.actor,
+                            op.key_id.map(|k| k.to_string()),
+                            op.smk_kid.to_string(),
+                            new_mns1,
+                            op.created_at_ms,
+                        ],
                     )
                     .map_err(|e| {
-                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "rebase leaf parents")
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "insert rebased leaf")
                     })?;
                 match op.entity_type {
                     EntityType::Block => {
                         if let Ok(blk_id) = BlockId::parse(&op.entity_id) {
-                            let _ = self.rematerialize_block(blk_id);
+                            touched_blocks.insert(blk_id);
                         }
                     }
                     EntityType::Buffer => {
                         if let Ok(buf_id) = BufferId::parse(&op.entity_id) {
-                            let _ = self.rematerialize_buffer(buf_id);
+                            touched_buffers.insert(buf_id);
                         }
                     }
                 }
+                to_delete.insert(op.op_id);
+                to_delete.extend(leaf_plan.collapsed_ancestors.iter().copied());
                 rekeyed_tier1_count += 1;
                 continue;
             }
 
-            let rekeyed_op_type = if collapsed_create && rebased_parents.is_empty() {
+            let rekeyed_op_type = if leaf_plan.collapsed_create && leaf_plan.frontier_parents.is_empty() {
                 OpType::Create
             } else {
                 inner.op_type
             };
 
-            let Some(old_kid) = op.key_id else { continue };
+            let Some(old_kid) = op.key_id else {
+                to_keep.insert(op.op_id);
+                to_keep.extend(leaf_plan.collapsed_ancestors.iter().copied());
+                continue;
+            };
             match &inner.body {
                 OpBodyV1::BlockContent {
                     tier: 1,
@@ -2243,7 +2409,7 @@ impl LocalStore {
                             entity_type: EntityType::Block,
                             entity_id: blk_id.to_string(),
                             op_type: rekeyed_op_type,
-                            parent_op_ids: rebased_parents.clone(),
+                            parent_op_ids: leaf_plan.merged_parents.clone(),
                             hlc: hlc.clone(),
                             actor: inner.actor.clone(),
                             body: OpBodyV1::BlockContent {
@@ -2278,35 +2444,12 @@ impl LocalStore {
                                 ],
                             )
                             .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "rekey outbox key"))?;
-                        // Replace unpublished local op & any collapsed retiring ancestors with rekeyed op
-                        for anc in safe_ancestors_to_drop(op.op_id, &collapsed_ancestors) {
-                            self.conn
-                                .execute(
-                                    "DELETE FROM sync_ops WHERE op_id = ?1 AND server_seq IS NULL",
-                                    [anc.to_string()],
-                                )
-                                .map_err(|e| {
-                                    CoreError::new(
-                                        ErrorCode::IntegrityError,
-                                        e.to_string(),
-                                        "drop collapsed retiring ancestor",
-                                    )
-                                })?;
-                        }
-                        self.conn
-                            .execute(
-                                "DELETE FROM sync_ops WHERE op_id = ?1 AND server_seq IS NULL",
-                                [op.op_id.to_string()],
-                            )
-                            .map_err(|e| {
-                                CoreError::new(ErrorCode::IntegrityError, e.to_string(), "delete rekeyed op")
-                            })?;
                         self.insert_sync_op(
                             new_op_id,
                             None,
                             EntityType::Block,
                             &blk_id.to_string(),
-                            &rebased_parents,
+                            &leaf_plan.merged_parents,
                             rekeyed_op_type,
                             &hlc,
                             &inner.actor,
@@ -2315,27 +2458,45 @@ impl LocalStore {
                             &new_mns1,
                             now as i64,
                         )?;
-                        let _ = self.rematerialize_block(blk_id);
+                        touched_blocks.insert(blk_id);
+                        to_delete.insert(op.op_id);
+                        to_delete.extend(leaf_plan.collapsed_ancestors.iter().copied());
                         rekeyed_tier1_count += 1;
+                    } else {
+                        to_keep.insert(op.op_id);
+                        to_keep.extend(leaf_plan.collapsed_ancestors.iter().copied());
                     }
                 }
                 OpBodyV1::BufferMeta {
-                    name_mnb1: Some(old_name_mnb1),
-                    position,
-                    ..
+                    name_mnb1, position, ..
                 } => {
                     let buf_id = BufferId::parse(&inner.entity_id)?;
-                    let name_pt = if let Ok(old_bdek) = self.unwrap_tier1_bdek(old_kid) {
-                        decrypt_mnb1(buf_id.as_bytes(), op.op_id, old_kid, &old_bdek, old_name_mnb1).ok()
+                    let existing_buf: Option<(String, String)> = self
+                        .conn
+                        .query_row(
+                            "SELECT name, position FROM buffers WHERE id = ?1",
+                            [buf_id.to_string()],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()
+                        .unwrap_or(None);
+                    let name_pt = match name_mnb1 {
+                        Some(old_name_mnb1) => {
+                            if let Ok(old_bdek) = self.unwrap_tier1_bdek(old_kid) {
+                                decrypt_mnb1(buf_id.as_bytes(), op.op_id, old_kid, &old_bdek, old_name_mnb1)
+                                    .ok()
+                            } else {
+                                existing_buf.as_ref().map(|(n, _)| n.clone())
+                            }
+                        }
+                        None => existing_buf.as_ref().map(|(n, _)| n.clone()),
+                    };
+                    let fill_pos = if leaf_plan.collapsed_create {
+                        position
+                            .clone()
+                            .or_else(|| existing_buf.as_ref().map(|(_, p)| p.clone()))
                     } else {
-                        self.conn
-                            .query_row(
-                                "SELECT name FROM buffers WHERE id = ?1",
-                                [buf_id.to_string()],
-                                |r| r.get::<_, String>(0),
-                            )
-                            .optional()
-                            .unwrap_or(None)
+                        position.clone()
                     };
                     if let Some(name_str) = name_pt {
                         let now = now_ms();
@@ -2371,13 +2532,13 @@ impl LocalStore {
                             entity_type: EntityType::Buffer,
                             entity_id: buf_id.to_string(),
                             op_type: rekeyed_op_type,
-                            parent_op_ids: rebased_parents.clone(),
+                            parent_op_ids: leaf_plan.merged_parents.clone(),
                             hlc: hlc.clone(),
                             actor: inner.actor.clone(),
                             body: OpBodyV1::BufferMeta {
                                 key_id: new_kid,
                                 name_mnb1: Some(new_name_mnb1),
-                                position: position.clone(),
+                                position: fill_pos,
                             },
                         };
                         let new_mns1 = encrypt_mns1(
@@ -2402,38 +2563,12 @@ impl LocalStore {
                                 ],
                             )
                             .map_err(|e| CoreError::new(ErrorCode::IntegrityError, e.to_string(), "rekey buffer key"))?;
-                        for anc in safe_ancestors_to_drop(op.op_id, &collapsed_ancestors) {
-                            self.conn
-                                .execute(
-                                    "DELETE FROM sync_ops WHERE op_id = ?1 AND server_seq IS NULL",
-                                    [anc.to_string()],
-                                )
-                                .map_err(|e| {
-                                    CoreError::new(
-                                        ErrorCode::IntegrityError,
-                                        e.to_string(),
-                                        "drop buffer ancestor",
-                                    )
-                                })?;
-                        }
-                        self.conn
-                            .execute(
-                                "DELETE FROM sync_ops WHERE op_id = ?1 AND server_seq IS NULL",
-                                [op.op_id.to_string()],
-                            )
-                            .map_err(|e| {
-                                CoreError::new(
-                                    ErrorCode::IntegrityError,
-                                    e.to_string(),
-                                    "delete rekeyed buffer op",
-                                )
-                            })?;
                         self.insert_sync_op(
                             new_op_id,
                             None,
                             EntityType::Buffer,
                             &buf_id.to_string(),
-                            &rebased_parents,
+                            &leaf_plan.merged_parents,
                             rekeyed_op_type,
                             &hlc,
                             &inner.actor,
@@ -2442,8 +2577,13 @@ impl LocalStore {
                             &new_mns1,
                             now as i64,
                         )?;
-                        let _ = self.rematerialize_buffer(buf_id);
+                        touched_buffers.insert(buf_id);
+                        to_delete.insert(op.op_id);
+                        to_delete.extend(leaf_plan.collapsed_ancestors.iter().copied());
                         rekeyed_tier1_count += 1;
+                    } else {
+                        to_keep.insert(op.op_id);
+                        to_keep.extend(leaf_plan.collapsed_ancestors.iter().copied());
                     }
                 }
                 OpBodyV1::BlockContent { tier: 2, .. } => {
@@ -2464,26 +2604,55 @@ impl LocalStore {
                                 "mark op NEEDS_VAULT_REKEY",
                             )
                         })?;
-                    for anc in safe_ancestors_to_drop(op.op_id, &collapsed_ancestors) {
-                        self.conn
-                            .execute(
-                                "UPDATE sync_ops SET sync_blocked_reason = 'NEEDS_VAULT_REKEY_ANCESTOR'
-                                 WHERE op_id = ?1 AND server_seq IS NULL AND sync_blocked_reason IS NULL",
-                                [anc.to_string()],
-                            )
-                            .map_err(|e| {
-                                CoreError::new(
-                                    ErrorCode::IntegrityError,
-                                    e.to_string(),
-                                    "mark ancestor NEEDS_VAULT_REKEY_ANCESTOR",
-                                )
-                            })?;
-                    }
+                    to_block_ancestor.extend(leaf_plan.collapsed_ancestors.iter().copied());
                     needs_vault_rekey_ops.push(op.op_id.to_string());
                 }
-                _ => {}
+                _ => {
+                    to_keep.insert(op.op_id);
+                    to_keep.extend(leaf_plan.collapsed_ancestors.iter().copied());
+                }
             }
         }
+
+        for anc in to_block_ancestor.difference(&to_keep) {
+            self.conn
+                .execute(
+                    "UPDATE sync_ops SET sync_blocked_reason = 'NEEDS_VAULT_REKEY_ANCESTOR'
+                     WHERE op_id = ?1 AND server_seq IS NULL AND sync_blocked_reason IS NULL",
+                    [anc.to_string()],
+                )
+                .map_err(|e| {
+                    CoreError::new(
+                        ErrorCode::IntegrityError,
+                        e.to_string(),
+                        "mark ancestor NEEDS_VAULT_REKEY_ANCESTOR",
+                    )
+                })?;
+        }
+        for oid in &to_delete {
+            if to_keep.contains(oid) || to_block_ancestor.contains(oid) {
+                continue;
+            }
+            self.conn
+                .execute(
+                    "DELETE FROM sync_ops WHERE op_id = ?1 AND server_seq IS NULL",
+                    [oid.to_string()],
+                )
+                .map_err(|e| {
+                    CoreError::new(
+                        ErrorCode::IntegrityError,
+                        e.to_string(),
+                        "delete superseded retiring outbox op",
+                    )
+                })?;
+        }
+        for buf_id in touched_buffers {
+            let _ = self.rematerialize_buffer(buf_id);
+        }
+        for blk_id in touched_blocks {
+            let _ = self.rematerialize_block(blk_id);
+        }
+
         Ok((needs_vault_rekey_ops, rekeyed_tier1_count))
     }
 
@@ -2661,6 +2830,29 @@ impl LocalStore {
         }
 
         let (receipt, shred_executed) = self.with_savepoint("rekey_blocked_tier2", |this| {
+            let mut removed_ids: BTreeSet<OpId> = BTreeSet::new();
+            {
+                let mut rstmt = this
+                    .conn
+                    .prepare(
+                        "SELECT op_id FROM sync_ops
+                         WHERE entity_type = 'block' AND entity_id = ?1 AND server_seq IS NULL
+                           AND (op_id = ?2 OR sync_blocked_reason = 'NEEDS_VAULT_REKEY_ANCESTOR')",
+                    )
+                    .map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "query blocked tier2 ops")
+                    })?;
+                let rrows = rstmt
+                    .query_map(params![&entity_id, blocked_op_id], |r| r.get::<_, String>(0))
+                    .map_err(|e| {
+                        CoreError::new(ErrorCode::IntegrityError, e.to_string(), "map blocked tier2 ops")
+                    })?;
+                for s in rrows.flatten() {
+                    if let Ok(oid) = OpId::parse(&s) {
+                        removed_ids.insert(oid);
+                    }
+                }
+            }
             // Remove unpublished blocked op, any blocked retiring ancestors on this entity, and saved mnw1 slot
             this.conn
                 .execute(
@@ -2681,7 +2873,15 @@ impl LocalStore {
                     CoreError::new(ErrorCode::IntegrityError, e.to_string(), "delete blocked mnw1 slot")
                 })?;
 
-            let parents = this.current_entity_leaves(EntityType::Block, &entity_id)?;
+            let live_leaves = this.current_entity_leaves(EntityType::Block, &entity_id)?;
+            let rekey_op_type = if live_leaves.is_empty() {
+                OpType::Create
+            } else {
+                OpType::Update
+            };
+            let mut parent_set: BTreeSet<OpId> = live_leaves.into_iter().collect();
+            parent_set.extend(removed_ids);
+            let parents: Vec<OpId> = parent_set.into_iter().collect();
             let now = now_ms();
             let hlc = this.hlc_clock.tick(now);
             let smk_kid = this.current_smk_kid;
@@ -2719,7 +2919,7 @@ impl LocalStore {
                 v: 1,
                 entity_type: EntityType::Block,
                 entity_id: entity_id.clone(),
-                op_type: OpType::Update,
+                op_type: rekey_op_type,
                 parent_op_ids: parents.clone(),
                 hlc: hlc.clone(),
                 actor: actor.to_string(),
@@ -2763,7 +2963,7 @@ impl LocalStore {
                 EntityType::Block,
                 &entity_id,
                 &parents,
-                OpType::Update,
+                rekey_op_type,
                 &hlc,
                 actor,
                 Some(new_kid),

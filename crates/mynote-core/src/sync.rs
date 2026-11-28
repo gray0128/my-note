@@ -85,6 +85,24 @@ pub enum OutboxKeyAction {
     NeedsRekey { key_shredded: bool },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboxLeafPlan {
+    pub op_id: OpId,
+    pub self_needs_rekey: bool,
+    pub frontier_parents: Vec<OpId>,
+    pub merged_parents: Vec<OpId>,
+    pub collapsed_ancestors: BTreeSet<OpId>,
+    pub collapsed_create: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutboxReconcilePlan {
+    pub leaves: Vec<OutboxLeafPlan>,
+    pub stranded_superseded_ops: BTreeSet<OpId>,
+    pub protected_ancestors: BTreeSet<OpId>,
+    pub blocked_rekey_ancestors: BTreeSet<OpId>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushRequestDto {
     pub expected_epoch: JournalEpoch,
@@ -526,6 +544,208 @@ impl EngineSnapshot {
         OutboxKeyAction::PushNormal
     }
 
+    /// Compute a deterministic causal-closure plan for reconciling unpushed ops against retiring/shredded keys.
+    ///
+    /// Every rekeyed or rebased leaf receives a fresh `op_id` from its caller and sets `parent_op_ids` to
+    /// `merged_parents` (`frontier_parents ∪ collapsed_ancestors ∪ {old_op_id}`), ensuring:
+    /// 1. No `op_id` ever maps to two different `MNS1` envelopes across peers or pre/post-PITR epochs;
+    /// 2. Peers that never saw `collapsed_ancestors` still supersede `frontier_parents`;
+    /// 3. Peers or R2 `MNA1` archives that DID see `collapsed_ancestors` or `old_op_id` still supersede them.
+    pub fn plan_outbox_reconciliation(&self) -> OutboxReconcilePlan {
+        let unpushed: Vec<&LocalOpRecord> = self
+            .ops
+            .values()
+            .filter(|o| o.server_seq.is_none() && o.sync_blocked_reason.is_none())
+            .collect();
+        if unpushed.is_empty() {
+            return OutboxReconcilePlan::default();
+        }
+        let mut unpushed_by_id: BTreeMap<OpId, &LocalOpRecord> = BTreeMap::new();
+        let mut needs_rekey_ids: BTreeSet<OpId> = BTreeSet::new();
+        for o in &unpushed {
+            unpushed_by_id.insert(o.op_id, o);
+            if matches!(self.classify_unpushed_op(o), OutboxKeyAction::NeedsRekey { .. }) {
+                needs_rekey_ids.insert(o.op_id);
+            }
+        }
+        if needs_rekey_ids.is_empty() {
+            return OutboxReconcilePlan::default();
+        }
+
+        let mut children_in_unpushed: BTreeMap<OpId, Vec<OpId>> = BTreeMap::new();
+        for o in &unpushed {
+            for &p in &o.parent_op_ids {
+                if unpushed_by_id.contains_key(&p) {
+                    children_in_unpushed.entry(p).or_default().push(o.op_id);
+                }
+            }
+        }
+        let mut tainted_unpushed: BTreeSet<OpId> = needs_rekey_ids.clone();
+        let mut t_stack: Vec<OpId> = needs_rekey_ids.iter().copied().collect();
+        while let Some(cur) = t_stack.pop() {
+            if let Some(kids) = children_in_unpushed.get(&cur) {
+                for &kid_op in kids {
+                    if tainted_unpushed.insert(kid_op) {
+                        t_stack.push(kid_op);
+                    }
+                }
+            }
+        }
+
+        let mut referenced_parents: BTreeSet<(EntityType, &str, OpId)> = BTreeSet::new();
+        let mut entities_with_surviving_create: BTreeSet<(EntityType, &str)> = BTreeSet::new();
+        for cand in self.ops.values() {
+            if cand.op_type.is_dag_op() {
+                for &p in &cand.parent_op_ids {
+                    referenced_parents.insert((cand.entity_type, cand.entity_id.as_str(), p));
+                }
+            }
+            if cand.op_type == OpType::Create
+                && (cand.server_seq.is_some()
+                    || (cand.sync_blocked_reason.is_none() && !tainted_unpushed.contains(&cand.op_id)))
+            {
+                entities_with_surviving_create.insert((cand.entity_type, cand.entity_id.as_str()));
+            }
+        }
+
+        let collapse_retiring_ancestors = |start_parents: &[OpId],
+                                           allow_collapse_create: bool|
+         -> (Vec<OpId>, BTreeSet<OpId>, bool, bool) {
+            let mut frontier: BTreeSet<OpId> = BTreeSet::new();
+            let mut collapsed: BTreeSet<OpId> = BTreeSet::new();
+            let mut collapsed_create = false;
+            let mut hit_unpushable_create = false;
+            let mut stack: Vec<OpId> = start_parents.to_vec();
+            let mut visited: BTreeSet<OpId> = BTreeSet::new();
+            while let Some(pid) = stack.pop() {
+                if !visited.insert(pid) {
+                    continue;
+                }
+                if tainted_unpushed.contains(&pid) {
+                    if let Some(anc) = unpushed_by_id.get(&pid) {
+                        if anc.op_type == OpType::Create && !allow_collapse_create {
+                            hit_unpushable_create = true;
+                            frontier.insert(pid);
+                            continue;
+                        }
+                        if anc.op_type == OpType::Create {
+                            collapsed_create = true;
+                        }
+                        collapsed.insert(pid);
+                        stack.extend(anc.parent_op_ids.iter().copied());
+                    } else {
+                        frontier.insert(pid);
+                    }
+                } else {
+                    frontier.insert(pid);
+                }
+            }
+            (
+                frontier.into_iter().collect(),
+                collapsed,
+                collapsed_create,
+                hit_unpushable_create,
+            )
+        };
+
+        let mut leaves = Vec::new();
+        let mut protected_roots: Vec<OpId> = Vec::new();
+        for o in &unpushed {
+            if !o.op_type.is_dag_op()
+                || referenced_parents.contains(&(o.entity_type, o.entity_id.as_str(), o.op_id))
+            {
+                continue;
+            }
+            let self_needs_rekey = needs_rekey_ids.contains(&o.op_id);
+            let allow_collapse_create = self_needs_rekey
+                || o.op_type != OpType::Delete
+                || entities_with_surviving_create.contains(&(o.entity_type, o.entity_id.as_str()));
+            let (frontier_parents, collapsed_ancestors, collapsed_create, hit_unpushable_create) =
+                collapse_retiring_ancestors(&o.parent_op_ids, allow_collapse_create);
+            if hit_unpushable_create || (!self_needs_rekey && collapsed_ancestors.is_empty()) {
+                protected_roots.push(o.op_id);
+                continue;
+            }
+            let mut merged: BTreeSet<OpId> = frontier_parents.iter().copied().collect();
+            merged.extend(collapsed_ancestors.iter().copied());
+            merged.insert(o.op_id);
+            leaves.push(OutboxLeafPlan {
+                op_id: o.op_id,
+                self_needs_rekey,
+                frontier_parents,
+                merged_parents: merged.into_iter().collect(),
+                collapsed_ancestors,
+                collapsed_create,
+            });
+        }
+
+        let mut protected_ancestors: BTreeSet<OpId> = BTreeSet::new();
+        let mut p_stack = protected_roots;
+        let mut p_visited = BTreeSet::new();
+        while let Some(oid) = p_stack.pop() {
+            if !p_visited.insert(oid) {
+                continue;
+            }
+            if let Some(u) = unpushed_by_id.get(&oid) {
+                protected_ancestors.insert(oid);
+                p_stack.extend(u.parent_op_ids.iter().copied());
+            }
+        }
+
+        let mut blocked_roots: Vec<OpId> = Vec::new();
+        for o in self.ops.values() {
+            if o.server_seq.is_none()
+                && matches!(
+                    o.sync_blocked_reason.as_deref(),
+                    Some("NEEDS_VAULT_REKEY" | "NEEDS_VAULT_REKEY_ANCESTOR")
+                )
+            {
+                blocked_roots.extend(o.parent_op_ids.iter().copied());
+            }
+        }
+        let mut blocked_rekey_ancestors: BTreeSet<OpId> = BTreeSet::new();
+        let mut b_visited = BTreeSet::new();
+        while let Some(oid) = blocked_roots.pop() {
+            if !b_visited.insert(oid) {
+                continue;
+            }
+            if let Some(u) = unpushed_by_id.get(&oid) {
+                if tainted_unpushed.contains(&oid) && !protected_ancestors.contains(&oid) {
+                    blocked_rekey_ancestors.insert(oid);
+                } else {
+                    protected_ancestors.insert(oid);
+                }
+                blocked_roots.extend(u.parent_op_ids.iter().copied());
+            } else if let Some(b) = self.ops.get(&oid) {
+                if b.server_seq.is_none() {
+                    blocked_roots.extend(b.parent_op_ids.iter().copied());
+                }
+            }
+        }
+
+        let mut stranded_superseded_ops: BTreeSet<OpId> = BTreeSet::new();
+        for o in &unpushed {
+            if !o.op_type.is_dag_op()
+                || o.op_type == OpType::Create
+                || !referenced_parents.contains(&(o.entity_type, o.entity_id.as_str(), o.op_id))
+                || protected_ancestors.contains(&o.op_id)
+                || blocked_rekey_ancestors.contains(&o.op_id)
+            {
+                continue;
+            }
+            if tainted_unpushed.contains(&o.op_id) {
+                stranded_superseded_ops.insert(o.op_id);
+            }
+        }
+
+        OutboxReconcilePlan {
+            leaves,
+            stranded_superseded_ops,
+            protected_ancestors,
+            blocked_rekey_ancestors,
+        }
+    }
+
     /// Collect keys currently referenced by live leaves of any `ACTIVE` block or `ACTIVE` buffer.
     pub(crate) fn active_live_keys(&self) -> BTreeSet<KeyId> {
         let mut live = BTreeSet::new();
@@ -604,6 +824,7 @@ impl EngineSnapshot {
                 let parents_ready = o.parent_op_ids.iter().all(|pid| match self.ops.get(pid) {
                     None => true,
                     Some(p) if p.server_seq.is_some() => true,
+                    Some(p) if p.sync_blocked_reason.as_deref() == Some("NEEDS_VAULT_REKEY_ANCESTOR") => true,
                     Some(_) => candidate_ids.contains(pid) && ready_ids.contains(pid),
                 });
                 if parents_ready {
@@ -1280,5 +1501,291 @@ fn build_key_sync_dto(state: &EngineSnapshot) -> KeyTableSyncDto {
         push_records,
         keyring_material: state.keys.keyring_material.clone(),
         vault_header_material: state.keys.vault_header_material.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::{BlockId, MarkId, Ulid};
+    use crate::model::{ShredMarkRow, ShredMarkState};
+    use crate::vault::T_GRACE_DEFAULT_MS;
+
+    fn test_op_id(n: u64) -> OpId {
+        OpId::from_ulid(Ulid::from_parts(1_710_000_000_000 + n, [n as u8; 10]))
+    }
+
+    fn test_key_id(n: u64) -> KeyId {
+        KeyId::from_ulid(Ulid::from_parts(1_710_000_100_000 + n, [n as u8; 10]))
+    }
+
+    fn dummy_op(
+        op_id: OpId,
+        entity_id: &str,
+        op_type: OpType,
+        parents: Vec<OpId>,
+        key_id: Option<KeyId>,
+        server_seq: Option<i64>,
+        blocked: Option<&str>,
+    ) -> LocalOpRecord {
+        let dev = DeviceId::from_random_bytes([1; 10]);
+        LocalOpRecord {
+            op_id,
+            server_seq,
+            sync_blocked_reason: blocked.map(str::to_string),
+            device_id: dev.clone(),
+            entity_type: EntityType::Block,
+            entity_id: entity_id.to_string(),
+            parent_op_ids: parents,
+            op_type,
+            hlc: Hlc::new(1_710_000_000_000, 0, dev),
+            actor: "human".into(),
+            key_id,
+            smk_kid: SmkKid::from_bytes([2; 16]),
+            envelope: vec![0u8; 8],
+            created_at_ms: 1_710_000_000_000,
+        }
+    }
+
+    fn insert_live_key(snap: &mut EngineSnapshot, kid: KeyId) {
+        snap.keys.insert_record(KeyRecordRow {
+            key_id: kid,
+            wrap_gen: 1,
+            key_record: Some(vec![1, 2, 3]),
+            created_at_ms: 1_710_000_000_000,
+        });
+    }
+
+    fn schedule_shred(snap: &mut EngineSnapshot, n: u64, kid: KeyId) {
+        snap.keys.insert_mark(ShredMarkRow {
+            mark_id: MarkId::from_ulid(Ulid::from_parts(1_710_000_200_000 + n, [n as u8; 10])),
+            key_id: kid,
+            seen_seq: 1,
+            requested_by: DeviceId::from_random_bytes([9; 10]),
+            requested_at_ms: 1_710_000_200_000,
+            grace_ms: T_GRACE_DEFAULT_MS,
+            not_before_ms: Some(1_710_000_200_000 + T_GRACE_DEFAULT_MS),
+            state: ShredMarkState::Scheduled,
+            confirmed_at_ms: None,
+            cancelled_by: None,
+            executed_at_ms: None,
+        });
+    }
+
+    #[test]
+    fn plan_collapses_tainted_delete_between_retiring_updates_and_keeps_synced_frontier() {
+        let dev = DeviceId::from_random_bytes([1; 10]);
+        let mut snap = EngineSnapshot::new(dev, 1_710_000_000_000);
+        let bid = BlockId::from_ulid(Ulid::from_parts(1_710_000_000_001, [7; 10])).to_string();
+        let k0 = test_key_id(1);
+        let k1 = test_key_id(2);
+        insert_live_key(&mut snap, k0);
+        insert_live_key(&mut snap, k1);
+        schedule_shred(&mut snap, 1, k1);
+
+        let f_synced = test_op_id(1);
+        let f_conflict = test_op_id(2);
+        let u1 = test_op_id(3);
+        let d = test_op_id(4);
+        let leaf = test_op_id(5);
+
+        snap.ops.insert(
+            f_synced,
+            dummy_op(f_synced, &bid, OpType::Create, vec![], Some(k0), Some(1), None),
+        );
+        snap.ops.insert(
+            f_conflict,
+            dummy_op(
+                f_conflict,
+                &bid,
+                OpType::Update,
+                vec![f_synced],
+                Some(k0),
+                Some(2),
+                None,
+            ),
+        );
+        snap.ops.insert(
+            u1,
+            dummy_op(
+                u1,
+                &bid,
+                OpType::Update,
+                vec![f_synced, f_conflict],
+                Some(k1),
+                None,
+                None,
+            ),
+        );
+        snap.ops
+            .insert(d, dummy_op(d, &bid, OpType::Delete, vec![u1], None, None, None));
+        snap.ops.insert(
+            leaf,
+            dummy_op(leaf, &bid, OpType::Update, vec![d], Some(k1), None, None),
+        );
+
+        let plan = snap.plan_outbox_reconciliation();
+        assert_eq!(plan.leaves.len(), 1);
+        let lp = &plan.leaves[0];
+        assert_eq!(lp.op_id, leaf);
+        assert!(lp.self_needs_rekey);
+        assert_eq!(lp.frontier_parents, vec![f_synced, f_conflict]);
+        assert_eq!(lp.collapsed_ancestors, BTreeSet::from([u1, d]));
+        assert_eq!(lp.merged_parents, vec![f_synced, f_conflict, u1, d, leaf]);
+        assert!(plan.protected_ancestors.is_empty());
+        assert!(plan.blocked_rekey_ancestors.is_empty());
+    }
+
+    #[test]
+    fn plan_collapses_tainted_fresh_intermediate_under_non_rekey_leaf() {
+        let dev = DeviceId::from_random_bytes([1; 10]);
+        let mut snap = EngineSnapshot::new(dev, 1_710_000_000_000);
+        let bid = BlockId::from_ulid(Ulid::from_parts(1_710_000_000_002, [8; 10])).to_string();
+        let k0 = test_key_id(10);
+        let k1 = test_key_id(11);
+        let k2 = test_key_id(12);
+        insert_live_key(&mut snap, k0);
+        insert_live_key(&mut snap, k1);
+        insert_live_key(&mut snap, k2);
+        schedule_shred(&mut snap, 2, k1);
+
+        let f_synced = test_op_id(10);
+        let u1 = test_op_id(11);
+        let u2 = test_op_id(12);
+        let del_leaf = test_op_id(13);
+
+        snap.ops.insert(
+            f_synced,
+            dummy_op(f_synced, &bid, OpType::Create, vec![], Some(k0), Some(1), None),
+        );
+        snap.ops.insert(
+            u1,
+            dummy_op(u1, &bid, OpType::Update, vec![f_synced], Some(k1), None, None),
+        );
+        snap.ops.insert(
+            u2,
+            dummy_op(u2, &bid, OpType::Update, vec![u1], Some(k2), None, None),
+        );
+        snap.ops.insert(
+            del_leaf,
+            dummy_op(del_leaf, &bid, OpType::Delete, vec![u2], None, None, None),
+        );
+
+        let plan = snap.plan_outbox_reconciliation();
+        assert_eq!(plan.leaves.len(), 1);
+        let lp = &plan.leaves[0];
+        assert_eq!(lp.op_id, del_leaf);
+        assert!(!lp.self_needs_rekey);
+        assert!(!lp.collapsed_create);
+        assert_eq!(lp.frontier_parents, vec![f_synced]);
+        assert_eq!(lp.collapsed_ancestors, BTreeSet::from([u1, u2]));
+        assert_eq!(lp.merged_parents, vec![f_synced, u1, u2, del_leaf]);
+        assert!(plan.protected_ancestors.is_empty());
+    }
+
+    #[test]
+    fn plan_handles_create_collapsing_only_when_create_is_unpushable_and_metadata_survives() {
+        let dev = DeviceId::from_random_bytes([1; 10]);
+        let mut snap = EngineSnapshot::new(dev, 1_710_000_000_000);
+        let bid_upd = BlockId::from_ulid(Ulid::from_parts(1_710_000_000_003, [3; 10])).to_string();
+        let bid_del = BlockId::from_ulid(Ulid::from_parts(1_710_000_000_004, [4; 10])).to_string();
+        let k1 = test_key_id(21);
+        let k2 = test_key_id(22);
+        insert_live_key(&mut snap, k1);
+        insert_live_key(&mut snap, k2);
+        schedule_shred(&mut snap, 3, k1);
+
+        // 1. Non-delete leaf on fresh K2 above retiring Create(K1) collapses Create -> promoted to Create
+        let c_upd = test_op_id(21);
+        let l_upd = test_op_id(22);
+        snap.ops.insert(
+            c_upd,
+            dummy_op(c_upd, &bid_upd, OpType::Create, vec![], Some(k1), None, None),
+        );
+        snap.ops.insert(
+            l_upd,
+            dummy_op(l_upd, &bid_upd, OpType::Update, vec![c_upd], Some(k2), None, None),
+        );
+
+        // 2. Delete leaf above unpushable Create(K1) with no surviving Create aborts partial collapse
+        let c_del = test_op_id(23);
+        let u_del = test_op_id(24);
+        let l_del = test_op_id(25);
+        snap.ops.insert(
+            c_del,
+            dummy_op(c_del, &bid_del, OpType::Create, vec![], Some(k1), None, None),
+        );
+        snap.ops.insert(
+            u_del,
+            dummy_op(u_del, &bid_del, OpType::Update, vec![c_del], Some(k1), None, None),
+        );
+        snap.ops.insert(
+            l_del,
+            dummy_op(l_del, &bid_del, OpType::Delete, vec![u_del], None, None, None),
+        );
+
+        let plan = snap.plan_outbox_reconciliation();
+        assert_eq!(plan.leaves.len(), 1);
+        let lp = &plan.leaves[0];
+        assert_eq!(lp.op_id, l_upd);
+        assert!(!lp.self_needs_rekey);
+        assert!(lp.collapsed_create);
+        assert!(lp.frontier_parents.is_empty());
+        assert_eq!(lp.collapsed_ancestors, BTreeSet::from([c_upd]));
+        assert_eq!(lp.merged_parents, vec![c_upd, l_upd]);
+        assert_eq!(plan.protected_ancestors, BTreeSet::from([c_del, u_del, l_del]));
+        assert!(!plan.stranded_superseded_ops.contains(&u_del));
+    }
+
+    #[test]
+    fn plan_separates_tainted_ancestors_of_blocked_vault_ops_from_protected_pushable_ancestors() {
+        let dev = DeviceId::from_random_bytes([1; 10]);
+        let mut snap = EngineSnapshot::new(dev, 1_710_000_000_000);
+        let bid = BlockId::from_ulid(Ulid::from_parts(1_710_000_000_005, [5; 10])).to_string();
+        let k0 = test_key_id(30);
+        let ka = test_key_id(31);
+        let kt2 = test_key_id(32);
+        insert_live_key(&mut snap, k0);
+        insert_live_key(&mut snap, ka);
+        insert_live_key(&mut snap, kt2);
+        schedule_shred(&mut snap, 4, ka);
+
+        let f_synced = test_op_id(30);
+        let anc_a = test_op_id(31);
+        let sib_l1 = test_op_id(32);
+        let blocked_l2 = test_op_id(33);
+
+        snap.ops.insert(
+            f_synced,
+            dummy_op(f_synced, &bid, OpType::Create, vec![], Some(k0), Some(1), None),
+        );
+        snap.ops.insert(
+            anc_a,
+            dummy_op(anc_a, &bid, OpType::Update, vec![f_synced], Some(ka), None, None),
+        );
+        snap.ops.insert(
+            sib_l1,
+            dummy_op(sib_l1, &bid, OpType::Update, vec![anc_a], Some(ka), None, None),
+        );
+        snap.ops.insert(
+            blocked_l2,
+            dummy_op(
+                blocked_l2,
+                &bid,
+                OpType::Lock,
+                vec![anc_a],
+                Some(kt2),
+                None,
+                Some("NEEDS_VAULT_REKEY"),
+            ),
+        );
+
+        let plan = snap.plan_outbox_reconciliation();
+        assert_eq!(plan.leaves.len(), 1);
+        assert_eq!(plan.leaves[0].op_id, sib_l1);
+        assert_eq!(plan.leaves[0].merged_parents, vec![f_synced, anc_a, sib_l1]);
+        assert!(plan.protected_ancestors.is_empty());
+        assert_eq!(plan.blocked_rekey_ancestors, BTreeSet::from([anc_a]));
+        assert!(plan.stranded_superseded_ops.is_empty());
     }
 }

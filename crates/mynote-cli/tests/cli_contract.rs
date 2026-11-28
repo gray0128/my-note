@@ -1127,16 +1127,31 @@ fn time_travel_cli_history_dry_run_undo_actor_shredded_and_conflict() {
         b"human v2"
     );
 
-    // 4. History purge + ExecuteShred -> `block history` flags shredded=true, `revert --to-op` exits 5 KEY_SHREDDED
+    // 4. History purge + sync push + ExecuteShred -> `block history` flags shredded=true, `revert --to-op` exits 5 KEY_SHREDDED
     {
         let mut store = LocalStore::open(&dir).unwrap();
         let (_rec, old_keys) = store
             .purge_block_history(&blk_id, None, None, T_GRACE_DEFAULT_MS, "human")
             .unwrap();
-        let muts: Vec<StoreMutation> = old_keys
-            .into_iter()
-            .map(|key_id| StoreMutation::ExecuteShred { key_id })
+        store.set_local_meta("bootstrap_completed", "1").unwrap();
+        let epoch = mynote_core::ids::JournalEpoch::from_random_bytes([0x99; 16]);
+        let acked: Vec<mynote_core::sync::AckedOp> = store
+            .export_engine_snapshot()
+            .unwrap()
+            .ops
+            .keys()
+            .enumerate()
+            .map(|(i, &op_id)| mynote_core::sync::AckedOp {
+                op_id,
+                seq: (i + 1) as i64,
+            })
             .collect();
+        let mut muts = vec![StoreMutation::MarkOpsSynced { epoch, acked }];
+        muts.extend(
+            old_keys
+                .into_iter()
+                .map(|key_id| StoreMutation::ExecuteShred { key_id }),
+        );
         store.apply_store_mutations(&muts).unwrap();
     }
     let hist_shred_j =

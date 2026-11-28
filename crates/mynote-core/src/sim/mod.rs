@@ -1209,99 +1209,34 @@ impl SimCluster {
 
     /// Mirror `LocalStore::reconcile_outbox_with_imminent_shreds` (`docs/sync-protocol.md` §5.7):
     /// rekey unpushed Tier 1 live leaves whose `key_id` was retired by remote `LOCK` or already shredded,
-    /// without cancelling the remote shred mark (`INV-SYNC-2`), and collapse retiring unpushed ancestors (`H8`).
+    /// without cancelling the remote shred mark (`INV-SYNC-2`), and rebase leaves over retiring ancestors (`H8`)
+    /// using fresh `op_id`s and transitive `merged_parents` so pre-PITR peers never diverge.
     fn reconcile_outbox_on_node(&mut self, node_idx: usize, pre_bdeks: &BTreeMap<KeyId, [u8; 32]>) -> bool {
         if !self.nodes[node_idx].engine.bootstrap_completed
             || self.nodes[node_idx].engine.reconciling_epoch.is_some()
         {
             return false;
         }
-        let unpushed: Vec<LocalOpRecord> = self.nodes[node_idx]
-            .engine
-            .ops
-            .values()
-            .filter(|o| o.server_seq.is_none() && o.sync_blocked_reason.is_none())
-            .cloned()
-            .collect();
-        if unpushed.is_empty() {
+        let plan = self.nodes[node_idx].engine.plan_outbox_reconciliation();
+        if plan.leaves.is_empty()
+            && plan.stranded_superseded_ops.is_empty()
+            && plan.blocked_rekey_ancestors.is_empty()
+        {
             return false;
         }
 
-        let mut unpushed_by_id: BTreeMap<OpId, &LocalOpRecord> = BTreeMap::new();
-        let mut needs_rekey_ids: BTreeSet<OpId> = BTreeSet::new();
-        for o in &unpushed {
-            unpushed_by_id.insert(o.op_id, o);
-            if matches!(
-                self.nodes[node_idx].engine.classify_unpushed_op(o),
-                crate::sync::OutboxKeyAction::NeedsRekey { .. }
-            ) {
-                needs_rekey_ids.insert(o.op_id);
-            }
-        }
-        if needs_rekey_ids.is_empty() {
-            return false;
-        }
-
-        let collapse_retiring_ancestors =
-            |start_parents: &[OpId], allow_collapse_create: bool| -> (Vec<OpId>, BTreeSet<OpId>, bool) {
-                let mut frontier: BTreeSet<OpId> = BTreeSet::new();
-                let mut collapsed: BTreeSet<OpId> = BTreeSet::new();
-                let mut collapsed_create = false;
-                let mut stack: Vec<OpId> = start_parents.to_vec();
-                let mut visited: BTreeSet<OpId> = BTreeSet::new();
-                while let Some(pid) = stack.pop() {
-                    if !visited.insert(pid) {
-                        continue;
-                    }
-                    if needs_rekey_ids.contains(&pid) {
-                        if let Some(anc) = unpushed_by_id.get(&pid) {
-                            if anc.op_type == OpType::Create && !allow_collapse_create {
-                                frontier.insert(pid);
-                                continue;
-                            }
-                            if anc.op_type == OpType::Create {
-                                collapsed_create = true;
-                            }
-                            collapsed.insert(pid);
-                            for &gp in &anc.parent_op_ids {
-                                stack.push(gp);
-                            }
-                        } else {
-                            frontier.insert(pid);
-                        }
-                    } else {
-                        frontier.insert(pid);
-                    }
-                }
-                (frontier.into_iter().collect(), collapsed, collapsed_create)
-            };
-
+        let mut to_delete: BTreeSet<OpId> = plan.stranded_superseded_ops.clone();
+        let to_block_ancestor: BTreeSet<OpId> = plan.blocked_rekey_ancestors.clone();
+        let mut to_keep: BTreeSet<OpId> = plan.protected_ancestors.clone();
         let mut changed = false;
-        for op in &unpushed {
-            // Compute maximal DAG leaves on full `G(entity)` so superseded ancestors are never resurrected.
-            let mut referenced_parents: BTreeSet<OpId> = BTreeSet::new();
-            for cand in self.nodes[node_idx].engine.ops.values() {
-                if cand.entity_type == op.entity_type
-                    && cand.entity_id == op.entity_id
-                    && cand.op_type.is_dag_op()
-                {
-                    for p in &cand.parent_op_ids {
-                        referenced_parents.insert(*p);
-                    }
-                }
-            }
-            if !op.op_type.is_dag_op() || referenced_parents.contains(&op.op_id) {
-                continue;
-            }
 
-            let self_needs_rekey = needs_rekey_ids.contains(&op.op_id);
-            let (rebased_parents, collapsed_ancestors, collapsed_create) =
-                collapse_retiring_ancestors(&op.parent_op_ids, self_needs_rekey);
-            if !self_needs_rekey && collapsed_ancestors.is_empty() {
+        for leaf_plan in &plan.leaves {
+            let Some(op) = self.nodes[node_idx].engine.ops.get(&leaf_plan.op_id).cloned() else {
                 continue;
-            }
-
+            };
             let Some(smk) = self.nodes[node_idx].engine.smks.get(&op.smk_kid).cloned() else {
+                to_keep.insert(op.op_id);
+                to_keep.extend(leaf_plan.collapsed_ancestors.iter().copied());
                 continue;
             };
             let Ok(inner) = crate::crypto::decrypt_mns1(
@@ -1312,45 +1247,199 @@ impl SimCluster {
                 op.key_id,
                 &op.envelope,
             ) else {
+                to_keep.insert(op.op_id);
+                to_keep.extend(leaf_plan.collapsed_ancestors.iter().copied());
                 continue;
             };
 
-            let safe_to_drop: Vec<OpId> = collapsed_ancestors
-                .iter()
-                .copied()
-                .filter(|anc| {
-                    !self.nodes[node_idx].engine.ops.values().any(|other| {
-                        other.op_id != op.op_id
-                            && !collapsed_ancestors.contains(&other.op_id)
-                            && other.parent_op_ids.contains(anc)
-                    })
-                })
-                .collect();
+            if !leaf_plan.self_needs_rekey {
+                let now = self.node_now(node_idx);
+                let new_op_id = OpId::from_ulid(self.nodes[node_idx].ulid_gen.next(now, self.rng.bytes_10()));
+                let rebased_op_type = if leaf_plan.collapsed_create && leaf_plan.frontier_parents.is_empty() {
+                    OpType::Create
+                } else {
+                    inner.op_type
+                };
+                let rebased_body = match inner.body {
+                    OpBodyV1::Tombstone { deleted_at_ms } => Some(OpBodyV1::Tombstone { deleted_at_ms }),
+                    OpBodyV1::BlockMeta {
+                        buffer_id,
+                        position,
+                        lang,
+                        public_hint,
+                    } => Some(OpBodyV1::BlockMeta {
+                        buffer_id,
+                        position,
+                        lang,
+                        public_hint,
+                    }),
+                    OpBodyV1::BlockContent {
+                        tier: 1,
+                        key_id,
+                        mnb1,
+                        buffer_id,
+                        position,
+                        lang,
+                        public_hint,
+                    } => BlockId::parse(&inner.entity_id).ok().and_then(|blk_id| {
+                        let kr = self.nodes[node_idx].engine.unwrap_key_record(key_id)?;
+                        (kr.bdek.len() == 32).then_some(())?;
+                        let mut bdek = [0u8; 32];
+                        bdek.copy_from_slice(&kr.bdek);
+                        let pt =
+                            crate::crypto::decrypt_mnb1(blk_id.as_bytes(), op.op_id, key_id, &bdek, &mnb1)
+                                .ok()?;
+                        let mat_meta = leaf_plan
+                            .collapsed_create
+                            .then(|| self.nodes[node_idx].engine.materialize_block_view(blk_id))
+                            .flatten();
+                        let fill_buf = buffer_id.or_else(|| mat_meta.as_ref().map(|m| m.buffer_id));
+                        let fill_pos = position.or_else(|| mat_meta.as_ref().map(|m| m.position.clone()));
+                        let fill_lang = lang.or_else(|| mat_meta.as_ref().map(|m| m.lang.clone()));
+                        let new_mnb1 = encrypt_mnb1(
+                            blk_id.as_bytes(),
+                            new_op_id,
+                            key_id,
+                            &bdek,
+                            &pt,
+                            self.rng.bytes_24(),
+                        )
+                        .ok()?;
+                        Some(OpBodyV1::BlockContent {
+                            buffer_id: fill_buf,
+                            position: fill_pos,
+                            lang: fill_lang,
+                            public_hint,
+                            tier: 1,
+                            key_id,
+                            mnb1: new_mnb1,
+                        })
+                    }),
+                    OpBodyV1::BufferMeta {
+                        key_id,
+                        name_mnb1,
+                        position,
+                    } => BufferId::parse(&inner.entity_id).ok().and_then(|buf_id| {
+                        let mat_buf = leaf_plan
+                            .collapsed_create
+                            .then(|| self.nodes[node_idx].engine.materialize_buffer_view(buf_id))
+                            .flatten();
+                        let fill_pos = position.or_else(|| mat_buf.as_ref().map(|m| m.position.clone()));
+                        let new_name_mnb1 = match name_mnb1 {
+                            None => match mat_buf.as_ref() {
+                                Some(m) => {
+                                    let kr = self.nodes[node_idx].engine.unwrap_key_record(key_id)?;
+                                    (kr.bdek.len() == 32).then_some(())?;
+                                    let mut bdek = [0u8; 32];
+                                    bdek.copy_from_slice(&kr.bdek);
+                                    Some(
+                                        encrypt_mnb1(
+                                            buf_id.as_bytes(),
+                                            new_op_id,
+                                            key_id,
+                                            &bdek,
+                                            &m.name,
+                                            self.rng.bytes_24(),
+                                        )
+                                        .ok()?,
+                                    )
+                                }
+                                None => None,
+                            },
+                            Some(old_mnb1) => {
+                                let kr = self.nodes[node_idx].engine.unwrap_key_record(key_id)?;
+                                (kr.bdek.len() == 32).then_some(())?;
+                                let mut bdek = [0u8; 32];
+                                bdek.copy_from_slice(&kr.bdek);
+                                let name_pt = crate::crypto::decrypt_mnb1(
+                                    buf_id.as_bytes(),
+                                    op.op_id,
+                                    key_id,
+                                    &bdek,
+                                    &old_mnb1,
+                                )
+                                .ok()?;
+                                Some(
+                                    encrypt_mnb1(
+                                        buf_id.as_bytes(),
+                                        new_op_id,
+                                        key_id,
+                                        &bdek,
+                                        &name_pt,
+                                        self.rng.bytes_24(),
+                                    )
+                                    .ok()?,
+                                )
+                            }
+                        };
+                        Some(OpBodyV1::BufferMeta {
+                            key_id,
+                            name_mnb1: new_name_mnb1,
+                            position: fill_pos,
+                        })
+                    }),
+                    OpBodyV1::BlockContent { .. } => None,
+                };
 
-            if !self_needs_rekey {
-                let mut rebased_inner = inner;
-                rebased_inner.parent_op_ids = rebased_parents.clone();
+                let Some(new_body) = rebased_body else {
+                    to_keep.insert(op.op_id);
+                    to_keep.extend(leaf_plan.collapsed_ancestors.iter().copied());
+                    continue;
+                };
+                let new_inner = InnerOpV1 {
+                    v: inner.v,
+                    entity_type: inner.entity_type,
+                    entity_id: inner.entity_id.clone(),
+                    op_type: rebased_op_type,
+                    parent_op_ids: leaf_plan.merged_parents.clone(),
+                    hlc: inner.hlc.clone(),
+                    actor: inner.actor.clone(),
+                    body: new_body,
+                };
                 let new_mns1 = encrypt_mns1(
                     op.smk_kid,
                     &smk,
-                    op.op_id,
+                    new_op_id,
                     &op.device_id,
-                    &rebased_inner,
+                    &new_inner,
                     self.rng.bytes_24(),
                 )
                 .unwrap();
-                for anc in safe_to_drop {
-                    self.nodes[node_idx].engine.ops.remove(&anc);
+                self.nodes[node_idx].engine.ops.insert(
+                    new_op_id,
+                    LocalOpRecord {
+                        op_id: new_op_id,
+                        server_seq: None,
+                        sync_blocked_reason: None,
+                        device_id: op.device_id,
+                        entity_type: inner.entity_type,
+                        entity_id: inner.entity_id,
+                        parent_op_ids: leaf_plan.merged_parents.clone(),
+                        op_type: rebased_op_type,
+                        hlc: inner.hlc,
+                        actor: inner.actor,
+                        key_id: op.key_id,
+                        smk_kid: op.smk_kid,
+                        envelope: new_mns1,
+                        created_at_ms: op.created_at_ms,
+                    },
+                );
+                for entry in &mut self.committed_tags {
+                    if entry.2 == op.op_id {
+                        entry.2 = new_op_id;
+                    }
                 }
-                if let Some(cur) = self.nodes[node_idx].engine.ops.get_mut(&op.op_id) {
-                    cur.parent_op_ids = rebased_parents;
-                    cur.envelope = new_mns1;
-                }
+                to_delete.insert(op.op_id);
+                to_delete.extend(leaf_plan.collapsed_ancestors.iter().copied());
                 changed = true;
                 continue;
             }
 
-            let Some(old_kid) = op.key_id else { continue };
+            let Some(old_kid) = op.key_id else {
+                to_keep.insert(op.op_id);
+                to_keep.extend(leaf_plan.collapsed_ancestors.iter().copied());
+                continue;
+            };
             if let OpBodyV1::BlockContent {
                 tier: 1,
                 mnb1,
@@ -1362,6 +1451,8 @@ impl SimCluster {
             } = &inner.body
             {
                 let Ok(blk_id) = BlockId::parse(&inner.entity_id) else {
+                    to_keep.insert(op.op_id);
+                    to_keep.extend(leaf_plan.collapsed_ancestors.iter().copied());
                     continue;
                 };
                 let old_bdek_opt = pre_bdeks.get(&old_kid).copied().or_else(|| {
@@ -1372,10 +1463,16 @@ impl SimCluster {
                         arr
                     })
                 });
-                let Some(old_bdek) = old_bdek_opt else { continue };
+                let Some(old_bdek) = old_bdek_opt else {
+                    to_keep.insert(op.op_id);
+                    to_keep.extend(leaf_plan.collapsed_ancestors.iter().copied());
+                    continue;
+                };
                 let Ok(pt) =
                     crate::crypto::decrypt_mnb1(blk_id.as_bytes(), op.op_id, old_kid, &old_bdek, mnb1)
                 else {
+                    to_keep.insert(op.op_id);
+                    to_keep.extend(leaf_plan.collapsed_ancestors.iter().copied());
                     continue;
                 };
 
@@ -1422,7 +1519,7 @@ impl SimCluster {
                     self.rng.bytes_24(),
                 )
                 .unwrap();
-                let rekeyed_op_type = if collapsed_create && rebased_parents.is_empty() {
+                let rekeyed_op_type = if leaf_plan.collapsed_create && leaf_plan.frontier_parents.is_empty() {
                     OpType::Create
                 } else {
                     inner.op_type
@@ -1432,7 +1529,7 @@ impl SimCluster {
                     entity_type: EntityType::Block,
                     entity_id: blk_id.to_string(),
                     op_type: rekeyed_op_type,
-                    parent_op_ids: rebased_parents.clone(),
+                    parent_op_ids: leaf_plan.merged_parents.clone(),
                     hlc: hlc.clone(),
                     actor: inner.actor.clone(),
                     body: OpBodyV1::BlockContent {
@@ -1461,10 +1558,6 @@ impl SimCluster {
                     key_record: Some(mnr1),
                     created_at_ms: now as i64,
                 });
-                for anc in safe_to_drop {
-                    self.nodes[node_idx].engine.ops.remove(&anc);
-                }
-                self.nodes[node_idx].engine.ops.remove(&op.op_id);
                 self.nodes[node_idx].engine.ops.insert(
                     new_op_id,
                     LocalOpRecord {
@@ -1474,7 +1567,7 @@ impl SimCluster {
                         device_id: dev_id,
                         entity_type: EntityType::Block,
                         entity_id: blk_id.to_string(),
-                        parent_op_ids: rebased_parents,
+                        parent_op_ids: leaf_plan.merged_parents.clone(),
                         op_type: rekeyed_op_type,
                         hlc,
                         actor: inner.actor,
@@ -1489,6 +1582,34 @@ impl SimCluster {
                         entry.2 = new_op_id;
                     }
                 }
+                to_delete.insert(op.op_id);
+                to_delete.extend(leaf_plan.collapsed_ancestors.iter().copied());
+                changed = true;
+            } else {
+                to_keep.insert(op.op_id);
+                to_keep.extend(leaf_plan.collapsed_ancestors.iter().copied());
+            }
+        }
+
+        for anc in to_block_ancestor.difference(&to_keep) {
+            if let Some(op) = self.nodes[node_idx].engine.ops.get_mut(anc) {
+                if op.server_seq.is_none() && op.sync_blocked_reason.is_none() {
+                    op.sync_blocked_reason = Some("NEEDS_VAULT_REKEY_ANCESTOR".into());
+                    changed = true;
+                }
+            }
+        }
+        for oid in &to_delete {
+            if to_keep.contains(oid) || to_block_ancestor.contains(oid) {
+                continue;
+            }
+            if self.nodes[node_idx]
+                .engine
+                .ops
+                .get(oid)
+                .is_some_and(|o| o.server_seq.is_none())
+            {
+                self.nodes[node_idx].engine.ops.remove(oid);
                 changed = true;
             }
         }
@@ -3012,11 +3133,481 @@ mod tests {
         assert_eq!(r2.shred_results[0].state, ShredMarkState::Scheduled);
     }
 
-    #[test]
-    fn dst_m2_multi_seed_random_shred_cancel_pitr_and_mobile_snapshot_convergence() {
+    fn run_m2_random_seed(seed: SimSeed, i: u64) {
         use crate::crypto::{encrypt_mnvh, KdfParamsV1, MNRS_KIND_VKEK};
         use crate::vault::UnlockedVaultKeys;
 
+        let mut cluster = SimCluster::new(seed);
+
+        // Fast deterministic VaultHeaderV1 + UnlockedVaultKeys setup (X25519 MNRS + XChaCha20 MNVH, zero Argon2id overhead)
+        let vkek_kid = VkekKid::from_ulid(
+            cluster.nodes[0]
+                .ulid_gen
+                .next(cluster.now_ms, cluster.rng.bytes_10()),
+        );
+        let vkek = cluster.rng.bytes_32();
+        let pass_key = cluster.rng.bytes_32();
+        let kdf = KdfParamsV1::argon2id_default(cluster.rng.bytes_16());
+        let wrapped_vkek = encrypt_mnvh(vkek_kid, &pass_key, &kdf, &vkek, cluster.rng.bytes_24()).unwrap();
+        let sealed_vkek = seal_mnrs(
+            &cluster.keyring.recovery_pk,
+            MNRS_KIND_VKEK,
+            vkek_kid.as_bytes(),
+            &vkek,
+            cluster.rng.bytes_32(),
+            cluster.rng.bytes_24(),
+        )
+        .unwrap();
+        let vh = VaultHeaderV1 {
+            v: 1,
+            vkek_kid,
+            kdf,
+            wrapped_vkek,
+            sealed_vkek,
+            retired: Vec::new(),
+            updated_at_ms: cluster.now_ms as i64,
+        };
+        let vh_bytes = rmp_serde::to_vec_named(&vh).unwrap();
+        cluster.nodes[0]
+            .engine
+            .keys
+            .update_vault_header_material(vh.updated_at_ms, vh_bytes);
+        let unlocked = UnlockedVaultKeys {
+            active_kid: vkek_kid,
+            active_vkek: Zeroizing::new(vkek),
+            retired: Vec::new(),
+        };
+
+        // Seed initial blocks across nodes 0 and 1 and sync baseline
+        for j in 0..4 {
+            cluster.create_block_on_node(j % 2, &format!("seed-{i}-init-{j}"));
+        }
+        for idx in 0..cluster.nodes.len() {
+            cluster.sync_node(idx, &mut false);
+        }
+        cluster.sync_node(0, &mut false);
+
+        let mut locked_canaries: BTreeMap<BlockId, String> = BTreeMap::new();
+        let mut deleted_by_user: BTreeSet<BlockId> = BTreeSet::new();
+
+        // Randomized 36-step M2 fault schedule: partitions, key delays, concurrent UPDATE vs DELETE+shred,
+        // Tier 2 LOCK rekeying, SMK rotation, DO PITR rollback, pending_confirm confirmation, and MNP1 snapshots!
+        for step_i in 0..36usize {
+            cluster.now_ms += 250 + (cluster.rng.next_u64() % 4_000);
+            let act = cluster.rng.next_usize(100);
+            let n_idx = cluster.rng.next_usize(cluster.nodes.len());
+
+            match act {
+                0..=19 => {
+                    cluster.create_block_on_node(n_idx, &format!("seed-{i}-c-{step_i}-n{n_idx}"));
+                }
+                20..=44 if !cluster.known_blocks.is_empty() => {
+                    let b = cluster.known_blocks[cluster.rng.next_usize(cluster.known_blocks.len())];
+                    // Only Tier 1 active blocks accept plaintext UPDATE
+                    let can_edit = cluster.nodes[n_idx]
+                        .engine
+                        .materialize_block_view(b)
+                        .is_some_and(|m| m.state == BlockState::Active && !m.is_locked);
+                    if can_edit
+                        && cluster.update_block_on_node(n_idx, b, &format!("seed-{i}-u-{step_i}-n{n_idx}"))
+                    {
+                        // An offline/concurrent edit revives the block via Update-Wins!
+                        deleted_by_user.remove(&b);
+                    }
+                }
+                45..=56 if !cluster.known_blocks.is_empty() => {
+                    // Delete an active Tier 1 block on bootstrapped node & queue shred marks
+                    if cluster.nodes[n_idx].engine.bootstrap_completed {
+                        let b = cluster.known_blocks[cluster.rng.next_usize(cluster.known_blocks.len())];
+                        let can_del = cluster.nodes[n_idx]
+                            .engine
+                            .materialize_block_view(b)
+                            .is_some_and(|m| m.state == BlockState::Active && !m.is_locked);
+                        if can_del && cluster.delete_block_on_node(n_idx, b) {
+                            deleted_by_user.insert(b);
+                            let dev = cluster.nodes[n_idx].engine.device_id.clone();
+                            let seen = cluster.nodes[n_idx].engine.last_seq;
+                            for kid in cluster.nodes[n_idx]
+                                .engine
+                                .collect_entity_unshredded_keys(EntityType::Block, &b.to_string())
+                            {
+                                let mid = MarkId::from_ulid(
+                                    cluster.nodes[n_idx]
+                                        .ulid_gen
+                                        .next(cluster.now_ms, cluster.rng.bytes_10()),
+                                );
+                                cluster.nodes[n_idx]
+                                    .engine
+                                    .pending_shred_marks
+                                    .push(ShredMarkRow {
+                                        mark_id: mid,
+                                        key_id: kid,
+                                        seen_seq: seen,
+                                        requested_by: dev.clone(),
+                                        requested_at_ms: cluster.now_ms as i64,
+                                        grace_ms: T_GRACE_DEFAULT_MS,
+                                        not_before_ms: None,
+                                        state: ShredMarkState::PendingConfirm,
+                                        confirmed_at_ms: None,
+                                        cancelled_by: None,
+                                        executed_at_ms: None,
+                                    });
+                            }
+                        }
+                    }
+                }
+                57..=64 if !cluster.known_blocks.is_empty() => {
+                    // Tier 2 LOCK rekey on node 0 + schedule shred of old Tier 1 keys
+                    let b = cluster.known_blocks[cluster.rng.next_usize(cluster.known_blocks.len())];
+                    let can_lock = !cluster.nodes[0].partitioned
+                        && cluster.nodes[0]
+                            .engine
+                            .materialize_block_view(b)
+                            .is_some_and(|m| m.state == BlockState::Active && !m.is_locked);
+                    if can_lock {
+                        let old_kids = cluster.nodes[0]
+                            .engine
+                            .collect_entity_unshredded_keys(EntityType::Block, &b.to_string());
+                        let parents = cluster.nodes[0]
+                            .engine
+                            .materialize_block_view(b)
+                            .unwrap()
+                            .head_op_ids();
+                        let lock_op_id = OpId::from_ulid(
+                            cluster.nodes[0]
+                                .ulid_gen
+                                .next(cluster.now_ms, cluster.rng.bytes_10()),
+                        );
+                        let lock_key_id = KeyId::from_ulid(
+                            cluster.nodes[0]
+                                .ulid_gen
+                                .next(cluster.now_ms, cluster.rng.bytes_10()),
+                        );
+                        let t2_bdek = cluster.rng.bytes_32();
+                        let canary = format!("T2_SECRET_{i}_{step_i}");
+                        let mnw1 = unlocked
+                            .wrap_bdek(lock_key_id, b, &t2_bdek, cluster.rng.bytes_24())
+                            .unwrap();
+                        let mnb1 = encrypt_mnb1(
+                            b.as_bytes(),
+                            lock_op_id,
+                            lock_key_id,
+                            &t2_bdek,
+                            &canary,
+                            cluster.rng.bytes_24(),
+                        )
+                        .unwrap();
+                        let mut clock = HlcClock::from_last(cluster.nodes[0].engine.hlc.clone());
+                        let lock_hlc = clock.tick(cluster.now_ms);
+                        cluster.nodes[0].engine.hlc = lock_hlc.clone();
+                        let krec = KeyRecordV1 {
+                            v: 1,
+                            key_id: lock_key_id,
+                            block_id: b.0,
+                            tier: 2,
+                            created_hlc: lock_hlc.canonical_string(),
+                            created_by: cluster.nodes[0].engine.device_id.clone(),
+                            bdek: mnw1,
+                        };
+                        let mnr1 = encrypt_mnr1(
+                            cluster.current_smk.0,
+                            &cluster.current_smk.1,
+                            cluster.keyring.keyring_gen,
+                            &krec,
+                            cluster.rng.bytes_24(),
+                        )
+                        .unwrap();
+                        let inner = InnerOpV1 {
+                            v: 1,
+                            entity_type: EntityType::Block,
+                            entity_id: b.to_string(),
+                            op_type: OpType::Lock,
+                            parent_op_ids: parents.clone(),
+                            hlc: lock_hlc.clone(),
+                            actor: "human".into(),
+                            body: OpBodyV1::BlockContent {
+                                buffer_id: None,
+                                position: None,
+                                lang: None,
+                                public_hint: Some(Some("sim hint".into())),
+                                tier: 2,
+                                key_id: lock_key_id,
+                                mnb1,
+                            },
+                        };
+                        let mns1 = encrypt_mns1(
+                            cluster.current_smk.0,
+                            &cluster.current_smk.1,
+                            lock_op_id,
+                            &cluster.nodes[0].engine.device_id,
+                            &inner,
+                            cluster.rng.bytes_24(),
+                        )
+                        .unwrap();
+                        cluster.nodes[0].engine.keys.insert_record(KeyRecordRow {
+                            key_id: lock_key_id,
+                            wrap_gen: cluster.keyring.keyring_gen,
+                            key_record: Some(mnr1),
+                            created_at_ms: cluster.now_ms as i64,
+                        });
+                        let dev0 = cluster.nodes[0].engine.device_id.clone();
+                        cluster.nodes[0].engine.ops.insert(
+                            lock_op_id,
+                            LocalOpRecord {
+                                op_id: lock_op_id,
+                                server_seq: None,
+                                sync_blocked_reason: None,
+                                device_id: dev0.clone(),
+                                entity_type: EntityType::Block,
+                                entity_id: b.to_string(),
+                                parent_op_ids: parents,
+                                op_type: OpType::Lock,
+                                hlc: lock_hlc,
+                                actor: "human".into(),
+                                key_id: Some(lock_key_id),
+                                smk_kid: cluster.current_smk.0,
+                                envelope: mns1,
+                                created_at_ms: cluster.now_ms as i64,
+                            },
+                        );
+                        let seen = cluster.nodes[0].engine.last_seq;
+                        for okid in old_kids {
+                            let mid = MarkId::from_ulid(
+                                cluster.nodes[0]
+                                    .ulid_gen
+                                    .next(cluster.now_ms, cluster.rng.bytes_10()),
+                            );
+                            cluster.nodes[0].engine.pending_shred_marks.push(ShredMarkRow {
+                                mark_id: mid,
+                                key_id: okid,
+                                seen_seq: seen,
+                                requested_by: dev0.clone(),
+                                requested_at_ms: cluster.now_ms as i64,
+                                grace_ms: T_GRACE_DEFAULT_MS,
+                                not_before_ms: None,
+                                state: ShredMarkState::PendingConfirm,
+                                confirmed_at_ms: None,
+                                cancelled_by: None,
+                                executed_at_ms: None,
+                            });
+                        }
+                        locked_canaries.insert(b, canary);
+                    }
+                }
+                65..=72 => {
+                    cluster.nodes[n_idx].partitioned = !cluster.nodes[n_idx].partitioned;
+                }
+                73..=77 => {
+                    cluster.nodes[n_idx].delay_keys = !cluster.nodes[n_idx].delay_keys;
+                }
+                78..=81 if !cluster.relay.ops.is_empty() => {
+                    let keep = cluster.rng.next_usize(cluster.relay.ops.len());
+                    let new_epoch = JournalEpoch::from_random_bytes(cluster.rng.bytes_16());
+                    cluster.relay.inject_pitr_rollback(keep, new_epoch);
+                }
+                82..=84 => {
+                    cluster.rotate_smk();
+                }
+                85..=89 if cluster.relay.head_seq() > 0 => {
+                    // Upload periodic MNP1 mobile snapshot from node 0 if synced to current epoch
+                    if cluster.nodes[0].engine.journal_epoch == Some(cluster.relay.epoch) {
+                        let snap_id = SnapshotId::from_ulid(
+                            cluster.nodes[0]
+                                .ulid_gen
+                                .next(cluster.now_ms, cluster.rng.bytes_10()),
+                        );
+                        let covers = cluster.nodes[0].engine.last_seq.min(cluster.relay.head_seq());
+                        if covers > 0 {
+                            let (_, bytes) = pack_state_snapshot(
+                                &cluster.nodes[0].engine,
+                                snap_id,
+                                covers,
+                                cluster.current_smk.0,
+                                &cluster.current_smk.1,
+                                cluster.now_ms as i64,
+                                cluster.rng.bytes_24(),
+                                cluster.rng.bytes_24(),
+                            )
+                            .unwrap();
+                            let _ = cluster.relay.handle_snapshot_put(
+                                cluster.relay.epoch,
+                                covers,
+                                snap_id,
+                                bytes,
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    cluster.sync_node(n_idx, &mut false);
+                }
+            }
+        }
+
+        // Heal all partitions & key delays, reconcile across all nodes
+        for n in &mut cluster.nodes {
+            n.partitioned = false;
+            n.delay_keys = false;
+        }
+        for _ in 0..4 {
+            for idx in 0..cluster.nodes.len() {
+                cluster.sync_node(idx, &mut false);
+            }
+        }
+
+        // Confirm any marks that overflowed rolling 24h N=20 into PendingConfirm (`INV-GRACE`)
+        let pending_confirm_kids: Vec<KeyId> = cluster
+            .relay
+            .keys
+            .marks
+            .values()
+            .filter(|m| m.state == ShredMarkState::PendingConfirm)
+            .map(|m| m.key_id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if !pending_confirm_kids.is_empty() {
+            cluster
+                .relay
+                .handle_keys_confirm(&pending_confirm_kids, None, cluster.now_ms as i64)
+                .unwrap();
+        }
+
+        // Ensure at least one MNP1 snapshot exists BEFORE shred alarm fires (tests tail-op + shred parity)
+        let snap_pre_id = SnapshotId::from_ulid(
+            cluster.nodes[0]
+                .ulid_gen
+                .next(cluster.now_ms, cluster.rng.bytes_10()),
+        );
+        let (_, snap_pre_bytes) = pack_state_snapshot(
+            &cluster.nodes[0].engine,
+            snap_pre_id,
+            cluster.relay.head_seq(),
+            cluster.current_smk.0,
+            &cluster.current_smk.1,
+            cluster.now_ms as i64,
+            cluster.rng.bytes_24(),
+            cluster.rng.bytes_24(),
+        )
+        .unwrap();
+        let _ = cluster.relay.handle_snapshot_put(
+            cluster.relay.epoch,
+            cluster.relay.head_seq(),
+            snap_pre_id,
+            snap_pre_bytes,
+        );
+
+        // Advance past T_grace -> execute due shreds idempotently & converge all desktop nodes
+        cluster.now_ms += (T_GRACE_DEFAULT_MS as u64) + 60_000;
+        cluster.relay.run_shred_alarm(cluster.now_ms as i64);
+        assert!(cluster.relay.run_shred_alarm(cluster.now_ms as i64).is_empty());
+        for _ in 0..3 {
+            for idx in 0..cluster.nodes.len() {
+                cluster.sync_node(idx, &mut false);
+            }
+        }
+
+        // 1. INV-SYNC-1 & INV-KEY-LIVENESS across all 3 desktop nodes
+        let all_ref = cluster.nodes[0].engine.all_blocks();
+        let ref_buffers = cluster.nodes[0].engine.all_buffers();
+        let ref_digest = cluster.nodes[0].engine.keys.digest();
+        for (idx, n) in cluster.nodes.iter().enumerate() {
+            assert_eq!(
+                n.engine.all_buffers(),
+                ref_buffers,
+                "M2 seed {seed:?} node {idx} buffers"
+            );
+            assert_eq!(
+                n.engine.all_blocks(),
+                all_ref,
+                "M2 seed {seed:?} node {idx} blocks"
+            );
+            assert_eq!(
+                n.engine.keys.digest(),
+                ref_digest,
+                "M2 seed {seed:?} node {idx} keys_digest"
+            );
+            let (ok, missing) = crate::keys::self_check_key_liveness(&n.engine.all_blocks(), &n.engine.keys);
+            assert!(
+                ok && missing.is_empty(),
+                "INV-KEY-LIVENESS failed on M2 seed {seed:?}: {missing:?}"
+            );
+        }
+
+        // 2. INV-SYNC-7: MobileReadState from MNP1 snapshot + tail ops + key table matches desktop non-shredded blocks!
+        let ref_non_shredded: Vec<crate::model::MaterializedBlock> = all_ref
+            .iter()
+            .filter(|b| b.state != BlockState::Shredded)
+            .cloned()
+            .collect();
+        let snap_rec = cluster
+            .relay
+            .handle_snapshot_get()
+            .expect("MNP1 snapshot present");
+        let (hdr, body) = decode_mnp1(&cluster.nodes[0].engine.smks, &snap_rec.bytes).unwrap();
+        let mut mobile = MobileReadState::new();
+        assert!(mobile.install_snapshot(hdr, body));
+        let (_, tail, _, _, _) = cluster.relay.handle_pull(mobile.last_seq, 500);
+        for r in &tail {
+            mobile
+                .apply_tail_envelope(r, &cluster.nodes[0].engine.smks)
+                .unwrap();
+        }
+        mobile.merge_key_table(&cluster.relay.keys, &cluster.nodes[0].engine.smks);
+        assert_eq!(
+            mobile.all_non_shredded_blocks(&cluster.nodes[0].engine.smks),
+            ref_non_shredded,
+            "INV-SYNC-7 mobile parity failed on M2 seed {seed:?}"
+        );
+
+        // 3. INV-RECOVERY: Zero-device offline restore from MNA1 + latest.mnks + 24 words (including Tier 2 VKEK!)
+        cluster
+            .relay
+            .run_daily_archive_alarm(&cluster.keyring, cluster.now_ms as i64)
+            .unwrap();
+        let restored = offline_restore_from_r2(
+            &cluster.recovery_words,
+            &cluster.relay.r2_op_archives,
+            cluster.relay.r2_latest_mnks.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.all_blocks(),
+            all_ref,
+            "INV-RECOVERY failed on M2 seed {seed:?}"
+        );
+        if !locked_canaries.is_empty() {
+            let kp = RecoveryKeypair::from_mnemonic_words(&cluster.recovery_words).unwrap();
+            let (_, vh_raw) = restored.keys.vault_header_material.as_ref().unwrap();
+            let restored_vh: VaultHeaderV1 = rmp_serde::from_slice(vh_raw).unwrap();
+            let recovered_vault = unseal_vault_with_recovery(&kp, &restored_vh).unwrap();
+            for (locked_bid, expected_secret) in &locked_canaries {
+                let mat = restored.materialize_block_view(*locked_bid).unwrap();
+                if mat.state == BlockState::Active && mat.is_locked {
+                    for leaf in &mat.leaves {
+                        if let LeafBody::Sealed { key_id, mnb1 } = &leaf.body {
+                            let krec = restored.unwrap_key_record(*key_id).unwrap();
+                            let bdek = recovered_vault
+                                .unwrap_bdek(*key_id, *locked_bid, &krec.bdek)
+                                .unwrap();
+                            let pt = decrypt_mnb1(locked_bid.as_bytes(), leaf.op_id, *key_id, &bdek, mnb1)
+                                .unwrap();
+                            assert_eq!(&pt, expected_secret, "Tier 2 recovery mismatch on {seed:?}");
+                        }
+                    }
+                }
+            }
+        }
+        let _ = deleted_by_user;
+    }
+
+    #[test]
+    fn dst_m2_seed_16088884978364103849_repro() {
+        run_m2_random_seed(SimSeed(16088884978364103849), 14_533);
+    }
+
+    #[test]
+    fn dst_m2_multi_seed_random_shred_cancel_pitr_and_mobile_snapshot_convergence() {
         let raw_seeds: u64 = std::env::var("MYNOTE_DST_SEEDS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -3030,475 +3621,7 @@ mod tests {
 
         for i in 1..=seed_count {
             let seed = SimSeed(0x2026_1125_A000_0000 ^ i.wrapping_mul(0x517C_C1B7_2722_0A95));
-            let mut cluster = SimCluster::new(seed);
-
-            // Fast deterministic VaultHeaderV1 + UnlockedVaultKeys setup (X25519 MNRS + XChaCha20 MNVH, zero Argon2id overhead)
-            let vkek_kid = VkekKid::from_ulid(
-                cluster.nodes[0]
-                    .ulid_gen
-                    .next(cluster.now_ms, cluster.rng.bytes_10()),
-            );
-            let vkek = cluster.rng.bytes_32();
-            let pass_key = cluster.rng.bytes_32();
-            let kdf = KdfParamsV1::argon2id_default(cluster.rng.bytes_16());
-            let wrapped_vkek =
-                encrypt_mnvh(vkek_kid, &pass_key, &kdf, &vkek, cluster.rng.bytes_24()).unwrap();
-            let sealed_vkek = seal_mnrs(
-                &cluster.keyring.recovery_pk,
-                MNRS_KIND_VKEK,
-                vkek_kid.as_bytes(),
-                &vkek,
-                cluster.rng.bytes_32(),
-                cluster.rng.bytes_24(),
-            )
-            .unwrap();
-            let vh = VaultHeaderV1 {
-                v: 1,
-                vkek_kid,
-                kdf,
-                wrapped_vkek,
-                sealed_vkek,
-                retired: Vec::new(),
-                updated_at_ms: cluster.now_ms as i64,
-            };
-            let vh_bytes = rmp_serde::to_vec_named(&vh).unwrap();
-            cluster.nodes[0]
-                .engine
-                .keys
-                .update_vault_header_material(vh.updated_at_ms, vh_bytes);
-            let unlocked = UnlockedVaultKeys {
-                active_kid: vkek_kid,
-                active_vkek: Zeroizing::new(vkek),
-                retired: Vec::new(),
-            };
-
-            // Seed initial blocks across nodes 0 and 1 and sync baseline
-            for j in 0..4 {
-                cluster.create_block_on_node(j % 2, &format!("seed-{i}-init-{j}"));
-            }
-            for idx in 0..cluster.nodes.len() {
-                cluster.sync_node(idx, &mut false);
-            }
-            cluster.sync_node(0, &mut false);
-
-            let mut locked_canaries: BTreeMap<BlockId, String> = BTreeMap::new();
-            let mut deleted_by_user: BTreeSet<BlockId> = BTreeSet::new();
-
-            // Randomized 36-step M2 fault schedule: partitions, key delays, concurrent UPDATE vs DELETE+shred,
-            // Tier 2 LOCK rekeying, SMK rotation, DO PITR rollback, pending_confirm confirmation, and MNP1 snapshots!
-            for step_i in 0..36usize {
-                cluster.now_ms += 250 + (cluster.rng.next_u64() % 4_000);
-                let act = cluster.rng.next_usize(100);
-                let n_idx = cluster.rng.next_usize(cluster.nodes.len());
-
-                match act {
-                    0..=19 => {
-                        cluster.create_block_on_node(n_idx, &format!("seed-{i}-c-{step_i}-n{n_idx}"));
-                    }
-                    20..=44 if !cluster.known_blocks.is_empty() => {
-                        let b = cluster.known_blocks[cluster.rng.next_usize(cluster.known_blocks.len())];
-                        // Only Tier 1 active blocks accept plaintext UPDATE
-                        let can_edit = cluster.nodes[n_idx]
-                            .engine
-                            .materialize_block_view(b)
-                            .is_some_and(|m| m.state == BlockState::Active && !m.is_locked);
-                        if can_edit
-                            && cluster.update_block_on_node(
-                                n_idx,
-                                b,
-                                &format!("seed-{i}-u-{step_i}-n{n_idx}"),
-                            )
-                        {
-                            // An offline/concurrent edit revives the block via Update-Wins!
-                            deleted_by_user.remove(&b);
-                        }
-                    }
-                    45..=56 if !cluster.known_blocks.is_empty() => {
-                        // Delete an active Tier 1 block on bootstrapped node & queue shred marks
-                        if cluster.nodes[n_idx].engine.bootstrap_completed {
-                            let b = cluster.known_blocks[cluster.rng.next_usize(cluster.known_blocks.len())];
-                            let can_del = cluster.nodes[n_idx]
-                                .engine
-                                .materialize_block_view(b)
-                                .is_some_and(|m| m.state == BlockState::Active && !m.is_locked);
-                            if can_del && cluster.delete_block_on_node(n_idx, b) {
-                                deleted_by_user.insert(b);
-                                let dev = cluster.nodes[n_idx].engine.device_id.clone();
-                                let seen = cluster.nodes[n_idx].engine.last_seq;
-                                for kid in cluster.nodes[n_idx]
-                                    .engine
-                                    .collect_entity_unshredded_keys(EntityType::Block, &b.to_string())
-                                {
-                                    let mid = MarkId::from_ulid(
-                                        cluster.nodes[n_idx]
-                                            .ulid_gen
-                                            .next(cluster.now_ms, cluster.rng.bytes_10()),
-                                    );
-                                    cluster.nodes[n_idx]
-                                        .engine
-                                        .pending_shred_marks
-                                        .push(ShredMarkRow {
-                                            mark_id: mid,
-                                            key_id: kid,
-                                            seen_seq: seen,
-                                            requested_by: dev.clone(),
-                                            requested_at_ms: cluster.now_ms as i64,
-                                            grace_ms: T_GRACE_DEFAULT_MS,
-                                            not_before_ms: None,
-                                            state: ShredMarkState::PendingConfirm,
-                                            confirmed_at_ms: None,
-                                            cancelled_by: None,
-                                            executed_at_ms: None,
-                                        });
-                                }
-                            }
-                        }
-                    }
-                    57..=64 if !cluster.known_blocks.is_empty() => {
-                        // Tier 2 LOCK rekey on node 0 + schedule shred of old Tier 1 keys
-                        let b = cluster.known_blocks[cluster.rng.next_usize(cluster.known_blocks.len())];
-                        let can_lock = !cluster.nodes[0].partitioned
-                            && cluster.nodes[0]
-                                .engine
-                                .materialize_block_view(b)
-                                .is_some_and(|m| m.state == BlockState::Active && !m.is_locked);
-                        if can_lock {
-                            let old_kids = cluster.nodes[0]
-                                .engine
-                                .collect_entity_unshredded_keys(EntityType::Block, &b.to_string());
-                            let parents = cluster.nodes[0]
-                                .engine
-                                .materialize_block_view(b)
-                                .unwrap()
-                                .head_op_ids();
-                            let lock_op_id = OpId::from_ulid(
-                                cluster.nodes[0]
-                                    .ulid_gen
-                                    .next(cluster.now_ms, cluster.rng.bytes_10()),
-                            );
-                            let lock_key_id = KeyId::from_ulid(
-                                cluster.nodes[0]
-                                    .ulid_gen
-                                    .next(cluster.now_ms, cluster.rng.bytes_10()),
-                            );
-                            let t2_bdek = cluster.rng.bytes_32();
-                            let canary = format!("T2_SECRET_{i}_{step_i}");
-                            let mnw1 = unlocked
-                                .wrap_bdek(lock_key_id, b, &t2_bdek, cluster.rng.bytes_24())
-                                .unwrap();
-                            let mnb1 = encrypt_mnb1(
-                                b.as_bytes(),
-                                lock_op_id,
-                                lock_key_id,
-                                &t2_bdek,
-                                &canary,
-                                cluster.rng.bytes_24(),
-                            )
-                            .unwrap();
-                            let mut clock = HlcClock::from_last(cluster.nodes[0].engine.hlc.clone());
-                            let lock_hlc = clock.tick(cluster.now_ms);
-                            cluster.nodes[0].engine.hlc = lock_hlc.clone();
-                            let krec = KeyRecordV1 {
-                                v: 1,
-                                key_id: lock_key_id,
-                                block_id: b.0,
-                                tier: 2,
-                                created_hlc: lock_hlc.canonical_string(),
-                                created_by: cluster.nodes[0].engine.device_id.clone(),
-                                bdek: mnw1,
-                            };
-                            let mnr1 = encrypt_mnr1(
-                                cluster.current_smk.0,
-                                &cluster.current_smk.1,
-                                cluster.keyring.keyring_gen,
-                                &krec,
-                                cluster.rng.bytes_24(),
-                            )
-                            .unwrap();
-                            let inner = InnerOpV1 {
-                                v: 1,
-                                entity_type: EntityType::Block,
-                                entity_id: b.to_string(),
-                                op_type: OpType::Lock,
-                                parent_op_ids: parents.clone(),
-                                hlc: lock_hlc.clone(),
-                                actor: "human".into(),
-                                body: OpBodyV1::BlockContent {
-                                    buffer_id: None,
-                                    position: None,
-                                    lang: None,
-                                    public_hint: Some(Some("sim hint".into())),
-                                    tier: 2,
-                                    key_id: lock_key_id,
-                                    mnb1,
-                                },
-                            };
-                            let mns1 = encrypt_mns1(
-                                cluster.current_smk.0,
-                                &cluster.current_smk.1,
-                                lock_op_id,
-                                &cluster.nodes[0].engine.device_id,
-                                &inner,
-                                cluster.rng.bytes_24(),
-                            )
-                            .unwrap();
-                            cluster.nodes[0].engine.keys.insert_record(KeyRecordRow {
-                                key_id: lock_key_id,
-                                wrap_gen: cluster.keyring.keyring_gen,
-                                key_record: Some(mnr1),
-                                created_at_ms: cluster.now_ms as i64,
-                            });
-                            let dev0 = cluster.nodes[0].engine.device_id.clone();
-                            cluster.nodes[0].engine.ops.insert(
-                                lock_op_id,
-                                LocalOpRecord {
-                                    op_id: lock_op_id,
-                                    server_seq: None,
-                                    sync_blocked_reason: None,
-                                    device_id: dev0.clone(),
-                                    entity_type: EntityType::Block,
-                                    entity_id: b.to_string(),
-                                    parent_op_ids: parents,
-                                    op_type: OpType::Lock,
-                                    hlc: lock_hlc,
-                                    actor: "human".into(),
-                                    key_id: Some(lock_key_id),
-                                    smk_kid: cluster.current_smk.0,
-                                    envelope: mns1,
-                                    created_at_ms: cluster.now_ms as i64,
-                                },
-                            );
-                            let seen = cluster.nodes[0].engine.last_seq;
-                            for okid in old_kids {
-                                let mid = MarkId::from_ulid(
-                                    cluster.nodes[0]
-                                        .ulid_gen
-                                        .next(cluster.now_ms, cluster.rng.bytes_10()),
-                                );
-                                cluster.nodes[0].engine.pending_shred_marks.push(ShredMarkRow {
-                                    mark_id: mid,
-                                    key_id: okid,
-                                    seen_seq: seen,
-                                    requested_by: dev0.clone(),
-                                    requested_at_ms: cluster.now_ms as i64,
-                                    grace_ms: T_GRACE_DEFAULT_MS,
-                                    not_before_ms: None,
-                                    state: ShredMarkState::PendingConfirm,
-                                    confirmed_at_ms: None,
-                                    cancelled_by: None,
-                                    executed_at_ms: None,
-                                });
-                            }
-                            locked_canaries.insert(b, canary);
-                        }
-                    }
-                    65..=72 => {
-                        cluster.nodes[n_idx].partitioned = !cluster.nodes[n_idx].partitioned;
-                    }
-                    73..=77 => {
-                        cluster.nodes[n_idx].delay_keys = !cluster.nodes[n_idx].delay_keys;
-                    }
-                    78..=81 if !cluster.relay.ops.is_empty() => {
-                        let keep = cluster.rng.next_usize(cluster.relay.ops.len());
-                        let new_epoch = JournalEpoch::from_random_bytes(cluster.rng.bytes_16());
-                        cluster.relay.inject_pitr_rollback(keep, new_epoch);
-                    }
-                    82..=84 => {
-                        cluster.rotate_smk();
-                    }
-                    85..=89 if cluster.relay.head_seq() > 0 => {
-                        // Upload periodic MNP1 mobile snapshot from node 0 if synced to current epoch
-                        if cluster.nodes[0].engine.journal_epoch == Some(cluster.relay.epoch) {
-                            let snap_id = SnapshotId::from_ulid(
-                                cluster.nodes[0]
-                                    .ulid_gen
-                                    .next(cluster.now_ms, cluster.rng.bytes_10()),
-                            );
-                            let covers = cluster.nodes[0].engine.last_seq.min(cluster.relay.head_seq());
-                            if covers > 0 {
-                                let (_, bytes) = pack_state_snapshot(
-                                    &cluster.nodes[0].engine,
-                                    snap_id,
-                                    covers,
-                                    cluster.current_smk.0,
-                                    &cluster.current_smk.1,
-                                    cluster.now_ms as i64,
-                                    cluster.rng.bytes_24(),
-                                    cluster.rng.bytes_24(),
-                                )
-                                .unwrap();
-                                let _ = cluster.relay.handle_snapshot_put(
-                                    cluster.relay.epoch,
-                                    covers,
-                                    snap_id,
-                                    bytes,
-                                );
-                            }
-                        }
-                    }
-                    _ => {
-                        cluster.sync_node(n_idx, &mut false);
-                    }
-                }
-            }
-
-            // Heal all partitions & key delays, reconcile across all nodes
-            for n in &mut cluster.nodes {
-                n.partitioned = false;
-                n.delay_keys = false;
-            }
-            for _ in 0..4 {
-                for idx in 0..cluster.nodes.len() {
-                    cluster.sync_node(idx, &mut false);
-                }
-            }
-
-            // Confirm any marks that overflowed rolling 24h N=20 into PendingConfirm (`INV-GRACE`)
-            let pending_confirm_kids: Vec<KeyId> = cluster
-                .relay
-                .keys
-                .marks
-                .values()
-                .filter(|m| m.state == ShredMarkState::PendingConfirm)
-                .map(|m| m.key_id)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            if !pending_confirm_kids.is_empty() {
-                cluster
-                    .relay
-                    .handle_keys_confirm(&pending_confirm_kids, None, cluster.now_ms as i64)
-                    .unwrap();
-            }
-
-            // Ensure at least one MNP1 snapshot exists BEFORE shred alarm fires (tests tail-op + shred parity)
-            let snap_pre_id = SnapshotId::from_ulid(
-                cluster.nodes[0]
-                    .ulid_gen
-                    .next(cluster.now_ms, cluster.rng.bytes_10()),
-            );
-            let (_, snap_pre_bytes) = pack_state_snapshot(
-                &cluster.nodes[0].engine,
-                snap_pre_id,
-                cluster.relay.head_seq(),
-                cluster.current_smk.0,
-                &cluster.current_smk.1,
-                cluster.now_ms as i64,
-                cluster.rng.bytes_24(),
-                cluster.rng.bytes_24(),
-            )
-            .unwrap();
-            let _ = cluster.relay.handle_snapshot_put(
-                cluster.relay.epoch,
-                cluster.relay.head_seq(),
-                snap_pre_id,
-                snap_pre_bytes,
-            );
-
-            // Advance past T_grace -> execute due shreds idempotently & converge all desktop nodes
-            cluster.now_ms += (T_GRACE_DEFAULT_MS as u64) + 60_000;
-            cluster.relay.run_shred_alarm(cluster.now_ms as i64);
-            assert!(cluster.relay.run_shred_alarm(cluster.now_ms as i64).is_empty());
-            for _ in 0..3 {
-                for idx in 0..cluster.nodes.len() {
-                    cluster.sync_node(idx, &mut false);
-                }
-            }
-
-            // 1. INV-SYNC-1 & INV-KEY-LIVENESS across all 3 desktop nodes
-            let all_ref = cluster.nodes[0].engine.all_blocks();
-            let ref_buffers = cluster.nodes[0].engine.all_buffers();
-            let ref_digest = cluster.nodes[0].engine.keys.digest();
-            for (idx, n) in cluster.nodes.iter().enumerate() {
-                assert_eq!(
-                    n.engine.all_buffers(),
-                    ref_buffers,
-                    "M2 seed {seed:?} node {idx} buffers"
-                );
-                assert_eq!(
-                    n.engine.all_blocks(),
-                    all_ref,
-                    "M2 seed {seed:?} node {idx} blocks"
-                );
-                assert_eq!(
-                    n.engine.keys.digest(),
-                    ref_digest,
-                    "M2 seed {seed:?} node {idx} keys_digest"
-                );
-                let (ok, missing) =
-                    crate::keys::self_check_key_liveness(&n.engine.all_blocks(), &n.engine.keys);
-                assert!(
-                    ok && missing.is_empty(),
-                    "INV-KEY-LIVENESS failed on M2 seed {seed:?}: {missing:?}"
-                );
-            }
-
-            // 2. INV-SYNC-7: MobileReadState from MNP1 snapshot + tail ops + key table matches desktop non-shredded blocks!
-            let ref_non_shredded: Vec<crate::model::MaterializedBlock> = all_ref
-                .iter()
-                .filter(|b| b.state != BlockState::Shredded)
-                .cloned()
-                .collect();
-            let snap_rec = cluster
-                .relay
-                .handle_snapshot_get()
-                .expect("MNP1 snapshot present");
-            let (hdr, body) = decode_mnp1(&cluster.nodes[0].engine.smks, &snap_rec.bytes).unwrap();
-            let mut mobile = MobileReadState::new();
-            assert!(mobile.install_snapshot(hdr, body));
-            let (_, tail, _, _, _) = cluster.relay.handle_pull(mobile.last_seq, 500);
-            for r in &tail {
-                mobile
-                    .apply_tail_envelope(r, &cluster.nodes[0].engine.smks)
-                    .unwrap();
-            }
-            mobile.merge_key_table(&cluster.relay.keys, &cluster.nodes[0].engine.smks);
-            assert_eq!(
-                mobile.all_non_shredded_blocks(&cluster.nodes[0].engine.smks),
-                ref_non_shredded,
-                "INV-SYNC-7 mobile parity failed on M2 seed {seed:?}"
-            );
-
-            // 3. INV-RECOVERY: Zero-device offline restore from MNA1 + latest.mnks + 24 words (including Tier 2 VKEK!)
-            cluster
-                .relay
-                .run_daily_archive_alarm(&cluster.keyring, cluster.now_ms as i64)
-                .unwrap();
-            let restored = offline_restore_from_r2(
-                &cluster.recovery_words,
-                &cluster.relay.r2_op_archives,
-                cluster.relay.r2_latest_mnks.as_ref().unwrap(),
-            )
-            .unwrap();
-            assert_eq!(
-                restored.all_blocks(),
-                all_ref,
-                "INV-RECOVERY failed on M2 seed {seed:?}"
-            );
-            if !locked_canaries.is_empty() {
-                let kp = RecoveryKeypair::from_mnemonic_words(&cluster.recovery_words).unwrap();
-                let (_, vh_raw) = restored.keys.vault_header_material.as_ref().unwrap();
-                let restored_vh: VaultHeaderV1 = rmp_serde::from_slice(vh_raw).unwrap();
-                let recovered_vault = unseal_vault_with_recovery(&kp, &restored_vh).unwrap();
-                for (locked_bid, expected_secret) in &locked_canaries {
-                    let mat = restored.materialize_block_view(*locked_bid).unwrap();
-                    if mat.state == BlockState::Active && mat.is_locked {
-                        for leaf in &mat.leaves {
-                            if let LeafBody::Sealed { key_id, mnb1 } = &leaf.body {
-                                let krec = restored.unwrap_key_record(*key_id).unwrap();
-                                let bdek = recovered_vault
-                                    .unwrap_bdek(*key_id, *locked_bid, &krec.bdek)
-                                    .unwrap();
-                                let pt =
-                                    decrypt_mnb1(locked_bid.as_bytes(), leaf.op_id, *key_id, &bdek, mnb1)
-                                        .unwrap();
-                                assert_eq!(&pt, expected_secret, "Tier 2 recovery mismatch on {seed:?}");
-                            }
-                        }
-                    }
-                }
-            }
-            let _ = deleted_by_user;
+            run_m2_random_seed(seed, i);
         }
     }
 
