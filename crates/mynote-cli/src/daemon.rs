@@ -941,7 +941,8 @@ pub async fn start_daemon_with_clipboard(
                     accepted = uds_listener.accept() => {
                         if let Ok((stream, _)) = accepted {
                             let st = ipc_state.clone();
-                            tokio::spawn(async move { handle_ipc_client(st, stream).await; });
+                            let client_rx = rx.clone();
+                            tokio::spawn(async move { handle_ipc_client(st, stream, client_rx).await; });
                         }
                     }
                 }
@@ -951,6 +952,9 @@ pub async fn start_daemon_with_clipboard(
 
     #[cfg(windows)]
     let ipc_accept_task = {
+        // Yield once so any just-aborted in-process daemon pipe listener on a current-thread test
+        // runtime drops its kernel NamedPipeServer handle before `first_pipe_instance(true)` binds.
+        tokio::task::yield_now().await;
         let pipe_name = crate::local_ipc::pipe_name_for(&cfg.data_dir);
         let mut pipe_server =
             crate::local_ipc::create_hardened_pipe_server(&pipe_name, true).map_err(|e| {
@@ -974,7 +978,8 @@ pub async fn start_daemon_with_clipboard(
                         let stream = std::mem::replace(&mut pipe_server, next_server);
                         if connected.is_ok() {
                             let st = ipc_state.clone();
-                            tokio::spawn(async move { handle_ipc_client(st, stream).await; });
+                            let client_rx = rx.clone();
+                            tokio::spawn(async move { handle_ipc_client(st, stream, client_rx).await; });
                         }
                     }
                 }
@@ -2899,14 +2904,21 @@ async fn serve_local_ws(state: Arc<DaemonState>, socket: WebSocket) {
     send_task.abort();
 }
 
-async fn handle_ipc_client<S>(state: Arc<DaemonState>, stream: S)
+async fn handle_ipc_client<S>(state: Arc<DaemonState>, stream: S, mut shutdown_rx: watch::Receiver<bool>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
-    while let Ok(n) = reader.read_line(&mut line).await {
+    loop {
+        let read_res = tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            res = reader.read_line(&mut line) => res,
+        };
+        let Ok(n) = read_res else {
+            break;
+        };
         if n == 0 {
             break;
         }

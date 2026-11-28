@@ -71,30 +71,30 @@ fn should_use_os_keychain(data_dir: &Path) -> bool {
     // Never touch the host OS keychain for temporary, CI, or explicit test data directories.
     let s = data_dir.to_string_lossy();
     let lower = s.to_ascii_lowercase();
-    if s.starts_with("/tmp/")
+    let is_ephemeral_or_override = s.starts_with("/tmp/")
         || s.contains("/.tmp")
         || lower.contains("\\appdata\\local\\temp\\")
         || lower.contains("/appdata/local/temp/")
         || data_dir.starts_with(std::env::temp_dir())
         || std::env::var("MYNOTE_DATA_DIR").is_ok()
-        || std::env::var("CI").is_ok()
-    {
-        return false;
-    }
+        || std::env::var("CI").is_ok();
     #[cfg(target_os = "macos")]
     {
-        Path::new("/usr/bin/security").exists()
+        !is_ephemeral_or_override && Path::new("/usr/bin/security").exists()
     }
     #[cfg(target_os = "linux")]
     {
-        std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok() && command_in_path("secret-tool")
+        !is_ephemeral_or_override
+            && std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok()
+            && command_in_path("secret-tool")
     }
     #[cfg(windows)]
     {
-        true
+        !is_ephemeral_or_override
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
+        let _ = is_ephemeral_or_override;
         false
     }
 }
@@ -317,7 +317,7 @@ mod win_sec {
         if ok2 == 0 {
             return Err(io::Error::last_os_error());
         }
-        let tu = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+        let tu = unsafe { &*buf.as_ptr().cast::<TOKEN_USER>() };
         let mut wide_ptr: *mut u16 = ptr::null_mut();
         let ok_sid = unsafe { ConvertSidToStringSidW(tu.User.Sid, &mut wide_ptr) };
         if ok_sid == 0 {
@@ -506,8 +506,8 @@ mod win_sec {
             unsafe { core::slice::from_raw_parts(cred.CredentialBlob, cred.CredentialBlobSize as usize) };
         if raw_slice.len().is_multiple_of(2) {
             let mut units = Zeroizing::new(Vec::with_capacity(raw_slice.len() / 2));
-            for chunk in raw_slice.chunks_exact(2) {
-                units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+            for &chunk in raw_slice.as_chunks::<2>().0 {
+                units.push(u16::from_le_bytes(chunk));
             }
             if let Ok(s) = String::from_utf16(&units) {
                 return Some(Zeroizing::new(s));

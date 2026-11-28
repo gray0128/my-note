@@ -592,10 +592,11 @@ timeout_ms = 5000
         );
 
         // 4. Default Windows data directory resolves to `%LOCALAPPDATA%\mynote` when `MYNOTE_DATA_DIR` is unset
-        if std::env::var_os("MYNOTE_DATA_DIR").is_none() {
-            if let Some(lad) = std::env::var_os("LOCALAPPDATA") {
-                assert_eq!(resolve_data_dir(None), PathBuf::from(lad).join("mynote"));
-            }
+        if let (None, Some(lad)) = (
+            std::env::var_os("MYNOTE_DATA_DIR"),
+            std::env::var_os("LOCALAPPDATA"),
+        ) {
+            assert_eq!(resolve_data_dir(None), PathBuf::from(lad).join("mynote"));
         }
 
         let _ = std::fs::remove_dir_all(&dir);

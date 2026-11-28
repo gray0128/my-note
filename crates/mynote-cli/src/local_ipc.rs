@@ -595,11 +595,11 @@ mod win_imp {
         let token_handle = token.as_raw_handle() as HANDLE;
 
         let token_user_sid = query_sid_class(token_handle, TokenUser, |buf| {
-            let tu = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+            let tu = unsafe { &*buf.as_ptr().cast::<TOKEN_USER>() };
             tu.User.Sid
         })?;
         let token_owner_sid = query_sid_class(token_handle, TokenOwner, |buf| {
-            let to = unsafe { &*(buf.as_ptr() as *const TOKEN_OWNER) };
+            let to = unsafe { &*buf.as_ptr().cast::<TOKEN_OWNER>() };
             to.Owner
         })?;
 
@@ -685,9 +685,7 @@ mod win_imp {
         opts.first_pipe_instance(first_instance)
             .reject_remote_clients(true);
 
-        unsafe {
-            opts.create_with_security_attributes_raw(pipe_name, (&mut sa as *mut SECURITY_ATTRIBUTES).cast())
-        }
+        unsafe { opts.create_with_security_attributes_raw(pipe_name, ptr::from_mut(&mut sa).cast()) }
     }
 
     /// Create the production `NamedPipeServer` for `pipe_name` using `PIPE_OWNER_ONLY_SDDL`
@@ -846,11 +844,8 @@ mod win_imp {
         let pipe_name = pipe_name_for(data_dir);
         let pipe_w: Vec<u16> = pipe_name.encode_utf16().chain(core::iter::once(0)).collect();
         let probe_ok = unsafe { WaitNamedPipeW(pipe_w.as_ptr(), 1) };
-        if probe_ok == 0 {
-            let err = unsafe { GetLastError() };
-            if err == ERROR_FILE_NOT_FOUND {
-                return Ok(None);
-            }
+        if probe_ok == 0 && unsafe { GetLastError() } == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
         }
 
         let mut line = serde_json::to_string(req)

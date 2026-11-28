@@ -616,7 +616,7 @@ mod win_proc {
             SetInformationJobObject(
                 job.as_raw_handle() as HANDLE,
                 JobObjectExtendedLimitInformation,
-                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                ptr::from_ref(&info).cast(),
                 core::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
         };
