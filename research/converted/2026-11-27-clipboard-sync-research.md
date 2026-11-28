@@ -1,10 +1,10 @@
-# 跨端剪贴板同步：可行性深度调研与迭代方案提案 (`clipboard-sync-proposal.md`)
+# 跨端剪贴板同步：可行性深度调研与迭代方案提案 (`2026-11-27-clipboard-sync-research.md`)
 
-> **文档状态**：`Decided（2026-11-27 拍板为 D8，Q1–Q6 全按默认；对应 `ADR-11` 为 `Proposed`，待 `S-Clip` 真机实测后转 `Accepted`）**。
+> **文档分类与状态**：调研报告（`research/converted/`，`Converted` — 已于 2026-11-27 拍板为 **D8**，Q1–Q6 全按默认；对应 [`architecture-proposal.md`](../../docs/architecture-proposal.md) `ADR-11` 为 `Proposed`，待 `S-Clip` 真机实测后转 `Accepted`）。本文已由原 `docs/clipboard-sync-proposal.md` 归类迁入本目录，仅作调研证据与决策追溯归档，**严禁直接作为开发实施依据**。
 >
-> **单一事实来源说明**：2026-11-27 拍板后的正式工程契约已同步合入全仓规范——线格式 `MNC1`、AAD、`ClipKey` 与全端 DDL 以 [`data-structures.md`](./data-structures.md) 为准；同步与防回环语义以 [`sync-protocol.md`](./sync-protocol.md) 为准；错误码、CLI、本地 Daemon、云端 `/v1/clip*` 与 WASM 契约以 [`interface-contracts.md`](./interface-contracts.md) 为准；安全承诺、四态令牌与敏感过滤以 [`threat-model.md`](./threat-model.md) 为准；Cloudflare 流式 R2 与配额实现以 [`cloudflare-cloud-architecture.md`](./cloudflare-cloud-architecture.md) 为准；测试门禁以 [`eval-framework.md`](./eval-framework.md) 为准。本文保留作为可行性调研、竞品对比、移动端三梯队交互说明与决策追溯归档，若与上述正式规范存在细微表述差异，一律以对应 SSOT 规范为准。
+> **单一事实来源说明**：2026-11-27 拍板后的正式工程契约已同步合入全仓规范——线格式 `MNC1`、AAD、`ClipKey` 与全端 DDL 以 [`data-structures.md`](../../docs/data-structures.md) 为准；同步与防回环语义以 [`sync-protocol.md`](../../docs/sync-protocol.md) 为准；错误码、CLI、本地 Daemon、云端 `/v1/clip*` 与 WASM 契约以 [`interface-contracts.md`](../../docs/interface-contracts.md) 为准；安全承诺、四态令牌与敏感过滤以 [`threat-model.md`](../../docs/threat-model.md) 为准；Cloudflare 流式 R2 与配额实现以 [`cloudflare-cloud-architecture.md`](../../docs/cloudflare-cloud-architecture.md) 为准；测试门禁以 [`eval-framework.md`](../../docs/eval-framework.md) 为准。本文保留作为可行性调研、竞品对比、移动端三梯队交互说明与决策追溯归档，若与上述正式规范存在细微表述差异，一律以对应 SSOT 规范为准。
 >
-> **写作基线**：基于 `main` @ `v0.2.0`（M1 / M2 / M3 已全部合入并上线生产 Cloudflare Worker，详见 [总架构设计方案 (`architecture-proposal.md`)](./architecture-proposal.md) 与 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md)）。文中所有体积、延迟、行数与成本数字均按 `AGENTS.md` 规范标注 `[保证]` / `[目标]` / `[估算]` / `[已测]`。
+> **写作基线**：基于 `main` @ `v0.2.0`（M1 / M2 / M3 已全部合入并上线生产 Cloudflare Worker，详见 [总架构设计方案 (`architecture-proposal.md`)](../../docs/architecture-proposal.md) 与 [第一性原理审查 §9](../../review/2026-11-24-first-principles-review.md)）。文中所有体积、延迟、行数与成本数字均按 `AGENTS.md` 规范标注 `[保证]` / `[目标]` / `[估算]` / `[已测]`。
 
 ---
 
@@ -49,7 +49,7 @@
 
 ### 1.1 历史回溯：为什么此前移除了 `ephemeral_clips`，以及现在为何重新评估？
 
-在 `main` @ `31931a2` 的早期草稿中，项目曾规划过 `ephemeral_clips` 表与 `mynote clip push/pull`。2026 年 11 月 24 日的第一性原理审查（[`review/2026-11-24-first-principles-review.md`](../review/2026-11-24-first-principles-review.md)）出于两项充分理由将其移除：
+在 `main` @ `31931a2` 的早期草稿中，项目曾规划过 `ephemeral_clips` 表与 `mynote clip push/pull`。2026 年 11 月 24 日的第一性原理审查（[`review/2026-11-24-first-principles-review.md`](../../review/2026-11-24-first-principles-review.md)）出于两项充分理由将其移除：
 
 1. **规范自相矛盾（F-06）**：旧方案声称瞬态剪贴板「绝不进入 30 天 PITR」，却将其写入 DO SQLite 表——而 Cloudflare SQLite DO 的 30 天 PITR 覆盖整库 SQLite 页面，无法排除单张表。
 2. **里程碑聚焦（D1）**：当时代码量为 0，首要目标是尽快做出能卸载 Heynote + iCloud 的最小可用版本；手机定位为只读 + 复制，桌面 → 手机的复制需求暂由块顶复制按钮覆盖。
@@ -327,7 +327,7 @@ sequenceDiagram
 
 ## 5. 数据结构、线格式与接口契约草案
 
-> 以下定义均为 `Proposed` 草案；待 §7 拍板后分别合入 [`data-structures.md`](./data-structures.md) 与 [`interface-contracts.md`](./interface-contracts.md)（单一事实来源）。
+> 以下定义均为 `Proposed` 草案；待 §7 拍板后分别合入 [`data-structures.md`](../../docs/data-structures.md) 与 [`interface-contracts.md`](../../docs/interface-contracts.md)（单一事实来源）。
 
 ### 5.1 线格式 `MNC1`（统一支撑元数据、小文本与二进制原图流）
 
@@ -505,9 +505,9 @@ flowchart LR
 
 | # | 决策问题 | 拍板结果（默认值） | 同步落位 |
 | --- | --- | --- | --- |
-| **Q1** | 是否局部修订 D1，新增仅作用于 `/v1/clip*` 的 `read+clip` 与 `clip-write` 令牌范围？ | **已决（选 A）**：批准局部修订 D1 → D1′，保持手机对笔记写、密钥与碎纸路由仍全部 `403`，仅开放物理隔离的剪贴板通道 | [`threat-model.md`](./threat-model.md) §7.1、[`data-structures.md`](./data-structures.md) §5、[`interface-contracts.md`](./interface-contracts.md) §4.1 |
-| **Q2** | 100 条剪贴板的云端 TTL 与单张图片上限设定？ | **已决（选 A）**：默认 **7 天 TTL**、单条硬上限 **`10 MiB`**，DO 存 100 条轻索引（`≤ 64 KiB` 小文本内联 + `≤ 16 KiB` 缩略图），图片与长文本流式存 R2 `clip/blobs/`（8 天前缀生命周期） | [`data-structures.md`](./data-structures.md) §5、[`cloudflare-cloud-architecture.md`](./cloudflare-cloud-architecture.md) §3.3 |
-| **Q3** | iOS 侧「移动端 → 桌面」图文分流策略？ | **已决（选 A）**：梯队 1（PWA `mynote-wasm` 最高 `10 MiB` 无损原图 + 文本）+ 梯队 2（iOS Shortcuts + Scriptable 不切屏发文本及前置缩放 `≤ 1.5 MiB` 截图，以 `S-Clip-1` 真机实测为准），不立项原生 Swift App | [`architecture-proposal.md`](./architecture-proposal.md) §5.2 / §7、[`threat-model.md`](./threat-model.md) §9 |
-| **Q4** | `clip-write` 快捷指令加密模式选择？ | **已决（选 A）**：全端统一对称 `MNC1`（独立可轮换 `ClipKey`，与 `SMK`/`VKEK` 物理隔离、不入恢复包；敏感一次性短串走 `≤ 256 KiB` 零写库 `--ephemeral` 纯内存 WS 直推） | [`data-structures.md`](./data-structures.md) §3.2 / §3.3 / §3.8、[`threat-model.md`](./threat-model.md) §2.3 / §9 |
-| **Q5** | 桌面收到手机显式发来的文本/图片时，是否默认直接写入系统剪贴板？ | **已决（选 A）**：显式发送项默认自动写入系统剪贴板（覆盖前保留内存可撤销槽 `mynote clip undo` 并弹轻通知）；桌面后台自动镜像默认仅进收件箱可配置 | [`sync-protocol.md`](./sync-protocol.md) §11、[`interface-contracts.md`](./interface-contracts.md) §2.3 / §3.2 |
-| **Q6** | 迭代节奏划分？ | **已决（选 A）**：先 `S-Clip`（3–4 天真机 Spike）→ `M4a`（100 条图文显式同步 + 移动端 → 桌面）→ `M4b`（桌面后台自动镜像，默认关闭 opt-in）→ `M4c` | [`architecture-proposal.md`](./architecture-proposal.md) §7 / §8（`ADR-11`）、[`eval-framework.md`](./eval-framework.md) §10 |
+| **Q1** | 是否局部修订 D1，新增仅作用于 `/v1/clip*` 的 `read+clip` 与 `clip-write` 令牌范围？ | **已决（选 A）**：批准局部修订 D1 → D1′，保持手机对笔记写、密钥与碎纸路由仍全部 `403`，仅开放物理隔离的剪贴板通道 | [`threat-model.md`](../../docs/threat-model.md) §7.1、[`data-structures.md`](../../docs/data-structures.md) §5、[`interface-contracts.md`](../../docs/interface-contracts.md) §4.1 |
+| **Q2** | 100 条剪贴板的云端 TTL 与单张图片上限设定？ | **已决（选 A）**：默认 **7 天 TTL**、单条硬上限 **`10 MiB`**，DO 存 100 条轻索引（`≤ 64 KiB` 小文本内联 + `≤ 16 KiB` 缩略图），图片与长文本流式存 R2 `clip/blobs/`（8 天前缀生命周期） | [`data-structures.md`](../../docs/data-structures.md) §5、[`cloudflare-cloud-architecture.md`](../../docs/cloudflare-cloud-architecture.md) §3.3 |
+| **Q3** | iOS 侧「移动端 → 桌面」图文分流策略？ | **已决（选 A）**：梯队 1（PWA `mynote-wasm` 最高 `10 MiB` 无损原图 + 文本）+ 梯队 2（iOS Shortcuts + Scriptable 不切屏发文本及前置缩放 `≤ 1.5 MiB` 截图，以 `S-Clip-1` 真机实测为准），不立项原生 Swift App | [`architecture-proposal.md`](../../docs/architecture-proposal.md) §5.2 / §7、[`threat-model.md`](../../docs/threat-model.md) §9 |
+| **Q4** | `clip-write` 快捷指令加密模式选择？ | **已决（选 A）**：全端统一对称 `MNC1`（独立可轮换 `ClipKey`，与 `SMK`/`VKEK` 物理隔离、不入恢复包；敏感一次性短串走 `≤ 256 KiB` 零写库 `--ephemeral` 纯内存 WS 直推） | [`data-structures.md`](../../docs/data-structures.md) §3.2 / §3.3 / §3.8、[`threat-model.md`](../../docs/threat-model.md) §2.3 / §9 |
+| **Q5** | 桌面收到手机显式发来的文本/图片时，是否默认直接写入系统剪贴板？ | **已决（选 A）**：显式发送项默认自动写入系统剪贴板（覆盖前保留内存可撤销槽 `mynote clip undo` 并弹轻通知）；桌面后台自动镜像默认仅进收件箱可配置 | [`sync-protocol.md`](../../docs/sync-protocol.md) §11、[`interface-contracts.md`](../../docs/interface-contracts.md) §2.3 / §3.2 |
+| **Q6** | 迭代节奏划分？ | **已决（选 A）**：先 `S-Clip`（3–4 天真机 Spike）→ `M4a`（100 条图文显式同步 + 移动端 → 桌面）→ `M4b`（桌面后台自动镜像，默认关闭 opt-in）→ `M4c` | [`architecture-proposal.md`](../../docs/architecture-proposal.md) §7 / §8（`ADR-11`）、[`eval-framework.md`](../../docs/eval-framework.md) §10 |

@@ -1,10 +1,10 @@
-# 轻量级多端可靠同步开发者笔记软件：深度调研与架构方案
+# 轻量级多端可靠同步开发者笔记软件：系统架构与演进方案
 
-> 2026-11-28 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D8（含 D1′、D2′、D5′/D5″ 去 Tauri 壳并增补零依赖纯 Swift 可选薄壳 `apps/macos/`、2026-11-25 真机实测拍板与 2026-11-27 剪贴板同步拍板 D8）更新。
+> 2026-11-28 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D10（含 D1′、D2′、D5′/D5″ 去 Tauri 壳并增补零依赖纯 Swift 可选薄壳 `apps/macos/`、2026-11-25 真机实测拍板、2026-11-27 剪贴板同步拍板 D8，以及 2026-11-28 Windows 一等桌面平台 D9 与 `wasmi` 优先双宿主插件体系 D10）更新。
 
-> **定位**：面向开发者的高频临时记录 / Scratchpad 工具，继承 Heynote「多语言分块 + 一键格式化」的顺手体验，从架构根源消除同步丢数问题，原生适配 **macOS**、**Omarchy（Arch + Hyprland）** 与 **移动端（笔记只读 + Vault 解锁 + 独立剪贴板双向图文同步）**，并兼顾**块级加密**、**Markdown/Mermaid 渲染**、**跨端 100 条图文剪贴板同步（M4）**与 **CLI + Skill（Agent 友好）**。
+> **定位**：面向开发者的高频临时记录 / Scratchpad 工具，继承 Heynote「多语言分块 + 一键格式化」的顺手体验，从架构根源消除同步丢数问题，原生适配 **macOS**、**Omarchy（Arch + Hyprland）**、**Windows（M5 升为一等桌面平台，D9）** 与 **移动端（笔记只读 + Vault 解锁 + 独立剪贴板双向图文同步）**，并兼顾**块级加密**、**Markdown/Mermaid 渲染**、**跨端图文剪贴板同步（M4，D8 / D8′：云端 1,000 条/30 天/5 GiB 中继 + 桌面无限归档）**、**`wasmi` 优先跨平台双宿主插件体系（M5，D10）**与 **CLI + Skill（Agent 友好）**。
 >
-> **文档状态**：Proposed。本文是总览、ADR 与路线图的单一事实来源；协议、线格式、安全承诺等细节只在下方配套规范中定义，本文仅做概述并链接。
+> **文档状态**：正式架构方案（SSOT）。本文是总览、ADR 与路线图的单一事实来源；协议、线格式、安全承诺等细节只在下方配套规范中定义，本文仅做概述并链接。前期可行性调研与发散分析独立归档于 [`research/`](../research/README.md)（调研报告严禁直接作为实施依据，仅在明确转化为本目录正式方案正文后方可实施）。
 
 ---
 
@@ -22,19 +22,20 @@
    - [5.4 安全与块级加密模型](#54-安全与块级加密模型)
    - [5.5 Agent 友好设计：CLI + Skill 与四级渐进披露帮助体系](#55-agent-友好设计cli--skill-与四级渐进披露帮助体系)
    - [5.6 Markdown 与 Mermaid 图渲染设计（轻量、离线与防 XSS）](#56-markdown-与-mermaid-图渲染设计轻量离线与防-xss)
+   - [5.7 跨平台双宿主插件体系与 Windows 一等桌面适配（M5，D9 / D10）](#57-跨平台双宿主插件体系与-windows-一等桌面适配m5d9--d10)
 6. [多端形态与技术栈选型对比](#6-多端形态与技术栈选型对比)
-7. [分阶段演进路线图（S0 → M4）](#7-分阶段演进路线图s0--m4)
+7. [分阶段演进路线图（S0 → M5）](#7-分阶段演进路线图s0--m5)
 8. [架构决策记录（ADR 摘要）](#8-架构决策记录adr-摘要)
-9. [已移除 / 推迟的机制（2026-11-24）](#9-已移除--推迟的机制2026-11-24)
+9. [已移除 / 推迟的机制（2026-11-24 / 2026-11-28 修订）](#9-已移除--推迟的机制2026-11-24--2026-11-28-修订)
 
-> **配套核心工程规范**（单一事实来源）：
-> - [核心数据结构、存储 Schema 与二进制线格式规范 (`data-structures.md`)](./data-structures.md)（ULID/定长 HLC/FractionalIndex、Rust Sans-I/O 类型、加密信封字节布局与**唯一的 AAD 定义**、独立密钥表、SQLite `STRICT` 完整 DDL 与 PWA IndexedDB Schema）
-> - [全链路接口与跨边界契约规范 (`interface-contracts.md`)](./interface-contracts.md)（统一错误码表、CLI 全子命令 JSON 信封、本地 Daemon REST/WS/UDS 契约、云端 Sync API 与 `mynote-wasm` FFI 契约）
+> **配套核心工程规范**（正式方案单一事实来源，完整索引见 [`docs/README.md`](./README.md)）：
+> - [核心数据结构、存储 Schema 与二进制线格式规范 (`data-structures.md`)](./data-structures.md)（ULID/定长 HLC/FractionalIndex、Rust Sans-I/O 类型、M5 插件领域契约与 Core WASM 3-Export ABI、加密信封字节布局与**唯一的 AAD 定义**、独立密钥表、SQLite `STRICT` 完整 DDL 与 PWA IndexedDB Schema）
+> - [全链路接口与跨边界契约规范 (`interface-contracts.md`)](./interface-contracts.md)（统一错误码表、CLI 全子命令 JSON 信封、本地 Daemon REST / WS / 跨平台 `LocalIpc` 契约、云端 Sync API 与 `mynote-wasm` / Tier 2 插件 Worker 边界）
 > - [同步协议与确定性物化规范 (`sync-protocol.md`)](./sync-protocol.md)
 > - [安全架构与威胁模型规范 (`threat-model.md`)](./threat-model.md)
 > - [Cloudflare 技术栈云端架构专项评估 (`cloudflare-cloud-architecture.md`)](./cloudflare-cloud-architecture.md)
 > - [评测与质量门禁规范 (`eval-framework.md`)](./eval-framework.md)
-> - [跨端剪贴板同步可行性调研与决策归档 (`clipboard-sync-proposal.md`)](./clipboard-sync-proposal.md)（`Decided`，2026-11-27 拍板为 D8，调研证据与移动端三梯队交互归档；正式契约以本清单其余 SSOT 规范为准）
+> - **已转化调研留档（不作为实施依据，仅追溯背景）**：[跨端剪贴板同步调研 (`2026-11-27-clipboard-sync-research.md`)](../research/converted/2026-11-27-clipboard-sync-research.md)（D8）、[插件化可行性与跨平台架构调研 (`2026-11-28-plugin-architecture-analysis.md`)](../research/converted/2026-11-28-plugin-architecture-analysis.md)（D9 / D10）
 
 ---
 
@@ -45,13 +46,13 @@
 按不可逆程度排序（来自审查 §1.2，已按 D1、D4、D7 修订）：
 
 - **G1 永不静默丢数**：涵盖同步 bug、**丢钥匙**、误操作、平台驱逐、逻辑 bug 扩散。
-- **G2 随手即记、随叫随到**：CLI 本地读写 `< 15 ms` [目标]；桌面底座统一为本地 Daemon + 内嵌 HTML（`http://localhost:<port>`），Omarchy 通过 Hyprland 键绑定唤出 Chromium webapp，macOS 可通过可选的零依赖纯 Swift `WKWebView` 薄壳 [`apps/macos/MyNote.app`](../apps/macos/README.md)（菜单栏 + Carbon 全局热键 `⌃⌥Space`，隐显 `5.1–7.9 ms` `[已测]`）或浏览器 / Web App / `mynote open` 直达（D5′ / D5″）。
-- **G3 多端可得**：桌面之间实时同步；**手机对笔记保持只读、可复制并可解锁 Vault（D1′、D7），并通过物理隔离的剪贴板通道与桌面双向同步 100 条文本与位图图片剪贴板（D8，M4）**。
+- **G2 随手即记、随叫随到**：CLI 本地读写 `< 15 ms` [目标]；桌面底座统一为本地 Daemon + 内嵌 HTML（`http://localhost:<port>`），覆盖 **macOS、Omarchy Linux 与 Windows（M5，D9）**三端一等桌面平台：Omarchy 通过 Hyprland 键绑定唤出 Chromium webapp，macOS 可通过可选的零依赖纯 Swift `WKWebView` 薄壳 [`apps/macos/MyNote.app`](../apps/macos/README.md)（菜单栏 + Carbon 全局热键 `⌃⌥Space`，隐显 `5.1–7.9 ms` `[已测]`）或浏览器 / Web App / `mynote open` 直达（D5′ / D5″），Windows 通过 `mynote open`（`ShellExecuteW`）与原生后台托管直达（可选 Win32 + WebView2 薄壳留作后续按需切片）。
+- **G3 多端可得**：三桌面（macOS / Omarchy / Windows）之间实时同步；**手机对笔记保持只读、可复制并可解锁 Vault（D1′、D7），并通过物理隔离的剪贴板通道与桌面双向同步图文剪贴板（D8 / D8′，M4：云端 1,000 条/30 天/5 GiB 滚动中继，桌面无限本地归档、手动清理）**。
 - **G4 秘密不落明文、不以明文进云端。**
 - **G5 Agent 可读写**（通过 CLI）。
-- **G6 Heynote 式分块与格式化，Markdown / Mermaid 渲染。**
-- **C1 一个人能长期维护**：复杂度预算建议为 M1 结束时云端代码 < 500 行 [目标]（M2 实测 `690` 行 `[已测]` <= `700` 行；M4 纳入 100 条图文剪贴板与流式 R2 后约 `870–930` 行 `[估算]`）、core 同步部分 < 3k 行 [目标]（剪贴板逻辑置于独立 `clip` 模块，不增加 `sync` 状态机复杂度）；任何新机制都需附上触发它的测量数据（F-08）。
-- **C2 成本约 \$5/月**（Cloudflare Workers Paid）[估算]，并配置支出告警（D4）；M4 图文剪贴板复用 R2 `10 GB/月` 免费额度与零出口流量，仍无额外月费 [估算]。
+- **G6 Heynote 式分块与格式化，Markdown / Mermaid 渲染，以及零云端侵入的跨平台双宿主插件扩展（M5，D10）。**
+- **C1 一个人能长期维护**：复杂度预算建议为 M1 结束时云端代码 < 500 行 [目标]（M2 实测 `690` 行 `[已测]` <= `700` 行；M4 实测 `929` 行 `[已测]` <= `950` 行；**M5 Windows 与插件体系对 `cloud-cf/src/` 改动量硬约束为 `0 LOC` `[保证]`，手机 PWA WASM 增量为 `0 B` `[保证]`**）、core 同步部分 < 3k 行 [目标]（剪贴板与插件领域类型分别置于独立 `clip` / `plugin` 模块，不增加 `sync` 状态机复杂度）；任何新机制都需附上触发它的测量数据（F-08）。
+- **C2 成本约 \$5/月**（Cloudflare Workers Paid）[估算]，并配置支出告警（D4）；M4 图文剪贴板复用 R2 `10 GB/月` 免费额度与零出口流量，M5 纯本地执行无云端增量，整体维持约 \$5/月 `[估算]`。
 
 ### 0.2 非目标（Non-goals）
 
@@ -60,6 +61,7 @@
 - 手机编辑或追加笔记块（按数据触发再议，§7；D8 仅开放与笔记物理隔离的 `/v1/clip*` 剪贴板通道，手机仍不可改写/删除笔记）。
 - 移动端后台静默自动监听剪贴板、替代 Maccy / `cliphist` 的重型富文本/OCR 剪贴板管理器、任意大文件（视频/压缩包/PDF）同步、以及原生 iOS / Android 独立 App（D8）。
 - 本地或云端 MCP、开放 API。
+- Obsidian 式主页面 JS / DOM 注入插件、捆绑 Node.js / Python 重型运行时、外部公共插件审核商店、以及经 `my-note` 云同步自动分发并执行插件代码（D10，防止击穿 `VKEK` 内存防线与将云端失守升级为全桌面 RCE）。
 - P2P、自托管多节点等去中心化部署。
 - 防御能持久化篡改执行环境的同 UID 攻击者（F-07，见 [`threat-model.md`](./threat-model.md)）。
 - 应用内自升级（交给包管理器，F-14）。
@@ -275,19 +277,19 @@ Heynote（Electron + Vue 3 + CodeMirror 6 + Prettier + Math.js）将每个 Buffe
 
 ```mermaid
 flowchart TD
-    subgraph Desktop["桌面端 (macOS / Omarchy Arch+Hyprland 统一形态)"]
+    subgraph Desktop["桌面端 (macOS / Omarchy / Windows [M5] 统一形态)"]
         Agent["本地 AI Agent (Claude Code / Codex / OpenCode)"]
         CLI["mynote CLI + SKILL.md (四级渐进帮助 / --json / 管道)"]
-        Browser["本地浏览器 / Web App (Omarchy Hyprland 绑定 / macOS 系统切窗或 mynote open)"]
-        UI_D["桌面本地内嵌 UI (CM6 + 本地 WASM 解密)"]
-        Daemon["mynote 单体二进制 Daemon (Rust, 不持有 Tier 2 明文)"]
+        Browser["本地浏览器 / Web App (Omarchy Hyprland / macOS MyNote.app 或系统切窗 / Windows mynote open)"]
+        UI_D["桌面本地内嵌 UI (CM6 + 本地 WASM 解密 + M5 Tier 2 插件 Worker)"]
+        Daemon["mynote 单体二进制 Daemon (Rust, 不持有 Tier 2 明文, 含 M5 wasmi/exec 宿主)"]
         DB_L[("本地 SQLite (WAL + FTS5 + secure_delete, 单写入方)")]
         Mirror["只读 Markdown 镜像 (M1 默认开启)"]
-        ExtFmt["外部格式化管道 (biome / gofmt / ruff / jq)"]
-        Keyring["OS Keychain / Secret Service (存 SMK)"]
+        ExtFmt["外部格式化与插件管道 (formatters.toml / M5 plugin.toml)"]
+        Keyring["OS Keychain / Secret Service / Windows Credential Manager+DPAPI (存 SMK)"]
 
         Agent -->|"Shell + SKILL.md"| CLI
-        CLI -->|"Daemon 运行时: 0600 UDS apply"| Daemon
+        CLI -->|"Daemon 运行时: LocalIpc (0600 UDS / 用户 SID Named Pipe) apply"| Daemon
         CLI -.->|"Daemon 未起时: 直写 WAL (只读始终直连 WAL)"| DB_L
         Browser -->|"http://localhost:<port>"| UI_D
         UI_D <-->|"localhost HTTP/WS (Host+Origin+HttpOnly Cookie)"| Daemon
@@ -298,7 +300,7 @@ flowchart TD
     end
 
     subgraph Mobile["手机 (iOS / Android)"]
-        PWA["PWA (笔记只读 + Vault 解锁 + 100 条图文剪贴板, read+clip)"]
+        PWA["PWA (笔记只读 + Vault 解锁 + 图文剪贴板, read+clip)"]
         SC["iOS Shortcuts + Scriptable (不切屏快传文本/压缩图, clip-write)"]
         IDB[("IndexedDB 只读笔记缓存 + 剪贴板轻索引 (可随时丢弃重拉)")]
         VaultM["Vault 解锁 (口令 → Argon2id, VKEK 仅在内存)"]
@@ -308,7 +310,7 @@ flowchart TD
 
     subgraph Cloud["Cloudflare Workers Paid (单 Worker + SQLite DO + R2 + Static Assets)"]
         SyncAPI["盲中继 (笔记 ops / 密钥表 / 碎纸 / WS 唤醒 / 独立 /v1/clip* 通道)"]
-        CloudDB[("DO SQLite (盲 ops 全历史 + block_keys + key_material + shred_marks + devices + M4 100 条 clip_items 索引)")]
+        CloudDB[("DO SQLite (盲 ops 全历史 + block_keys + key_material + shred_marks + devices + M4 1,000 条/30 天 clip_items 索引)")]
         R2[("R2 (op 密文归档永久 + 密钥快照 + 手机快照 2 份 + M4 clip/blobs/ 加密原图 8 天生命周期)")]
         SyncAPI --> CloudDB
         SyncAPI --> R2
@@ -446,11 +448,11 @@ sequenceDiagram
 6. **`epoch` 并集对账**：PITR 回滚或迁移导致 `epoch` 变化时，客户端按 `op_id` 求本地与远端的**集合并集**（不清空本地表），补推远端缺失项。
 7. **密钥表与 op 日志分开同步**：`block_keys` / `key_material` / `shred_marks` 按 2P-Set 合并、每次同步全量比对；删除的唯一路径是带服务端强制宽限期的加密碎纸（§5.4）。
 
-#### 跨设备复制粘贴与独立 100 条图文剪贴板通道（D8，M4）
+#### 跨设备复制粘贴与独立图文剪贴板通道（D8 / D8′，M4）
 
 1. **笔记块快车道（M1–M3 既有）**：普通输入防抖 `400–500ms` 本地合并；粘贴（`paste`）、失焦（`blur`）或 CLI 写入时立即 HTTP `push`，其他桌面经 WebSocket 唤醒后 `pull`；块顶与手机端提供一键复制按钮。
-2. **独立 100 条图文剪贴板通道（D8，M4）**：与笔记 `ops` / `block_keys` / R2 永久归档 / 手机状态快照完全物理隔离，采用「**DO SQLite 存 100 条轻索引（默认 7 天 TTL、≤ `64 KiB` 小文本内联与 ≤ `16 KiB` 图片缩略图）+ R2 `clip/blobs/` 流式存加密原图与长文本（单条上限 `10 MiB`，0 DO 30 天 PITR）**」分离架构；全端统一 `MNC1` 信封与独立可轮换 `ClipKey`，并支持 `≤ 256 KiB` 零写库 `--ephemeral` 纯内存 WS 直推。
-3. **移动端 → 桌面分流入口**：Android 通过 PWA `share_target` 直接从系统分享菜单接收文本与图片文件，由 `mynote-wasm` 加密直传；iOS 采用主屏 PWA（`mynote-wasm` 无损发最高 `10 MiB` 大图 + 原生输入框零弹窗粘贴文本）与 iOS Shortcuts + Scriptable（Keychain 存密钥、Share Sheet / Action Button 不切屏发文本及前置缩放 `≤ 1.5 MiB` 压缩图）双通道；桌面收到显式发送项后默认自动写入系统剪贴板（macOS 原生 `NSPasteboard`、Omarchy `wl-copy`）并保留可撤销槽 `mynote clip undo`，支持文本项一键 Promote 为正式笔记块。协议细节见 [`sync-protocol.md`](./sync-protocol.md) §11，调研与交互方案见 [`clipboard-sync-proposal.md`](./clipboard-sync-proposal.md)。
+2. **独立图文剪贴板通道（D8 / D8′，M4）**：与笔记 `ops` / `block_keys` / R2 永久归档 / 手机状态快照完全物理隔离，采用「**云端 DO SQLite 存 1,000 条/30 天 TTL 轻索引（≤ `64 KiB` 小文本内联与 ≤ `16 KiB` 图片缩略图）+ R2 `clip/blobs/` 流式存加密原图与长文本（单条上限 `10 MiB`、总容量硬护栏 `5 GiB` 触顶返 `507 CLIP_QUOTA_EXCEEDED`、0 DO 30 天 PITR）+ 桌面无限本地归档与后台 Eager Prefetch（仅手动 `prune`/`clear`）**」分层架构；全端统一 `MNC1` 信封与独立可轮换 `ClipKey`（默认轮换仅清云端、保留桌面本地归档），并支持 `≤ 256 KiB` 零写库 `--ephemeral` 纯内存 WS 直推。
+3. **移动端 → 桌面分流入口**：Android 通过 PWA `share_target` 直接从系统分享菜单接收文本与图片文件，由 `mynote-wasm` 加密直传；iOS 采用主屏 PWA（`mynote-wasm` 无损发最高 `10 MiB` 大图 + 原生输入框零弹窗粘贴文本）与 iOS Shortcuts + Scriptable（Keychain 存密钥、Share Sheet / Action Button 不切屏发文本及前置缩放 `≤ 1.5 MiB` 压缩图）双通道；桌面收到显式发送项后默认自动写入系统剪贴板（macOS 原生 `NSPasteboard`、Omarchy `wl-copy`、Windows Win32 `OpenClipboard`）并保留可撤销槽 `mynote clip undo`，支持文本项一键 Promote 为正式笔记块。协议细节见 [`sync-protocol.md`](./sync-protocol.md) §11，已转化调研背景留档见 [`2026-11-27-clipboard-sync-research.md`](../research/converted/2026-11-27-clipboard-sync-research.md)。
 
 ---
 
@@ -674,6 +676,54 @@ flowchart LR
 
 ---
 
+### 5.7 跨平台双宿主插件体系与 Windows 一等桌面适配（M5，D9 / D10）
+
+依据 2026-11-28 拍板的 **D9（Windows 一等桌面平台）** 与 **D10（路线 B：`wasmi` 零依赖优先双宿主插件体系）**，M5 在严守 **`cloud-cf/src/` `0 LOC` 改动 `[保证]`**、**手机 PWA WASM `0 B` 增量 `[保证]`**、**单二进制 `< 15 MB` `[目标]`** 与全部现有安全不变量的前提下，分两波补齐三桌面同构基座与极简插件层（类型契约见 [`data-structures.md`](./data-structures.md) §2.3，接口与协议见 [`interface-contracts.md`](./interface-contracts.md) §2.3–§3.3 / §5，安全边界见 [`threat-model.md`](./threat-model.md) §10，门禁见 [`eval-framework.md`](./eval-framework.md) §5 / §10）：
+
+```mermaid
+flowchart TB
+    subgraph Core["mynote-core (纯 Sans-I/O · 全端/wasm32 同构)"]
+        PluginTypes["plugin.rs: PluginId / PluginManifestV1 / PluginRuntime / PluginResult"]
+    end
+
+    subgraph DesktopUI["桌面 Web UI (http://localhost:port · 严守 CSP · 持 WasmVaultSession)"]
+        VaultMem["WasmVaultSession (VKEK 仅驻留内存)"]
+        Tier2Worker["Tier 2 Plugin Web Worker (WebAssembly.instantiate(bytes, {}) · 零 import · terminate 超时)"]
+        SafeRender["声明式安全渲染器 (DOMPurify Markdown / Pele SVG / Diff / Table / KV / CM6 Gutter)"]
+    end
+
+    subgraph Daemon["mynote Daemon & CLI (macOS / Omarchy / Windows 一等桌面平台)"]
+        LocalIpc["LocalIpc: Unix 0600 UDS / Windows 用户 SID DACL Named Pipe"]
+        WinOS["Windows 原生适配: Credential Manager+DPAPI / NTFS ACL / CONIN$ / Win32 剪贴板监听"]
+        WasmHost["WasmHost: wasmi 2.x (零 import 硬校验 / fuel 限额 / 16 MiB StoreLimits)"]
+        ExecHost["ExecHost: oneshot / worker (Win32 CREATE_NO_WINDOW + JobObject + SYSTEMROOT 白名单)"]
+        Gate["安全闸门 (exec 硬拒 Tier 2 / 零字节熔断 / 强标 actor=plugin:id / 防回环限流)"]
+    end
+
+    VaultMem -->|"仅单块明文 + .wasm 字节 (不含 VKEK)"| Tier2Worker
+    Tier2Worker -->|"PluginResult JSON"| SafeRender
+    Daemon -->|"GET /v1/local/plugins/:id/module.wasm"| Tier2Worker
+    Daemon -->|"Tier 1: wasmi / exec"| Gate
+    Gate --> WasmHost
+    Gate --> ExecHost
+    WasmHost -->|"PluginResult JSON"| SafeRender
+    ExecHost -->|"PluginResult JSON / ApplyRequest"| LocalIpc
+    VaultMem -.-|"物理隔离：Tier 2 明文永不发给 Daemon / exec"| Gate
+```
+
+1. **Windows 一等桌面平台基座（D9，`M5-W1..W3`，先于插件独立成波）**：
+   - **跨平台 `LocalIpc`**：将既有 `uds.rs` 重构为 `local_ipc.rs`，Unix 维持 `0600` UDS，Windows 实现 `tokio::net::windows::named_pipe`（`\\.\pipe\mynote-<blake3_16>`），强制 `first_pipe_instance(true)` 防管道抢注、显式 `SECURITY_ATTRIBUTES` + SDDL `D:P(A;;GA;;;OW)` 仅放行当前用户 SID、强制 `reject_remote_clients(true)` 阻断 SMB 远程管道。
+   - **Windows 凭据、权限、交互口令与剪贴板**：凭据走 Windows Credential Manager（`CredWriteW` / `CredReadW` / `CredDeleteW`）+ 用户态 DPAPI（`CryptProtectData`）降级；数据文件与插件目录放在 `%LOCALAPPDATA%\mynote\` 并设置 NTFS 当前用户专属 DACL（`SetNamedSecurityInfoW`）；交互口令走 `CONIN$` + `SetConsoleMode(& ~ENABLE_ECHO_INPUT)`；原生剪贴板与 M4b 监听使用 `windows-sys` `OpenClipboard` + `HWND_MESSAGE` + `WM_CLIPBOARDUPDATE`（事件驱动零轮询，硬过滤 Windows 隐私格式，优先读 `"PNG"` 回退 `CF_DIBV5` 转 PNG，严禁 SVG）；`mynote open` 走 `ShellExecuteW`。
+   - **加固跨平台外部子进程**：保留 Windows 最小系统环境变量白名单（`SYSTEMROOT`、`WINDIR`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE`、`LOCALAPPDATA`、`APPDATA`、`SystemDrive`、`PATH`），注入 `PYTHONUTF8=1` / `PYTHONIOENCODING=utf-8`，采用 `CREATE_NO_WINDOW | CREATE_SUSPENDED` → 绑定 Windows Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）→ `ResumeThread` 实现零黑框闪屏与内核级子进程树回收，严禁 `.bat`/`.cmd`（防 CVE-2024-24576），全部业务载荷经 UTF-8 `stdin` JSON 传递并归一化 `\r\n`。
+2. **路线 B：`wasmi` 零依赖优先双宿主插件体系（D10，`M5-P1..P4`）**：
+   - **一份零导入 `.wasm` 双宿主执行**：采用 Core WASM 零导入 3-Export ABI（`mynote_abi_version`、`mynote_alloc`、`mynote_invoke`，可选 `mynote_dealloc`），加载期强制断言 `module.imports().is_empty()`，在字节码验证层杜绝网络与文件外带。Tier 1 / CLI / Daemon 侧由纯 Rust `wasmi`（fuel 计费 + `16 MiB` `StoreLimits`）执行；桌面 Web UI 解锁态 Tier 2 块由前端独立 `'self'` `Web Worker` 直接调用浏览器原生 `WebAssembly.instantiate(bytes, {})` + `worker.terminate()` 硬超时执行（Worker 仅接收单块明文与 `.wasm` 字节，永不接触 `VKEK`，常驻 Daemon 保持零 Tier 2 明文，现有 CSP 仅明确声明 `worker-src 'self'`，零放宽 `script-src`）。
+   - **四大正交垂直槽位**：`transform`（格式化/编码转换，向下兼容既有 `formatters.toml`）、`command`（命令面板 `Cmd+K` / 块动作 / `mynote ext run`）、`inspector`（只读衍生视图或 CM6 行尾标注）、`reactor`（订阅 `LocalIpc` 异步事件如 `block.saved` / `clip.received` / `clip.ephemeral`，默认过滤插件自身 `actor` 防回环并配滚动限流）。
+   - **Level 1 `exec` 辅助宿主**：仅服务需访问本机工具链或网络的 Tier 1 `command` / `reactor` 插件，支持 `oneshot`（默认）与 `worker`（长驻 NDJSON、闲置回收，抵消 Windows `CreateProcessW` + Defender 冷启税）双模式；在类型系统层 `PluginRuntime::Exec` 无法表达 `tier2_capable = true`，Daemon 运行时同步硬拒加锁块（`423 BLOCK_LOCKED`）。
+   - **数据驱动声明式安全 UI**：插件严禁接触主 DOM 或注入任何 HTML / JS，只能返回 6 种结构化 `PluginResult`（`noop`、`toast`、`replace_content`、`insert_block`、`gutter`、`view[markdown|mermaid|diff|table|kv|code]`），全部由主前端既有 DOMPurify / Pele 纯 SVG / `diff.ts` / 纯文本组件渲染；所有持久化写操作强制经 `LocalIpc` 单写入方提交并标注 `actor = "plugin:<plugin_id>"`，不发明云端或手机不认识的专有底层数据格式。
+   - **插件分发物理隔离**：严禁通过 `my-note` 云同步流自动分发并执行插件代码（守住 T2 / T8，防止云端失守升级为全平台桌面 RCE）；插件由用户通过独立 dotfiles / Git 仓库或包管理器手工同步与审计。
+
+---
+
 ## 6. 多端形态与技术栈选型对比
 
 ### 6.1 核心语言选型：已确认 Rust（Sans-I/O 核心 + WASM）+ TypeScript（前端 & Cloudflare Worker）
@@ -696,12 +746,15 @@ my-note/
 │   └── mynote-cli/            # 单体二进制入口 (CLI + Heynote导入 + 守护进程 Daemon + rust-embed 本地 WebUI)
 ├── apps/
 │   └── macos/                 # 可选零依赖纯 Swift WKWebView macOS 薄壳 (MyNote.app，仅连 daemon.sock、不碰 Keychain)
-├── web/                       # TypeScript 前端：桌面编辑 UI (CM6) + Markdown/Pele 预览层 + 手机只读 PWA (IndexedDB 只读缓存)
-├── cloud-cf/                  # Cloudflare Worker (极薄中继 + SQLite DO + WS Hibernation + R2 + Static Assets)
+├── deploy/                    # 各平台守护进程与快捷入口模板 (launchd / systemd / hyprland / ios-shortcuts / M5 windows)
+├── web/                       # TypeScript 前端：桌面编辑 UI (CM6 + M5 Tier 2 插件 Worker) + Markdown/Pele 预览层 + 手机只读 PWA (IndexedDB 只读缓存)
+├── cloud-cf/                  # Cloudflare Worker (极薄中继 + SQLite DO + WS Hibernation + R2 + Static Assets；M5 硬约束 0 LOC 改动)
 ├── skill/
 │   └── SKILL.md               # 随版本同步的极轻 Agent Skill (<250 tokens)
 ├── evals/                     # Plane A 质量门禁资产 (seeds/ DST 回归种子、golden/ CLI 黄金测试、archive/ 推迟的 Plane B 资产)
-└── docs/                      # 架构蓝图、数据结构、接口契约、同步协议、威胁模型与评测执行规范 (eval-framework.md)
+├── docs/                      # 正式方案与工程规范 SSOT (含 docs/README.md 与 docs/spikes/ 限时实测报告)
+├── research/                  # 独立调研报告目录 (pending/ 未转化禁止实施，converted/ 已转化为 docs/ 追溯留档)
+└── review/                    # 方案审查与决策追溯目录 (2026-11-24 第一性原理审查与 §9 D1–D10 决策台账)
 ```
 
 ### 6.2 桌面端 UI 形态对比（重点考量 macOS + Omarchy）
@@ -721,22 +774,23 @@ my-note/
 
 ---
 
-## 7. 分阶段演进路线图（S0 → M4）
+## 7. 分阶段演进路线图（S0 → M5）
 
 <a id="7-分阶段演进路线图m0--m3"></a>
 
 > [!IMPORTANT]
-> 2026-11-24：本节按 [审查 §9.11](../review/2026-11-24-first-principles-review.md) 重排路线图；2026-11-27 依据 **D8** 追加 `S-Clip → M4a → M4b → M4c` 剪贴板同步迭代阶段。
+> 2026-11-24：本节按 [审查 §9.11](../review/2026-11-24-first-principles-review.md) 重排路线图；2026-11-27 依据 **D8** 追加 `S-Clip → M4a → M4b → M4c`；2026-11-28 依据 **D9 / D10** 追加 `Phase 0 Spike（S-Plugin-1 + S-Win-1）→ M5-W1..W3（Windows 一等桌面平台）→ M5-P1..P4（wasmi 优先双宿主插件体系）`。
 
 ```mermaid
 flowchart LR
     S0["S0 技术 Spike<br/>(已完成)"] --> M1["M1 替换 Heynote+iCloud<br/>(已落地)"]
     M1 --> M2["M2 手机只读 + Vault + 碎纸<br/>(已落地)"]
     M2 --> M3["M3 渲染与打磨<br/>(已落地)"]
-    M3 --> SC["S-Clip 技术 Spike<br/>(3-4 天真机实测)"]
-    SC --> M4a["M4a 100 条图文显式剪贴板<br/>+ 移动端→桌面双向通道"]
-    M4a --> M4b["M4b 桌面↔桌面<br/>后台自动镜像 (opt-in)"]
-    M4b --> T["按数据触发的待办 (含 M4c)"]
+    M3 --> SC["S-Clip + M4<br/>独立图文剪贴板 (已落地)"]
+    SC --> SP["M5 Phase 0 Spike<br/>(S-Plugin-1 + S-Win-1)"]
+    SP --> M5W["M5-W1..W3<br/>Windows 一等桌面平台"]
+    M5W --> M5P["M5-P1..P4<br/>wasmi 优先双宿主插件"]
+    M5P --> T["按数据触发的待办"]
 ```
 
 ### S0：技术 spike（约 1–1.5 周 [估算]，每项限时）
@@ -770,15 +824,34 @@ flowchart LR
 - [x] **Layer 2 外部格式化管道（`#22 [M3-3]`，§5.3）**：支持 `formatters.toml` 数组与字符串命令解析、非零退出（含半截 stdout）/ 0 字节输出 / 非法 UTF-8 / 超时 / 敏感环境变量隔离全 5 类故障熔断（退出码 `7` `FORMAT_SYNTAX_ERROR` 且零写库）；Daemon `POST /v1/local/format` 经 `spawn_blocking` 执行并强制拒绝锁定块（HTTP `423` `BLOCK_LOCKED`，零外部子进程，`SEC-03`）。
 - [x] **历史时间旅行与全链路真实浏览器 E2E 门禁（`#22 [M3-3]`，[`tests/e2e/test_m3_sec06_pele_history.py`](../tests/e2e/test_m3_sec06_pele_history.py)）**：`mynote block history` / `block revert --to-op` / `--undo-actor` / `--dry-run`、Daemon `GET /v1/local/blocks/{id}/history/{op_id}`（Tier 2 仅返密文零明文）与 `POST /v1/local/blocks/{id}/revert`（支持 Tier 2 WASM 加密提交）、桌面历史抽屉（`actor` 徽标、有界 LCS 行级 diff、一键回滚与撤销整批 `actor` 写入、碎纸祖先 fail-closed 标记、切后台 `visibilitychange -> hidden` 立即清空历史与 Tier 2 预览 DOM）。macOS aarch64 实测门禁全绿 `[已测]`：Rust workspace `75/75`、Web Vitest `31/31`（含 `m3_render.test.ts` 20 项）、`cloud-cf` `workerd` `8/8`（`690 LOC` TS <= `700 LOC`），以及全部 4 套真实编译二进制 + `wrangler dev` + Playwright E2E 脚本全通过——其中 `SEC-06` 覆盖 [`tests/fixtures/xss_vectors.json`](../tests/fixtures/xss_vectors.json) 全部 36 条向量（22 Markdown XSS + 7 外链图片 + 7 Mermaid XSS），在桌面 Chromium + WebKit 与手机 PWA WebKit 下均 **0 XSS、0 禁用标签/属性/内联样式、0 外发请求、0 CSP 违规**，`Copy PNG` 在桌面 Chromium（`30,611 B`）、桌面 WebKit（`23,867 B`）与手机 PWA WebKit（`18,216 B`）三端均输出合法 PNG 魔数且零 Tainted Canvas 异常，`SEC-08` 手机 PWA 取证零明文落盘；已接入 CI（[`.github/workflows/ci.yml`](../.github/workflows/ci.yml)）。
 
-### S-Clip 与 M4：独立 100 条图文跨端剪贴板同步（D8，2026-11-27 拍板）
+### S-Clip 与 M4：独立图文跨端剪贴板同步（D8 / D8′，2026-11-27 / 2026-11-28 拍板）
 - [ ] **S-Clip 技术 Spike（`#54`，隔离于 `spikes/`）**：`S-Clip-3`（macOS 真机 `objc2-app-kit` +20 KiB / 0 `unsafe`）、`S-Clip-4`（Omarchy Hyprland 真机纯 Rust `wl-clipboard-rs 0.9.5` 多 MIME + 只读 `Watcher` 零冲突）与 `S-Clip-5`（`workerd` `FixedLengthStream` 10 MiB 流式 R2 + 生产桶 `mynote-archive` `clip/blobs/` 8 天生命周期）已全部闭环 `[已测]`（PR #62，关闭 #51/#52/#53）；`S-Clip-1` JS↔Rust 双向互通与 LLInt 基准、`S-Clip-2` `--remove-name-section` 压 PWA WASM 至 `< 305 KiB` gzip -9 与 Playwright WebKit/Chromium 10 MiB + 同步 Promise 写图已通过 `[已测]`，剩余物理 iPhone 实测项待真机补齐后将 `ADR-11` 升为 `Accepted`。
 - [x] **M4a：100 条图文显式剪贴板 + 移动端 → 桌面双向通道（PR #63–#66，#55/#56/#57 闭环、#58 工程与自动化门禁闭环）**：`mynote-core::clip` + `mynote-wasm` `WasmClipCodec`（PWA WASM `304,412 B` gzip -9 `[已测]`）；`cloud-cf/src/` `929/950` LOC TS `[已测]`（含存量 M2→M4 DO 平滑迁移、四态令牌、`FixedLengthStream` 流式 R2、`--ephemeral` 零写库 `409 NO_ONLINE_DESKTOP`、`INV-CLIP-ISOLATION` 与 `SEC-09` `workerd` `13/13` 绿灯 `[已测]`）；桌面 SQLite v2 `VACUUM INTO` 自动迁移 + `clip_cache/` LRU `256 MiB` + 原生 macOS `NSPasteboard` / Linux `wl-clipboard-rs` + `mynote clip` CLI 与 `/v1/local/clip*`；桌面 UI 100 条图文抽屉 + 手机 PWA IndexedDB v2（7 表密文）+ Android `share_target` 瞬态缓存消费即删 + iOS Scriptable 模板（`deploy/ios-shortcuts/mynote-clip-push.js` 与真 WASM 双向互通通过 `[已测]`）；物理 iPhone 端到端体感待真机核验。
 - [x] **M4b：桌面 ↔ 桌面图文后台自动镜像（PR #67，#59 工程与自动化门禁闭环）**：默认关闭（`auto_watch_desktop = false` opt-in）+ 持久化配置、macOS `changeCount` 轮询器与 Linux `wl-clipboard-rs` 只读 `Watcher`、7 类敏感 UTI/MIME 与 `detect_secret_pattern` 拦截（0 出站 + `CLIP_SECRET_BLOCKED` WS 告警）、250 ms 防抖与每分钟 30 条 / 10 图限流、含 JPEG→PNG 转码 BLAKE3 哈希的双重防回环（100 轮互推恒为 1 次网络推送 `[已测]`），以及全链路 Chromium/WebKit `tests/e2e/test_m4_clip_sec08_sec09.py` 接入 CI 绿灯 `[已测]`；Mac ↔ Omarchy 2 周日常浸泡待长期观测。
+
+### M5：Windows 一等桌面平台与 `wasmi` 优先双宿主插件体系（D9 / D10，2026-11-28 拍板）
+
+> **预算红线（全程不可违背）**：`cloud-cf/src/` 改动量 == **`0 LOC` `[保证]`**；手机 PWA WASM（`web/src/wasm/pkg-pwa/`）体积增量 == **`0 B` `[保证]`**；单体 `mynote` Release 二进制接入 `wasmi` 后保持 `< 15 MB` `[目标]`（由 `S-Plugin-1` 实测确认）。
+
+- [ ] **Phase 0：限时技术 Spike（隔离于 `spikes/`，不动正式业务代码）**：
+  - **`S-Plugin-1`（`docs/spikes/s-plugin-1-wasmi.md`）**：实测 `wasmi` 2.x 最小 feature 编入 `mynote-cli` Release 的真实体积增量（macOS / Linux / Windows），并验证 1 个极简 3-Export 零导入 `.wasm` 样例在 Rust `wasmi` 与浏览器 `'self'` Web Worker（`WebAssembly.instantiate(bytes, {})`）双宿主的往返延迟、fuel 死循环中止与 `16 MiB` OOM 拦截；
+  - **`S-Win-1`（`docs/spikes/s-win-1-platform.md`）**：在 Windows 环境下实测 Named Pipe SDDL + `first_pipe_instance` + `reject_remote_clients`、`CREATE_NO_WINDOW` + Job Object 杀孙进程树、以及 Win32 `OpenClipboard` + 隐私格式过滤。
+  - *待确认项（开做前拍板）*：① 是否先执行 `S-Plugin-1` + `S-Win-1`（推荐按仓库 S0 / S-Clip 纪律先行）；② Windows 首波 Release 目标架构仅 `x86_64-pc-windows-msvc` 还是同时覆盖 `aarch64-pc-windows-msvc`；③ Windows 验证以 GitHub Actions `windows-latest` 为主还是另接可调度 Windows 真机。
+- [ ] **Phase 1：Windows 一等桌面平台基座（`M5-W1` ~ `M5-W3`，独立成波，不夹带插件）**：
+  - **`M5-W1`**：重构 `uds.rs` → `local_ipc.rs`（Unix `0600` UDS + Windows 用户 SID SDDL Named Pipe）；加固 `formatters.rs` Windows 最小环境白名单、`CREATE_NO_WINDOW` + Job Object 与 `PYTHONUTF8=1`；`credentials.rs` 接入 Windows Credential Manager / DPAPI，`schema.rs` 接入 NTFS 用户专属 ACL，`runner.rs` 接入 `CONIN$` 无回显口令；`.github/workflows/ci.yml` 接入 `windows-latest` Rust 构建与 `SEC-WIN-PIPE` / CLI 门禁；
+  - **`M5-W2`**：`clipboard.rs` / `clip_watch.rs` 实现 Win32 `OpenClipboard` + `HWND_MESSAGE` + `WM_CLIPBOARDUPDATE` 监听、敏感格式硬过滤与 `SEC-WIN-CLIP` 测试；`mynote open` 走 `ShellExecuteW`；
+  - **`M5-W3`**：`.github/workflows/release.yml` 增加 Windows Release ZIP（默认先覆盖 `x86_64-pc-windows-msvc`，`aarch64-pc-windows-msvc` 待确认）与 `deploy/windows/` 后台静默启动模板，实测闭环后将 `ADR-12` 升为 `Accepted`。
+- [ ] **Phase 2：`wasmi` 优先双宿主插件体系（`M5-P1` ~ `M5-P4`，建立在三端全绿基座之上）**：
+  - **`M5-P1`**：落地 `crates/mynote-core/src/plugin.rs`（`PluginId` / `PluginManifestV1` / `PluginRuntime` / `PluginResult`）与跨平台 `LocalIpc` 只读 `Subscribe` 帧及 `mynote watch [--buf] [--clip] --jsonl`（按 Rule of Three 先行验证真实外部脚本痛点）；
+  - **`M5-P2`**：落地 `wasm_host.rs`（`wasmi` 2.x + 加载期 `module.imports().is_empty()` 硬门禁 + fuel + `16 MiB` `StoreLimits` + 模块编译缓存）、`mynote ext ls / run <id>` 与 `format` 自动发现 `transform` WASM 插件、1–2 个 `< 50 KiB` 参考 `.wasm` 插件及 `INV-PLUGIN-ZERO-IMPORT` / `INV-PLUGIN-RESOURCE-BOUND` 门禁；
+  - **`M5-P3`**：新增桌面专属 `web/src/plugins/worker.ts` 与 `renderer.ts`（`pkg-pwa` `0 B` 改动），`Cmd+K` 命令面板与块菜单接入插件动作，解锁态 Tier 2 块走 `'self'` Web Worker 执行 `.wasm`，落地 Playwright `SEC-10` 门禁（6 种声明式视图 XSS 净化 + Daemon 零 Tier 2 明文取证）；
+  - **`M5-P4`**：落地 Level 1 `exec` 辅助宿主（兼容 `formatters.toml`、`oneshot` / 长驻 `worker` 双模式、`launcher` 映射、禁 `.bat`/`.cmd`、硬拒 `is_locked == true`、强标 `actor = "plugin:<id>"`、`reactor` 防回环与滚动限流），全门禁绿灯后将 `ADR-13` 升为 `Accepted`。
 
 ### 按数据触发的待办
 
 | 机制 | 触发条件 |
 | --- | --- |
+| `apps/windows/` 可选 Win32 + WebView2 全局热键薄壳（对标 `apps/macos/MyNote.app`） | M5-W3 落地后，Windows 上浏览器 / Web App 切窗体验成为高频痛点（仅连用户 SID Named Pipe 拿 `open_ticket`，不碰凭据库与 SQLite） |
 | M4c 剪贴板远期增强（图片 Promote 为笔记块、`MNCB` 公钥单向信封、极薄原生 iOS Companion App） | 分别在 `blobs/` 附件落地、对组合失守提出更高安全要求、或 M4a 长期使用后 Scriptable 压缩图/单步体验成为高频痛点时触发 |
 | 手机追加 / 编辑笔记块（届时再引入 outbox、持久化存储申请、写令牌） | 每周多次出现「想在手机上记一条却记不了」 |
 | 加密图片 / 二进制附件（`blobs/`，每个附件独立随机 32B `BlobKey` 存入 `BlockPlaintextV1`，避免块换钥时重传附件） | 纯文本 + Mermaid 不足以承载日常临时截图或文件片段需求 |
@@ -805,16 +878,18 @@ flowchart LR
 | ADR-03 | **同步协议（路径 γ）** | 全量载荷 op；在完整因果图 `G(b)` 上求叶子，冲突 = 同块多存活叶子，并列展示 + 手动合并；HLC 只决定展示顺序；字段 LWW；Update-Wins；无 `SPAN_PATCH` / Lock-Wins / GC / 快照 CAS | D3 | Proposed（500 种子 PR M1 DST + 20 种子 M2 碎纸/复活/快照 DST + `INV-SYNC-7` 状态快照/尾部对账 + 100k 夜间浸泡工作流 + 回归种子集 + 属性测试绿灯 `[已测]`；待真机双桌面持续验证） |
 | ADR-04 | **加密与密钥** | 每块 BDEK，信封只带 `key_id`；独立密钥表 `block_keys` + `key_material` + `shred_marks`（2P-Set）；统一恢复包 → Root Seed → X25519 恢复密钥对（设备只存公钥，SMK 代际 / VKEK 封装追加，旧 SMK 代际永久保留）；AAD 只在 `data-structures.md` 定义 | D2′、F-01、F-05 | Proposed（M2 Tier 2 Vault `MNW1`/`VaultHeaderV1` + `INV-RECOVERY` / `INV-KEY-LIVENESS` / `SEC-01`/`03`/`04`/`08` + 真实 PTY 24 词恢复与跨语言 TS↔Rust 离线恢复绿灯 `[已测]`；待真机联调闭环） |
 | ADR-05 | **删除语义** | 删除优先、有界时延：M1 软删回收站，M2 启用服务端强制宽限期（`T_grace` = 7 天）+ 加密碎纸（仅服务端 `executed` 触发本地删钥）；彻底不可恢复上界约 37 天；op 密文永久保留 | D2′、Q7–Q9 | **Accepted**（[`s0-4-cloudflare-relay.md`](./spikes/s0-4-cloudflare-relay.md)：M2 `INV-SHRED-BOUND`、`INV-GRACE`、`SEC-01` 原始磁盘零残留、DO alarm 置空与 UI 二段确认 `workerd` 全部绿灯 `[已测]`；2026-11-26 真实 CF Paid `mynote-archive` 桶 `archives/keys/history/` 30 天前缀生命周期及 `archives/ops/` Bucket Lock 不阻断 `latest.mnks` 覆写实测通过 `[已测]`） |
-| ADR-06 | **平台形态** | macOS 与 Omarchy 底座 100% 统一为纯 `mynote` 单二进制（CLI + Daemon + 内嵌 HTML），放弃 macOS Tauri 薄壳与单端 GPUI 重写；macOS 另提供可选的零依赖纯 Swift `WKWebView` 薄壳 [`apps/macos/MyNote.app`](../apps/macos/README.md)（不碰 Keychain、仅连 `daemon.sock`）；手机：只读 PWA + Vault 解锁（Argon2id 定值 `(32768, 2, 1)`）；本地 UI 唯一入口 `http://localhost:<port>` | D1、D5′/D5″、D7、F-15 | **Accepted**（[`s0-2-macos-tauri-shell.md`](./spikes/s0-2-macos-tauri-shell.md)：D5′ 去 Tauri 壳；[`apps/macos/README.md`](../apps/macos/README.md) + PR #70 + `v0.3.2` Release：`MyNote.app` `140 KiB` zip、唤出 `5.1–7.9 ms`、`macos-latest` CI 自检全绿 `[已测]`；[`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md)：iPhone `(32768, 2, 1)` = `1553 ms` `[已测]`；`SEC-03`/`05`/`08` 自动化 Chromium + WebKit 全部绿灯 `[已测]`） |
+| ADR-06 | **平台形态（macOS / Omarchy / 手机 PWA）** | macOS 与 Omarchy 底座 100% 统一为纯 `mynote` 单二进制（CLI + Daemon + 内嵌 HTML），放弃 macOS Tauri 薄壳与单端 GPUI 重写；macOS 另提供可选的零依赖纯 Swift `WKWebView` 薄壳 [`apps/macos/MyNote.app`](../apps/macos/README.md)（不碰 Keychain、仅连 `daemon.sock`）；手机：只读 PWA + Vault 解锁（Argon2id 定值 `(32768, 2, 1)`）；本地 UI 唯一入口 `http://localhost:<port>`（Windows 扩展见 `ADR-12`） | D1、D5′/D5″、D7、F-15 | **Accepted**（[`s0-2-macos-tauri-shell.md`](./spikes/s0-2-macos-tauri-shell.md)：D5′ 去 Tauri 壳；[`apps/macos/README.md`](../apps/macos/README.md) + PR #70 + `v0.3.2` Release：`MyNote.app` `140 KiB` zip、唤出 `5.1–7.9 ms`、`macos-latest` CI 自检全绿 `[已测]`；[`s0-3-wasm-argon2.md`](./spikes/s0-3-wasm-argon2.md)：iPhone `(32768, 2, 1)` = `1553 ms` `[已测]`；`SEC-03`/`05`/`08` 自动化 Chromium + WebKit 全部绿灯 `[已测]`） |
 | ADR-07 | **编辑器与渲染** | CodeMirror 6 **候选 A：视口虚拟化 + 按源码块独立挂载 `EditorView`** + Markdown 双模 + `Pele` 纯 SVG | F-11 | **Accepted**（[`s0-1-editor-architecture.md`](./spikes/s0-1-editor-architecture.md)：200 块虚拟化挂载 `31.7 ms` `[已测]`；正式 `web/` Vitest `7/7` + Playwright Chromium `SEC-03` 实测绿灯 `[已测]`） |
 | ADR-08 | **Agent 集成** | 纯 CLI（Daemon 运行时 UDS `apply` / 未起时直写 WAL）+ 极轻 `SKILL.md`（L0–L3a，`--help-json` 推迟）；不做本地与云端 MCP；CLI 只能把块删进回收站 | §5.5、D2′ | Proposed（`mynote-cli` + UDS `apply` 实时 WS 刷新 + 离线 WAL 回退 + `skill/SKILL.md` + `G01–G11` + PTY Vault/Trash 边界测试绿灯 `[已测]`；待独立 `[eval-only]` 黄金快照） |
 | ADR-09 | **分发与升级** | Homebrew tap / AUR / `cargo install`，二进制装在用户不可写位置；不做自升级；Schema 迁移前 `VACUUM INTO` 备份 | F-14、F-07 | Proposed（`VACUUM INTO` 备份、`SCHEMA_TOO_NEW` 守卫与 systemd/Hyprland/launchd 模板已就绪 `[已测]`；待打包发布） |
 | ADR-10 | **质量保障** | 只保留 Plane A 确定性门禁（属性测试、DST、真实 Worker 契约测试、INV-RECOVERY、SEC 取证、格式化幂等、CLI 黄金测试、双平台 CI） | D6 | Proposed（双平台 CI + 500 种子 M1/M2 DST + 100k 夜间浸泡 + `cloud-cf` 真实 `workerd` 契约与 M1/M2 共用场景 + `SEC-01`/`03`/`04`/`05`/`08` 已全部接入 CI `[已测]`；待独立 `[eval-only]` 黄金快照） |
-| ADR-11 | **独立 100 条图文剪贴板通道** | 与笔记 `ops` 物理隔离；DO SQLite `clip_items` 存最近 100 条轻索引（7 天 TTL、≤ `64 KiB` 小文本内联 + ≤ `16 KiB` 缩略图），图片与长文本（上限 `10 MiB`）流式存 R2 `clip/blobs/`（8 天前缀生命周期，0 DO PITR）；四态令牌新增 `read+clip` / `clip-write`（笔记写仍 `403`）；全端统一 `MNC1` + 可轮换 `ClipKey` + 可选 `≤ 256 KiB` 零写库 `--ephemeral` 直推；移动端 → 桌面由 PWA + iOS Shortcuts/Scriptable 分流；macOS 改用原生 `NSPasteboard`（`objc2-app-kit`），Omarchy 改用纯 Rust `wl-clipboard-rs` 多 MIME 与只读 `Watcher`；分 `S-Clip → M4a → M4b` 交付 | D8、D1′ | Proposed（`S-Clip-3` macOS 真机、`S-Clip-4` Omarchy Hyprland 真机、`S-Clip-5` `workerd` `FixedLengthStream` + 生产 `mynote-archive` 8 天生命周期已全部实测通过 `[已测]`；`S-Clip-1` JS↔Rust 双向互通与 LLInt 基准、`S-Clip-2` `--remove-name-section` 降 WASM 至 `291.31 KiB` gzip -9 与 Playwright WebKit/Chromium 10 MiB + 同步 Promise 写图已实测通过 `[已测]`；待物理 iPhone 补齐 `S-Clip-1`/`S-Clip-2` 真机验证后升级为 `Accepted`） |
+| ADR-11 | **独立图文剪贴板通道与分层留存** | 与笔记 `ops` 物理隔离；云端 DO SQLite `clip_items` 存最近 1,000 条轻索引（30 天 TTL、≤ `64 KiB` 小文本内联 + ≤ `16 KiB` 缩略图），图片与长文本（单条上限 `10 MiB`）流式存 R2 `clip/blobs/`（**`5 GiB` 硬容量护栏**触顶返 `507 CLIP_QUOTA_EXCEEDED`、31 天前缀生命周期、0 DO PITR、分批 `R2.delete(keys[])`）；桌面本地无限归档 + 单并发后台 Eager Prefetch + 手动 `prune`/`clear`（云端清理与默认 `rotate-key` 均 `scope=cloud` 保留桌面本地归档）；手机 PWA 200 条增量 IndexedDB；四态令牌新增 `read+clip` / `clip-write`（笔记写仍 `403`）；全端统一 `MNC1` + 可轮换 `ClipKey` + 可选 `≤ 256 KiB` 零写库 `--ephemeral` 直推；移动端 → 桌面由 PWA + iOS Shortcuts/Scriptable 分流；macOS 改用原生 `NSPasteboard`（`objc2-app-kit`），Omarchy 改用纯 Rust `wl-clipboard-rs` 多 MIME 与只读 `Watcher`；分 `S-Clip → M4a → M4b` 交付 | D8、D8′、D1′ | Proposed（`S-Clip-3` macOS 真机、`S-Clip-4` Omarchy Hyprland 真机、`S-Clip-5` `workerd` `FixedLengthStream` + 生产 `mynote-archive` 前缀生命周期已全部实测通过 `[已测]`；`S-Clip-1` JS↔Rust 双向互通与 LLInt 基准、`S-Clip-2` `--remove-name-section` 降 WASM 至 `291.31 KiB` gzip -9 与 Playwright WebKit/Chromium 10 MiB + 同步 Promise 写图已实测通过 `[已测]`；D8′ 全链路单测与 `workerd` 契约测试已通过 `[已测]`；待物理 iPhone 补齐 `S-Clip-1`/`S-Clip-2` 真机验证及生产桶前缀生命周期切至 31 天后升级为 `Accepted`） |
+| ADR-12 | **Windows 一等桌面平台** | 将 Windows 升为与 macOS、Omarchy 并列的一等桌面平台：跨平台 `LocalIpc`（Unix `0600` UDS / Windows 用户 SID SDDL Named Pipe，强制 `first_pipe_instance` 与 `reject_remote_clients`）、Credential Manager / DPAPI 与 NTFS 用户专属 ACL、`CONIN$` 无回显口令、Win32 原生剪贴板（`HWND_MESSAGE` + `WM_CLIPBOARDUPDATE` + 隐私格式硬过滤）、加固外部子进程（`SYSTEMROOT` 白名单 + `CREATE_NO_WINDOW` + Job Object + `PYTHONUTF8=1` + 禁 `.bat`/`.cmd`）、`windows-latest` CI 与 Release 预编译包；`cloud-cf` `0 LOC` 改动 | D9、§5.7 | Proposed（待 `S-Win-1` 与 `M5-W1..W3` 在 `windows-latest` / Windows 真机实测并绿灯通过 `SEC-WIN-PIPE`、`SEC-WIN-CLIP` 后升级为 `Accepted`） |
+| ADR-13 | **`wasmi` 优先跨平台双宿主插件体系** | 采用路线 B「协议优先、双层四槽位（`transform`/`command`/`inspector`/`reactor`）」：纯计算插件统一为 Core WASM 零导入 3-Export ABI（加载期硬校验 `module.imports().is_empty()`），同一 `.wasm` 在 Tier 1 / CLI / Daemon 跑 Rust `wasmi`（fuel + `16 MiB` `StoreLimits`）、在桌面解锁态 Tier 2 跑独立 `'self'` Web Worker 原生 `WebAssembly.instantiate(bytes, {})` + `worker.terminate()`；外部工具链 / 网络类 Tier 1 插件走 Level 1 `exec`（`oneshot`/`worker` 双模式，类型级禁止 Tier 2）；前端仅开放 6 种声明式 `PluginResult` 原语（严禁主 DOM/JS 注入与云同步分发插件）；全程 `cloud-cf` `0 LOC`、手机 PWA WASM `0 B` 增量 | D10、§5.7 | Proposed（待 `S-Plugin-1` 实测 `wasmi` 二进制体积与双宿主性能，及 `M5-P1..P4` 通过 `INV-PLUGIN-ZERO-IMPORT`、`INV-PLUGIN-RESOURCE-BOUND`、`SEC-10` 后升级为 `Accepted`） |
 
 ---
 
-## 9. 已移除 / 推迟的机制（2026-11-24）
+## 9. 已移除 / 推迟的机制（2026-11-24 / 2026-11-28 修订）
 
 依据 [第一性原理审查](../review/2026-11-24-first-principles-review.md) 及 PR #31 审阅补充决议，以下机制已从本方案正文移除或推迟（每条一行；括号内 § 号与 F-xx 均指审查文档）：
 
@@ -828,7 +903,7 @@ flowchart LR
 - Vault 第二套 24 词恢复码：并入统一恢复包（F-05）。
 - `/v1/archive/*` 云端归档 HTTP 路由与恢复专用挑战-应答鉴权：移除，改为 `BOOTSTRAP_TOKEN`（DO 健在时）+ 从 R2 下载目录本地执行 `mynote restore --from-archive <local-dir>`（§9.12）。
 - `/v1/blobs/:sha256` 加密附件：推迟至「按数据触发的待办」（届时每附件独立随机 `BlobKey`，§9.12）。
-- 旧版写入 DO SQLite 且声称零 PITR 的 `ephemeral_clips`（`/v1/sync/ephemeral-clip`）：已永久废弃（F-06）；2026-11-27 拍板 **D8** 以「物理隔离 100 条图文通道（DO 轻索引 + R2 流式原图 + 独立可轮换 `ClipKey` + 零写库 `--ephemeral` WS 直推）」重新纳入 M4（见 §5.2、§7、ADR-11）。
+- 旧版写入 DO SQLite 且声称零 PITR 的 `ephemeral_clips`（`/v1/sync/ephemeral-clip`）：已永久废弃（F-06）；2026-11-27 拍板 **D8**（2026-11-28 **D8′** 修订）以「物理隔离独立图文通道（云端 `1,000 条 / 30 天 / 5 GiB` 硬护栏 + R2 流式原图 + 桌面无限归档 + 独立可轮换 `ClipKey` + 零写库 `--ephemeral` WS 直推）」重新纳入 M4（见 §5.2、§7、ADR-11）。
 - 移动端编辑器 / outbox / 冲突合并 UI / Layer 3 移动端格式化：手机只读（§9.2）。
 - WebSocket 携带 op（「顺风车」）：推迟，WebSocket 只发通知（§9.11 待办）。
 - WebAuthn PRF 多槽位：推迟，口令为主路径（§9.10）。
@@ -837,4 +912,5 @@ flowchart LR
 - `mynote update` 自升级子系统：交给包管理器（F-14）。
 - Plane B 统计评测与自动爬山：移出路线图（§9.9）。
 - macOS Tauri 薄壳（`shell-macos/`）、Scheme B Bearer 鉴权分支与单端 GPUI 重写：2026-11-25 拍板 D5′ 移除 Tauri 壳、2026-11-28 拍板 D5″ 淘汰单端 GPUI 重写；macOS 原生菜单栏与全局热键改由零第三方依赖可选纯 Swift `WKWebView` 薄壳 [`apps/macos/`](../apps/macos/README.md) 承担，双桌面核心底座保持单一 `mynote` 二进制（§9.8、§9.12）。
+- Obsidian 式进程内 JS / DOM 注入插件、WASI Preview 2 / WIT 破坏浏览器原生零依赖直跑、捆绑 Node.js / Python 运行时、经 `my-note` 云同步自动下发可执行插件代码、`exec` 子进程接触 Tier 2 明文、以及向外部进程暴露高频按键事件 `onKeystroke`：2026-11-28 拍板 D10 明确拒绝，改采 Core WASM 零导入 3-Export ABI 双宿主 + 6 种声明式 `PluginResult` 安全原语（§5.7、ADR-13）。
 - 「复杂度只有 CRDT 的 1/5」「云端代码量骤减 ~70%」「约 300–350 行 TypeScript」等无测量依据的论断：已删除（F-09、F-16）。

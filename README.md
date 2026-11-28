@@ -1,6 +1,6 @@
 # my-note
 
-> 2026-11-28 修订：依据 [第一性原理审查 §9](./review/2026-11-24-first-principles-review.md) 的决策 D1–D8（含 D1′、D5′/D5″ 去 Tauri 壳并新增零依赖纯 Swift 可选薄壳 `apps/macos/`、S0-3 iPhone Argon2id 定值 `(32768, 2, 1)` 与 2026-11-27 独立 100 条图文剪贴板同步拍板 D8）更新。
+> 2026-11-28 修订：依据 [第一性原理审查 §9](./review/2026-11-24-first-principles-review.md) 的决策 D1–D10（含 D1′、D5′/D5″ 去 Tauri 壳并新增零依赖纯 Swift 可选薄壳 `apps/macos/`、S0-3 iPhone Argon2id 定值 `(32768, 2, 1)`、2026-11-27 独立 100 条图文剪贴板同步 D8，以及 2026-11-28 Windows 一等桌面平台 D9 与 `wasmi` 优先双宿主插件体系 D10）更新。
 
 一款面向开发者的**轻量、简洁、多端可靠同步、支持块级加密、Markdown/Mermaid 渲染与 CLI + Skill（Agent 友好）**的临时笔记 / Scratchpad 软件。
 
@@ -34,7 +34,7 @@
 
 源自长期使用 [Heynote](https://heynote.com/) + iCloud 同步过程中多次遭遇「内容被无故清空」的痛点，目标是在保留 Heynote「多语言分块、随手即记、即时格式化」核心体验的基础上，重构底层数据模型、同步协议、安全边界与 Agent 交互能力，覆盖 **macOS**、**Omarchy（Arch + Hyprland）** 两台桌面，以及**手机只读访问**（iOS / Android PWA）。
 
-## 已拍板的决策（D1–D8，摘要）
+## 已拍板的决策（D1–D10，摘要）
 
 | # | 决策 | 要点 |
 | --- | --- | --- |
@@ -45,7 +45,9 @@
 | D5′ / D5″ | 双桌面统一纯 CLI + Daemon + HTML 底座 + macOS 可选纯 Swift 薄壳（2026-11-25 去 Tauri；2026-11-28 补充 `apps/macos/`） | 永久移除 macOS Tauri 薄壳；macOS 与 Omarchy 底座统一为单一 `mynote` 二进制提供 `http://localhost:<port>`；macOS 另可选零第三方依赖纯 Swift `WKWebView` 薄壳 [`apps/macos/MyNote.app`](./apps/macos/README.md)（仅连 `0600 daemon.sock`、不碰 Keychain、提供菜单栏与 Carbon 全局热键 `⌃⌥Space`） |
 | D6 | 评测只为质量保障 | 保留确定性门禁（属性测试、DST、真实 Worker 契约测试、CLI 黄金测试等）；Plane B 与自动爬山推迟 |
 | D7 | 手机可解锁 Vault | Argon2id（WASM）+ 单套 KDF 参数 `(32768, 2, 1)`（iPhone 主屏 PWA 实测 `1553 ms` [已测]），VKEK 仅在内存；手机 PWA 代码由 Cloudflare 下发是新的信任边界 |
-| D8 | 独立 100 条图文跨端剪贴板同步（M4，2026-11-27 拍板） | 与笔记 `ops` 物理隔离：DO 存最近 100 条轻索引（7 天 TTL、≤ `64 KiB` 小文本内联 + ≤ `16 KiB` 缩略图），图片与长文本（上限 `10 MiB`）流式存 R2 `clip/blobs/`（8 天生命周期，0 DO PITR）；统一 `MNC1` + 独立可轮换 `ClipKey` + 可选 `≤ 256 KiB` 零写库 `--ephemeral` WS 直推；移动端 → 桌面由 PWA（Android `share_target` + iOS 无损大图 `mynote-wasm`）与 iOS Shortcuts/Scriptable 分流；先 `S-Clip` → `M4a`（显式）再 `M4b`（桌面后台自动镜像 opt-in） |
+| D8 / D8′ | 独立图文跨端剪贴板同步与分层留存（M4，2026-11-27 / 2026-11-28 拍板） | 与笔记 `ops` 物理隔离：云端 DO 存最近 `1,000 条` 轻索引（`30 天` TTL、≤ `64 KiB` 小文本内联 + ≤ `16 KiB` 缩略图），图片与长文本（单条上限 `10 MiB`）流式存 R2 `clip/blobs/`（`5 GiB` 硬容量护栏触顶返 `507 CLIP_QUOTA_EXCEEDED`、`31 天` 孤儿生命周期，0 DO PITR）；桌面本地无限归档 + 单并发后台 Eager Prefetch + 手动 `prune`/`clear`（云端清理与默认 `rotate-key` 均保留桌面本地归档）；手机 PWA `200 条` 增量缓存；统一 `MNC1` + 独立可轮换 `ClipKey` + 可选 `≤ 256 KiB` 零写库 `--ephemeral` WS 直推；移动端 → 桌面由 PWA（Android `share_target` + iOS 无损大图 `mynote-wasm`）与 iOS Shortcuts/Scriptable 分流 |
+| D9 | Windows 升为一等桌面平台（M5，2026-11-28 拍板） | 与 macOS、Omarchy 并列：跨平台 `LocalIpc`（Unix `0600` UDS / Windows 用户 SID SDDL Named Pipe，防抢注与禁 SMB）、Credential Manager / DPAPI 与 NTFS 用户专属 ACL、`CONIN$` 无回显口令、Win32 原生剪贴板监听与隐私过滤、加固外部子进程（`SYSTEMROOT` 白名单 + `CREATE_NO_WINDOW` + Job Object + `PYTHONUTF8=1` + 禁 `.bat`/`.cmd`）、`windows-latest` CI 与 Release 预编译包（`ADR-12`） |
+| D10 | 路线 B `wasmi` 优先双宿主插件体系（M5，2026-11-28 拍板） | 纯计算 `transform` / `inspector` 插件统一为 Core WASM 零导入 3-Export ABI（`module.imports().is_empty()`），同一 `.wasm` 在 Tier 1 跑 Rust `wasmi`、在桌面解锁态 Tier 2 跑独立 `'self'` Web Worker（守住 Daemon 零 Tier 2 明文与现有 CSP）；外部工具链 / 网络类 Tier 1 插件走 Level 1 `exec`（`oneshot`/`worker` 双模式，禁 Tier 2）；前端仅开放 6 种声明式 `PluginResult` 安全原语（严禁主 DOM/JS 注入与云同步分发插件）；全程 `cloud-cf` `0 LOC` 改动、手机 PWA WASM `0 B` 增量（`ADR-13`） |
 
 ## 架构基线
 
@@ -56,17 +58,31 @@
 - **Agent 集成**：不做 MCP，通过 CLI（`--json`、稳定退出码与错误码，Daemon 未起亦可用）+ 极轻 `SKILL.md`。
 - **分发**：GitHub Releases 预编译包（附 `SHA256SUMS.txt`、`skill/SKILL.md` 与 `deploy/` 模板）/ Homebrew tap / AUR / `cargo install`，不做自升级。
 
-## 文档索引
+## 文档索引（按性质物理分类）
 
-- [调研报告与系统架构设计方案 (`docs/architecture-proposal.md`)](./docs/architecture-proposal.md) — 根因复盘、竞品调研、整体架构、ADR（Proposed）与 S0 → M3 路线图
-- [核心数据结构、存储 Schema 与二进制线格式规范 (`docs/data-structures.md`)](./docs/data-structures.md) — 线格式、AAD、op 信封（带 `key_id`）、独立密钥表、本地 / DO / PWA 表结构的单一事实来源
-- [全链路接口与跨边界契约规范 (`docs/interface-contracts.md`)](./docs/interface-contracts.md) — 错误码注册表、CLI 子命令与 `--json` 契约、本地 Daemon API、云端请求响应 Schema、WASM FFI
-- [同步协议与确定性物化规范 (`docs/sync-protocol.md`)](./docs/sync-protocol.md) — 路径 γ 多叶子并列与手动合并、epoch 对账、密钥表 2P-Set 同步、碎纸与宽限期协议、手机状态快照
-- [安全架构与威胁模型规范 (`docs/threat-model.md`)](./docs/threat-model.md) — 敌手模型与诚实承诺、删除优先与时间上界、代码管不到的副本、只读令牌、手机 PWA 代码下发信任边界
-- [Cloudflare 技术栈云端架构专项评估 (`docs/cloudflare-cloud-architecture.md`)](./docs/cloudflare-cloud-architecture.md) — Workers Paid 配额、DO / R2 实现、alarm 碎纸、归档生命周期、支出告警
-- [质量门禁与评测框架 (`docs/eval-framework.md`)](./docs/eval-framework.md)（配 [`evals/`](./evals/)） — Plane A 确定性门禁；Plane B 与自动爬山资产已归档至 [`evals/archive/`](./evals/archive/)
-- [跨端剪贴板同步可行性调研与决策归档 (`docs/clipboard-sync-proposal.md`)](./docs/clipboard-sync-proposal.md)（`Decided`，D8） — 100 条图文跨端剪贴板同步调研证据、移动端三梯队交互与 Q1–Q6 拍板记录（正式契约已同步至上述 SSOT 规范）
-- [方案审查记录 (`review/`)](./review/) — [2026-11-24 第一性原理审查](./review/2026-11-24-first-principles-review.md)（§9 为决策记录 D1–D8，与其他文档冲突时以 §9 为准）
+本仓库严格分离**正式方案（`docs/`）**、**技术 Spike 实测报告（`docs/spikes/`）**、**调研报告（`research/`）**与**方案审查记录（`review/`）**。**调研与审查文档仅作分析与决策追溯，严禁直接作为开发实施依据；只有转化为 `docs/` 正式方案正文后方可实施。**
+
+### 正式方案与工程规范（[`docs/`](./docs/README.md)，唯一实施依据）
+
+- [系统架构与演进方案 (`docs/architecture-proposal.md`)](./docs/architecture-proposal.md) — 根因复盘、整体架构、ADR-01～ADR-13 与 S0 → M5 路线图
+- [核心数据结构、存储 Schema 与二进制线格式规范 (`docs/data-structures.md`)](./docs/data-structures.md) — 线格式、AAD、op 信封（带 `key_id`）、独立密钥表、M5 插件契约与 Core WASM 3-Export ABI、全端表结构的单一事实来源
+- [全链路接口与跨边界契约规范 (`docs/interface-contracts.md`)](./docs/interface-contracts.md) — 错误码注册表、CLI 子命令与 `--json` 契约、本地 Daemon REST / WS / 跨平台 `LocalIpc`、云端 Sync API、WASM / Tier 2 插件 Worker 边界
+- [同步协议与确定性物化规范 (`docs/sync-protocol.md`)](./docs/sync-protocol.md) — 路径 γ 多叶子并列与手动合并、epoch 对账、密钥表 2P-Set 同步、碎纸与宽限期协议、手机状态快照、独立剪贴板通道
+- [安全架构与威胁模型规范 (`docs/threat-model.md`)](./docs/threat-model.md) — 敌手模型与诚实承诺、删除优先与时间上界、代码管不到的副本、只读令牌、手机 PWA 信任边界、剪贴板与 Windows / 双宿主插件安全边界
+- [Cloudflare 技术栈云端架构专项评估 (`docs/cloudflare-cloud-architecture.md`)](./docs/cloudflare-cloud-architecture.md) — Workers Paid 配额、DO / R2 实现、alarm 碎纸、归档生命周期、支出告警（M5 云端 `0 LOC` 改动）
+- [质量门禁与评测框架 (`docs/eval-framework.md`)](./docs/eval-framework.md)（配 [`evals/`](./evals/)） — Plane A 确定性门禁（S0 → M5）；Plane B 与自动爬山资产已归档至 [`evals/archive/`](./evals/archive/)
+
+### 独立调研报告（[`research/`](./research/README.md)，严禁直接实施）
+
+- 已转化为正式方案（`research/converted/`）：
+  - [跨端剪贴板同步可行性深度调研](./research/converted/2026-11-27-clipboard-sync-research.md)（已转化为 D8 / M4，`ADR-11`）
+  - [插件化可行性与跨平台架构深度调研（含 macOS / Linux / Windows）](./research/converted/2026-11-28-plugin-architecture-analysis.md)（已转化为 D9 / D10 / M5，`ADR-12` / `ADR-13`）
+- 待转化探索调研（`research/pending/`，禁止直接实施）：
+  - [`v0.3.2` 基建能力外延：10 个发散方向深度调研](./research/pending/2026-11-28-10-directions-infra-analysis.md)
+
+### 方案审查与决策追溯（[`review/`](./review/README.md)）
+
+- [2026-11-24 第一性原理审查与 §9 决策记录（D1–D10）](./review/2026-11-24-first-principles-review.md)（已同步转化为 `docs/` 正文）
 
 ## 已移除 / 推迟的机制（2026-11-24 / 2026-11-27 / 2026-11-28 修订）
 
@@ -77,4 +93,5 @@
 - `SPAN_PATCH` / delta 链、HLC 漂移拒收、Lock-Wins 特例、分数索引重平衡（D3）。
 - DO 滑动窗口 GC、R2 多代快照 + CAS、「\$0/月免费额度」约束（D4）。
 - macOS Tauri 薄壳（`shell-macos/`）、Scheme B Bearer 鉴权分支与单端 GPUI 重写（D5′ / D5″；macOS 全局热键窗口改由零依赖可选纯 Swift `WKWebView` 薄壳 `apps/macos/` 承担）。
+- Obsidian 式主 DOM / 任意 JS 注入插件、WASI Preview 2 / WIT 破坏浏览器原生零依赖直跑、捆绑 Node.js / Python 运行时、经云同步自动分发可执行插件代码、`exec` 子进程接触 Tier 2 明文、以及向外部进程暴露高频按键 `onKeystroke`（D10）。
 - Plane B 统计评测、自动爬山（D6）；`mynote update` 自升级（F-14）。

@@ -1,6 +1,6 @@
 # 核心数据结构、存储 Schema 与二进制线格式规范 (`data-structures.md`)
 
-> 2026-11-27 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D8（含 2026-11-27 剪贴板同步拍板 D8 / D1′）更新。
+> 2026-11-28 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D10（含 2026-11-27 剪贴板同步拍板 D8 / D1′，以及 2026-11-28 Windows 一等桌面平台 D9 与 `wasmi` 优先双宿主插件体系 D10）更新。
 
 > 本文档是 [总架构设计方案 (`architecture-proposal.md`)](./architecture-proposal.md)、[同步协议规范 (`sync-protocol.md`)](./sync-protocol.md) 与 [威胁模型规范 (`threat-model.md`)](./threat-model.md) 的底层数据结构基准，定义全端统一的标识符编码、`mynote-core` Rust 类型定义、精确到字节偏移的二进制信封格式、**AAD 的唯一权威定义**、密钥表 / 密钥环 / 恢复包结构，以及桌面 SQLite、云端 Durable Object SQLite 与移动端 IndexedDB 的完整 Schema。
 >
@@ -272,6 +272,70 @@ pub enum SyncCommand {
     UploadSnapshot { epoch: JournalEpoch, covers_seq: i64, bytes: Vec<u8> }, // 仅桌面；无 prev 指针、无 CAS
 }
 ```
+
+### 2.3 跨平台双宿主插件领域契约与 Core WASM 3-Export ABI（M5，D10）
+
+插件清单（`plugin.toml`）、运行时能力与声明式渲染结果均在系统边界解析为强类型（`crates/mynote-core/src/plugin.rs`，纯 Sans-I/O，零平台依赖），**非法组合在编译期或加载期即被拒绝**（同步与云端线格式零变动）：
+
+```rust
+/// 品牌化插件标识：严格匹配 `^[a-z0-9][a-z0-9_-]{1,39}$`。
+/// 经由 LocalIpc 提交变更时强制映射为 `actor = format!("plugin:{}", id.as_str())`。
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PluginId(String);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginSlot {
+    Transform,  // 格式化 / 编码转换（兼容既有 formatters.toml）
+    Command,    // 命令面板 / 块动作 / CLI `mynote ext run`
+    Inspector,  // 只读视图或 CM6 行尾标注（零副作用）
+    Reactor,    // 后台事件响应（block.saved / clip.received / clip.ephemeral）
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "runtime", rename_all = "snake_case")]
+pub enum PluginRuntime {
+    /// 纯计算 Core WASM 模块（加载期硬校验 `module.imports().is_empty()`）。
+    /// 同一 `.wasm` 字节码在 Tier 1 / CLI / Daemon 侧由 Rust `wasmi` 执行，
+    /// 在桌面 Web UI 解锁态 Tier 2 块上由独立 `'self'` Web Worker 原生 `WebAssembly.instantiate(bytes, {})` 执行。
+    Wasm {
+        module_rel_path: String, // 相对插件目录路径，严格拒绝 `..` 路径穿越
+        fuel_limit: u64,         // 默认 50_000_000 ops（硬上限由宿主约束）
+        memory_limit_bytes: u32, // 默认 16 * 1024 * 1024 (16 MiB)，硬上限 32 MiB
+        tier2_capable: bool,     // 仅 Wasm 变体合法；Exec 变体在类型层面不可表达
+    },
+    /// OS 外部子进程（NDJSON over stdio）。结构性禁止访问 Tier 2 加密块。
+    Exec {
+        mode: ExecMode,          // Oneshot | Worker { idle_ttl_ms: u64 }
+        entry: CrossOsEntry,     // Launcher { python|node|pwsh|native, script } | PerOs { unix, windows }
+        timeout_ms: u64,         // 默认 5_000 ms，硬上限 30_000 ms
+        env_passthrough: Vec<String>,
+        scopes: Vec<ExecScope>,  // BlockRead | BlockWrite | BlockInsert | ClipRead | ClipWrite
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PluginResult {
+    Noop,
+    Toast { level: ToastLevel, message: String },
+    ReplaceContent { content: String, lang: Option<String> },
+    InsertBlock { buffer: Option<String>, after_block_id: Option<String>, lang: String, content: String },
+    Gutter { annotations: Vec<GutterAnnotation> }, // { line: u32, text: String, copy: Option<String> }
+    View { title: String, view: DeclarativeView }, // Markdown | Mermaid | Diff | Table | Kv | Code
+}
+
+pub const PLUGIN_MANIFEST_SCHEMA_V1: u32 = 1;
+pub const PLUGIN_WASM_ABI_VERSION: u32 = 1;
+```
+
+- **Core WASM 零导入 3-Export ABI（v1）**：
+  - `mynote_abi_version() -> u32`：必须返回 `1`；
+  - `mynote_alloc(len: u32) -> u32`：由 Guest 在线性内存分配 UTF-8 JSON 请求缓冲区；
+  - `mynote_invoke(ptr: u32, len: u32) -> u64`：高 32 位为响应指针 `resp_ptr`，低 32 位为 UTF-8 JSON `PluginResult` 字节长度 `resp_len`；
+  - `mynote_dealloc(ptr: u32, len: u32)`（可选）：宿主调用完成后释放 Guest 缓冲区；
+  - **加载期硬门禁（`INV-PLUGIN-ZERO-IMPORT`）**：Rust `wasmi` 与桌面 Web Worker 在实例化前均强制校验模块 **`imports` 集合为空**（零 WASI、零宿主函数导入），确保网络、文件系统与系统时钟外带在字节码层不可表达。
+- **配置项与路径约束**：`PluginManifestV1` 支持声明式 `[[options]]`（含 `string` / `number` / `boolean` / `secret`，其中 `secret` 绝不落明文配置，存 OS 凭据库）及 `[[contributes.*]]`；`CrossOsEntry` 严格拒绝相对路径穿越（`..`）、绝对路径与 Windows `.bat`/`.cmd` 脚本（防参数注入）。
 
 ---
 
@@ -571,7 +635,7 @@ pub enum SnapshotLeafBody {
 独立剪贴板通道与笔记主日志完全隔离，不复用 `SMK` / `VKEK` / `BDEK`，统一采用 45 B 标准信封头 `magic ("MNC1") || ver (0x01) || clip_kid (16B) || nonce (24B) || XChaCha20-Poly1305 ciphertext (含 16B Tag)`，AAD 以 §3.3 为准：
 
 - **`flags` 字节位定义（参与 AAD 认证）**：
-  - `bit 0`（`0x01`）：`ephemeral`（`1` = 纯内存 WS 直推，零写库零 R2；`0` = 常规 100 条环形队列）；
+  - `bit 0`（`0x01`）：`ephemeral`（`1` = 纯内存 WS 直推，零写库零 R2；`0` = 常规云端滚动中继队列）；
   - `bit 1`（`0x02`）：`payload_type`（`0` = `pad256(utf8_json(ClipMetaV1))` 元数据/小文本帧；`1` = R2 原始二进制大对象帧，直接加密原始图片或长文本字节，不做 JSON 包装与 Base64 膨胀）；
   - 其余位保留为 `0`（解码器收到非零保留位必须报 `INTEGRITY_ERROR`）。
 - **`ClipMetaV1`（UTF-8 紧凑 JSON，避免在 iOS Scriptable 快捷指令引入 MsgPack / zstd 编码依赖）**：
@@ -598,9 +662,9 @@ pub enum SnapshotLeafBody {
   - **图片（`kind = "image"` 且 `≤ 10 MiB`）**：`mime` 严格限定位图白名单 **`image/png` | `image/jpeg` | `image/webp` | `image/gif`**，**拒绝 `image/svg+xml`**（SVG 一律按 `kind = "text"`、`mime = "text/plain"` 同步）；解密 R2 `blob` 后强制比对 `sha256_hex`；
   - `source_mode` 取值为 `"explicit"`（手机、CLI `clip push`、UI 发送）或 `"auto"`（M4b 桌面后台自动镜像）。
 - **独立剪贴板密钥 `ClipKey`（存入 `key_material(kind = 'clip_key')`）**：
-  - 32 B 随机对称密钥 + 16 B `clip_kid`，使用当前 `SMK` 经 `XChaCha20-Poly1305` 封装为 `ClipKeyMaterialV1`（`{ v: 1, clip_kid, smk_kid, wrapped_clip_key }`）存入 `key_material` 表，按单调递增 `gen` 同步给所有桌面与 `read+clip` 手机；
-  - **不进入统一恢复包 `RecoveryKeyringV1`**（7 天临时缓存数据，灾难恢复后直接生成新 `ClipKey`）；
-  - **轮换不保留旧钥**：`mynote clip rotate-key` 生成全新 `(clip_kid', ClipKey')` 递增 `gen` 覆盖并清空云端 `clip_items` 与 R2 `clip/blobs/*`，各端立即销毁旧 `ClipKey`，使 DO 30 天 PITR 中的旧剪贴板密文立即可证明无法解密。
+  - 首次使用剪贴板时由桌面自动生成 32 B 随机对称密钥 + 16 B `clip_kid`（无需用户输入），使用当前 `SMK` 经 `XChaCha20-Poly1305` 封装为 `ClipKeyMaterialV1`（`{ v: 1, clip_kid, smk_kid, wrapped_clip_key }`）存入 `key_material` 表，按单调递增 `gen` 同步给所有桌面与 `read+clip` 手机；
+  - **不进入统一恢复包 `RecoveryKeyringV1`**（云端为 30 天滚动中继缓冲，灾难恢复后直接生成新 `ClipKey`）；
+  - **轮换不保留旧钥（D8′ 作用域语义）**：`mynote clip rotate-key` 生成全新 `(clip_kid', ClipKey')` 递增 `gen` 覆盖并清空云端 `clip_items` 与 R2 `clip/blobs/*`，各端立即销毁旧 `ClipKey`（使 DO 30 天 PITR 中的旧剪贴板密文立即可证明无法解密）；默认 `clear_clips_scope = "cloud"` **保留各桌面已解密的本地归档**，仅传入 `--wipe-local` 时广播 `scope = "all"` 同步抹除本地与对端桌面归档。
 
 ---
 
@@ -775,7 +839,7 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     created_at_ms  INTEGER NOT NULL
 ) STRICT;
 
--- 11. 独立 100 条图文剪贴板本地索引表（M4，D8；原图本体存独立文件目录 clip_cache/，严禁大二进制入主库）
+-- 11. 独立图文剪贴板桌面本地归档索引表（M4，D8 / D8′：桌面无限保存、仅手动 prune/clear；原图本体存独立文件目录 clip_cache/，严禁大二进制入主库）
 CREATE TABLE IF NOT EXISTS clip_items (
     clip_id        TEXT PRIMARY KEY,          -- 26B ULID
     clip_kid       TEXT NOT NULL,             -- 26B ULID
@@ -804,18 +868,19 @@ CREATE INDEX IF NOT EXISTS idx_local_clip_created ON clip_items (created_at_ms D
 - `DELETE`：块 `state → 'TRASHED'`，`block_leaves` 只剩墓碑叶子，FTS 条目立即删除；`sync_ops` 中的密文原样保留，宽限期内可据此恢复。
 - `ExecuteShred { key_id }`（仅在收到服务端 `state = 'executed'` 时执行）：`block_keys.key_record = NULL`；引用该 `key_id` 的叶子转为 `KEY_UNAVAILABLE`；若该块全部叶子均为墓碑/已碎纸且已无任何可用密钥则 `state → 'SHREDDED'`（若目标为 Buffer，则 `buffers.name = ''` 且 `state → 'SHREDDED'`，若其下仍有存活块则在 UI 归入「已删除工作区遗留块」视图）；随后 `PRAGMA wal_checkpoint(TRUNCATE)`（`secure_delete` 已开启）。门禁 INV-SHRED-BOUND 断言此后本地数据库、WAL、FTS、本地备份中都找不到该密钥与对应明文。
 
-### 4.1 本地数据目录、备份与 Schema 版本保护
+### 4.1 本地数据目录、插件目录、备份与 Schema 版本保护
 
-桌面数据目录（Linux: `~/.local/share/mynote/`；macOS: `~/Library/Application Support/mynote/`）默认排除出 Time Machine（`tmutil addexclusion`）与 Omarchy 文件系统快照，维护以下受控结构：
+桌面数据目录（Linux: `~/.local/share/mynote/`；macOS: `~/Library/Application Support/mynote/`；Windows [M5, D9]: `%LOCALAPPDATA%\mynote\`，均支持 `MYNOTE_DATA_DIR` 覆盖，规避 Windows Roaming `%APPDATA%` 漫游膨胀）默认排除出 Time Machine（`tmutil addexclusion`）与 Omarchy 文件系统快照；Unix 文件权限强制 `0600` / 目录 `0700`，Windows 强制经 `SetNamedSecurityInfoW` 设置仅放行当前用户 SID 的 NTFS 专属 DACL。数据目录维护以下受控结构：
 
 - **`local_meta` 强制版本锁键**：
   - `schema_version`（同步写入 `PRAGMA user_version`）：当前库已应用的最新迁移号；
   - `min_reader_schema_version`：允许安全读写当前库的最低二进制可识别 Schema 版本号。若旧版二进制（例如经包管理器降级后）发现自身支持的最高 Schema 版本 `< min_reader_schema_version`，立即以退出码 `8`（`INTEGRITY_ERROR: SCHEMA_TOO_NEW`）拒绝写入，防止旧代码误毁新表结构。
 - **跨 Schema 升级前自动一致性快照（`backups/mynote-pre-schema-v<N>.db`）**：
-  - 仅在版本升级触发 `PRAGMA user_version` 递增前自动通过 `VACUUM INTO` 生成单文件快照（权限 `0600`，最多保留最近 2 代）。
-- **每日自动备份（`backups/auto-<yyyy-mm-dd>.db`）**：`VACUUM INTO` 生成，权限 `0600`，按 `T_snap`（30 天）轮换删除，使碎纸后的残留副本在有界时间内消失。
+  - 仅在版本升级触发 `PRAGMA user_version` 递增前自动通过 `VACUUM INTO` 生成单文件快照（Unix `0600` / Windows 当前用户专属 NTFS DACL，最多保留最近 2 代）。
+- **每日自动备份（`backups/auto-<yyyy-mm-dd>.db`）**：`VACUUM INTO` 生成，权限同上，按 `T_snap`（30 天）轮换删除，使碎纸后的残留副本在有界时间内消失。
 - **只读 Markdown 镜像（`mirror/`）**：只含 `ACTIVE` 且未加锁块的展示版本，块删除时同步删除对应文件。
-- **剪贴板大对象本地缓存（`clip_cache/`，M4，D8）**：权限 `0700`，仅存放按需下载并已解密校验的剪贴板原图与长文本文件，按 **100 条 / `256 MiB`** LRU 自动淘汰；与 `mynote.db` 物理分离，不进入 `VACUUM INTO` 自动备份与只读镜像。
+- **剪贴板大对象本地归档目录（`clip_cache/`，M4，D8 / D8′）**：权限 `0700`（Windows 当前用户专属 DACL），存放桌面后台 Eager Prefetch 或按需下载并已解密校验的剪贴板原图与长文本文件；**桌面本地不做自动条数或容量 LRU 淘汰**，仅在用户手动删除、`mynote clip prune` / `clear` 或 `--wipe-local` 轮换时回收磁盘空间；与 `mynote.db` 物理分离，不进入 `VACUUM INTO` 自动备份与只读镜像。
+- **本地插件目录（M5，D10，与云同步及数据库物理分离）**：macOS / Linux 为 `${XDG_CONFIG_HOME:-~/.config}/mynote/plugins/<plugin-id>/plugin.toml`，Windows 为 `%LOCALAPPDATA%\mynote\plugins\<plugin-id>\plugin.toml`（均支持 `MYNOTE_PLUGINS_DIR` 覆盖）。Daemon 启动时仅惰性解析 TOML 清单，**零代码预执行**；不进入笔记同步流与云端备份。
 
 ---
 
@@ -924,17 +989,17 @@ CREATE TABLE IF NOT EXISTS phone_snapshots (
     UNIQUE (journal_epoch, covers_seq)
 );
 
--- 9. 独立 100 条图文剪贴板环形索引表（§3.8，M4，D8；严禁进入 R2 每日 op 归档与手机状态快照）
+-- 9. 独立图文剪贴板云端滚动中继索引表（§3.8，M4，D8 / D8′：最多 1,000 条 / 默认 30 天 TTL / R2 大对象总计 5 GiB 硬护栏；严禁进入 R2 每日 op 归档与手机状态快照）
 CREATE TABLE IF NOT EXISTS clip_items (
     clip_id        TEXT PRIMARY KEY,          -- 26B ULID（时间有序）
     clip_kid       TEXT NOT NULL,             -- 26B ULID
     device_id      TEXT NOT NULL,
     kind           TEXT NOT NULL CHECK (kind IN ('text', 'image')),
     created_at_ms  INTEGER NOT NULL,
-    expires_at_ms  INTEGER NOT NULL,          -- 默认 created_at_ms + 7 * 86_400_000 (7 天)
+    expires_at_ms  INTEGER NOT NULL,          -- 默认 created_at_ms + 30 * 86_400_000 (30 天)
     meta_envelope  BLOB NOT NULL,             -- MNC1 (payload_type=0，含小文本或图片元数据+缩略图，<= 96 KiB)
     r2_key         TEXT,                      -- NULL 表示内联小文本；非 NULL 时为 'clip/blobs/<clip_id>.mnc1'
-    blob_bytes     INTEGER                    -- R2 密文字节数（上限 <= 10.5 MiB）
+    blob_bytes     INTEGER                    -- R2 密文字节数（单条上限 <= 10.5 MiB，全部未过期条目之和上限 5 GiB）
 );
 
 CREATE INDEX IF NOT EXISTS idx_clip_items_expires ON clip_items (expires_at_ms);
@@ -946,7 +1011,7 @@ CREATE INDEX IF NOT EXISTS idx_clip_items_expires ON clip_items (expires_at_ms);
 
 ## 6. 移动端 PWA IndexedDB 存储结构规范（`web`，笔记只读缓存 + M4 剪贴板索引）
 
-手机对笔记主库保持只读（D1′）：IndexedDB 只是一份**可随时丢弃的缓存**，被 iOS 驱逐的后果只是下次打开时重新下载「最新快照 + 尾部 op + 最近 100 条剪贴板索引」。**笔记侧无 outbox、无本地 op 日志写路径、无冲突合并数据**。
+手机对笔记主库保持只读（D1′）：IndexedDB 只是一份**可随时丢弃的缓存**，被 iOS 驱逐的后果只是下次打开时重新下载「最新快照 + 尾部 op + 云端剪贴板索引（本地增量保留最近 200 条）」。**笔记侧无 outbox、无本地 op 日志写路径、无冲突合并数据**。
 
 数据库名称：`mynote_pwa_v1`（M2 为 Schema Version `1` 共 6 个 Object Stores；M4 升至 Version `2` 新增 `clip_items` 共 **7 个 Object Stores**）：
 
@@ -958,7 +1023,7 @@ CREATE INDEX IF NOT EXISTS idx_clip_items_expires ON clip_items (expires_at_ms);
 | `blocks` | `"id"` | `by_buffer_pos`: `["buffer_id", "position", "id"]` | `SnapshotBlockV1` 形状：字段 LWW 结果 + 全部叶子。**叶子正文一律保持 `MNB1` 密文**（Tier 1 也不例外），只在渲染 / 复制时于内存中解密 |
 | `block_keys` | `"key_id"` | 无 | 同步下来的可用密钥记录（`MNR1`）；收到碎纸执行即 `store.delete(key_id)`，并删除该块的缓存 |
 | `vault_header` | `"id"` | 无 | `VaultHeaderV1`（KDF 参数、盐、`wrapped_vkek`），供手机解锁 Vault |
-| `clip_items`（M4，D8） | `"clip_id"` | `by_created`: `["created_at_ms", "clip_id"]` | 最近 100 条剪贴板轻元数据（**`meta_envelope` 保持 `MNC1` 密文**，不落盘明文正文与原图大对象；原图仅点击查看/复制时按需流式拉取并在内存中解密） |
+| `clip_items`（M4，D8 / D8′） | `"clip_id"` | `by_created`: `["created_at_ms", "clip_id"]` | 最近 **200 条**增量缓存的剪贴板轻元数据（同步时按 `clip_id` 增量写入，不清空重写；**`meta_envelope` 保持 `MNC1` 密文**，不落盘明文正文与原图大对象；原图仅点击查看/复制时按需流式拉取并在内存中解密） |
 
 - **VKEK 永不落盘**：口令 → Argon2id（WASM）→ PassKey → 解开 `wrapped_vkek` 得到的 VKEK 只存在于内存，**永不写入 IndexedDB 或 Cache Storage**；`visibilitychange` 或闲置 N 分钟后清零上锁。
 - 恢复密钥环（`RecoveryKeyringV1`）、Root Seed 与 `recovery_sk` 不进入手机。
@@ -977,7 +1042,7 @@ CREATE INDEX IF NOT EXISTS idx_clip_items_expires ON clip_items (expires_at_ms);
 - `SPAN_PATCH` / `BlockSpanPatch` / `SpanPatchV1` / 每 20 步全量检查点：op 只用全量载荷；单条 op p95 > 64 KB 时再议（§9.4、§9.11、F-02）。
 - `block_conflicts` 及其允许明文分支的 Lock-Wins 约束：由 `block_leaves`（多叶子并列、任一叶子加锁则整块按加锁渲染）取代（§9.4、F-06）。
 - `purge_op_ids` / `sync_ops.is_purged` / 可置空的 `ops.envelope` / `ScrubBlockPlaintextHistory`：op 密文永不删除，删除只作用于密钥（§9.3、F-04）。
-- 旧版写入 DO SQLite 且声称零 PITR 的 `ephemeral_clips` 表：已永久废弃（F-06）；2026-11-27 拍板 **D8** 改为 §3.8 / §5 的独立 `clip_items` 100 条轻索引 + R2 `clip/blobs/` 流式原图 + 独立可轮换 `ClipKey`（`MNC1`）+ 零写库 `--ephemeral` WS 直推。
+- 旧版写入 DO SQLite 且声称零 PITR 的 `ephemeral_clips` 表：已永久废弃（F-06）；2026-11-27 拍板 **D8**（2026-11-28 **D8′** 修订）改为 §3.8 / §5 的独立 `clip_items` 云端滚动索引（`1,000 条 / 30 天 / 5 GiB`）+ R2 `clip/blobs/` 流式原图 + 桌面无限归档 + 独立可轮换 `ClipKey`（`MNC1`）+ 零写库 `--ephemeral` WS 直推。
 - R2 K=5 多世代快照 + CAS（`snapshot_meta`、`prev_snapshot_id`、`rolling_op_hash`、`state_blake3`、`covers_key_seq`）：改为只给手机用的当前状态快照（§9.2、F-02）。
 - DO 滑动窗口 GC 与 `min_retained_seq`：Paid 套餐 10 GB 下不需要（§9.5）。
 - HLC 漂移钳制 `MAX_FORWARD_DRIFT_MS` / `ClockDriftExceeded`：HLC 只决定展示顺序，只做本地偏差提示（§9.4、F-03）。

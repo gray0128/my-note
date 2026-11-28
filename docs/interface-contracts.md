@@ -1,8 +1,8 @@
 # 全链路接口与跨边界契约规范 (`interface-contracts.md`)
 
-> 2026-11-27 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D8（含 2026-11-27 剪贴板同步拍板 D8 / D1′）更新。
+> 2026-11-28 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D10（含 2026-11-27 剪贴板同步拍板 D8 / D1′，以及 2026-11-28 Windows 一等桌面平台 D9 与 `wasmi` 优先双宿主插件体系 D10）更新。
 
-> 本文档与 [数据结构规范 (`data-structures.md`)](./data-structures.md)、[同步协议规范 (`sync-protocol.md`)](./sync-protocol.md)、[威胁模型规范 (`threat-model.md`)](./threat-model.md) 共同构成编码级契约基准，精确定义 **统一错误码表、Agent-Native CLI 契约、本地 Daemon REST/WS/UDS 契约、Cloudflare 云端同步 API 契约，以及 `mynote-wasm` 前后端 FFI 接口**。
+> 本文档与 [数据结构规范 (`data-structures.md`)](./data-structures.md)、[同步协议规范 (`sync-protocol.md`)](./sync-protocol.md)、[威胁模型规范 (`threat-model.md`)](./threat-model.md) 共同构成编码级契约基准，精确定义 **统一错误码表、Agent-Native CLI 契约、本地 Daemon REST / WS / 跨平台 `LocalIpc` 契约、Cloudflare 云端同步 API 契约，以及 `mynote-wasm` / 桌面插件 Web Worker 边界接口**。
 >
 > **单一事实来源**：本文档是**本地 API / CLI** 的唯一定义处。线格式、信封与 AAD 只在 [`data-structures.md`](./data-structures.md) 定义；合并规则、密钥表 2P-Set、碎纸与宽限期语义只在 [`sync-protocol.md`](./sync-protocol.md) 定义；安全承诺只在 [`threat-model.md`](./threat-model.md) 定义；测试门禁只在 [`eval-framework.md`](./eval-framework.md) 定义。本文只引用这些概念，不重复定义。
 
@@ -12,7 +12,7 @@
 
 1. [全局错误码注册表与跨层映射契约](#1-全局错误码注册表与跨层映射契约)
 2. [Agent-Native CLI 命令、JSON 信封与外部格式化契约](#2-agent-native-cli-命令json-信封与外部格式化契约)
-3. [本地桌面 Daemon 契约（HTTP + WebSocket + Unix Socket IPC）](#3-本地桌面-daemon-契约http--websocket--unix-socket-ipc)
+3. [本地桌面 Daemon 契约（HTTP + WebSocket + 跨平台 `LocalIpc`）](#3-本地桌面-daemon-契约http--websocket--跨平台-localipc)
 4. [Cloudflare 云端盲同步中继契约（HTTP + R2 + WebSocket Hibernation）](#4-cloudflare-云端盲同步中继契约http--r2--websocket-hibernation)
 5. [`mynote-wasm` TypeScript ↔ Rust WASM 边界契约](#5-mynote-wasm-typescript--rust-wasm-边界契约)
 6. [已移除 / 推迟的机制（2026-11-24）](#6-已移除--推迟的机制2026-11-24)
@@ -53,10 +53,14 @@
 | `SHRED_STALE` | `4` | `409` | `true` | 云端拒收碎纸标记：本批之前该 `key_id` 下已存在请求方未见过的远端 op（`seq > seen_seq`）。core 自动 pull、重新评估后再提交 |
 | `GRACE_TOO_SHORT` | `5` | `422` | `false` | 云端拒收 `grace_ms < T_grace_min`（或缩短后早于 `requested_at_ms + T_grace_min`）的碎纸请求。正常客户端不会触发，出现即说明有 bug 或滥用 |
 | `AUTH_REQUIRED` / `DEVICE_REVOKED` / `TOKEN_SCOPE_FORBIDDEN` | `5` | `401 / 403` | `false` | 本地 Cookie / Origin 校验失败；云端 `device_token` 无效/未认领/已吊销；或 `scope=read` 令牌尝试写操作 |
-| `SYNC_OFFLINE` | `6` | `502 / 503` | `true` | **仅用于显式联网阻塞命令**（`sync push/pull`、`clip push --wait-sync`、`clip pull`、`clip rotate-key`、`keyring rotate`、`device bootstrap/add/refresh/claim`）无法连通远端 |
-| `NO_ONLINE_DESKTOP` | `6` | `409` | `true` | **（M4，D8）**`POST /v1/clip` 传入 `ephemeral: true`（零写库纯内存直推）时当前无任何在线 `read-write` 桌面 WebSocket 可交付，服务端拒绝悄悄写库；`hint: "Bring a desktop daemon online and retry, or omit --ephemeral to send via the 100-item encrypted clip queue"` |
+| `SYNC_OFFLINE` | `6` | `502 / 503` | `true` | **仅用于显式联网阻塞命令**（`sync push/pull`、`clip push --wait-sync`、`clip pull`、`clip prune/clear --scope cloud\|all`、`clip rotate-key`、`keyring rotate`、`device bootstrap/add/refresh/claim`）无法连通远端 |
+| `NO_ONLINE_DESKTOP` | `6` | `409` | `true` | **（M4，D8）**`POST /v1/clip` 传入 `ephemeral: true`（零写库纯内存直推）时当前无任何在线 `read-write` 桌面 WebSocket 可交付，服务端拒绝悄悄写库；`hint: "Bring a desktop daemon online and retry, or omit --ephemeral to send via the encrypted clip queue"` |
+| `CLIP_QUOTA_EXCEEDED` | `6` | `507` | `false` | **（M4，D8′）**`PUT /v1/clip/blob` 写入后云端 R2 活跃剪贴板大对象总占用将超过 `5 GiB` 硬护栏；`details: { used_bytes, limit_bytes, incoming_bytes }`；不阻塞 `≤ 64 KiB` 内联文本与 `--ephemeral`；`hint: "Run 'mynote clip prune --scope cloud --kind image --before-days 7' or 'mynote clip clear --scope cloud' to free cloud space (desktop local archive is preserved)"` |
 | `RATE_LIMITED` | `6` | `429` | `true` | 云端限流；按 `Retry-After` 退避 |
 | `FORMAT_SYNTAX_ERROR` | `7` | `422` | `false` | Layer 1/2 格式化输入语法错误或外部命令返回 0 字节/超时；原块保持未修改 |
+| `PLUGIN_INVALID_MANIFEST` | `2` | `400` | `false` | **（M5，D10）**`plugin.toml` 校验失败、`exec` 声明 `tier2_capable = true`、路径穿越或 `.bat`/`.cmd` 入口、或 `.wasm` 含非空 `imports` / ABI 版本不匹配 |
+| `PLUGIN_RESOURCE_EXCEEDED` | `7` | `422` | `false` | **（M5，D10）**WASM 插件命中 `fuel_limit` / `16 MiB` `StoreLimits` / Worker `terminate()` 超时，或 `exec` 插件超时（击杀整棵进程树）或触发 `reactor` 速率上限；原块保持未修改 |
+| `PLUGIN_EXECUTION_FAILED` | `7` | `422` | `false` | **（M5，D10）**插件 trap、非零退出、输出非合法 `PluginResult` JSON 或触发零字节熔断；原块保持未修改 |
 | `KEY_MISSING` | `8` | `500` | `false` | 活跃块（未进入碎纸流程）找不到可用密钥，违反 INV-KEY-LIVENESS；本设备随即停止发起碎纸（见 §2.3 `sync status`）；`hint: "Run 'mynote sync pull'; if it persists, do not delete anything and report"` |
 | `INTEGRITY_ERROR` | `8` | `422 / 500` | `false` | AEAD 解密失败、请求字段与密文 AAD 不符、手机状态快照 `BLAKE3` 失配，或本地库 `min_reader_schema_version` 高于当前二进制（`SCHEMA_TOO_NEW`） |
 
@@ -137,32 +141,37 @@ interface CliEnvelope<T> {
 | `mynote trash ls` | 列出所有设备删除、尚未碎纸的块：`{ id, buffer_id, buffer_name, is_locked, preview \| null, deleted_at_ms, deleted_by_device, actor, shred_not_before_ms \| null, shred_state }`，按 `shred_not_before_ms` 升序（`null` 排最后，再按 `deleted_at_ms` 降序） | 只读 | M1 |
 | `mynote trash restore <id>` | **撤销删除**：（M2 起同时撤销碎纸标记）生成一个恢复 op 让块回到原 buffer。宽限期已过则返回 `KEY_SHREDDED`；支持 `--dry-run` | 天然幂等（对未在回收站的块返回 `NOT_FOUND`） | M1 |
 | `mynote trash <empty\|expedite\|confirm>` | **仅 UI 操作的存根**：清空回收站、缩短宽限期、确认超阈值的碎纸。这三个子命令存在，只是为了给出明确的拒绝：**无论是否 TTY**，一律返回 `UI_CONFIRMATION_REQUIRED`（退出码 `2`），零副作用。由本地 Daemon / CLI 强制，这样 Agent（唯一入口是 CLI）就做不到加速删除。真正的操作在桌面 UI 中交互确认（§3.2 `trash/actions`），下限仍是服务端强制的 `T_grace_min` | — | M1（UI 侧 M2） |
-| `mynote format [id]` | 传 `<id>` 原地格式化该块（需 `--expected-head`；多叶子块返回 `CONFLICT_PRESENT`）；不传 `<id>` 作为纯流过滤器格式化 `stdin -> stdout`（`--lang`、`--action unescape-json\|to-yaml\|...`） | 语法错误退出码 `7` 且零副作用 | M1 |
+| `mynote format [id]` | 传 `<id>` 原地格式化该块（需 `--expected-head`；多叶子块返回 `CONFLICT_PRESENT`）；不传 `<id>` 作为纯流过滤器格式化 `stdin -> stdout`（`--lang`、`--action unescape-json\|to-yaml\|...`）；M5-P2 起自动发现匹配语言的 `transform` WASM 插件（优先级低于内置 Layer 1、高于外部 `formatters.toml`） | 语法错误退出码 `7` 且零副作用 | M1（WASM 插件随 M5-P2） |
 | `mynote vault <init\|lock\|unlock\|passwd>` | 全部要求 TTY。`init`：生成 VKEK 并追加进密钥环，**并入统一恢复包，不生成第二套恢复码**；KDF 参数与盐写入 Vault 头部（单套参数，按 iPhone 定）。`lock <id> [--hint "..."]`：**换钥**，即用新的 VKEK 包裹 DEK 重新加密当前版本，写一个带新 `key_id` 的 `LOCK` op，同批在 op 之后（或确认后）对旧 Tier 1 `key_id` 登记碎纸标记（`T_grace`；缩短到 `T_grace_min` 只能在 UI 中操作）。`unlock <id> [--shred-old-key]`：换回新的 Tier 1 BDEK，旧 Tier 2 密钥默认保留，带该参数则对其登记碎纸标记。`passwd`：用新口令重新包裹 VKEK | 客户端短进程内存执行；`lock` / `unlock` 支持 `--expected-head` | M2 |
 | `mynote keyring <rotate\|unlock>` | 只允许 TTY。`rotate`（原 `sync rotate-smk`）：向密钥环追加新 SMK 代际，重新包裹全部 Tier 1 `MNR1` 并连同新 `RecoveryKeyringV1` 推送；旧 SMK 代际**永久保留**；轮换后**不需要重新抄写 24 词**，提示运行 `mynote recovery drill`（未演练前 `sync status` 报 `recovery_drill_due: true`）。`unlock`：在未丢失的存留桌面上输入一次 24 词恢复包，从已同步的 `RecoveryKeyringV1` 解封本机缺失的 SMK 代际写入 Keychain（异地单机兜底） | `rotate` 断网返回退出码 `6` | M1 |
 | `mynote recovery <show\|drill>` | `show`：在 TTY 中经交互确认后显示统一恢复包（24 词，仅初次生成或本机仍在引导会话内可用）。`drill`：恢复演练，在 TTY 中输入恢复包，验证它能解封当前密钥环（含最新 SMK 代际与 VKEK），**不写入任何数据**；响应 `data`：`{ ok, keyring_generations, includes_vkek, drilled_at_ms }`。两者都只允许 TTY，恢复包内容永不写入 `--json` 输出 | 只读 | M1 |
 | `mynote sync <status\|push\|pull>` | 显式触发同步对账。`status --json` 的 `data`：`{ sync_state, epoch, last_seq, pending_ops, blocked_ops, clock_skew_ms, key_self_check: { ok, last_run_ms, blocks_missing_key }, trash: { count, pending_confirm_count, next_shred_ms }, recovery_drill_due, last_recovery_drill_ms, last_local_backup_ms }`。时钟偏差过大**只提示、不拒收** | `push/pull` 断网返回退出码 `6` | M1 |
 | `mynote device <bootstrap\|add\|refresh\|claim\|ls\|revoke>` | `bootstrap --url <server> [--revoke-existing]`：首台桌面引导（或全设备丢失后重连健在的 DO），从 TTY 读 `BOOTSTRAP_TOKEN` 注册本机生成的 `device_token`。`add --name <label> [--scope read\|read+clip\|clip-write\|read-write]`：桌面自行生成新 `device_token` 与一次性密钥 `K_pair`，把 `SHA-256(token)` 与 `K_pair` 加密的凭据暂存服务端（TTL 10 分钟，首次领取即删；`clip-write` 仅封装 `{ device_token, device_id, sync_url, clip_kid, clip_key }`，不含 `SMK`）。`refresh <device_id>`：SMK 轮换后为既有存活设备生成 10 分钟一次性密钥刷新码（免翻 24 词）。`claim`：在目标桌面读取配对码 / 刷新码完成接入或刷新。`bootstrap/add/refresh/claim` 只允许 TTY，配对码永不写入 `--json` 输出。`ls` 列出设备；`revoke <device_id>` 成功后 `hint` 建议执行 `mynote keyring rotate`（若吊销 `clip-write` 设备则建议 `mynote clip rotate-key`） | 联网管理鉴权，断网返回 `6` | M1（`read` 随 M2；`read+clip`/`clip-write` 随 M4） |
-| `mynote clip <push\|pull\|history\|promote\|undo\|rotate-key>` | **（M4，D8）**独立 100 条图文剪贴板命令：`push [--stdin \| --text <str> \| --file <image-path>] [--ephemeral] [--wait-sync]`（默认读取本机系统剪贴板文本或位图图片：macOS 经原生 `NSPasteboard` 优先读 `public.png`、Omarchy 经 `wl-paste`；位图白名单拒 `image/svg+xml`，上限 `10 MiB`；`--ephemeral` 限 `≤ 256 KiB` 零写库直推，无在线桌面返退出码 `6` `NO_ONLINE_DESKTOP`）；`pull [clip_id] [--apply \| --raw \| --out <path>]`（拉取最新或指定项，`--apply` 写入本机系统剪贴板并记录防回环哈希，`--out` 保存图片文件）；`history [--limit 100] [--kind text\|image]`（摘要视图保护 Token 预算）；`promote [clip_id] [--buf <name>] [--lang <lang>]`（将文本项转存为标准笔记块；图片项提示改用 `--out`）；`undo`（恢复上次覆写前的桌面剪贴板）；`rotate-key`（TTY 确认，轮换 `ClipKey` 并清空云端 `clip_items` 与 `clip/blobs/*`） | 显式联网命令断网返回 `6`；`push` / `pull` 按 `clip_id` 幂等 | M4 |
+| `mynote clip <push\|pull\|history\|stats\|prune\|clear\|promote\|undo\|rotate-key>` | **（M4，D8 / D8′）**独立图文剪贴板命令（云端 `1,000 条 / 30 天 / 5 GiB` 硬护栏 + 桌面本地无限归档）：`push [--stdin \| --text <str> \| --file <image-path>] [--ephemeral] [--wait-sync]`（默认读取本机系统剪贴板文本或位图图片：macOS 经原生 `NSPasteboard` 优先读 `public.png`、Omarchy 经 `wl-paste`；位图白名单拒 `image/svg+xml`，上限 `10 MiB`；大对象超云端 `5 GiB` 返退出码 `6` `CLIP_QUOTA_EXCEEDED`；`--ephemeral` 限 `≤ 256 KiB` 零写库直推，无在线桌面返退出码 `6` `NO_ONLINE_DESKTOP`）；`pull [clip_id] [--apply \| --raw \| --out <path>]`（拉取最新或指定项，`--apply` 写入本机系统剪贴板并记录防回环哈希，`--out` 保存图片文件）；`history [--limit <N>] [--before-id <ulid>] [--kind text\|image] [--query <str>]`（游标分页与全文搜索）；`stats`（输出本地归档条数/磁盘占用与云端 5 GiB 配额）；`prune [--before-days <N>] [--keep-latest <N>] [--kind text\|image] [--scope local\|cloud\|all] [--dry-run]`（按规则预览或回收空间）；`clear [--scope local\|cloud\|all]`（按作用域清空；默认 `cloud` 保留桌面本地归档）；`promote [clip_id] [--buf <name>] [--lang <lang>]`（将文本项转存为标准笔记块；图片项提示改用 `--out`）；`undo`（恢复上次覆写前的桌面剪贴板）；`rotate-key [--wipe-local]`（TTY 确认，轮换 `ClipKey` 并清空云端 `clip_items` 与 `clip/blobs/*`；默认 `scope=cloud` 保留桌面本地归档，传 `--wipe-local` 则同步清空本地与对端桌面） | 显式联网命令断网返回 `6`；`push` / `pull` 按 `clip_id` 幂等 | M4 |
 | `mynote import heynote <path>` | `--buf <name>`、`--dry-run` | 文件哈希防重复提示 | M1 |
 | `mynote restore --from-archive <local-dir>` | **纯离线灾难恢复**（INV-RECOVERY）：从本地目录（从 R2 下载的 `archives/ops/` + `archives/keys/latest.mnks`）配合 TTY 输入的 24 词恢复包，重建全部已归档且**未删除**数据。`--to <empty-data-dir>`（**永不覆盖**非空数据目录）、`--key-snapshot <path\|latest>`、`--dry-run`。零网络请求，不为极端场景维护云端归档 API。响应 `data`：`{ restored_blocks, skipped_shredded, archive_segments, key_snapshot_at_ms, data_dir }` | 非 TTY 返回 `INTERACTION_REQUIRED` | M1 |
-| `mynote open` | 打开本地 UI：macOS 与 Omarchy 统一生成一次性 ticket（见 §3.1）并用系统默认浏览器 / Web App 打开 `http://localhost:<port>` | — | M1 |
+| `mynote open` | 打开本地 UI：macOS、Omarchy 与 Windows（M5-W2 起经 `ShellExecuteW`）统一经 `LocalIpc` 申请一次性 ticket（见 §3.1）并用系统默认浏览器 / Web App 打开 `http://localhost:<port>` | — | M1（Windows 随 M5-W2） |
+| `mynote watch [--buf <name\|id>] [--clip] --jsonl` | **（M5-P1，D10）**经跨平台 `LocalIpc` 只读 `Subscribe` 帧持续输出 NDJSON 事件流（`block.saved` / `clip.received` / `clip.ephemeral`，每条事件携带 `actor` 以便外部脚本防回环）；仅覆盖 Tier 1 普通块与剪贴板，加锁块仅发元数据摘要不发正文 | 只读；Daemon 未运行时返回明确错误提示 | M5-P1 |
+| `mynote ext <ls\|run <plugin_id>>` | **（M5-P2/P4，D10）**`ls` 列出已发现的 `plugin.toml`（含 `id`、`runtime`、`slots`、`tier2_capable` 与校验状态）；`run <plugin_id> [--block <id>] [--command <cmd_id>] [--arg <k=v>]` 显式调用插件（`wasmi` 或 `exec`），写结果经单写入方 `LocalIpc` 提交并强制标注 `actor = "plugin:<plugin_id>"`；`exec` 插件访问加锁块返回退出码 `5`（`BLOCK_LOCKED`） | 写块自动附带 `expected_heads` 与零字节熔断 | M5-P2（`exec` 随 M5-P4） |
 
-### 2.4 帮助体系与 Layer 2 `formatters.toml` 规范
+### 2.4 帮助体系、Layer 2 `formatters.toml` 与 M5 `plugin.toml` 子进程加固契约
 
 - **L0–L3 渐进帮助保留**：L0 `SKILL.md` → L1 `mynote --help` → L2 `mynote <cmd> --help` → L3 `mynote help <topic>`（体系说明见 [`architecture-proposal.md`](./architecture-proposal.md)）。帮助文案中的退出码与错误码必须与 §1 一致。
 - **`--help-json` 推迟**：M1 由 CLI 黄金测试（§2.6）守护机读契约；只有当出现需要严格 Schema 的自动化消费方时，才按原结构 `{ command, about, args, stdin_mode, exit_codes, response_schema }` 引入。
-- `~/.config/mynote/formatters.toml` 契约：
-  - 子进程在无网络/受限环境变量下通过 `stdin` 喂入原块 UTF-8 字节，在 `timeout_ms`（默认 `2000 ms`）内等待退出；
-  - **熔断条件**：`exit_code != 0`、超时杀死、输出非合法 UTF-8，或 **`input.len() > 0 && stdout.is_empty()`** 时一律返回 `FORMAT_SYNTAX_ERROR`（退出码 `7`），绝不写回数据库。
+- **跨平台外部子进程加固契约（`formatters.toml` 与 M5 `exec_host` 共用，D9 / D10）**：
+  - `formatters.toml`（Unix `~/.config/mynote/formatters.toml`；Windows `%LOCALAPPDATA%\mynote\formatters.toml`）保持 100% 向下兼容，M5 内部统一编译为 `Slot: Transform`（`runtime = "exec"`, `mode = "oneshot"`）条目；
+  - **环境变量隔离（修复 Windows `SYSTEMROOT` 崩溃）**：Unix 维持 `env_clear()` + `PATH` / `LC_ALL`；Windows 强制保留最小系统白名单（`SYSTEMROOT`、`WINDIR`、`COMSPEC`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE`、`LOCALAPPDATA`、`APPDATA`、`SystemDrive`、`PATH`）并自动注入 `PYTHONUTF8=1`、`PYTHONIOENCODING=utf-8`、`POWERSHELL_TELEMETRY_OPTOUT=1`，仅额外放行 `plugin.toml` 显式声明的 `env_passthrough`；
+  - **进程树回收与零黑框闪屏**：Unix 使用 `setsid` / PGID 击杀；Windows 使用 `CREATE_NO_WINDOW | CREATE_SUSPENDED` → 绑定 Windows Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）→ `ResumeThread`，超时或 Daemon 崩溃时由内核原子清理整棵子进程树；
+  - **防命令注入（BatBadBut / CVE-2024-24576）**：严禁经 `cmd.exe` 启动或执行 `.bat`/`.cmd` 入口；跨平台脚本通过 `launcher = "python" | "node" | "pwsh" | "native"` 由宿主直调真实可执行文件，100% 业务载荷经 UTF-8 `stdin` JSON 传递并归一化 `\r\n`；
+  - **熔断条件**：`exit_code != 0`、超时杀死、输出非合法 UTF-8，或对 `transform` 出现 **`input.len() > 0 && stdout.is_empty()`** 时一律返回 `FORMAT_SYNTAX_ERROR` / `PLUGIN_EXECUTION_FAILED` / `PLUGIN_RESOURCE_EXCEEDED`（退出码 `7`），绝不写回数据库。
 
 ### 2.5 分发、升级与 Schema 迁移
 
-- **分发交给包管理器（F-14）**：Homebrew tap（macOS）、AUR（Omarchy），开发期可用 `cargo install`。完整性校验、升级与回滚都由包管理器负责。`mynote` **不内置自升级**，也**绝不在后台联网检查更新或上报遥测**。
-- **安装位置与 F-07**：Homebrew / AUR 把二进制装到用户不可写的位置，这也是 T5 缓解措施之一。`cargo install` 装在用户可写的 `~/.cargo/bin`，只建议开发期使用。Tier 2 对同 UID 攻击者的真实边界见 [`threat-model.md`](./threat-model.md)。
-- **Schema 迁移前自动备份（保留）**：新版本首次打开数据库、需要升级 `PRAGMA user_version` 时，必须在独占写事务**之前**通过 `VACUUM INTO` 生成权限 `0600` 的快照 `~/.local/share/mynote/backups/mynote-pre-schema-v<old>.db`，再执行迁移。
+- **分发交给包管理器与 GitHub Releases（F-14，D9）**：Homebrew tap（macOS）、AUR（Omarchy）、GitHub Releases 预编译包（含 M5-W3 新增的 Windows `x86_64-pc-windows-msvc` ZIP 包，是否同步打 `aarch64-pc-windows-msvc` 待确认；附 `SHA256SUMS.txt`、`skill/SKILL.md` 与 `deploy/` 模板），开发期可用 `cargo install`。`mynote` **不内置自升级**，也**绝不在后台联网检查更新或上报遥测**。
+- **安装位置与 F-07**：Linux 经 AUR 安装到用户不可写的 `/usr/bin`；Windows 推荐由管理员安装至 `Program Files` 或受控目录。Tier 2 对同 UID 攻击者的真实边界见 [`threat-model.md`](./threat-model.md)。
+- **Schema 迁移前自动备份（保留）**：新版本首次打开数据库、需要升级 `PRAGMA user_version` 时，必须在独占写事务**之前**通过 `VACUUM INTO` 生成单文件快照（Unix `0600` / Windows 当前用户专属 NTFS DACL，路径 `<data_dir>/backups/mynote-pre-schema-v<old>.db`），再执行迁移。
 - **降级**：旧二进制打开较新的库时返回 `INTEGRITY_ERROR`（`SCHEMA_TOO_NEW`，退出码 `8`），不做任何写入。回退步骤是用包管理器装回旧版本，再手动换回上面的迁移前备份（步骤写进 `mynote help upgrade`）。
-- **升级后的 Daemon 重启**：交给系统托管方（macOS `launchd` / `brew services`，Omarchy `systemctl --user`）。前端在 `/v1/local/ws` 断开后按指数退避重连。CLI 通过 UDS `ping` 发现 Daemon 版本与自身不一致时，只在 `stderr` 告警。
+- **升级后的 Daemon 重启**：交给系统托管方（macOS `launchd` / `brew services`，Omarchy `systemctl --user`，Windows `deploy/windows/` Task Scheduler / Startup 静默托管模板）。前端在 `/v1/local/ws` 断开后按指数退避重连。CLI 通过 `LocalIpc` `ping` 发现 Daemon 版本与自身不一致时，只在 `stderr` 告警。
 
 ### 2.6 CLI 黄金测试需稳定的输出契约
 
@@ -186,14 +195,14 @@ interface CliEnvelope<T> {
 
 ---
 
-## 3. 本地桌面 Daemon 契约（HTTP + WebSocket + Unix Socket IPC）
+## 3. 本地桌面 Daemon 契约（HTTP + WebSocket + 跨平台 `LocalIpc`）
 
 ### 3.0 进程模型：Daemon 与 CLI
 
-- **双桌面统一底座 + macOS 可选纯 Swift 薄壳（D5′ / D5″）**：macOS 与 Omarchy 均运行同一个 `mynote` 单体二进制（CLI + 内嵌 Web UI 的 Daemon），不引入 Tauri 壳或额外本地鉴权通道。Omarchy 由 `systemd --user` 托管 Daemon、通过 Hyprland 键绑定唤出 Chromium webapp 加载 `http://localhost:<port>`；macOS 由 `launchd` LaunchAgent（或 `brew services`）托管 Daemon，既可通过浏览器 / Web App（配合 Raycast / Hammerspoon / Karabiner 或 `mynote open`）访问 `http://localhost:<port>`，也可安装可选的零依赖纯 Swift `WKWebView` 薄壳 [`apps/macos/MyNote.app`](../apps/macos/README.md)（复用既有 `0600 daemon.sock` 的 `ping` 与 `open_ticket` 帧换取 `HttpOnly` Cookie，不直连 SQLite，不访问 Keychain，不新增 Daemon 路由）。
+- **三桌面统一底座 + macOS 可选纯 Swift 薄壳（D5′ / D5″ / D9）**：macOS、Omarchy Linux 与 Windows（M5）均运行同一个 `mynote` 单体二进制（CLI + 内嵌 Web UI 的 Daemon），不引入 Tauri 壳或额外本地鉴权通道。Omarchy 由 `systemd --user` 托管 Daemon、通过 Hyprland 键绑定唤出 Chromium webapp 加载 `http://localhost:<port>`；macOS 由 `launchd` LaunchAgent（或 `brew services`）托管 Daemon，既可通过浏览器 / Web App 访问 `http://localhost:<port>`，也可安装可选的零依赖纯 Swift `WKWebView` 薄壳 [`apps/macos/MyNote.app`](../apps/macos/README.md)（复用既有 `LocalIpc` 的 `ping` 与 `open_ticket` 帧换取 `HttpOnly` Cookie，不直连 SQLite，不访问 Keychain，不新增 Daemon 路由）；Windows（M5）由 Task Scheduler / Startup 静默托管 Daemon，通过 `mynote open`（`ShellExecuteW`）经浏览器 / Web App 访问 `http://localhost:<port>`（交互式终端口令读取在 Unix 走 `/dev/tty` + `termios`，在 Windows 走 `CreateFileW("CONIN$")` + `SetConsoleMode(& ~ENABLE_ECHO_INPUT)`）。
 - 核心运行契约：
   1. **CLI 在 UI 未打开时独立工作**：关闭浏览器窗口不影响 CLI 读写。CLI 离线写入成功返回 `0`（`pending_offline`），之后由 Daemon 补推。
-  2. **SQLite 单写入方**：任一时刻最多一个 Daemon 实例（`<data_dir>/daemon.lock` 独占文件锁），第二个实例启动即退出并提示。CLI 写入路径：**Daemon 运行时**，写命令经 UDS 的 `apply` 帧转交 Daemon 执行（载荷与 §3.2 的 REST DTO 相同，由 Daemon 生成 `op_id` 与 HLC）；**Daemon 未运行时**，CLI 以短事务直接写本地 SQLite，此时它就是唯一写入方（协议见 [`sync-protocol.md`](./sync-protocol.md) §7）。
+  2. **SQLite 单写入方**：任一时刻最多一个 Daemon 实例（`<data_dir>/daemon.lock` 独占文件锁），第二个实例启动即退出并提示。CLI 与插件写入路径：**Daemon 运行时**，写命令经跨平台 `LocalIpc`（Unix `0600` UDS / Windows 用户 SID SDDL Named Pipe）的 `apply` 帧转交 Daemon 执行（载荷与 §3.2 的 REST DTO 相同，由 Daemon 生成 `op_id` 与 HLC；插件写入强制标注 `actor = "plugin:<plugin_id>"`）；**Daemon 未运行时**，CLI 以短事务直接写本地 SQLite，此时它就是唯一写入方（协议见 [`sync-protocol.md`](./sync-protocol.md) §7）。
   3. 读路径始终可以由 CLI 直接打开 SQLite（WAL 并发读）完成。
 
 ### 3.1 安全握手中介层契约（`localhost:<port>`）
@@ -230,28 +239,36 @@ interface CliEnvelope<T> {
 | `POST /v1/local/format` | `{ content, lang, action? }` | 调用内置 Layer 1 或外部 Layer 2 管线，返回 `{ formatted }`（**严禁把处于解锁态的加密块发给外部 CLI 子进程！加密块格式化仅允许在前端 `mynote-wasm` Layer 1 内纯内存完成**） |
 | `GET /v1/local/keys?block_id=<id>` / `POST /v1/local/keys` | `GET` 读取密钥表记录与碎纸标记；`POST` 追加新的密钥记录（只创建、不修改） | 仅传递包裹后的密文字节（对 Tier 2 记录可由 Daemon 用 `SMK` 剥离外层 `MNR1` 后返回内层 `mnw1_b64`）；表结构见 [`data-structures.md`](./data-structures.md) |
 | `GET / PUT /v1/local/vault/header` | Vault 头部：`gen` + `VaultHeaderV1`（KDF 参数、盐、口令包裹槽与恢复公钥封装槽） | `PUT` 仅用于 `vault init` / `passwd`（递增 `gen` 并同步至云端 `key_material`）；仅传递密文 |
-| `GET / POST / DELETE /v1/local/clip[/:clip_id]` | **（M4，D8）**`GET` 返回最多 100 条轻元数据（含小文本与图片缩略图 `data:` / `blob:` 信息）；`POST` 从桌面 UI 发送文本或位图图片（`multipart/form-data` 或 JSON，`≤ 10 MiB`）；`DELETE` 清空单条或全部剪贴板 | 校验位图 MIME 白名单（拒 `image/svg+xml`），同步推送云端 `/v1/clip` 或 `/v1/clip/blob` |
-| `GET /v1/local/clip/:clip_id/blob` | **（M4，D8）**查询单条图片/大文本明文二进制流 | 优先命中本地 `clip_cache/` LRU，未命中时向云端流式下载并解密校验 `sha256_hex` 后返回（附 `Content-Type` 仅限安全位图或 `text/plain`） |
+| `GET / POST / DELETE /v1/local/clip[/:clip_id]` | **（M4，D8 / D8′）**`GET` 支持游标分页与搜索（`?limit=<1..1000>&before_id=<ulid>&kind=text\|image&q=<str>`），返回 `{ items, has_more, next_before_id, total_count, stats, cloud_quota }`；`POST` 从桌面 UI 发送文本或位图图片（`multipart/form-data` 或 JSON，`≤ 10 MiB`；云端触达 `5 GiB` 时透传 `507 CLIP_QUOTA_EXCEEDED`）；`DELETE /v1/local/clip/:clip_id` 全端删单条；`DELETE /v1/local/clip?scope=local\|cloud\|all` 按作用域清空 | 校验位图 MIME 白名单（拒 `image/svg+xml`），同步推送云端 `/v1/clip` 或 `/v1/clip/blob`；桌面本地无限归档，Daemon 单并发后台 Eager Prefetch 远端大对象 |
+| `POST /v1/local/clip/prune` | **（M4，D8′）**`{ scope?: "local" \| "cloud" \| "all", before_ms?, keep_latest?, kind?, dry_run? }` | 按与云端一致的过滤规则预览（`dry_run: true`）或回收本地 / 云端 / 全端剪贴板历史与大对象磁盘空间，返回 `{ local_deleted, local_freed_bytes, cloud_deleted, cloud_freed_bytes, cloud_quota }` |
+| `GET /v1/local/clip/:clip_id/blob` | **（M4，D8 / D8′）**查询单条图片/大文本明文二进制流 | 优先命中本地无限归档目录 `clip_cache/`，未命中时向云端流式下载并解密校验 `sha256_hex` 后持久落盘并返回（附 `Content-Type` 仅限安全位图或 `text/plain`） |
 | `POST /v1/local/clip/:clip_id/apply` / `promote` / `POST /v1/local/clip/undo` / `PATCH /v1/local/clip/watch` | **（M4，D8）**`apply` 将指定项写入本机系统剪贴板（附防回环标记）；`promote` 将文本项转为正式笔记块；`undo` 恢复被覆写前的桌面剪贴板；`watch` 临时暂停/恢复 M4b 后台自动监听 | 均校验 `Host` + `Origin` + `HttpOnly` Cookie |
+| `GET /v1/local/plugins` | **（M5-P2/P3，D10）**无 | 返回惰性扫描到的合法插件清单摘要（`id`、`name`、`version`、`runtime`、`tier2_capable`、`slots`、`contributes`、`options` 表单定义，不含 `secret` 值）与加载错误诊断 |
+| `POST /v1/local/plugins/:id/invoke` | **（M5-P2/P4，D10）**`{ slot, action_or_command_id, block_id?, expected_heads?, args? }` | 仅用于 **Tier 1 普通块或非块动作**：Daemon 侧按 `runtime` 路由至 `WasmHost`（`wasmi`）或 `ExecHost`（`oneshot`/`worker`）；遇 `is_locked == true` 的块一律返回 `423 BLOCK_LOCKED`（零外发）；若 `PluginResult` 为 `replace_content` / `insert_block`，经单写入方提交并强制写入 `actor = "plugin:<id>"`；若为 `view` / `gutter` / `toast`，原样返回纯 JSON 供主前端声明式安全渲染 |
+| `GET /v1/local/plugins/:id/module.wasm` | **（M5-P3，D10）**无 | 仅对声明 `runtime = "wasm"` 且 `tier2_capable = true`、通过 `module.imports().is_empty()` 校验的插件返回原始 `.wasm` 字节流（`Content-Type: application/wasm`），供桌面前端独立 `'self'` Web Worker 在解锁态 Tier 2 块上纯内存执行；Daemon 永不接收 Tier 2 明文 |
 
 > [!NOTE]
 > `trash/actions` 的 `confirm_nonce` 防的是 **Agent 经 CLI 误用或被注入**：CLI 没有对应命令，也拿不到 UI 的 `HttpOnly` 会话。它**不防**能篡改执行环境的恶意同 UID 进程（见 [`threat-model.md`](./threat-model.md) T5）。「无法立即删除」的硬保证来自服务端强制的 `T_grace_min` 与批量阈值。
 
-### 3.3 本地 WebSocket（`/v1/local/ws`）与 Unix Socket（`daemon.sock`）协议
+### 3.3 本地 WebSocket（`/v1/local/ws`）与跨平台 `LocalIpc` 协议
 
 - **`/v1/local/ws` 服务端推送帧（JSON）**：
   - `{ "type": "blocks_changed", "upserted": BlockDto[], "deleted_ids": string[] }`
   - `{ "type": "buffers_changed", "upserted": BufferDto[], "deleted_ids": string[] }`
   - `{ "type": "trash_changed", "count": number, "pending_confirm_count": number, "next_shred_ms": number | null }`
   - `{ "type": "sync_status", "state": "synced" | "syncing" | "pending_offline" | "conflict_present", "last_seq": number }`
-  - `{ "type": "clip_changed", "upserted": ClipItemDto[], "deleted_ids": string[], "cleared": boolean, "watch_paused": boolean }`（M4，D8：桌面 UI 100 条图文剪贴板面板实时刷新）
+  - `{ "type": "clip_changed", "upserted": ClipItemDto[], "deleted_ids": string[], "cleared": boolean, "watch_paused": boolean, "cloud_quota"?: CloudClipQuota }`（M4，D8 / D8′：桌面 UI 剪贴板抽屉与配额条实时刷新）
   - `{ "type": "alert", "code": "KEY_MISSING" | "SHRED_PENDING_CONFIRM" | "NEEDS_VAULT_REKEY" | "CLOCK_SKEW" | "RECOVERY_DRILL_DUE" | "CLIP_SECRET_BLOCKED", "details": object }`（UI 常驻提示；`NEEDS_VAULT_REKEY` 表示离线缓存的 Tier 2 op 遇到旧钥待碎纸/已碎纸而挂起，需解锁 Vault 完成换钥重签，不阻塞其他普通 op 同步；`CLOCK_SKEW` 只提示、不影响接收；`CLIP_SECRET_BLOCKED` 表示 M4b 后台监听命中高危凭据特征已拦截上传）
-- **Unix Domain Socket（`0600`，NDJSON 单行请求-响应）**：
+- **跨平台 `LocalIpc`（Unix `0600` UDS / Windows 用户 SID SDDL Named Pipe，NDJSON 单行帧）**：
+  - **传输层与权限约束**：
+    - macOS / Linux：权限 `0600` 的 Unix Domain Socket（`<runtime_dir>/daemon.sock`）；
+    - Windows（M5-W1，D9）：`tokio::net::windows::named_pipe`，管道名 `\\.\pipe\mynote-<blake3_16(canonical_data_dir)>`；首个实例强制 `first_pipe_instance(true)` 防管道抢注，显式传入 `SECURITY_ATTRIBUTES` + SDDL `D:P(A;;GA;;;OW)`（仅当前用户 SID，彻底关闭默认 `Everyone`），强制 `reject_remote_clients(true)` 阻断 SMB 远程连接；
   - CLI 写命令转交（Daemon 运行时）：`{"cmd":"apply","meta":{"actor":"...","idempotency_key":"...","allow_empty":false,"force":false},"request":<§3.2 REST DTO>}\n` → `{"ok":true,"data":...}\n` 或 `{"ok":false,"error":{...}}\n`（错误码同 §1）；
   - Daemon 未运行时 CLI 直写 SQLite 后，Daemon 启动扫描补推，无需通知；`poke`（`{"cmd":"poke","fast_flush":false}\n` → `{"ok":true}\n`）仅用于 `sync` 以外的唤醒场景；
   - CLI 显式等待同步（`sync push`）：`{"cmd":"sync_now","wait":true}\n` → Daemon 完成本轮 HTTP `push/pull` 后返回 `{"ok":true,"head_seq":120}\n` 或 `{"ok":false,"code":"SYNC_OFFLINE"}\n`；
   - CLI 健康探针：`{"cmd":"ping"}\n` → `{"ok":true,"version":"0.2.0","pid":4821}\n`（版本与 CLI 不一致时 CLI 在 `stderr` 告警）；
-  - 壳 / `mynote open` 申请会话票据：`{"cmd":"open_ticket"}\n` → `{"ok":true,"url":"http://localhost:<port>/v1/local/auth/exchange?ticket=..."}\n`。
+  - 壳 / `mynote open` 申请会话票据：`{"cmd":"open_ticket"}\n` → `{"ok":true,"url":"http://localhost:<port>/v1/local/auth/exchange?ticket=..."}\n`；
+  - **只读事件订阅（M5-P1，D10，供 `mynote watch` 与 `reactor`）**：`{"cmd":"subscribe","filters":{"buffer_id":null,"include_clip":true}}\n` → 持续推送单行 NDJSON 事件帧 `{"event":"block.saved"|"clip.received"|"clip.ephemeral","actor":"...","payload":{...}}\n`（严禁携带任何 Tier 2 加密块正文）。
 
 ---
 
@@ -268,7 +285,7 @@ interface CliEnvelope<T> {
 
 ### 4.2 核心同步与密钥端点精确 Schema
 
-端点分组：`/v1/sync/*`（op 日志与唤醒）、`/v1/keys*`（密钥表、`key_material` 与碎纸标记）、`/v1/snapshots/state`（手机状态快照）、`/v1/devices*`（设备引导、配对与刷新）、`/v1/clip*`（M4 独立 100 条图文剪贴板通道，D8）。**不存在任何删除 op 的接口，也不暴露任何 `/v1/archive/*` 云端归档读取/枚举接口**（极端双重灾难恢复直接从 R2 下载 `archives/` 目录到本地执行离线 `mynote restore --from-archive <local-dir>`）。
+端点分组：`/v1/sync/*`（op 日志与唤醒）、`/v1/keys*`（密钥表、`key_material` 与碎纸标记）、`/v1/snapshots/state`（手机状态快照）、`/v1/devices*`（设备引导、配对与刷新）、`/v1/clip*`（M4 独立图文剪贴板通道，D8 / D8′）。**不存在任何删除 op 的接口，也不暴露任何 `/v1/archive/*` 云端归档读取/枚举接口**（极端双重灾难恢复直接从 R2 下载 `archives/` 目录到本地执行离线 `mynote restore --from-archive <local-dir>`）。
 
 #### (1) `POST /v1/sync/push` — 幂等追加盲操作日志（`read-write`）
 
@@ -344,7 +361,7 @@ interface CliEnvelope<T> {
 | 方法与路径 | 范围 | 请求 → 响应 |
 | --- | --- | --- |
 | `GET /v1/keys` | `read` / `read+clip` | → `{ ok, key_material: { keyring: { gen, blob_b64 } \| null, vault_header: { gen, blob_b64 } \| null, clip_key: { gen, blob_b64 } \| null }, key_records: [{ key_id, wrap_gen, key_record_b64 \| null, created_at_ms }], shred_marks: [{ mark_id, key_id, grace_ms, not_before_ms \| null, requested_by, state, confirmed_at_ms \| null }], digest }`（体量 ≈ 块数 × 250 B + `< 2 KB` `key_material` [估算]）。`block_id` 与 `tier` 只在 `MNR1` 密文（`key_record_b64`）内，**服务端不可见**。已执行碎纸的记录 `key_record_b64 = null`，客户端据此且仅据此触发本地 `ExecuteShred`。合并规则（2P-Set + `min` 到期日收敛）见 [`sync-protocol.md`](./sync-protocol.md) |
-| `POST /v1/keys` | `read-write` | `{ key_records?: [...], key_material?: { keyring?: { gen, blob_b64 }, vault_header?: { gen, blob_b64 }, clip_key?: { gen, blob_b64 } } }` → `{ ok, acked_key_ids, key_material_gens }`。`key_records` 只创建或以更大 `wrap_gen` 重包（同 `key_id` 同 `wrap_gen` 内容不同返回 `INTEGRITY_ERROR`，相同则幂等）；`key_material` 按各自 `gen` 严格单调递增接受（小于当前 `gen` 返回 `409 CAS_MISMATCH`，相等且字节相同幂等；更新 `clip_key` 时可附带 `clear_clips: true` 同步清空云端 `clip_items` 与 `clip/blobs/*`） |
+| `POST /v1/keys` | `read-write` | `{ key_records?: [...], key_material?: { keyring?: { gen, blob_b64 }, vault_header?: { gen, blob_b64 }, clip_key?: { gen, blob_b64 } }, clear_clips?: boolean, clear_clips_scope?: "cloud" \| "all" }` → `{ ok, acked_key_ids, key_material_gens }`。`key_records` 只创建或以更大 `wrap_gen` 重包（同 `key_id` 同 `wrap_gen` 内容不同返回 `INTEGRITY_ERROR`，相同则幂等）；`key_material` 按各自 `gen` 严格单调递增接受（小于当前 `gen` 返回 `409 CAS_MISMATCH`，相等且字节相同幂等；更新 `clip_key` 且 `clear_clips: true` 时同步清空云端 `clip_items` 与 `clip/blobs/*` 并按 `clear_clips_scope`（默认 `"cloud"` 保留桌面本地归档，`"all"` 通知全端清空）广播 `clip_cleared` + `key_rotated: true`） |
 | `POST /v1/keys/shred` | `read-write` | **（M2）** `{ seen_seq, expedite?: boolean, marks: [{ mark_id, key_id, grace_ms, requested_by }] }` → `{ ok, results: [{ key_id, state: "scheduled" \| "pending_confirm", not_before_ms \| null }] }`。任一 `grace_ms < T_grace_min` → 整个请求 `422 GRACE_TOO_SHORT`（不落库）。服务端以自身时钟算 `candidate_ms = now_ms + grace_ms`：新建时超出滚动 24 小时批量阈值（20 块）的部分置 `state = "pending_confirm", not_before_ms = null`（不计时）；对已有 `scheduled` 标记且 `expedite = true` 时更新为 `min(existing.not_before_ms, candidate_ms)`（不重复计入配额）。视图过期 → `409 SHRED_STALE` |
 | `POST /v1/keys/cancel` | `read-write` | **（M2）** `{ key_ids }` → `{ ok, cancelled }`。用于 `trash restore` 和 Update-Wins 复活；已到期置空的 `key_id` → `410 KEY_SHREDDED` |
 | `POST /v1/keys/confirm` | `read-write` | **（M2）** `{ key_ids, grace_ms }` → `{ ok, results: [{ key_id, state: "scheduled", not_before_ms }] }`。把 `pending_confirm` 转为 `scheduled`，服务端记录 `confirmed_at_ms = now_ms` 并计算 `not_before_ms = confirmed_at_ms + max(grace_ms, T_grace_min)`。只由桌面 UI 的 `trash/actions/commit` 发起，见 §3.2 |
@@ -371,20 +388,21 @@ interface CliEnvelope<T> {
 - 客户端应用层心跳文本帧：`"ping"` → Cloudflare 边缘自动零唤醒回复 `"pong"`；
 - 服务端只发唤醒通知，**不携带 op**：`{ "type": "wake", "epoch": "...", "head_seq": 110 }`，客户端发现 `head_seq > local_seq` 即调用 (2)；密钥表或 `key_material` 变化由 pull 响应中的 `keys_digest` 发现；
 - 设备被吊销通知：`{ "type": "device_revoked" }`（随即服务端以 Close Code `4401` 断开连接）；
-- **剪贴板唤醒与瞬态帧（M4，D8）**：
-  - `{ "type": "clip_wake", "clip_id": "01J...", "kind": "text" | "image", "created_at_ms": 1795600000000 }`（常规 100 条队列通知，不含大对象正文）；
+- **剪贴板唤醒与瞬态帧（M4，D8 / D8′）**：
+  - `{ "type": "clip_wake", "clip_id": "01J...", "kind": "text" | "image", "created_at_ms": 1795600000000 }`（常规云端滚动队列通知，不含大对象正文）；
   - `{ "type": "clip_ephemeral", "clip_id": "01J...", "clip_kid": "01J...", "device_id": "dev_...", "envelope_b64": "..." }`（仅发往在线 `read-write` 桌面，零写库零 R2）；
-  - `{ "type": "clip_cleared", "clip_id": "01J..." | null }`（单条或全量清空通知）。
+  - `{ "type": "clip_cleared", "clip_id": "01J..." | null, "scope": "cloud" | "all", "key_rotated"?: boolean }`（单条删除固定 `scope: "all"`；云端批量清理/清空与默认 `rotate-key` 为 `scope: "cloud"`，桌面保留本地归档）。
 
-#### (7) `/v1/clip*` — 独立 100 条图文剪贴板通道（M4，D8）
+#### (7) `/v1/clip*` — 独立图文剪贴板云端滚动中继通道（M4，D8 / D8′：`1,000 条 / 30 天 / 5 GiB`）
 
 | 方法与路径 | 允许 `scope` | 请求 → 响应与硬约束 |
 | --- | :---: | --- |
-| `POST /v1/clip` | `read-write`, `read+clip`, `clip-write` | `{ clip_id, clip_kid, kind: "text", ephemeral?: boolean, meta_envelope_b64 }` → 常规模式返回 `{ ok: true, clip_id, created_at_ms, expires_at_ms }`；`ephemeral: true`（上限 `≤ 256 KiB`，零 SQLite / R2 写入）返回 `{ ok: true, clip_id, delivered_to }`，若 `delivered_to === 0` 返回 `409 NO_ONLINE_DESKTOP`。常规模式幂等写入 DO `clip_items`（`meta_envelope_b64` 上限 `≤ 96 KiB`），裁剪超出最近 **100 条**的旧行并异步 `R2.delete` 旧大对象，默认 `expires_at_ms = now + 7 天`，广播 `clip_wake` |
-| `PUT /v1/clip/blob` | `read-write`, `read+clip`, `clip-write` | **流式上传图片或 `> 64 KiB` 长文本密文**：请求体为原始二进制 `MNC1`（`payload_type=1`）密文流（`Content-Type: application/octet-stream`，上限 `10.5 MiB`），请求头携带 `X-Clip-Id`、`X-Clip-Kid`、`X-Clip-Kind: image\|text` 与 `X-Clip-Meta-B64`（`≤ 32 KiB` 的加密 `ClipMetaV1` 含缩略图）。Worker 零缓冲流式写入 R2 `clip/blobs/<clip_id>.mnc1` 后在 DO 事务登记 `clip_items` 并裁剪超 100 条旧项（DO 失败立即清理孤儿 R2 对象），返回 `{ ok: true, clip_id, blob_bytes, created_at_ms, expires_at_ms }` 并广播 `clip_wake` |
-| `GET /v1/clip?since_id=<ulid>&limit=<1..100>` | `read-write`, `read+clip`, `read` | 返回最多 100 条未过期剪贴板轻元数据：`{ ok: true, items: [{ clip_id, clip_kid, device_id, kind, created_at_ms, expires_at_ms, meta_envelope_b64, has_blob, blob_bytes \| null }] }`（按 `clip_id ASC`）；`clip-write` 返回 `403 TOKEN_SCOPE_FORBIDDEN` |
+| `POST /v1/clip` | `read-write`, `read+clip`, `clip-write` | `{ clip_id, clip_kid, kind: "text", ephemeral?: boolean, meta_envelope_b64 }` → 常规模式返回 `{ ok: true, clip_id, created_at_ms, expires_at_ms, quota }`；`ephemeral: true`（上限 `≤ 256 KiB`，零 SQLite / R2 写入）返回 `{ ok: true, clip_id, delivered_to }`，若 `delivered_to === 0` 返回 `409 NO_ONLINE_DESKTOP`。常规模式幂等写入 DO `clip_items`（`meta_envelope_b64` 上限 `≤ 96 KiB`，**不受 R2 5 GiB 大对象配额阻塞**），裁剪超出最近 **1,000 条**的旧行并分批 `R2.delete(keys[])` 清理旧大对象，默认 `expires_at_ms = now + 30 天`，广播 `clip_wake` |
+| `PUT /v1/clip/blob` | `read-write`, `read+clip`, `clip-write` | **流式上传图片或 `> 64 KiB` 长文本密文**：请求体为原始二进制 `MNC1`（`payload_type=1`）密文流（`Content-Type: application/octet-stream`，单条上限 `10.5 MiB`），请求头携带 `X-Clip-Id`、`X-Clip-Kid`、`X-Clip-Kind: image\|text` 与 `X-Clip-Meta-B64`（`≤ 32 KiB` 的加密 `ClipMetaV1` 含缩略图）。执行 **两段 `5 GiB` 硬配额检查**（写入 R2 前预检 + DO 事务内复检，超限回滚并立即删除 R2 对象，返回 **`507 CLIP_QUOTA_EXCEEDED`** 附 `{ used_bytes, limit_bytes, incoming_bytes }`）。通过后零缓冲流式写入 R2 `clip/blobs/<clip_id>.mnc1`、在 DO 事务登记 `clip_items` 并裁剪超 1,000 条旧项，返回 `{ ok: true, clip_id, blob_bytes, created_at_ms, expires_at_ms, quota }` 并广播 `clip_wake` |
+| `GET /v1/clip?since_id=<ulid>&limit=<1..100>` | `read-write`, `read+clip`, `read` | 分页返回未过期剪贴板轻元数据（单页最多 100 条）：`{ ok: true, items: [{ clip_id, clip_kid, device_id, kind, created_at_ms, expires_at_ms, meta_envelope_b64, has_blob, blob_bytes \| null }], has_more, next_since_id, quota: { used_bytes, limit_bytes, item_count, max_items } }`（按 `clip_id ASC`）；`clip-write` 返回 `403 TOKEN_SCOPE_FORBIDDEN` |
 | `GET /v1/clip/:clip_id/blob` | `read-write`, `read+clip`, `read` | 经 DO 校验未过期后直接流式返回 R2 加密二进制本体（`Content-Type: application/octet-stream`、`X-Clip-Id`、`X-Clip-Kid`、`X-Clip-Device-Id`）；不存在或过期返回 `404 NOT_FOUND`；`clip-write` 返回 `403` |
-| `DELETE /v1/clip[/:clip_id]` | `read-write`, `read+clip` | 删除单条或清空全部 `clip_items` 并同步删除对应 R2 `clip/blobs/*` 对象，返回 `{ ok: true, deleted_count }` 并广播 `clip_cleared` |
+| `POST /v1/clip/prune` | `read-write`, `read+clip` | **按规则回收云端空间（D8′）**：`{ before_ms?, keep_latest?, kind?: "text" \| "image", dry_run?: boolean }`（至少提供一项过滤条件）。按 `(created_at_ms DESC, clip_id DESC)` 跳过最新 `keep_latest` 条后删除满足条件的行并分批 `R2.delete(keys[])`，返回 `{ ok: true, dry_run, deleted_count, freed_bytes, quota }`；非 `dry_run` 且有删除时广播 `{ type: "clip_cleared", clip_id: null, scope: "cloud" }`（桌面保留本地归档）；`read` / `clip-write` 返回 `403` |
+| `DELETE /v1/clip[/:clip_id]` | `read-write`, `read+clip` | 单条 `DELETE /v1/clip/:clip_id` 固定广播 `scope: "all"`（全端同步删除）；批量清空 `DELETE /v1/clip[?scope=cloud\|all]` 默认 `scope = "cloud"`（仅清空云端，桌面保留本地归档；显式 `?scope=all` 才通知全端清空）；分批 `R2.delete(keys[])` 并返回 `{ ok: true, deleted_count, freed_bytes, scope, quota }` |
 
 ---
 
@@ -482,6 +500,14 @@ export class WasmClipCodec {
 }
 ```
 
+### 5.1 桌面专属 Tier 2 插件 Web Worker 边界契约（M5-P3，D10）
+
+为守住「常驻 Daemon 零 Tier 2 明文」与「手机 PWA WASM `0 B` 增量」两条铁律，解锁态 Tier 2 块运行 `tier2_capable = true` 的 `.wasm` 插件仅存在于**桌面专属前端**（`web/src/plugins/worker.ts`，绝不编入 `web/src/wasm/pkg-pwa/`）：
+
+- **输入隔离**：主页面先从 `GET /v1/local/plugins/:id/module.wasm` 拉取原始 `.wasm` 字节，再由独立同源 `'self'` `Web Worker` 调用 `WebAssembly.compile(bytes)` → 硬断言 **`WebAssembly.Module.imports(mod).length === 0`** → `WebAssembly.instantiate(mod, {})`，随后仅向 Worker 发送「当前单块已解密明文 + 请求参数 JSON」，**绝不传递 `VKEK`、`WasmVaultSession` 句柄、其他块内容或会话 Cookie**；
+- **执行与硬超时**：按 [`data-structures.md`](./data-structures.md) §2.3 的 Core WASM 3-Export ABI 调用 `mynote_abi_version` / `mynote_alloc` / `mynote_invoke`；超过单次超时阈值直接 `worker.terminate()` 销毁整线程并返回 `PLUGIN_RESOURCE_EXCEEDED`；
+- **结果回写**：Worker 仅返回纯 JSON `PluginResult`。若为 `view` / `gutter` / `toast`，交由桌面主前端 6 种声明式安全组件渲染；若为 `replace_content`（修改当前加密块），由主页面 `WasmVaultSession.encryptUpdate` 在内存重加密后，按 §3.2 既有 Tier 2 密文通道提交 Daemon（Daemon 全程零明文）。
+
 ---
 
 ## 6. 已移除 / 推迟的机制（2026-11-24）
@@ -494,7 +520,7 @@ export class WasmClipCodec {
 - **`vault_keys` / `vault_key_slots` keystore 端点、`key_mutations`、`MNK1`、`key_seq` / `key_since`**：已移除，由只创建的密钥表 + `key_material` + 碎纸标记（2P-Set）全量比对取代（§9.3）。
 - **`/v1/archive/*` 云端归档 HTTP 路由与恢复专用挑战-应答鉴权**：已移除。所有客户端设备丢失而云端 DO 仍在时凭部署级 `BOOTSTRAP_TOKEN` + 24 词直接从 DO 零丢失拉回；客户端与 DO 同时损毁时从 CF 控制台 / `wrangler` / `rclone` 下载 R2 `archives/` 到本地执行纯离线 `mynote restore --from-archive <local-dir>`（§9.12）。
 - **`/v1/blobs/:sha256` 与 R2 `blobs/` 加密附件端点**：已推迟至「按数据触发的待办」（届时每个附件使用独立随机 `BlobKey` 存入 `BlockPlaintextV1`，避免块换钥时重传附件）（§9.12）。
-- **旧版写入 DO SQLite 的 `/v1/sync/ephemeral-clip` 瞬态剪贴板**：已永久废弃（F-06）；2026-11-27 拍板 **D8** 以物理隔离的 `/v1/clip*`（100 条 DO 轻索引 + R2 流式大对象 + 零写库 `--ephemeral` WS 直推）与 `mynote clip` 子命令重新纳入 M4（见 §2.3、§3.2、§4.2(7)）。
+- **旧版写入 DO SQLite 的 `/v1/sync/ephemeral-clip` 瞬态剪贴板**：已永久废弃（F-06）；2026-11-27 拍板 **D8**（2026-11-28 **D8′** 修订）以物理隔离的 `/v1/clip*`（云端 `1,000 条 / 30 天 / 5 GiB` 硬护栏 + R2 流式大对象 + 桌面无限归档 + 零写库 `--ephemeral` WS 直推）与 `mynote clip` 子命令重新纳入 M4（见 §2.3、§3.2、§4.2(7)）。
 - **快照 `prev_snapshot_id` CAS、K=5 多代快照、`requires_snapshot_bootstrap` / DO 滑动窗口**：已移除，无 GC，只保留给手机读的状态快照（§9.2、§9.5）。
 - **WebSocket 携带 op 的「顺风车」推送**：已推迟，WS 只发唤醒通知（§9.11 按数据触发的待办）。
 - **`SPAN_PATCH` 完整性校验、`head_op_id` 单值、`conflict_siblings`**：已移除，改为全量载荷、`head_op_ids` 与 `versions`（D3，§9.4）。

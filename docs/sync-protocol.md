@@ -1,6 +1,6 @@
 # 同步协议与确定性物化规范 (`sync-protocol.md`)
 
-> 2026-11-27 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D8（含 2026-11-27 剪贴板同步拍板 D8 / D1′）更新。
+> 2026-11-28 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D10（含 2026-11-27 剪贴板同步拍板 D8 / D1′，以及 2026-11-28 Windows 一等桌面平台 D9 与 `wasmi` 优先双宿主插件体系 D10）更新。
 
 > 本文档是 [总架构设计方案 (`architecture-proposal.md`)](./architecture-proposal.md) 与 [Cloudflare 云端专项架构 (`cloudflare-cloud-architecture.md`)](./cloudflare-cloud-architecture.md) 的形式化同步协议子规范，并与 [数据结构规范 (`data-structures.md`)](./data-structures.md)、[全链路接口契约 (`interface-contracts.md`)](./interface-contracts.md) 配套执行，将「永不静默丢数（Anti-Wipe by Construction）」与「删除优先、有界时延」收敛为无歧义的因果合并规则、密钥表同步规则、删除 / 碎纸协议与确定性模拟测试契约。
 >
@@ -345,7 +345,7 @@ stateDiagram-v2
      PRAGMA foreign_keys = ON;
      PRAGMA secure_delete = ON;
      ```
-   - **Daemon 运行时**：CLI 的写命令经权限 `0600` 的 Unix Socket（Linux: `$XDG_RUNTIME_DIR/mynote/daemon.sock`；macOS: `~/Library/Application Support/mynote/run/daemon.sock`）发送 `apply` 帧交给 Daemon 串行执行（携带 `actor`、`idempotency_key` 等 CLI 元信息，由 Daemon 生成 `op_id` 与 HLC、加密写入 `sync_ops`，随即走快车道推送上云并刷新已打开的 UI）；CLI 读命令直接并发读 WAL。
+   - **Daemon 运行时**：CLI 与本地插件的写命令经跨平台 `LocalIpc`（Linux: `0600` `$XDG_RUNTIME_DIR/mynote/daemon.sock`；macOS: `0600` `~/Library/Application Support/mynote/run/daemon.sock`；Windows [M5-W1, D9]: 用户 SID 专属 SDDL Named Pipe `\\.\pipe\mynote-<blake3_16>`，强制 `first_pipe_instance` 与 `reject_remote_clients`）发送 `apply` 帧交给 Daemon 串行执行（携带 `actor`、`idempotency_key` 等元信息，插件写入强制 `actor = "plugin:<plugin_id>"`，由 Daemon 生成 `op_id` 与 HLC、加密写入 `sync_ops`，随即走快车道推送上云并刷新已打开的 UI）；CLI 读命令直接并发读 WAL。
    - **Daemon 未运行时**：CLI 自己以短事务直接写入本地 SQLite（`server_seq = NULL`），此时它就是唯一写入方；SQLite 写锁与 `busy_timeout` 作为 Daemon 恰好同时启动时的兜底。目标耗时 `5–15 ms` [目标]。
 2. **无 Daemon 时的同步补偿**：
    - Daemon 未运行时，普通写命令落盘后直接返回成功，Daemon 下次启动时自动扫描 `WHERE server_seq IS NULL` 补推；显式的 `mynote sync` 在检测到 Socket 未监听时，在当前 CLI 进程内直接执行一轮完整同步（§2.4）。
@@ -435,33 +435,38 @@ INV-SHRED-BOUND（碎纸到期后本地数据库、WAL、FTS、本地备份、�
 
 ---
 
-## 11. 独立 100 条图文剪贴板通道同步语义（M4，D8）
+## 11. 独立图文剪贴板通道同步语义（M4，D8 / D8′）
 
-依据 2026-11-27 拍板的 **D8（局部修订 D1 → D1′）**，剪贴板同步以**物理隔离的独立通道**运行，严禁与笔记主同步状态机耦合：
+依据 2026-11-27 拍板的 **D8（局部修订 D1 → D1′）** 与 2026-11-28 拍板的 **D8′（方案 A 分层留存 + 5 GiB 云端硬护栏）**，剪贴板同步以**物理隔离的独立通道**运行，严禁与笔记主同步状态机耦合：
 
 ### 11.1 与笔记同步的完全解耦边界
 
 1. **零写 `ops` 与 `block_keys`**：剪贴板条目不分配笔记 `server_seq`、不进入 `sync_ops`、不消耗 `block_keys`、不触发 `shred_marks` 20 块/天批量阈值、不进入 FTS5 与只读 Markdown 镜像、不写入手机 `MNP1` 状态快照、不写入 R2 永久 op 归档与密钥表快照（`INV-CLIP-ISOLATION`）。
-2. **不参与 `epoch` 并集对账**：当 DO 发生 PITR 回滚或迁移导致 `journal_epoch` 变更时，笔记主库按 §6 执行集合并集补推；剪贴板通道视为短期临时缓存（最近 100 条 / 7 天 TTL），仅重置剪贴板增量游标 `last_clip_id` 并重拉当前列表，绝不向新 DO 补推历史剪贴板。
+2. **不参与 `epoch` 并集对账**：当 DO 发生 PITR 回滚或迁移导致 `journal_epoch` 变更时，笔记主库按 §6 执行集合并集补推；云端剪贴板通道定位为滚动同步中继（`1,000 条 / 30 天 TTL / 5 GiB`），桌面端仅重置剪贴板增量游标 `last_clip_id` 并重拉当前云端窗口，**保留本地已有无限归档**且绝不向新 DO 补推历史剪贴板。
 3. **无冲突单向追加模型**：每条剪贴板分配单调有序的 `clip_id`（ULID）并按 `clip_id` 全序排序，不存在同条目的多端并发编辑、无 outbox、无冲突合并状态。
 4. **显式提升（Promote）**：仅当用户在桌面显式执行「转存为笔记块（`mynote clip promote` 或 UI 动作）」时，才将**文本**剪贴板内容生成一条标准 `CREATE` op 进入笔记同步主线；图片剪贴板在正式笔记 `blobs/` 附件落地前仅支持复制到系统剪贴板与另存为本地文件。
 
-### 11.2 100 条环形索引、R2 按需大对象与两类发送模式
+### 11.2 分层留存模型（云端 1,000 条/30 天/5 GiB 中继 + 桌面无限归档）与两类发送模式
 
 - **常规模式（默认，`ephemeral = false`）**：
-  - `≤ 64 KiB` 纯文本通过 `POST /v1/clip` 直接内联写入 DO `clip_items.meta_envelope`；
+  - `≤ 64 KiB` 纯文本通过 `POST /v1/clip` 直接内联写入 DO `clip_items.meta_envelope`（**不受 R2 5 GiB 大对象配额阻塞**）；
   - 图片（严格限定 `image/png`、`image/jpeg`、`image/webp`、`image/gif`，拒绝 `image/svg+xml`）与 `> 64 KiB` 长文本（单条上限 `10 MiB`）通过 `PUT /v1/clip/blob` 流式写入 R2 `clip/blobs/<clip_id>.mnc1`，DO 仅存轻元数据与可选 `≤ 16 KiB` 加密缩略图；
-  - 每次写入事务中自动裁剪超过 **100 条**的最旧记录，DO Alarm 定期清理超过 **7 天 TTL** 的过期记录；凡被淘汰或过期的记录均同步执行 `R2.delete(r2_key)`，辅以 R2 `clip/blobs/` 8 天前缀生命周期清理极端异常孤儿对象；
-  - 服务端提交后向其他在线设备广播 `{ type: "clip_wake", clip_id, kind, created_at_ms }`；各端收到后拉取轻元数据与缩略图，**不批量下载全部 100 张原图**——仅对「需自动写入系统剪贴板的最新图片」或「用户主动点击预览/复制/保存的条目」按需流式下载 `/v1/clip/:clip_id/blob`，解密后校验元数据中的 `sha256_hex` 并写入本地独立缓存目录 `clip_cache/`（LRU `256 MiB`）。
+  - **云端 5 GiB 硬容量护栏与滚动窗口（D8′）**：云端 R2 活跃大对象总占用上限为 **`5 GiB`（`5,368,709,120 B`）**（`4 GiB` / `80%` 告警）；若写入前或事务提交时超出上限，`PUT /v1/clip/blob` 直接硬拒绝返回 **`HTTP 507` + `CLIP_QUOTA_EXCEEDED`**（附 `{ used_bytes, limit_bytes, incoming_bytes }`，事务回滚并删除刚写入的 R2 对象），不会静默丢弃旧数据。云端每次写入仍自动裁剪超过 **1,000 条**的最旧记录，DO Alarm 定期清理超过 **30 天 TTL** 的过期记录；用户也可通过 `POST /v1/clip/prune` 或 `DELETE /v1/clip` 主动清理云端空间。凡被淘汰、过期或清理的记录均分批执行 `R2.delete(keys[])`（单批 ≤ 1,000 键），辅以 R2 `clip/blobs/` **31 天**前缀生命周期清理极端异常孤儿对象；
+  - **桌面端无限本地归档 + 后台 Eager Prefetch（D8′）**：服务端提交后向其他在线设备广播 `{ type: "clip_wake", clip_id, kind, created_at_ms }`；桌面 Daemon 收到后按游标分页（`has_more`）拉取轻元数据落入本地 `clip_items`（**不做自动条数裁剪、不做自动过期、不做 `clip_cache/` 自动 LRU 淘汰**，仅由用户手动 `prune` / `clear` 清理），并启动单并发后台 **Eager Prefetch** 任务，按需在云端 30 天 TTL 到期前将未缓存的远端图片/大文本流式下载、解密并校验 `sha256_hex` 后持久落盘到 `clip_cache/`；
+  - **手机 PWA 轻缓存**：通过 `GET /v1/clip` 分页循环拉取并增量写入 IndexedDB（上限 **200 条**，不再全表重写），**不批量下载全部原图**——仅在用户主动查看/复制时按需流式拉取 `/v1/clip/:clip_id/blob` 于内存中解密。
 - **纯内存瞬态直推模式（`ephemeral = true`，仅限 `≤ 256 KiB` 敏感短串）**：
-  - 服务端零 SQLite 写入、零 R2 写入，直接向所有非发送方且 `scope = 'read-write'` 的在线桌面 WebSocket 转发 `{ type: "clip_ephemeral", ... }`；若当前无在线桌面（`delivered_to === 0`），直接返回 `409 NO_ONLINE_DESKTOP`，绝不降级写库。
+  - 服务端零 SQLite 写入、零 R2 写入、不受 5 GiB 配额影响，直接向所有非发送方且 `scope = 'read-write'` 的在线桌面 WebSocket 转发 `{ type: "clip_ephemeral", ... }`；若当前无在线桌面（`delivered_to === 0`），直接返回 `409 NO_ONLINE_DESKTOP`，绝不降级写库。
 
-### 11.3 `ClipKey` 轮换、桌面防回环与防覆盖规则
+### 11.3 清理作用域、`ClipKey` 轮换、桌面防回环与防覆盖规则
 
-- **独立可轮换 `ClipKey`**：由 `SMK` 封装存于 `key_material(kind = 'clip_key')`（不入 24 词恢复包）；执行 `mynote clip rotate-key` 时生成全新 `ClipKey'` 覆盖 `key_material` 并清空 DO `clip_items` 与 R2 `clip/blobs/*`，所有客户端立即丢弃旧 `ClipKey`（使 DO 30 天 PITR 中的历史剪贴板密文立即可证明无法解密）。
-- **桌面接收与防覆盖**：来自手机或 CLI 的显式发送项（`source_mode = "explicit"`）默认自动写入桌面系统剪贴板（JPEG / WebP 写入前解码转 `image/png`，macOS 走原生 `NSPasteboard`，Omarchy 走 `wl-copy`）并弹轻通知；覆写前把原桌面剪贴板内容保存至内存可撤销槽（`mynote clip undo`）。来自另一台桌面后台自动镜像（M4b，`source_mode = "auto"`）的条目默认进收件箱（可配置 `auto-apply`）。
-- **双重防回环（Echo Loop Prevention）**：写入本机系统剪贴板时附带自定义来源标记（macOS UTI `dev.mynote.synced-clip`；Wayland MIME `application/x-mynote-synced`）并在内存登记 `(last_applied_blake3, applied_at_ms)`（**图片登记转码后实际写入剪贴板的 PNG 字节哈希**）。桌面监听捕获变更时命中来源标记或 `2,000 ms` 抑制窗内哈希相等即直接跳过，严禁回推。
-- **敏感标记与未压缩 TIFF 护栏**：桌面读取与监听硬编码跳过 macOS `org.nspasteboard.ConcealedType` / `TransientType` / `AutoGeneratedType` / `com.agilebits.onepassword` / `dev.mynote.vault-secret` / 默认忽略的 `com.apple.is-remote-clipboard`，以及 Wayland `x-kde-passwordManagerHint`；macOS 优先读取 `public.png` 避开超大 `public.tiff`；后台自动监听捕获文本命中 `detect_secret_pattern` 时拦截不自动上传。
+- **作用域隔离清理（D8′）**：
+  - **单条删除**（`DELETE /v1/clip/:clip_id`）：删除云端记录与 R2 对象，并广播 `{ type: "clip_cleared", clip_id, scope: "all" }`，全端桌面与 PWA 同步删除该条目；
+  - **云端批量清理 / 清空**（`DELETE /v1/clip` 默认 `?scope=cloud`、`POST /v1/clip/prune`、手机 PWA 清理入口）：仅释放云端 `clip_items` 与 R2 `clip/blobs/*`，广播 `scope: "cloud"`，**桌面保留已落盘的本地归档**；显式传入 `?scope=all` 时才通知全端同步清空本地归档；
+  - **仅本地清理**（`DELETE /v1/local/clip?scope=local` 或 `mynote clip prune --scope local`）：仅清理本机 `clip_items` 与 `clip_cache/`，不触碰云端与其他设备。
+- **独立可轮换 `ClipKey`（自动生成、默认保留桌面本地归档）**：`ClipKey` 在首次使用剪贴板时由桌面自动生成 32 B 随机密钥，由 `SMK` 封装存于 `key_material(kind = 'clip_key')`（无需用户输入，不入 24 词恢复包）；执行 `mynote clip rotate-key` 时自动生成全新 `ClipKey'` 覆盖 `key_material`、清空云端 DO `clip_items` 与 R2 `clip/blobs/*` 并使所有客户端丢弃旧 `ClipKey`（令 DO 30 天 PITR 中的历史剪贴板密文立即可证明无法解密），**默认采用 `clear_clips_scope = "cloud"` 保留各桌面已解密落盘的本地归档**；仅显式传入 `--wipe-local` 时广播 `scope: "all"` 同步抹除本地与对端桌面归档。存留桌面与 `read+clip` PWA 自动凭 `SMK` 无感解封新 `ClipKey'`；仅使用 `clip-write`（无 `SMK`）的 iOS Shortcuts / Scriptable 需重新配对或刷新 Keychain。
+- **桌面接收与防覆盖**：来自手机或 CLI 的显式发送项（`source_mode = "explicit"`）默认自动写入桌面系统剪贴板（JPEG / WebP 写入前解码转 `image/png`，macOS 走原生 `NSPasteboard`，Omarchy 走 `wl-copy`，Windows [M5-W2, D9] 走 Win32 `OpenClipboard`）并弹轻通知；覆写前把原桌面剪贴板内容保存至内存可撤销槽（`mynote clip undo`）。来自另一台桌面后台自动镜像（M4b，`source_mode = "auto"`）的条目默认进收件箱（可配置 `auto-apply`）。
+- **双重防回环（Echo Loop Prevention）**：写入本机系统剪贴板时附带自定义来源标记（macOS UTI `dev.mynote.synced-clip`；Wayland MIME `application/x-mynote-synced`；Windows 注册剪贴板格式 `dev.mynote.synced-clip`）并在内存登记 `(last_applied_blake3, applied_at_ms)`（**图片登记转码后实际写入剪贴板的 PNG 字节哈希**）。桌面监听捕获变更时命中来源标记或 `2,000 ms` 抑制窗内哈希相等即直接跳过，严禁回推。
+- **敏感标记与未压缩位图护栏**：桌面读取与监听硬编码跳过 macOS `org.nspasteboard.ConcealedType` / `TransientType` / `AutoGeneratedType` / `com.agilebits.onepassword` / `dev.mynote.vault-secret` / 默认忽略的 `com.apple.is-remote-clipboard`，Wayland `x-kde-passwordManagerHint`，以及 Windows（M5-W2, D9）`ExcludeClipboardContentFromMonitorProcessing`、`CanIncludeInClipboardHistory == 0`、`CanUploadClipboardDataToCloud == 0`；macOS 优先读取 `public.png` 避开超大 `public.tiff`，Windows 优先读取 `"PNG"` 注册格式、回退 `CF_DIBV5`/`CF_DIB` 转 PNG，三端一律拒绝 `image/svg+xml` 进图片通道；后台自动监听捕获文本命中 `detect_secret_pattern` 时拦截不自动上传。
 
 ---
 
@@ -476,7 +481,7 @@ INV-SHRED-BOUND（碎纸到期后本地数据库、WAL、FTS、本地备份、�
 - **Lock-Wins 特例**：❌ `LOCK` 是普通版本，改为加锁渲染规则（§9.4）。
 - **`purge_op_ids` / 信封置 `NULL` 墓碑擦除**：❌ op 密文永不删除，删除只作用于密钥（F-04、§9.3）。
 - **`vault_keys` + `MNK1` + `key_seq` + INV-SYNC-4**：❌ 由独立密钥表 `block_keys`（2P-Set、全量比对）取代（§9.3、§9.7）。
-- **旧版写入 DO SQLite 且声称零 PITR 的 `ephemeral_clips` 表**：❌ 永久废弃（F-06）；2026-11-27 拍板 **D8** 改为物理隔离的 100 条图文通道（DO 轻索引 + R2 流式原图 + 独立可轮换 `ClipKey` + 零写库 `--ephemeral` 直推，见 §11）。
+- **旧版写入 DO SQLite 且声称零 PITR 的 `ephemeral_clips` 表**：❌ 永久废弃（F-06）；2026-11-27 拍板 **D8**（2026-11-28 **D8′** 修订）改为物理隔离的独立图文通道（云端 `1,000 条 / 30 天 TTL / 5 GiB` 硬护栏 + R2 流式原图 + 桌面无限归档 + 独立可轮换 `ClipKey` + 零写库 `--ephemeral` 直推，见 §11）。
 - **分数索引重平衡**：❌ 并发交错乱序，个人规模几乎触发不到（F-18、§9.4）。
 - **对账中的「创世快照」分支**：❌ 无压缩、无 GC 后不再需要（§4 审计表「epoch 并集对账 ✂️」）。
 - **手机 outbox、本地写路径、冲突合并 UI、手机侧 Bootstrap Gate**：❌ 手机只读（§9.2）。

@@ -1,6 +1,6 @@
 # 质量门禁与测试规范 (`eval-framework.md`)
 
-> 2026-11-27 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D8（含 2026-11-27 剪贴板同步拍板 D8 / D1′）更新。
+> 2026-11-28 修订：依据 [第一性原理审查 §9](../review/2026-11-24-first-principles-review.md) 的决策 D1–D10（含 2026-11-27 剪贴板同步拍板 D8 / D1′，以及 2026-11-28 Windows 一等桌面平台 D9 与 `wasmi` 优先双宿主插件体系 D10）更新。
 
 > 本文档是 `my-note` **测试门禁的单一事实来源**。评测与自动爬山不是本项目的研究目标（D6），所以这里只保留**确定性、可在 CI 中零方差复现**的质量手段，用来守护两件不可逆的事：**G1 永不静默丢数**、**G4 安全承诺不被破坏**。所有手段都要在一个人的维护预算内可持续。线格式、同步协议、安全承诺、云端实现与 CLI 契约分别以 [data-structures.md](./data-structures.md)、[sync-protocol.md](./sync-protocol.md)、[threat-model.md](./threat-model.md)、[cloudflare-cloud-architecture.md](./cloudflare-cloud-architecture.md)、[interface-contracts.md](./interface-contracts.md) 为准，本文只定义「怎么测、测到什么程度算过」。
 
@@ -17,8 +17,8 @@
 7. [CLI 黄金测试](#7-cli-黄金测试)
 8. [可选：线格式解析 fuzz](#8-可选线格式解析-fuzz)
 9. [CI 编排、仓库布局与执行纪律](#9-ci-编排仓库布局与执行纪律)
-10. [里程碑门禁矩阵（S0 → M4）](#10-里程碑门禁矩阵s0--m4)
-11. [已移除 / 推迟的机制（2026-11-24 / 2026-11-27 修订）](#11-已移除--推迟的机制2026-11-24--2026-11-27-修订)
+10. [里程碑门禁矩阵（S0 → M5）](#10-里程碑门禁矩阵s0--m5)
+11. [已移除 / 推迟的机制（2026-11-24 / 2026-11-27 / 2026-11-28 修订）](#11-已移除--推迟的机制2026-11-24--2026-11-27--2026-11-28-修订)
 
 ---
 
@@ -185,6 +185,11 @@ flowchart TB
 | **`SEC-06`** | Markdown / `Pele` 零 XSS、零外带 | 输入 OWASP XSS 向量库、恶意外链图片、含伪造 `<foreignObject>` 与 `<script>` 的 Mermaid 文本，经渲染管线在无头浏览器 CSP 沙盒中加载 | 渲染 DOM 中 `<script>`、`<iframe>`、`<foreignObject>`、`on*` 属性数为 `0`；外部网络请求数为 `0` | M3 |
 | **`SEC-08`** | 手机 PWA 不落盘秘密 | Playwright WebKit 中运行只读 PWA：浏览含加锁块的库、解锁 Vault、复制，然后切后台 / 闲置；导出 IndexedDB 与 Cache Storage 全部内容扫描 | IndexedDB / Cache Storage 中零 Tier 2 明文、零 VKEK；`visibilitychange` 与闲置超时后自动上锁，内存会话被清除；M4 `clip_items` 仅存 `MNC1` 密文，Android `share_target` 临时交接缓存消费后立即删除 | M2（M4 扩展） |
 | **`SEC-09`** | 独立剪贴板四态越权、防 XSS、密钥轮换与防泄露 | ① `clip-write` 访问全部 `GET`（含 `GET /v1/clip*`）与笔记路由，`read+clip` 访问笔记写/碎纸/设备路由；② 上传伪造 `image/svg+xml` 图片；③ `ClipKey` 轮换后尝试用新密钥解旧元数据与旧 R2 大对象；④ 桌面模拟收到含 `ConcealedType`、`x-kde-passwordManagerHint`、`com.apple.is-remote-clipboard` 与密钥正则特征的剪贴板事件；⑤ 双桌面含 JPEG → PNG 转码写入的互推测试 | ① 越权请求 100% 返回 `403`；② SVG 图片被拒绝（`400 INVALID_ARGUMENT`）；③ 旧密文解密失败（`INTEGRITY_ERROR`）；④ 敏感事件 0 次网络出站；⑤ 100 轮互推网络消息数恒为 1（零回环放大） | M4a（监听过滤与回环随 M4b） |
+| **`INV-PLUGIN-ZERO-IMPORT`** | Core WASM 插件零导入硬门禁（D10） | 向 Rust `wasmi` 与桌面前端 `'self'` Web Worker 分别加载含任意非空 `import` 段（含 WASI）的 `.wasm` 模块 | 加载期双宿主 100% 拒绝并返回 `PLUGIN_INVALID_MANIFEST`，零实例化执行 | M5-P2 / P3 |
+| **`INV-PLUGIN-RESOURCE-BOUND`** | WASM 插件资源有界与崩溃隔离（D10） | 注入无限循环 `.wasm` 与申请超 `16 MiB` 内存的 OOM `.wasm` 至 Rust `wasmi` 与前端 Web Worker | 死循环确定性命中 `fuel_limit` / `worker.terminate()` 中止、内存炸弹命中 `StoreLimits` 失败，返回 `PLUGIN_RESOURCE_EXCEEDED`；宿主进程与其余块零影响 | M5-P2 / P3 |
+| **`SEC-10`** | 插件声明式渲染零 XSS、Tier 2 零 Daemon 明文、`exec` 禁锁块（D10） | Playwright + 单元取证：① 恶意插件在 6 种 `PluginResult` 视图返回 `<script>` / `<img onerror>` / `<foreignObject>`；② `exec` 插件请求加锁块；③ 解锁态 Tier 2 块在前端 Web Worker 执行 `.wasm` 时抓包 Daemon HTTP 与日志；④ `reactor` 自触发事件循环注入 | ① 渲染 DOM 零危险标签/属性、零外发请求、CSP 零违规；② `exec` 返 `423 BLOCK_LOCKED` 零启动子进程；③ Daemon 载荷与日志零 Tier 2 明文、Worker 零 `VKEK`；④ `reactor` 零自发回环并命中滚动限流 | M5-P3 / P4 |
+| **`SEC-WIN-PIPE`** | Windows Named Pipe 防抢注与用户 SID ACL（D9） | `windows-latest` CI 实测二次抢注同名管道、读取内核 SDDL 与 `reject_remote_clients` 标志，并验证 Job Object 超时击杀孙进程树与中文 UTF-8 管道无乱码 | 二次绑定因 `first_pipe_instance` 失败；SDDL 仅含当前用户 SID 且不含 `Everyone`；子进程树 0 孤儿残留、UTF-8 往返无乱码 | M5-W1 |
+| **`SEC-WIN-CLIP`** | Windows 原生剪贴板隐私过滤与格式安全（D9） | `windows-latest` CI 模拟含 `ExcludeClipboardContentFromMonitorProcessing` 或 `CanIncludeInClipboardHistory = 0` 的剪贴板事件、PNG / `CF_DIBV5` 与 SVG 载荷 | 敏感事件 0 次网络出站；PNG / `CF_DIBV5` / 中文 UTF-8 往返无损；SVG 进图片通道被拒绝 | M5-W2 |
 
 补充说明：
 
@@ -242,8 +247,8 @@ flowchart TB
 ### 9.1 GitHub Actions 编排与统一三层入口
 
 - **不可变验证器前置阻断**：`immutable-verifier-guard` 作为所有构建与测试任务的 `needs` 前置依赖运行。非 `[eval-only]` PR 触碰 `evals/` 直接阻断后续任务，且各执行任务在运行前强制执行 `rm -rf evals/ && git checkout <base-sha> -- evals/`；`[eval-only]` PR 仅允许修改 `evals/` 与 `docs/eval-framework.md`。
-- **平台矩阵**：`macos-latest`（aarch64）与 `ubuntu-latest` 同时运行；Worker 契约测试与 Playwright Chromium / WebKit 运行时审计在 Linux 上必跑。
-- **静态与架构守卫**：`scripts/check-architecture.py`（含 `--selftest` 变异自检，强制校验 `mynote-core` Sans-I/O 零平台依赖、`spikes/` 物理隔离、`cloud-cf/src/` M2 `<= 700` 行 / M4 `<= 950` 行与 `mynote-core` 同步核心 `< 3,000` 行预算 [目标]、同步客户端防 `302` 重定向配置、HTML 零内联脚本与三包版本号一致）、`cargo fmt --check`、`cargo clippy -- -D warnings`、TypeScript 类型检查。
+- **平台矩阵**：当前 `macos-latest`（aarch64）与 `ubuntu-latest` 同时运行；M5-W1 起扩展为三平台矩阵，新增 `windows-latest`（Rust 构建、`clippy`、`SEC-WIN-PIPE`、`SEC-WIN-CLIP` 与跨平台子进程/CLI 契约测试）；Worker 契约测试与 Playwright Chromium / WebKit 运行时审计在 Linux 上必跑。
+- **静态与架构守卫**：`scripts/check-architecture.py`（含 `--selftest` 变异自检，强制校验 `mynote-core` Sans-I/O 零平台依赖、`spikes/` 物理隔离、`cloud-cf/src/` M2 `<= 700` 行 / M4 初版 `<= 950` 行 / D8′ `<= 1,050` 行与 `mynote-core` 同步核心 `< 3,000` 行预算 [目标]、同步客户端防 `302` 重定向配置、HTML 零内联脚本与三包版本号一致）、`cargo fmt --check`、`cargo clippy -- -D warnings`、TypeScript 类型检查。
 - **真实浏览器 CDP 几何与状态等价门禁**：除 `SEC-03`、`SEC-06`、`SEC-08` 外，`tests/e2e/test_ui_cdp_equivalence.py` 在真实 `mynote daemon` 与无头 Chromium / WebKit 下断言零 `console.error` / `pageerror`、桌面（`1440x900`、`900x700`）与移动（`390x844`）视口 `scrollWidth <= innerWidth`、`.sr-only` 包含块隔离、实时 WebSocket 并发新建 Buffer 零重复标签，以及前端 DOM 排序与 SQLite 快照等价。
 
 | 层级 | 标准入口命令 | 触发时机 | 耗时 | 内容 | 失败策略 |
@@ -281,7 +286,7 @@ my-note/
 
 ---
 
-## 10. 里程碑门禁矩阵（S0 → M4）
+## 10. 里程碑门禁矩阵（S0 → M5）
 
 路线图以 [architecture-proposal.md](./architecture-proposal.md) 为准（审查 §9.11、§9.12）。
 
@@ -294,6 +299,9 @@ my-note/
 | **S-Clip 技术 spike** | 无门禁；隔离于 `spikes/`。完成 `S-Clip-1`–`S-Clip-5` 真机实测（iPhone Scriptable JS 互通与压缩图稳定性、PWA WASM 体积与 Safari Promise 写图、macOS `NSPasteboard`、Hyprland `cliphist` 共存、Worker 流式写 `10 MiB` 到 R2） | 5 项实测报告入库后 `ADR-11` 升为 `Accepted` |
 | **M4a 100 条图文显式剪贴板** | 新增：`INV-CLIP-ISOLATION`；`SEC-09`（越权 `403`、拒 SVG、`ClipKey` 轮换、`ephemeral` 零写库）；`SEC-08` 扩展（PWA `clip_items` 密文与 `share_target` 缓存清零） | 真实 iPhone（PWA 无损原图 + Shortcuts 文本/压缩图）→ Mac / Omarchy 端到端实测通过 |
 | **M4b 桌面后台自动镜像（opt-in）** | 新增：`SEC-09` 桌面监听过滤（敏感 UTI/MIME 与 `detect_secret_pattern` 0 出站）与含 JPEG → PNG 转码的 Echo Loop 免疫测试 | Mac ↔ Omarchy 连续 2 周日常使用零回环、零密码管理器泄露、与 `cliphist` 零冲突 |
+| **M5 Phase 0 Spike（`S-Plugin-1` + `S-Win-1`）** | 无门禁；隔离于 `spikes/`。产出 `docs/spikes/s-plugin-1-wasmi.md`（`wasmi` Release 体积增量与双宿主 fuel / OOM 延迟）与 `docs/spikes/s-win-1-platform.md`（Named Pipe SDDL / Job Object / Win32 剪贴板实测） | 拿到真实 `[已测]` 体积与 Windows 原语证据后再进入 M5-W1 / M5-P1（启动前待确认） |
+| **M5-W1..W3（Windows 一等桌面平台，D9）** | 新增：`windows-latest` CI 三平台矩阵；`SEC-WIN-PIPE`；`SEC-WIN-CLIP`；预算红线 `cloud-cf/src/` `0 LOC` 改动与 `pkg-pwa` `0 B` 增量；Release 预编译包 SHA-256 校验 | Windows 真机 / `windows-latest` 完成三端 E2EE 同步、剪贴板与后台守护验证后，`ADR-12` 升为 `Accepted` |
+| **M5-P1..P4（`wasmi` 优先双宿主插件体系，D10）** | 新增：`INV-PLUGIN-ZERO-IMPORT`；`INV-PLUGIN-RESOURCE-BOUND`；`SEC-10`（6 种声明式视图 XSS 净化、`exec` 拒锁块 `423`、Tier 2 Worker 零 Daemon 明文、`reactor` 防回环）；无插件启动增量 `< 1 ms` `[目标]`；预算红线 `cloud-cf/src/` `0 LOC` 改动、`pkg-pwa` `0 B` 增量与单二进制 `< 15 MB` `[目标]` | 1–2 个 `< 50 KiB` 参考 `.wasm` 插件在三桌面 + 解锁态 Tier 2 实测通过后，`ADR-13` 升为 `Accepted` |
 
 ### 10.1 观测指标（不阻断）
 
@@ -309,7 +317,7 @@ my-note/
 
 ---
 
-## 11. 已移除 / 推迟的机制（2026-11-24 / 2026-11-27 修订）
+## 11. 已移除 / 推迟的机制（2026-11-24 / 2026-11-27 / 2026-11-28 修订）
 
 依据 [第一性原理审查](../review/2026-11-24-first-principles-review.md)：
 
