@@ -12,6 +12,8 @@ exclude = [
     "spikes/s-clip-1-ios-shortcuts/rust-interop",
     "spikes/s-clip-3-macos-pasteboard",
     "spikes/s-clip-4-hyprland-wayland",
+    "spikes/s-plugin-1-wasmi",
+    "spikes/s-plugin-1-wasmi/guest-calc",
 ]
 
 [workspace.package]
