@@ -1823,12 +1823,12 @@ pub(super) async fn handle_patch_clip_watch(
 }
 
 // ---------------------------------------------------------------------------
-// UDS Clip Dispatch Helpers
+// LocalIpc Clip Dispatch Helpers
 // ---------------------------------------------------------------------------
 
-pub(super) async fn dispatch_uds_clip_undo(state: &Arc<DaemonState>) -> UdsResponse {
+pub(super) async fn dispatch_ipc_clip_undo(state: &Arc<DaemonState>) -> LocalIpcResponse {
     match state.undo_clipboard() {
-        Ok(restored) => UdsResponse {
+        Ok(restored) => LocalIpcResponse {
             ok: true,
             version: Some(state.version.to_string()),
             pid: None,
@@ -1840,13 +1840,13 @@ pub(super) async fn dispatch_uds_clip_undo(state: &Arc<DaemonState>) -> UdsRespo
             data: Some(serde_json::json!({ "restored": restored })),
             error: None,
         },
-        Err(e) => UdsResponse::from_core_error(&e),
+        Err(e) => LocalIpcResponse::from_core_error(&e),
     }
 }
 
-pub(super) async fn dispatch_uds_clip_apply(state: &Arc<DaemonState>, clip_id: &str) -> UdsResponse {
+pub(super) async fn dispatch_ipc_clip_apply(state: &Arc<DaemonState>, clip_id: &str) -> LocalIpcResponse {
     match state.apply_clip_by_id(clip_id).await {
-        Ok(has_undo) => UdsResponse {
+        Ok(has_undo) => LocalIpcResponse {
             ok: true,
             version: Some(state.version.to_string()),
             pid: None,
@@ -1862,15 +1862,15 @@ pub(super) async fn dispatch_uds_clip_apply(state: &Arc<DaemonState>, clip_id: &
             })),
             error: None,
         },
-        Err(e) => UdsResponse::from_core_error(&e),
+        Err(e) => LocalIpcResponse::from_core_error(&e),
     }
 }
 
-pub(super) async fn dispatch_uds_clip_poke(
+pub(super) async fn dispatch_ipc_clip_poke(
     state: &Arc<DaemonState>,
     clip_id: Option<String>,
     cleared: bool,
-) -> UdsResponse {
+) -> LocalIpcResponse {
     if cleared {
         state.broadcast_clip_changed(Vec::new(), Vec::new(), true);
     } else if let Some(cid) = clip_id {
@@ -1893,7 +1893,7 @@ pub(super) async fn dispatch_uds_clip_poke(
             st.spawn_clip_blob_prefetch();
         });
     }
-    UdsResponse {
+    LocalIpcResponse {
         ok: true,
         version: Some(state.version.to_string()),
         pid: None,
@@ -1907,14 +1907,14 @@ pub(super) async fn dispatch_uds_clip_poke(
     }
 }
 
-pub(super) fn dispatch_uds_clip_watch_set(
+pub(super) fn dispatch_ipc_clip_watch_set(
     state: &Arc<DaemonState>,
     paused: Option<bool>,
     enabled: Option<bool>,
     auto_apply_mirror: Option<String>,
-) -> UdsResponse {
+) -> LocalIpcResponse {
     match state.update_clip_watch(paused, enabled, auto_apply_mirror) {
-        Ok(cfg) => UdsResponse {
+        Ok(cfg) => LocalIpcResponse {
             ok: true,
             version: Some(state.version.to_string()),
             pid: None,
@@ -1926,6 +1926,6 @@ pub(super) fn dispatch_uds_clip_watch_set(
             data: serde_json::to_value(cfg).ok(),
             error: None,
         },
-        Err(e) => UdsResponse::from_core_error(&e),
+        Err(e) => LocalIpcResponse::from_core_error(&e),
     }
 }

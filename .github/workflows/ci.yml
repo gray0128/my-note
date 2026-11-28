@@ -145,13 +145,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
+      - name: Preserve LF line endings on Windows checkout
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Pin evals/ to PR base commit on non-[eval-only] PRs
         if: github.event_name == 'pull_request' && !startsWith(github.event.pull_request.title, '[eval-only]')
+        shell: bash
         run: rm -rf evals/ && git checkout "${{ github.event.pull_request.base.sha }}" -- evals/
       - name: Download embedded Desktop Web UI assets
         uses: actions/download-artifact@v4
@@ -167,11 +171,15 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test workspace (including 500-seed M1/M2 DST + INV-RECOVERY + INV-SHRED-BOUND + SEC-01/04/05)
+      - name: Test workspace (including 500-seed M1/M2 DST + INV-RECOVERY + INV-SHRED-BOUND + SEC-01/04/05 + SEC-WIN-PIPE)
         env:
           MYNOTE_DST_SEEDS: "500"
         run: cargo test --workspace
+      - name: Run SEC-WIN-PIPE Windows platform security gate with diagnostic output
+        if: runner.os == 'Windows'
+        run: cargo test -p mynote-cli --test sec_win_pipe -- --nocapture
       - name: Run frozen CLI golden tests (evals/golden/ G01-G11 + static checks)
+        if: runner.os != 'Windows'
         run: |
           cargo build --bin mynote
           ./evals/golden/run_golden.sh

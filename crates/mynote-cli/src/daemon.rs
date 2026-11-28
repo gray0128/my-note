@@ -4,8 +4,8 @@
 use crate::clip_watch::{load_persisted_watch_config, spawn_clip_watch_supervisor, ClipWatchFilter};
 use crate::clipboard::{default_system_clipboard, EchoGuard, SystemClipboard, UndoClipboardSlot};
 use crate::formatters::format_content;
+use crate::local_ipc::{socket_path_for, ApplyMeta, ApplyRequest, LocalIpcRequest, LocalIpcResponse};
 use crate::sync_client::{hex_encode, run_cloud_ws_loop, PushOutcome, RelayClient};
-use crate::uds::{socket_path_for, ApplyMeta, ApplyRequest, UdsRequest, UdsResponse};
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
 use axum::http::header::{
@@ -743,6 +743,7 @@ pub struct RunningDaemon {
     pub port: u16,
     pub state: Arc<DaemonState>,
     shutdown_tx: watch::Sender<bool>,
+    ipc_accept_task: tokio::task::JoinHandle<()>,
     _lock_file: File,
     sock_path: PathBuf,
 }
@@ -750,7 +751,11 @@ pub struct RunningDaemon {
 impl RunningDaemon {
     pub fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
+        self.ipc_accept_task.abort();
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.sock_path);
+        #[cfg(not(unix))]
+        let _ = &self.sock_path;
     }
 }
 
@@ -873,10 +878,10 @@ pub async fn start_daemon_with_clipboard(
         });
     }
 
-    // Bind `0600` Unix Domain Socket inside `0700` owner-verified parent directory
+    // Bind cross-platform `LocalIpc` (`0600` UDS on Unix / current-user SDDL Named Pipe on Windows)
     let sock_path = socket_path_for(&cfg.data_dir);
     #[cfg(unix)]
-    {
+    let ipc_accept_task = {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if let Some(parent) = sock_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -893,7 +898,7 @@ pub async fn start_daemon_with_clipboard(
                     "Check directory permissions",
                 )
             })?;
-            if meta.file_type().is_symlink() || meta.uid() != crate::uds::current_uid() {
+            if meta.file_type().is_symlink() || meta.uid() != crate::local_ipc::current_uid() {
                 return Err(CoreError::new(
                     ErrorCode::IntegrityError,
                     format!(
@@ -927,7 +932,7 @@ pub async fn start_daemon_with_clipboard(
                 "Check socket directory permissions",
             )
         })?;
-        let uds_state = state.clone();
+        let ipc_state = state.clone();
         let mut rx = shutdown_rx.clone();
         tokio::spawn(async move {
             loop {
@@ -935,14 +940,50 @@ pub async fn start_daemon_with_clipboard(
                     _ = rx.changed() => break,
                     accepted = uds_listener.accept() => {
                         if let Ok((stream, _)) = accepted {
-                            let st = uds_state.clone();
-                            tokio::spawn(async move { handle_uds_client(st, stream).await; });
+                            let st = ipc_state.clone();
+                            tokio::spawn(async move { handle_ipc_client(st, stream).await; });
                         }
                     }
                 }
             }
-        });
-    }
+        })
+    };
+
+    #[cfg(windows)]
+    let ipc_accept_task = {
+        let pipe_name = crate::local_ipc::pipe_name_for(&cfg.data_dir);
+        let mut pipe_server =
+            crate::local_ipc::create_hardened_pipe_server(&pipe_name, true).map_err(|e| {
+                CoreError::new(
+                    ErrorCode::IntegrityError,
+                    format!("cannot bind hardened Named Pipe '{pipe_name}': {e}"),
+                    "Ensure another process is not squatting on the mynote Named Pipe",
+                )
+            })?;
+        let ipc_state = state.clone();
+        let mut rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = rx.changed() => break,
+                    connected = pipe_server.connect() => {
+                        let next_server = match crate::local_ipc::create_hardened_pipe_server(&pipe_name, false) {
+                            Ok(s) => s,
+                            Err(_) => break,
+                        };
+                        let stream = std::mem::replace(&mut pipe_server, next_server);
+                        if connected.is_ok() {
+                            let st = ipc_state.clone();
+                            tokio::spawn(async move { handle_ipc_client(st, stream).await; });
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let ipc_accept_task = tokio::spawn(async {});
 
     // Spawn background Single-Flight cloud sync loop + dynamic Cloud WS Hibernation wakeup watcher
     if cfg.enable_cloud_sync {
@@ -1018,6 +1059,7 @@ pub async fn start_daemon_with_clipboard(
         port: actual_port,
         state,
         shutdown_tx,
+        ipc_accept_task,
         _lock_file: lock_file,
         sock_path,
     })
@@ -2857,21 +2899,23 @@ async fn serve_local_ws(state: Arc<DaemonState>, socket: WebSocket) {
     send_task.abort();
 }
 
-#[cfg(unix)]
-async fn handle_uds_client(state: Arc<DaemonState>, stream: tokio::net::UnixStream) {
-    let (read_half, mut write_half) = stream.into_split();
+async fn handle_ipc_client<S>(state: Arc<DaemonState>, stream: S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
     while let Ok(n) = reader.read_line(&mut line).await {
         if n == 0 {
             break;
         }
-        let resp = match serde_json::from_str::<UdsRequest>(line.trim()) {
-            Ok(req) => dispatch_uds_request(&state, req).await,
-            Err(e) => UdsResponse::from_core_error(&CoreError::new(
+        let resp = match serde_json::from_str::<LocalIpcRequest>(line.trim()) {
+            Ok(req) => dispatch_ipc_request(&state, req).await,
+            Err(e) => LocalIpcResponse::from_core_error(&CoreError::new(
                 ErrorCode::InvalidArgument,
-                format!("malformed UDS request: {e}"),
-                "Send valid NDJSON UdsRequest",
+                format!("malformed LocalIpc request: {e}"),
+                "Send valid NDJSON LocalIpcRequest",
             )),
         };
         if let Ok(mut out) = serde_json::to_string(&resp) {
@@ -2885,9 +2929,9 @@ async fn handle_uds_client(state: Arc<DaemonState>, stream: tokio::net::UnixStre
     }
 }
 
-async fn dispatch_uds_request(state: &Arc<DaemonState>, req: UdsRequest) -> UdsResponse {
+async fn dispatch_ipc_request(state: &Arc<DaemonState>, req: LocalIpcRequest) -> LocalIpcResponse {
     match req {
-        UdsRequest::Ping => UdsResponse {
+        LocalIpcRequest::Ping => LocalIpcResponse {
             ok: true,
             version: Some(state.version.to_string()),
             pid: Some(std::process::id()),
@@ -2899,8 +2943,8 @@ async fn dispatch_uds_request(state: &Arc<DaemonState>, req: UdsRequest) -> UdsR
             data: None,
             error: None,
         },
-        UdsRequest::OpenTicket => match state.issue_open_ticket() {
-            Ok(url) => UdsResponse {
+        LocalIpcRequest::OpenTicket => match state.issue_open_ticket() {
+            Ok(url) => LocalIpcResponse {
                 ok: true,
                 version: None,
                 pid: None,
@@ -2912,9 +2956,9 @@ async fn dispatch_uds_request(state: &Arc<DaemonState>, req: UdsRequest) -> UdsR
                 data: None,
                 error: None,
             },
-            Err(e) => UdsResponse::from_core_error(&e),
+            Err(e) => LocalIpcResponse::from_core_error(&e),
         },
-        UdsRequest::Poke { fast_flush: _ } => {
+        LocalIpcRequest::Poke { fast_flush: _ } => {
             let (bufs_updated, new_creds, refreshed_blocks) = {
                 let mut store = state.store.lock().unwrap();
                 let changed = store.reload_smks_from_disk().unwrap_or(false);
@@ -2946,7 +2990,7 @@ async fn dispatch_uds_request(state: &Arc<DaemonState>, req: UdsRequest) -> UdsR
                 state.broadcast_sync_and_trash();
             }
             state.sync_notify.notify_one();
-            UdsResponse {
+            LocalIpcResponse {
                 ok: true,
                 version: None,
                 pid: None,
@@ -2959,10 +3003,10 @@ async fn dispatch_uds_request(state: &Arc<DaemonState>, req: UdsRequest) -> UdsR
                 error: None,
             }
         }
-        UdsRequest::SyncNow { wait } => {
+        LocalIpcRequest::SyncNow { wait } => {
             if !wait {
                 state.sync_notify.notify_one();
-                return UdsResponse {
+                return LocalIpcResponse {
                     ok: true,
                     version: None,
                     pid: None,
@@ -2976,7 +3020,7 @@ async fn dispatch_uds_request(state: &Arc<DaemonState>, req: UdsRequest) -> UdsR
                 };
             }
             match state.run_cloud_sync_now().await {
-                Ok((head_seq, sync_state, pending)) => UdsResponse {
+                Ok((head_seq, sync_state, pending)) => LocalIpcResponse {
                     ok: true,
                     version: None,
                     pid: None,
@@ -2988,24 +3032,24 @@ async fn dispatch_uds_request(state: &Arc<DaemonState>, req: UdsRequest) -> UdsR
                     data: None,
                     error: None,
                 },
-                Err(e) => UdsResponse::from_core_error(&e),
+                Err(e) => LocalIpcResponse::from_core_error(&e),
             }
         }
-        UdsRequest::Apply { meta, request } => execute_uds_apply(state, meta, request),
-        UdsRequest::ClipUndo => daemon_clip::dispatch_uds_clip_undo(state).await,
-        UdsRequest::ClipApply { clip_id } => daemon_clip::dispatch_uds_clip_apply(state, &clip_id).await,
-        UdsRequest::ClipPoke { clip_id, cleared } => {
-            daemon_clip::dispatch_uds_clip_poke(state, clip_id, cleared).await
+        LocalIpcRequest::Apply { meta, request } => execute_ipc_apply(state, meta, request),
+        LocalIpcRequest::ClipUndo => daemon_clip::dispatch_ipc_clip_undo(state).await,
+        LocalIpcRequest::ClipApply { clip_id } => daemon_clip::dispatch_ipc_clip_apply(state, &clip_id).await,
+        LocalIpcRequest::ClipPoke { clip_id, cleared } => {
+            daemon_clip::dispatch_ipc_clip_poke(state, clip_id, cleared).await
         }
-        UdsRequest::ClipWatchSet {
+        LocalIpcRequest::ClipWatchSet {
             paused,
             enabled,
             auto_apply_mirror,
-        } => daemon_clip::dispatch_uds_clip_watch_set(state, paused, enabled, auto_apply_mirror),
+        } => daemon_clip::dispatch_ipc_clip_watch_set(state, paused, enabled, auto_apply_mirror),
     }
 }
 
-fn execute_uds_apply(state: &Arc<DaemonState>, meta: ApplyMeta, req: ApplyRequest) -> UdsResponse {
+fn execute_ipc_apply(state: &Arc<DaemonState>, meta: ApplyMeta, req: ApplyRequest) -> LocalIpcResponse {
     let mut broadcast_block_up: Option<String> = None;
     let mut broadcast_block_del: Option<String> = None;
     let mut broadcast_bufs: Option<Vec<String>> = None;
@@ -3262,7 +3306,7 @@ fn execute_uds_apply(state: &Arc<DaemonState>, meta: ApplyMeta, req: ApplyReques
                 state.broadcast_buffers_snapshot(dels);
             }
             state.sync_notify.notify_one();
-            UdsResponse {
+            LocalIpcResponse {
                 ok: true,
                 version: Some(state.version.to_string()),
                 pid: None,
@@ -3275,6 +3319,6 @@ fn execute_uds_apply(state: &Arc<DaemonState>, meta: ApplyMeta, req: ApplyReques
                 error: None,
             }
         }
-        Err(e) => UdsResponse::from_core_error(&e),
+        Err(e) => LocalIpcResponse::from_core_error(&e),
     }
 }
