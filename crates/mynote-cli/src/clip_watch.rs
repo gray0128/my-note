@@ -22,7 +22,6 @@ use mynote_core::vault::detect_secret_pattern;
 use mynote_store::LocalStore;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 
 /// Persisted `local_meta` key for opt-in background auto-watch (`"1"` = enabled, default OFF).
@@ -325,7 +324,9 @@ pub enum WatchCaptureOutcome {
     Dropped(WatchDecision),
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn now_ms_u64() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

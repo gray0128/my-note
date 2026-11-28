@@ -28,7 +28,7 @@ use mynote_core::vault::{
 use mynote_store::store::{DeleteReceipt, LocalStore, WriteReceipt};
 use mynote_store::Tier2OpInput;
 use std::collections::BTreeSet;
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
@@ -264,6 +264,7 @@ pub const fn suppress_console_echo_mode(orig_mode: u32) -> u32 {
 fn read_tty_secret(prompt: &str) -> Result<Zeroizing<String>, CoreError> {
     #[cfg(unix)]
     {
+        use std::io::BufRead;
         struct EchoRestore(Option<std::fs::File>);
         impl Drop for EchoRestore {
             fn drop(&mut self) {
