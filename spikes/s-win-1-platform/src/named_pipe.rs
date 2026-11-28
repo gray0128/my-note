@@ -217,7 +217,7 @@ mod imp {
         GetTokenInformation, TokenOwner, TokenUser, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
         PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
     };
-    use windows_sys::Win32::System::Pipes::{GetNamedPipeInfo, PIPE_SERVER_END};
+    use windows_sys::Win32::System::Pipes::{GetNamedPipeInfo, PIPE_REJECT_REMOTE_CLIENTS, PIPE_SERVER_END};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     struct LocalAllocGuard(*mut core::ffi::c_void);
@@ -353,6 +353,7 @@ mod imp {
         pub owner_sid: String,
         pub pipe_flags: u32,
         pub is_server_end: bool,
+        pub rejects_remote_clients: bool,
     }
 
     /// Read the live kernel Security Descriptor and Named Pipe flags back from `server` via
@@ -404,6 +405,7 @@ mod imp {
             owner_sid: owner_sid_str,
             pipe_flags,
             is_server_end: (pipe_flags & PIPE_SERVER_END) != 0,
+            rejects_remote_clients: (pipe_flags & PIPE_REJECT_REMOTE_CLIENTS) != 0,
         })
     }
 

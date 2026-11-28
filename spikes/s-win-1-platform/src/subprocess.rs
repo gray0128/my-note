@@ -195,9 +195,14 @@ pub fn build_windows_command_line_utf16(program: &str, args: &[&str]) -> Vec<u16
     line.encode_utf16().chain(core::iter::once(0)).collect()
 }
 
-/// Normalize Windows `\r\n` line endings to `\n` without disturbing UTF-8 content.
+/// Normalize Windows `\r\n` (and text-mode CRT doubled `\r\r\n`) line endings to `\n` without
+/// disturbing UTF-8 content.
 pub fn normalize_crlf(s: &str) -> String {
-    s.replace("\r\n", "\n")
+    let mut out = s.replace("\r\n", "\n");
+    while out.contains("\r\n") {
+        out = out.replace("\r\n", "\n");
+    }
+    out
 }
 
 #[cfg(windows)]
