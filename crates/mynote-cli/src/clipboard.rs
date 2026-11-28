@@ -1,14 +1,14 @@
 //! Native desktop OS clipboard adapters (`macOS NSPasteboard` via `objc2-app-kit`,
-//! `Linux Wayland` via `wl-clipboard-rs`), bitmap normalization/thumbnailing,
-//! `EchoGuard`, `UndoClipboardSlot`, and lightweight OS notifications.
+//! `Linux Wayland` via `wl-clipboard-rs`, `Windows Win32` via `windows-sys`),
+//! bitmap normalization/thumbnailing, `EchoGuard`, `UndoClipboardSlot`, and OS notifications.
 //!
 //! Grounded in `docs/spikes/s-clip-3-macos-pasteboard.md`,
-//! `docs/spikes/s-clip-4-hyprland-wayland.md`, `docs/threat-model.md` §9.2,
-//! and `docs/sync-protocol.md` §11.3.
+//! `docs/spikes/s-clip-4-hyprland-wayland.md`, `docs/spikes/s-win-1-platform.md`,
+//! `docs/threat-model.md` §9.2 & §10.1, and `docs/sync-protocol.md` §11.3.
 
 use base64::Engine;
 use image::codecs::jpeg::JpegEncoder;
-use image::{ImageFormat, ImageReader};
+use image::{ImageFormat, ImageReader, RgbaImage};
 use mynote_core::clip::{validate_clip_image_mime, CLIP_BLOB_MAX_BYTES, CLIP_THUMB_MAX_BYTES};
 use mynote_core::error::{CoreError, ErrorCode};
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,26 @@ pub const UTI_MYNOTE_VAULT_SECRET: &str = "dev.mynote.vault-secret";
 pub const MIME_KDE_PASSWORD_HINT: &str = "x-kde-passwordManagerHint";
 pub const MIME_MYNOTE_SYNCED: &str = "application/x-mynote-synced";
 pub const MIME_MYNOTE_VAULT_SECRET: &str = "application/x-mynote-vault-secret";
+
+/// Windows Win32 clipboard format names & standard format IDs
+/// (`docs/spikes/s-win-1-platform.md`, `docs/threat-model.md` §9.2 & §10.1).
+pub const WIN_FMT_PNG: &str = "PNG";
+pub const WIN_FMT_IMAGE_PNG_MIME: &str = "image/png";
+pub const WIN_FMT_SVG_MIME: &str = "image/svg+xml";
+pub const WIN_FMT_SVG_SHORT: &str = "SVG";
+pub const WIN_FMT_EXCLUDE_MONITOR: &str = "ExcludeClipboardContentFromMonitorProcessing";
+pub const WIN_FMT_CAN_INCLUDE_HISTORY: &str = "CanIncludeInClipboardHistory";
+pub const WIN_FMT_CAN_UPLOAD_CLOUD: &str = "CanUploadClipboardDataToCloud";
+pub const WIN_FMT_MYNOTE_ECHO_MARKER: &str = "MyNoteClipEchoMarker";
+pub const WIN_FMT_MYNOTE_SYNCED: &str = "dev.mynote.synced-clip";
+pub const WIN_FMT_MYNOTE_VAULT_SECRET: &str = "dev.mynote.vault-secret";
+
+pub const WIN_CF_DIB: u32 = 8;
+pub const WIN_CF_UNICODETEXT: u32 = 13;
+pub const WIN_CF_DIBV5: u32 = 17;
+
+const WIN_BI_RGB: u32 = 0;
+const WIN_BI_BITFIELDS: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClipboardPayload {
@@ -266,6 +286,387 @@ pub fn make_thumbnail(bytes: &[u8], mime: &str) -> Option<(String, Vec<u8>)> {
     None
 }
 
+/// Validate raw `"PNG"` clipboard bytes: reject SVG spoofing, enforce 10 MiB ceiling, and inspect `(width, height)`.
+pub fn validate_png_clipboard_bytes(bytes: &[u8]) -> Result<(u32, u32), CoreError> {
+    if bytes.is_empty() {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            "clipboard PNG payload is empty",
+            "Copy a non-empty PNG/JPEG/WebP/GIF bitmap",
+        ));
+    }
+    if is_svg_bytes(bytes) {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            "disallowed image/svg+xml payload disguised inside PNG clipboard format",
+            "Sync SVG markup as plain text instead of an image",
+        ));
+    }
+    if bytes.len() > CLIP_BLOB_MAX_BYTES {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!("clipboard PNG ({} bytes) exceeds 10 MiB limit", bytes.len()),
+            "Resize or compress the image under 10 MiB",
+        ));
+    }
+    if bytes.len() < 8 || bytes[..8] != PNG_MAGIC {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            "clipboard PNG payload missing 8-byte PNG signature",
+            "Copy a valid PNG bitmap",
+        ));
+    }
+    ImageReader::with_format(Cursor::new(bytes), ImageFormat::Png)
+        .into_dimensions()
+        .map_err(|e| {
+            CoreError::new(
+                ErrorCode::InvalidArgument,
+                format!("invalid clipboard PNG header dimensions: {e}"),
+                "Copy a valid PNG bitmap",
+            )
+        })
+}
+
+/// Build a standard Win32 `CF_DIBV5` (`BITMAPV5HEADER`, 124-byte header, bottom-up 32-bpp BGRA)
+/// byte buffer from an RGBA8 image.
+pub fn rgba_to_dibv5_bytes(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    assert_eq!(rgba.len(), (width as usize) * (height as usize) * 4);
+    let header_size = 124usize;
+    let pixel_bytes = (width as usize) * (height as usize) * 4;
+    let mut out = vec![0u8; header_size + pixel_bytes];
+
+    out[0..4].copy_from_slice(&(header_size as u32).to_le_bytes());
+    out[4..8].copy_from_slice(&(width as i32).to_le_bytes());
+    out[8..12].copy_from_slice(&(height as i32).to_le_bytes());
+    out[12..14].copy_from_slice(&1u16.to_le_bytes());
+    out[14..16].copy_from_slice(&32u16.to_le_bytes());
+    out[16..20].copy_from_slice(&WIN_BI_BITFIELDS.to_le_bytes());
+    out[20..24].copy_from_slice(&(pixel_bytes as u32).to_le_bytes());
+    out[40..44].copy_from_slice(&0x00FF_0000u32.to_le_bytes());
+    out[44..48].copy_from_slice(&0x0000_FF00u32.to_le_bytes());
+    out[48..52].copy_from_slice(&0x0000_00FFu32.to_le_bytes());
+    out[52..56].copy_from_slice(&0xFF00_0000u32.to_le_bytes());
+    out[56..60].copy_from_slice(&0x7352_4742u32.to_le_bytes());
+
+    let row_bytes = (width as usize) * 4;
+    for y in 0..(height as usize) {
+        let src_row = (height as usize - 1 - y) * row_bytes;
+        let dst_row = header_size + y * row_bytes;
+        for x in 0..(width as usize) {
+            let s = src_row + x * 4;
+            let d = dst_row + x * 4;
+            out[d] = rgba[s + 2];
+            out[d + 1] = rgba[s + 1];
+            out[d + 2] = rgba[s];
+            out[d + 3] = rgba[s + 3];
+        }
+    }
+    out
+}
+
+/// Build a classic Win32 `CF_DIB` (`BITMAPINFOHEADER`, 40-byte header, bottom-up 32-bpp BGRA `BI_RGB`)
+/// byte buffer from an RGBA8 image.
+pub fn rgba_to_dib_bytes(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    assert_eq!(rgba.len(), (width as usize) * (height as usize) * 4);
+    let header_size = 40usize;
+    let pixel_bytes = (width as usize) * (height as usize) * 4;
+    let mut out = vec![0u8; header_size + pixel_bytes];
+
+    out[0..4].copy_from_slice(&(header_size as u32).to_le_bytes());
+    out[4..8].copy_from_slice(&(width as i32).to_le_bytes());
+    out[8..12].copy_from_slice(&(height as i32).to_le_bytes());
+    out[12..14].copy_from_slice(&1u16.to_le_bytes());
+    out[14..16].copy_from_slice(&32u16.to_le_bytes());
+    out[16..20].copy_from_slice(&WIN_BI_RGB.to_le_bytes());
+    out[20..24].copy_from_slice(&(pixel_bytes as u32).to_le_bytes());
+
+    let row_bytes = (width as usize) * 4;
+    for y in 0..(height as usize) {
+        let src_row = (height as usize - 1 - y) * row_bytes;
+        let dst_row = header_size + y * row_bytes;
+        for x in 0..(width as usize) {
+            let s = src_row + x * 4;
+            let d = dst_row + x * 4;
+            out[d] = rgba[s + 2];
+            out[d + 1] = rgba[s + 1];
+            out[d + 2] = rgba[s];
+            out[d + 3] = rgba[s + 3];
+        }
+    }
+    out
+}
+
+fn extract_masked_channel(pixel: u32, mask: u32) -> u8 {
+    if mask == 0 {
+        return 0;
+    }
+    let shift = mask.trailing_zeros();
+    let max_val = mask >> shift;
+    let raw = (pixel & mask) >> shift;
+    if max_val == 0xFF {
+        raw as u8
+    } else {
+        ((raw as u64 * 255 + (max_val as u64 / 2)) / (max_val as u64)) as u8
+    }
+}
+
+/// Losslessly convert raw Win32 `CF_DIBV5` (`BITMAPV5HEADER`) or `CF_DIB` (`BITMAPINFOHEADER` /
+/// `BITMAPV4HEADER`) bytes into PNG `(png_bytes, width, height)` via the `image` crate.
+pub fn dib_to_png(dib: &[u8]) -> Result<(Vec<u8>, u32, u32), CoreError> {
+    if is_svg_bytes(dib) {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            "disallowed image/svg+xml payload rejected in DIB decoder",
+            "Sync SVG markup as plain text instead",
+        ));
+    }
+    if dib.len() < 40 {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!("DIB buffer too short ({} bytes < 40)", dib.len()),
+            "Copy a valid bitmap image",
+        ));
+    }
+    if dib.len() > MAX_RAW_TIFF_BYTES {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!("raw DIB payload ({} bytes) exceeds 64 MiB safety cap", dib.len()),
+            "Resize the image under 10 MiB",
+        ));
+    }
+
+    let bi_size = u32::from_le_bytes(dib[0..4].try_into().unwrap()) as usize;
+    if bi_size < 40 || dib.len() < bi_size {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!("invalid DIB header size {bi_size} for buffer len {}", dib.len()),
+            "Copy a valid bitmap image",
+        ));
+    }
+
+    let width_i32 = i32::from_le_bytes(dib[4..8].try_into().unwrap());
+    let height_i32 = i32::from_le_bytes(dib[8..12].try_into().unwrap());
+    if width_i32 <= 0 || height_i32 == 0 || height_i32 == i32::MIN {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!("invalid DIB dimensions {width_i32}x{height_i32}"),
+            "Copy a valid bitmap image",
+        ));
+    }
+    let width = width_i32 as u32;
+    let bottom_up = height_i32 > 0;
+    let height = height_i32.unsigned_abs();
+
+    let planes = u16::from_le_bytes(dib[12..14].try_into().unwrap());
+    let bit_count = u16::from_le_bytes(dib[14..16].try_into().unwrap());
+    let compression = u32::from_le_bytes(dib[16..20].try_into().unwrap());
+    let clr_used = u32::from_le_bytes(dib[32..36].try_into().unwrap()) as usize;
+
+    if planes != 1 || !matches!(bit_count, 24 | 32) || !matches!(compression, WIN_BI_RGB | WIN_BI_BITFIELDS) {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "unsupported DIB format (planes={planes}, bit_count={bit_count}, compression={compression})"
+            ),
+            "Copy a 24-bit or 32-bit uncompressed bitmap or PNG image",
+        ));
+    }
+
+    let stride = ((width as usize)
+        .checked_mul(bit_count as usize)
+        .ok_or_else(|| CoreError::new(ErrorCode::InvalidArgument, "DIB stride overflow", "Resize image"))?)
+    .div_ceil(32)
+        * 4;
+    let pixel_bytes = stride.checked_mul(height as usize).ok_or_else(|| {
+        CoreError::new(
+            ErrorCode::InvalidArgument,
+            "DIB pixel size overflow",
+            "Resize image",
+        )
+    })?;
+    let palette_bytes = clr_used.checked_mul(4).ok_or_else(|| {
+        CoreError::new(
+            ErrorCode::InvalidArgument,
+            "DIB color table overflow",
+            "Resize image",
+        )
+    })?;
+    let base_after_palette = bi_size
+        .checked_add(palette_bytes)
+        .ok_or_else(|| CoreError::new(ErrorCode::InvalidArgument, "DIB offset overflow", "Resize image"))?;
+
+    let (r_mask, g_mask, b_mask, a_mask, pixel_offset) = if compression == WIN_BI_BITFIELDS {
+        if bi_size >= 108 {
+            let rm = u32::from_le_bytes(dib[40..44].try_into().unwrap());
+            let gm = u32::from_le_bytes(dib[44..48].try_into().unwrap());
+            let bm = u32::from_le_bytes(dib[48..52].try_into().unwrap());
+            let am = u32::from_le_bytes(dib[52..56].try_into().unwrap());
+            let extra_masks_end = base_after_palette.saturating_add(12);
+            let off = if extra_masks_end
+                .checked_add(pixel_bytes)
+                .is_some_and(|end| dib.len() >= end)
+                && dib[base_after_palette..extra_masks_end] == dib[40..52]
+            {
+                extra_masks_end
+            } else {
+                base_after_palette
+            };
+            (rm, gm, bm, am, off)
+        } else {
+            let masks_end = bi_size.checked_add(12).ok_or_else(|| {
+                CoreError::new(ErrorCode::InvalidArgument, "DIB mask overflow", "Resize image")
+            })?;
+            if dib.len() < masks_end {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    "BITMAPINFOHEADER BI_BITFIELDS missing 12-byte channel masks",
+                    "Copy a valid bitmap image",
+                ));
+            }
+            let rm = u32::from_le_bytes(dib[bi_size..bi_size + 4].try_into().unwrap());
+            let gm = u32::from_le_bytes(dib[bi_size + 4..bi_size + 8].try_into().unwrap());
+            let bm = u32::from_le_bytes(dib[bi_size + 8..bi_size + 12].try_into().unwrap());
+            let off = base_after_palette.checked_add(12).ok_or_else(|| {
+                CoreError::new(ErrorCode::InvalidArgument, "DIB offset overflow", "Resize image")
+            })?;
+            (rm, gm, bm, 0, off)
+        }
+    } else {
+        let am = if bit_count == 32 && bi_size >= 108 {
+            u32::from_le_bytes(dib[52..56].try_into().unwrap())
+        } else {
+            0
+        };
+        (0x00FF_0000, 0x0000_FF00, 0x0000_00FF, am, base_after_palette)
+    };
+
+    let required_len = pixel_offset.checked_add(pixel_bytes).ok_or_else(|| {
+        CoreError::new(
+            ErrorCode::InvalidArgument,
+            "DIB total size overflow",
+            "Resize image",
+        )
+    })?;
+    if dib.len() < required_len {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!("truncated DIB buffer ({} bytes < {required_len})", dib.len()),
+            "Copy a complete bitmap image",
+        ));
+    }
+
+    let rgba_len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| CoreError::new(ErrorCode::InvalidArgument, "RGBA buffer overflow", "Resize image"))?;
+    let pixels = &dib[pixel_offset..required_len];
+    let mut rgba = vec![0u8; rgba_len];
+    let mut any_nonzero_alpha = false;
+
+    for out_y in 0..(height as usize) {
+        let src_y = if bottom_up {
+            height as usize - 1 - out_y
+        } else {
+            out_y
+        };
+        let row = &pixels[src_y * stride..(src_y + 1) * stride];
+        let dst_row = out_y * (width as usize) * 4;
+        if bit_count == 32 {
+            for x in 0..(width as usize) {
+                let px = u32::from_le_bytes(row[x * 4..x * 4 + 4].try_into().unwrap());
+                let r = extract_masked_channel(px, r_mask);
+                let g = extract_masked_channel(px, g_mask);
+                let b = extract_masked_channel(px, b_mask);
+                let a = if a_mask != 0 {
+                    extract_masked_channel(px, a_mask)
+                } else {
+                    (px >> 24) as u8
+                };
+                if a != 0 {
+                    any_nonzero_alpha = true;
+                }
+                let d = dst_row + x * 4;
+                rgba[d] = r;
+                rgba[d + 1] = g;
+                rgba[d + 2] = b;
+                rgba[d + 3] = a;
+            }
+        } else {
+            for x in 0..(width as usize) {
+                let s = x * 3;
+                let d = dst_row + x * 4;
+                rgba[d] = row[s + 2];
+                rgba[d + 1] = row[s + 1];
+                rgba[d + 2] = row[s];
+                rgba[d + 3] = 0xFF;
+            }
+            any_nonzero_alpha = true;
+        }
+    }
+
+    if bit_count == 32 && a_mask == 0 && !any_nonzero_alpha {
+        for chunk in rgba.chunks_exact_mut(4) {
+            chunk[3] = 0xFF;
+        }
+    }
+
+    let img = RgbaImage::from_raw(width, height, rgba).ok_or_else(|| {
+        CoreError::new(
+            ErrorCode::IntegrityError,
+            "failed constructing RgbaImage from DIB",
+            "Retry copying bitmap",
+        )
+    })?;
+    let mut png_out = Vec::new();
+    img.write_to(&mut Cursor::new(&mut png_out), ImageFormat::Png)
+        .map_err(|e| {
+            CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("failed encoding DIB to PNG: {e}"),
+                "Retry copying bitmap",
+            )
+        })?;
+    if png_out.len() > CLIP_BLOB_MAX_BYTES {
+        return Err(CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "transcoded DIB PNG ({} bytes) exceeds 10 MiB limit ({CLIP_BLOB_MAX_BYTES} bytes)",
+                png_out.len()
+            ),
+            "Resize or compress the image under 10 MiB",
+        ));
+    }
+    Ok((png_out, width, height))
+}
+
+/// Encode a UTF-8 string into NUL-terminated UTF-16LE bytes for Win32 `CF_UNICODETEXT`.
+pub fn utf8_to_utf16le_clipboard_bytes(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity((text.len() + 1) * 2);
+    for unit in text.encode_utf16().chain(std::iter::once(0u16)) {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    out
+}
+
+/// Decode NUL-terminated UTF-16LE bytes from Win32 `CF_UNICODETEXT` into a UTF-8 `String`.
+pub fn utf16le_clipboard_bytes_to_utf8(raw: &[u8]) -> Result<String, CoreError> {
+    let mut units = Vec::with_capacity(raw.len() / 2);
+    for pair in raw.chunks_exact(2) {
+        let unit = u16::from_le_bytes([pair[0], pair[1]]);
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+    }
+    String::from_utf16(&units).map_err(|e| {
+        CoreError::new(
+            ErrorCode::InvalidArgument,
+            format!("clipboard CF_UNICODETEXT is not valid UTF-16: {e}"),
+            "Copy valid Unicode text or pass --text / --stdin",
+        )
+    })
+}
+
 // ---------------------------------------------------------------------------
 // EchoGuard & UndoClipboardSlot
 // ---------------------------------------------------------------------------
@@ -442,6 +843,74 @@ pub fn wayland_classify_mimes(mimes: &[String]) -> WaylandOfferChoice {
         return WaylandOfferChoice::SvgOnlyRejected;
     }
     WaylandOfferChoice::Empty
+}
+
+/// Evaluate a 4-byte Windows clipboard `DWORD` privacy flag (`CanIncludeInClipboardHistory` or
+/// `CanUploadClipboardDataToCloud`): returns `true` when `DWORD == 0` OR when the buffer is
+/// malformed (`< 4` bytes, fail-closed).
+pub fn windows_is_dword_zero_or_malformed(raw_bytes: &[u8]) -> bool {
+    if raw_bytes.len() < 4 {
+        return true;
+    }
+    u32::from_le_bytes([raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3]]) == 0
+}
+
+/// Pure Windows format-name presence pre-check executed BEFORE any `GetClipboardData` call:
+/// skips `MyNoteClipEchoMarker`, `dev.mynote.*` markers, and
+/// `ExcludeClipboardContentFromMonitorProcessing`.
+pub fn windows_precheck_presence_format<'a>(format_names: &[&'a str]) -> Option<&'a str> {
+    format_names.iter().copied().find(|&name| {
+        name == WIN_FMT_MYNOTE_ECHO_MARKER
+            || name == WIN_FMT_MYNOTE_SYNCED
+            || name == WIN_FMT_MYNOTE_VAULT_SECRET
+            || name.starts_with("dev.mynote.")
+            || name.eq_ignore_ascii_case(WIN_FMT_EXCLUDE_MONITOR)
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WinSelectedFormat {
+    Png(u32),
+    DibV5,
+    Dib,
+    UnicodeText,
+    SvgOnlyRejected,
+}
+
+/// Pure Windows clipboard source selector (`"PNG"` strictly before `CF_DIBV5` / `CF_DIB`,
+/// `CF_UNICODETEXT` for text, and strict rejection of `image/svg+xml` / `SVG` without plain text).
+pub fn windows_select_source_format(formats: &[(u32, &str)]) -> Option<WinSelectedFormat> {
+    if let Some(&(id, _)) = formats.iter().find(|(_, name)| *name == WIN_FMT_PNG) {
+        return Some(WinSelectedFormat::Png(id));
+    }
+    if let Some(&(id, _)) = formats
+        .iter()
+        .find(|(_, name)| name.eq_ignore_ascii_case(WIN_FMT_IMAGE_PNG_MIME))
+    {
+        return Some(WinSelectedFormat::Png(id));
+    }
+
+    let has_svg = formats.iter().any(|(_, name)| {
+        name.eq_ignore_ascii_case(WIN_FMT_SVG_MIME) || name.eq_ignore_ascii_case(WIN_FMT_SVG_SHORT)
+    });
+    let has_unicode_text = formats.iter().any(|(id, _)| *id == WIN_CF_UNICODETEXT);
+
+    if has_svg && !has_unicode_text {
+        return Some(WinSelectedFormat::SvgOnlyRejected);
+    }
+    if formats.iter().any(|(id, _)| *id == WIN_CF_DIBV5) {
+        return Some(WinSelectedFormat::DibV5);
+    }
+    if formats.iter().any(|(id, _)| *id == WIN_CF_DIB) {
+        return Some(WinSelectedFormat::Dib);
+    }
+    if has_unicode_text {
+        return Some(WinSelectedFormat::UnicodeText);
+    }
+    if has_svg {
+        return Some(WinSelectedFormat::SvgOnlyRejected);
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,6 +1557,508 @@ mod linux_impl {
 #[cfg(target_os = "linux")]
 pub use linux_impl::{run_serve_wayland_helper, write_detached_for_standalone_cli};
 
+#[cfg(target_os = "windows")]
+mod windows_impl {
+    use super::*;
+    use std::ptr;
+    use std::thread;
+    use std::time::Duration;
+    use windows_sys::Win32::Foundation::{GlobalFree, HGLOBAL};
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardFormatNameW,
+        OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
+    };
+    use windows_sys::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_UNICODETEXT};
+
+    const OPEN_CLIPBOARD_RETRIES: usize = 15;
+    const OPEN_CLIPBOARD_BACKOFF_MS: u64 = 5;
+
+    #[derive(Clone, Debug, Default)]
+    pub struct WinClipboardReadTrace {
+        pub enumerated_formats: Vec<(u32, String)>,
+        pub get_clipboard_data_calls: Vec<u32>,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    pub struct WinRawClipboardSpec {
+        pub unicode_text: Option<String>,
+        pub png_bytes: Option<Vec<u8>>,
+        pub dibv5_bytes: Option<Vec<u8>>,
+        pub dib_bytes: Option<Vec<u8>>,
+        pub svg_xml_bytes: Option<Vec<u8>>,
+        pub exclude_from_monitor: bool,
+        pub can_include_in_history: Option<u32>,
+        pub can_upload_to_cloud: Option<u32>,
+        pub echo_marker: bool,
+        pub legacy_synced_marker: bool,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct RegisteredWinFormats {
+        pub png: u32,
+        pub svg_mime: u32,
+        pub svg_short: u32,
+        pub exclude_monitor: u32,
+        pub can_include_history: u32,
+        pub can_upload_cloud: u32,
+        pub echo_marker: u32,
+        pub synced_clip: u32,
+        pub vault_secret: u32,
+    }
+
+    pub fn register_win_formats() -> Result<RegisteredWinFormats, CoreError> {
+        Ok(RegisteredWinFormats {
+            png: register_format(WIN_FMT_PNG)?,
+            svg_mime: register_format(WIN_FMT_SVG_MIME)?,
+            svg_short: register_format(WIN_FMT_SVG_SHORT)?,
+            exclude_monitor: register_format(WIN_FMT_EXCLUDE_MONITOR)?,
+            can_include_history: register_format(WIN_FMT_CAN_INCLUDE_HISTORY)?,
+            can_upload_cloud: register_format(WIN_FMT_CAN_UPLOAD_CLOUD)?,
+            echo_marker: register_format(WIN_FMT_MYNOTE_ECHO_MARKER)?,
+            synced_clip: register_format(WIN_FMT_MYNOTE_SYNCED)?,
+            vault_secret: register_format(WIN_FMT_MYNOTE_VAULT_SECRET)?,
+        })
+    }
+
+    fn register_format(name: &str) -> Result<u32, CoreError> {
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let id = unsafe { RegisterClipboardFormatW(wide.as_ptr()) };
+        if id == 0 {
+            Err(CoreError::new(
+                ErrorCode::IntegrityError,
+                format!(
+                    "RegisterClipboardFormatW({name}) failed: {}",
+                    std::io::Error::last_os_error()
+                ),
+                "Retry Win32 clipboard operation",
+            ))
+        } else {
+            Ok(id)
+        }
+    }
+
+    struct OpenClipboardGuard;
+
+    impl OpenClipboardGuard {
+        fn open_with_retry() -> Result<Self, CoreError> {
+            let mut last_err = std::io::Error::other("OpenClipboard failed");
+            for attempt in 0..OPEN_CLIPBOARD_RETRIES {
+                let ok = unsafe { OpenClipboard(ptr::null_mut()) };
+                if ok != 0 {
+                    return Ok(Self);
+                }
+                last_err = std::io::Error::last_os_error();
+                if attempt + 1 < OPEN_CLIPBOARD_RETRIES {
+                    thread::sleep(Duration::from_millis(OPEN_CLIPBOARD_BACKOFF_MS));
+                }
+            }
+            Err(CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("OpenClipboard failed after {OPEN_CLIPBOARD_RETRIES} attempts: {last_err}"),
+                "Another Windows process is holding the clipboard lock; retry shortly",
+            ))
+        }
+    }
+
+    impl Drop for OpenClipboardGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseClipboard();
+            }
+        }
+    }
+
+    fn set_raw_clipboard_bytes(format: u32, bytes: &[u8]) -> Result<(), CoreError> {
+        let alloc_len = bytes.len().max(1);
+        let hmem: HGLOBAL = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, alloc_len) };
+        if hmem.is_null() {
+            return Err(CoreError::new(
+                ErrorCode::IntegrityError,
+                format!(
+                    "GlobalAlloc({alloc_len}) failed: {}",
+                    std::io::Error::last_os_error()
+                ),
+                "Retry Win32 clipboard write",
+            ));
+        }
+        if !bytes.is_empty() {
+            let dst = unsafe { GlobalLock(hmem) };
+            if dst.is_null() {
+                let err = std::io::Error::last_os_error();
+                unsafe {
+                    let _ = GlobalFree(hmem);
+                }
+                return Err(CoreError::new(
+                    ErrorCode::IntegrityError,
+                    format!("GlobalLock failed: {err}"),
+                    "Retry Win32 clipboard write",
+                ));
+            }
+            unsafe {
+                ptr::copy_nonoverlapping(bytes.as_ptr(), dst.cast::<u8>(), bytes.len());
+                let _ = GlobalUnlock(hmem);
+            }
+        }
+        let placed = unsafe { SetClipboardData(format, hmem) };
+        if placed.is_null() {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                let _ = GlobalFree(hmem);
+            }
+            return Err(CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("SetClipboardData(format={format}) failed: {err}"),
+                "Retry Win32 clipboard write",
+            ));
+        }
+        // System owns `hmem` once `SetClipboardData` succeeds.
+        Ok(())
+    }
+
+    fn get_raw_clipboard_bytes(format: u32, trace: &mut WinClipboardReadTrace) -> Result<Vec<u8>, CoreError> {
+        trace.get_clipboard_data_calls.push(format);
+        let hdata = unsafe { GetClipboardData(format) };
+        if hdata.is_null() {
+            return Err(CoreError::new(
+                ErrorCode::IntegrityError,
+                format!(
+                    "GetClipboardData(format={format}) returned NULL: {}",
+                    std::io::Error::last_os_error()
+                ),
+                "Retry reading Windows clipboard",
+            ));
+        }
+        let hmem: HGLOBAL = hdata;
+        let size = unsafe { GlobalSize(hmem) };
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let ptr = unsafe { GlobalLock(hmem) };
+        if ptr.is_null() {
+            return Err(CoreError::new(
+                ErrorCode::IntegrityError,
+                format!(
+                    "GlobalLock(format={format}) returned NULL: {}",
+                    std::io::Error::last_os_error()
+                ),
+                "Retry reading Windows clipboard",
+            ));
+        }
+        let out = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), size).to_vec() };
+        unsafe {
+            let _ = GlobalUnlock(hmem);
+        }
+        Ok(out)
+    }
+
+    fn format_name_for_id(fmt: u32) -> String {
+        if fmt == CF_UNICODETEXT as u32 {
+            return "CF_UNICODETEXT".to_string();
+        }
+        if fmt == CF_DIBV5 as u32 {
+            return "CF_DIBV5".to_string();
+        }
+        if fmt == CF_DIB as u32 {
+            return "CF_DIB".to_string();
+        }
+        let mut buf = [0u16; 128];
+        let len = unsafe { GetClipboardFormatNameW(fmt, buf.as_mut_ptr(), buf.len() as i32) };
+        if len > 0 {
+            String::from_utf16_lossy(&buf[..len as usize])
+        } else {
+            format!("CF_{fmt}")
+        }
+    }
+
+    fn enumerate_open_clipboard_formats() -> Vec<(u32, String)> {
+        let mut out = Vec::new();
+        let mut cur = 0u32;
+        loop {
+            cur = unsafe { EnumClipboardFormats(cur) };
+            if cur == 0 {
+                break;
+            }
+            out.push((cur, format_name_for_id(cur)));
+        }
+        out
+    }
+
+    /// Read the Win32 clipboard while recording exact `EnumClipboardFormats` and `GetClipboardData`
+    /// calls so `SEC-WIN-CLIP` can prove zero user-payload reads on privacy/echo formats and
+    /// zero `CF_DIBV5` reads when `"PNG"` is present.
+    pub fn read_win32_clipboard_with_trace() -> Result<(ReadClipboardResult, WinClipboardReadTrace), CoreError>
+    {
+        let fmts = register_win_formats()?;
+        let _guard = OpenClipboardGuard::open_with_retry()?;
+        let enumerated = enumerate_open_clipboard_formats();
+        let mut trace = WinClipboardReadTrace {
+            enumerated_formats: enumerated,
+            get_clipboard_data_calls: Vec::new(),
+        };
+        if trace.enumerated_formats.is_empty() {
+            return Ok((ReadClipboardResult::Empty, trace));
+        }
+
+        // 1. Presence-based echo & privacy check (0 GetClipboardData calls)
+        let name_refs: Vec<&str> = trace.enumerated_formats.iter().map(|(_, s)| s.as_str()).collect();
+        if let Some(reason) = windows_precheck_presence_format(&name_refs) {
+            return Ok((ReadClipboardResult::SkippedSensitive(reason.to_string()), trace));
+        }
+
+        // 2. DWORD == 0 privacy checks (reads ONLY the 4-byte flag, never user text/image)
+        if trace
+            .enumerated_formats
+            .iter()
+            .any(|(id, _)| *id == fmts.can_include_history)
+        {
+            let raw = get_raw_clipboard_bytes(fmts.can_include_history, &mut trace)?;
+            if windows_is_dword_zero_or_malformed(&raw) {
+                return Ok((
+                    ReadClipboardResult::SkippedSensitive("CanIncludeInClipboardHistory == 0".to_string()),
+                    trace,
+                ));
+            }
+        }
+        if trace
+            .enumerated_formats
+            .iter()
+            .any(|(id, _)| *id == fmts.can_upload_cloud)
+        {
+            let raw = get_raw_clipboard_bytes(fmts.can_upload_cloud, &mut trace)?;
+            if windows_is_dword_zero_or_malformed(&raw) {
+                return Ok((
+                    ReadClipboardResult::SkippedSensitive("CanUploadClipboardDataToCloud == 0".to_string()),
+                    trace,
+                ));
+            }
+        }
+
+        // 3. Source format selection (`"PNG"` -> `CF_DIBV5` -> `CF_DIB` -> `CF_UNICODETEXT`)
+        let pairs: Vec<(u32, &str)> = trace
+            .enumerated_formats
+            .iter()
+            .map(|(id, s)| (*id, s.as_str()))
+            .collect();
+        let Some(selected) = windows_select_source_format(&pairs) else {
+            return Ok((ReadClipboardResult::Empty, trace));
+        };
+
+        match selected {
+            WinSelectedFormat::SvgOnlyRejected => Err(CoreError::new(
+                ErrorCode::InvalidArgument,
+                "Windows clipboard contains image/svg+xml without plain text; SVG cannot sync as an image",
+                "Copy SVG markup as plain text or copy a PNG/JPEG/WebP/GIF bitmap",
+            )),
+            WinSelectedFormat::Png(png_fmt_id) => {
+                let bytes = get_raw_clipboard_bytes(png_fmt_id, &mut trace)?;
+                let (w, h) = validate_png_clipboard_bytes(&bytes)?;
+                Ok((
+                    ReadClipboardResult::Payload(ClipboardPayload::Image {
+                        mime: "image/png".to_string(),
+                        bytes,
+                        width: Some(w),
+                        height: Some(h),
+                    }),
+                    trace,
+                ))
+            }
+            WinSelectedFormat::DibV5 => {
+                let dib = get_raw_clipboard_bytes(CF_DIBV5 as u32, &mut trace)?;
+                let (png_bytes, w, h) = dib_to_png(&dib)?;
+                Ok((
+                    ReadClipboardResult::Payload(ClipboardPayload::Image {
+                        mime: "image/png".to_string(),
+                        bytes: png_bytes,
+                        width: Some(w),
+                        height: Some(h),
+                    }),
+                    trace,
+                ))
+            }
+            WinSelectedFormat::Dib => {
+                let dib = get_raw_clipboard_bytes(CF_DIB as u32, &mut trace)?;
+                let (png_bytes, w, h) = dib_to_png(&dib)?;
+                Ok((
+                    ReadClipboardResult::Payload(ClipboardPayload::Image {
+                        mime: "image/png".to_string(),
+                        bytes: png_bytes,
+                        width: Some(w),
+                        height: Some(h),
+                    }),
+                    trace,
+                ))
+            }
+            WinSelectedFormat::UnicodeText => {
+                let raw = get_raw_clipboard_bytes(CF_UNICODETEXT as u32, &mut trace)?;
+                let text = utf16le_clipboard_bytes_to_utf8(&raw)?;
+                if text.len() > CLIP_BLOB_MAX_BYTES {
+                    return Err(CoreError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("clipboard text ({} bytes) exceeds 10 MiB limit", text.len()),
+                        "Shorten clipboard text under 10 MiB",
+                    ));
+                }
+                Ok((ReadClipboardResult::Payload(ClipboardPayload::Text(text)), trace))
+            }
+        }
+    }
+
+    pub fn read() -> Result<ReadClipboardResult, CoreError> {
+        read_win32_clipboard_with_trace().map(|(res, _)| res)
+    }
+
+    pub fn write(payload: &ClipboardPayload, opts: ClipboardWriteOpts) -> Result<WriteReceipt, CoreError> {
+        enum PreparedPayload {
+            Text(Vec<u8>),
+            Png(Vec<u8>),
+        }
+
+        let (prepared, written_blake3) = match payload {
+            ClipboardPayload::Text(text) => {
+                if text.len() > CLIP_BLOB_MAX_BYTES {
+                    return Err(CoreError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("clipboard text ({} bytes) exceeds 10 MiB limit", text.len()),
+                        "Shorten clipboard text under 10 MiB",
+                    ));
+                }
+                let h = *blake3::hash(text.as_bytes()).as_bytes();
+                (PreparedPayload::Text(utf8_to_utf16le_clipboard_bytes(text)), h)
+            }
+            ClipboardPayload::Image { mime, bytes, .. } => {
+                validate_clip_image_mime(mime)?;
+                let (png, _, _) = transcode_to_png(bytes)?;
+                let h = *blake3::hash(&png).as_bytes();
+                (PreparedPayload::Png(png), h)
+            }
+        };
+
+        let fmts = register_win_formats()?;
+        let is_private = opts.sensitive || opts.ephemeral;
+        let _guard = OpenClipboardGuard::open_with_retry()?;
+        if unsafe { EmptyClipboard() } == 0 {
+            return Err(CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("EmptyClipboard failed: {}", std::io::Error::last_os_error()),
+                "Retry Win32 clipboard write",
+            ));
+        }
+
+        // Write echo-suppression and Windows privacy formats FIRST inside the single
+        // OpenClipboard..CloseClipboard transaction so external listeners never see unmarked data.
+        if opts.synced_marker {
+            set_raw_clipboard_bytes(fmts.echo_marker, &[1u8])?;
+            set_raw_clipboard_bytes(fmts.synced_clip, &[1u8])?;
+        }
+        if is_private {
+            set_raw_clipboard_bytes(fmts.exclude_monitor, &1u32.to_le_bytes())?;
+            set_raw_clipboard_bytes(fmts.can_include_history, &0u32.to_le_bytes())?;
+            set_raw_clipboard_bytes(fmts.can_upload_cloud, &0u32.to_le_bytes())?;
+            set_raw_clipboard_bytes(fmts.vault_secret, &[1u8])?;
+        }
+
+        match prepared {
+            PreparedPayload::Text(utf16_bytes) => {
+                set_raw_clipboard_bytes(CF_UNICODETEXT as u32, &utf16_bytes)?;
+            }
+            PreparedPayload::Png(png_bytes) => {
+                set_raw_clipboard_bytes(fmts.png, &png_bytes)?;
+            }
+        }
+
+        Ok(WriteReceipt { written_blake3 })
+    }
+
+    pub fn clear() -> Result<(), CoreError> {
+        let _guard = OpenClipboardGuard::open_with_retry()?;
+        if unsafe { EmptyClipboard() } == 0 {
+            return Err(CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("EmptyClipboard failed: {}", std::io::Error::last_os_error()),
+                "Retry clearing Windows clipboard",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn current_mynote_blake3() -> Option<[u8; 32]> {
+        let fmts = register_win_formats().ok()?;
+        let _guard = OpenClipboardGuard::open_with_retry().ok()?;
+        let enumerated = enumerate_open_clipboard_formats();
+        let has_mynote_marker = enumerated
+            .iter()
+            .any(|(id, _)| *id == fmts.echo_marker || *id == fmts.synced_clip);
+        if !has_mynote_marker {
+            return None;
+        }
+        let mut trace = WinClipboardReadTrace::default();
+        if enumerated.iter().any(|(id, _)| *id == fmts.png) {
+            let png = get_raw_clipboard_bytes(fmts.png, &mut trace).ok()?;
+            return Some(*blake3::hash(&png).as_bytes());
+        }
+        if enumerated.iter().any(|(id, _)| *id == CF_UNICODETEXT as u32) {
+            let raw = get_raw_clipboard_bytes(CF_UNICODETEXT as u32, &mut trace).ok()?;
+            let text = utf16le_clipboard_bytes_to_utf8(&raw).ok()?;
+            return Some(*blake3::hash(text.as_bytes()).as_bytes());
+        }
+        None
+    }
+
+    /// Atomically place custom combinations of Win32 formats onto the system clipboard
+    /// (used by `SEC-WIN-CLIP` integration tests to simulate password managers, `CF_DIBV5`, and SVG).
+    pub fn write_raw_win32_clipboard(spec: &WinRawClipboardSpec) -> Result<(), CoreError> {
+        let fmts = register_win_formats()?;
+        let _guard = OpenClipboardGuard::open_with_retry()?;
+        if unsafe { EmptyClipboard() } == 0 {
+            return Err(CoreError::new(
+                ErrorCode::IntegrityError,
+                format!("EmptyClipboard failed: {}", std::io::Error::last_os_error()),
+                "Retry Win32 clipboard write",
+            ));
+        }
+        if spec.echo_marker {
+            set_raw_clipboard_bytes(fmts.echo_marker, &[1u8])?;
+        }
+        if spec.legacy_synced_marker {
+            set_raw_clipboard_bytes(fmts.synced_clip, &[1u8])?;
+        }
+        if spec.exclude_from_monitor {
+            set_raw_clipboard_bytes(fmts.exclude_monitor, &1u32.to_le_bytes())?;
+        }
+        if let Some(flag) = spec.can_include_in_history {
+            set_raw_clipboard_bytes(fmts.can_include_history, &flag.to_le_bytes())?;
+        }
+        if let Some(flag) = spec.can_upload_to_cloud {
+            set_raw_clipboard_bytes(fmts.can_upload_cloud, &flag.to_le_bytes())?;
+        }
+        if let Some(text) = &spec.unicode_text {
+            set_raw_clipboard_bytes(CF_UNICODETEXT as u32, &utf8_to_utf16le_clipboard_bytes(text))?;
+        }
+        if let Some(dibv5) = &spec.dibv5_bytes {
+            set_raw_clipboard_bytes(CF_DIBV5 as u32, dibv5)?;
+        }
+        if let Some(dib) = &spec.dib_bytes {
+            set_raw_clipboard_bytes(CF_DIB as u32, dib)?;
+        }
+        if let Some(png) = &spec.png_bytes {
+            set_raw_clipboard_bytes(fmts.png, png)?;
+        }
+        if let Some(svg) = &spec.svg_xml_bytes {
+            set_raw_clipboard_bytes(fmts.svg_mime, svg)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub use windows_impl::{
+    read_win32_clipboard_with_trace, register_win_formats, write_raw_win32_clipboard, RegisteredWinFormats,
+    WinClipboardReadTrace, WinRawClipboardSpec,
+};
+
 impl SystemClipboard for NativeSystemClipboard {
     fn read(&self) -> Result<ReadClipboardResult, CoreError> {
         #[cfg(target_os = "macos")]
@@ -1098,11 +2069,15 @@ impl SystemClipboard for NativeSystemClipboard {
         {
             linux_impl::read()
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        {
+            windows_impl::read()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             Err(CoreError::new(
                 ErrorCode::InvalidArgument,
-                "native system clipboard adapter is only supported on macOS and Linux Wayland",
+                "native system clipboard adapter is only supported on macOS, Linux Wayland, and Windows",
                 "Pass --text, --stdin, or --file explicitly",
             ))
         }
@@ -1117,12 +2092,16 @@ impl SystemClipboard for NativeSystemClipboard {
         {
             linux_impl::write(payload, opts)
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        {
+            windows_impl::write(payload, opts)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             let _ = (payload, opts);
             Err(CoreError::new(
                 ErrorCode::InvalidArgument,
-                "native system clipboard adapter is only supported on macOS and Linux Wayland",
+                "native system clipboard adapter is only supported on macOS, Linux Wayland, and Windows",
                 "Use --raw or --out instead of --apply",
             ))
         }
@@ -1137,7 +2116,11 @@ impl SystemClipboard for NativeSystemClipboard {
         {
             linux_impl::clear()
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        {
+            windows_impl::clear()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             Ok(())
         }
@@ -1152,7 +2135,11 @@ impl SystemClipboard for NativeSystemClipboard {
         {
             linux_impl::current_mynote_blake3()
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        {
+            windows_impl::current_mynote_blake3()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             None
         }
