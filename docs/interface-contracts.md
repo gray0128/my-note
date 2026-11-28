@@ -190,7 +190,7 @@ interface CliEnvelope<T> {
 
 ### 3.0 进程模型：Daemon 与 CLI
 
-- **双桌面统一形态（D5′）**：macOS 与 Omarchy 均运行同一个 `mynote` 单体二进制（CLI + 内嵌 Web UI 的 Daemon），不引入原生 GUI / Tauri 薄壳。macOS 由 `launchd` LaunchAgent（或 `brew services`）托管 Daemon、通过浏览器 / Web App（可配合 Raycast / Hammerspoon / Karabiner 切窗）打开 `http://localhost:<port>`；Omarchy 由 `systemd --user` 托管 Daemon、通过 Hyprland 键绑定唤出 Chromium webapp 加载同一地址。
+- **双桌面统一底座 + macOS 可选纯 Swift 薄壳（D5′ / D5″）**：macOS 与 Omarchy 均运行同一个 `mynote` 单体二进制（CLI + 内嵌 Web UI 的 Daemon），不引入 Tauri 壳或额外本地鉴权通道。Omarchy 由 `systemd --user` 托管 Daemon、通过 Hyprland 键绑定唤出 Chromium webapp 加载 `http://localhost:<port>`；macOS 由 `launchd` LaunchAgent（或 `brew services`）托管 Daemon，既可通过浏览器 / Web App（配合 Raycast / Hammerspoon / Karabiner 或 `mynote open`）访问 `http://localhost:<port>`，也可安装可选的零依赖纯 Swift `WKWebView` 薄壳 [`apps/macos/MyNote.app`](../apps/macos/README.md)（复用既有 `0600 daemon.sock` 的 `ping` 与 `open_ticket` 帧换取 `HttpOnly` Cookie，不直连 SQLite，不访问 Keychain，不新增 Daemon 路由）。
 - 核心运行契约：
   1. **CLI 在 UI 未打开时独立工作**：关闭浏览器窗口不影响 CLI 读写。CLI 离线写入成功返回 `0`（`pending_offline`），之后由 Daemon 补推。
   2. **SQLite 单写入方**：任一时刻最多一个 Daemon 实例（`<data_dir>/daemon.lock` 独占文件锁），第二个实例启动即退出并提示。CLI 写入路径：**Daemon 运行时**，写命令经 UDS 的 `apply` 帧转交 Daemon 执行（载荷与 §3.2 的 REST DTO 相同，由 Daemon 生成 `op_id` 与 HLC）；**Daemon 未运行时**，CLI 以短事务直接写本地 SQLite，此时它就是唯一写入方（协议见 [`sync-protocol.md`](./sync-protocol.md) §7）。

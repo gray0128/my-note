@@ -11,7 +11,7 @@
 所有设计与实现取舍按**不可逆程度**排序：
 
 1. **G1 永不静默丢数**：覆盖同步 bug、**丢钥匙**、误操作、平台存储驱逐与逻辑 bug 扩散。
-2. **G2 随手即记、随叫随到**：CLI 本地读写 `< 15 ms` [目标]；双桌面统一纯 CLI + Daemon + 内嵌 HTML（`http://localhost:<port>`），Omarchy 由 Hyprland 键绑定唤出 Chromium webapp，macOS 由浏览器 / Web App（配合系统切窗工具）或 `mynote open` 直达（D5′）。
+2. **G2 随手即记、随叫随到**：CLI 本地读写 `< 15 ms` [目标]；双桌面统一纯 CLI + Daemon + 内嵌 HTML 底座（`http://localhost:<port>`），Omarchy 由 Hyprland 键绑定唤出 Chromium webapp，macOS 可通过可选的零依赖纯 Swift `WKWebView` 薄壳 `apps/macos/MyNote.app`（菜单栏 + Carbon 全局热键 `⌃⌥Space`，隐显 `5–8 ms` `[已测]`）或浏览器 / Web App / `mynote open` 直达（D5′ / D5″）。
 3. **G3 多端可得**：双桌面实时 E2EE 同步；手机对笔记保持只读 + 一键复制 + 可解锁 Vault（D1′、D7），并通过物理隔离的剪贴板通道与桌面双向同步 100 条文本与位图图片剪贴板（D8，M4）。
 4. **G4 秘密不落明文、不以明文进云端**：Tier 1 云端盲存储零知识 + Tier 2 客户端内存级 Vault（诚实边界见 `docs/threat-model.md`）。
 5. **G5 Agent 可读写**：纯本地 CLI（`--json`、稳定退出码、乐观锁）+ 极轻 `skill/SKILL.md`（`< 250 tokens`），不做 MCP。
@@ -29,7 +29,7 @@
 
 | 关注域 | 唯一权威文档 | 关键内容 |
 | --- | --- | --- |
-| **已拍板决策（最高优先级）** | [`review/2026-11-24-first-principles-review.md`](review/2026-11-24-first-principles-review.md) §9 | 决策 D1–D8（含 D1′、D2′、D5′）及 PR #31 / 2026-11-25 / 2026-11-27 补充拍板；**与旧文档冲突时一律以 §9 为准** |
+| **已拍板决策（最高优先级）** | [`review/2026-11-24-first-principles-review.md`](review/2026-11-24-first-principles-review.md) §9 | 决策 D1–D8（含 D1′、D2′、D5′/D5″）及 PR #31 / 2026-11-25 / 2026-11-27 / 2026-11-28 补充拍板；**与旧文档冲突时一律以 §9 为准** |
 | **总览、ADR 与路线图** | [`docs/architecture-proposal.md`](docs/architecture-proposal.md) | 目标、非目标、Monorepo 布局、S0 → M4 路线图、ADR-01～ADR-11 状态 |
 | **剪贴板调研与决策归档** | [`docs/clipboard-sync-proposal.md`](docs/clipboard-sync-proposal.md) | 2026-11-27 D8（Q1–Q6）可行性调研、竞品对比与移动端三梯队交互设计；底层契约以各专题 SSOT 规范为准 |
 | **数据结构与线格式** | [`docs/data-structures.md`](docs/data-structures.md) | ULID、定长 HLC、FractionalIndex、`InnerOpV1`、信封布局、**全项目唯一 AAD 定义（§3.3）**、全端 DDL |
@@ -90,7 +90,7 @@
 - **D2′ / F-04 / F-05**：`purge_op_ids`、可变 `vault_keys` / `MNK1` / `key_seq` / `INV-SYNC-4`、`vault_key_slots` 多槽位、Vault 第二套恢复码、云端 `/v1/archive/*` 路由。
 - **D3 / F-02 / F-03 / F-18**：`SPAN_PATCH` / delta 链、Loro/Yjs CRDT、HLC 漂移拒收、Lock-Wins 特例、分数索引重平衡。
 - **D4**：DO 滑动窗口 GC、R2 K=5 多代快照 + CAS、「\$0/月免费额度」约束。
-- **D5′（2026-11-25 修订）**：macOS Tauri 薄壳（`shell-macos/`）、Tauri 自定义协议 `tauri://localhost` / Bearer 鉴权分支与独立 `.app` 打包（双桌面统一纯 CLI + Daemon + 内嵌 HTML）。
+- **D5′ / D5″（2026-11-25 移除 Tauri，2026-11-28 补充可选纯 Swift 壳）**：macOS Tauri 薄壳（`shell-macos/`）、Tauri 自定义协议 `tauri://localhost` / Bearer 鉴权分支与单端 GPUI 重写均永久不引入；双桌面底座保持纯 `mynote` 单二进制（CLI + Daemon + 内嵌 HTML），macOS 另提供零第三方依赖纯 Swift `WKWebView` 可选薄壳 `apps/macos/`（仅连 `daemon.sock`，不碰 Keychain、不改 `SEC-05`）。
 - **D6 / F-13 / F-14 / ADR-08**：本地与云端 MCP、`mynote update` 自升级、WebAuthn PRF、`--help-json`、加密图片附件 `blobs/`、WebSocket 携带 op 顺风车、Plane B 统计评测、自动爬山与 LLM 评委（`evals/archive/` 仅供存档参考）。
 
 ---
