@@ -811,7 +811,7 @@ cmd = ["python", "-c", "import os, sys; s = os.environ.get('AWS_SECRET_ACCESS_KE
 timeout_ms = 3000
 
 [formatters.env_clean_array]
-cmd = ["python", "-c", "import os, sys; sys.stdout.write('CLEAN:{}:{}:{}:{}'.format(os.environ.get('AWS_SECRET_ACCESS_KEY',''), os.environ.get('MYNOTE_BOOTSTRAP_TOKEN',''), os.environ.get('OPENAI_API_KEY',''), os.environ.get('PYTHONUTF8','')))"]
+cmd = ["python", "-c", "import os, sys; sys.stdout.write(':'.join(['CLEAN', os.environ.get('AWS_SECRET_ACCESS_KEY',''), os.environ.get('MYNOTE_BOOTSTRAP_TOKEN',''), os.environ.get('OPENAI_API_KEY',''), os.environ.get('PYTHONUTF8','')]))"]
 timeout_ms = 3000
 
 [formatters.empty_array]
