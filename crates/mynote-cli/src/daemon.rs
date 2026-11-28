@@ -91,6 +91,7 @@ pub struct DaemonState {
     pub clip_watch_state: Mutex<ClipWatchConfig>,
     pub clip_watch_tx: watch::Sender<ClipWatchConfig>,
     pub clip_watch_filter: Mutex<ClipWatchFilter>,
+    pub clip_last_auto_applied_id: Mutex<Option<String>>,
 }
 
 impl DaemonState {
@@ -848,6 +849,7 @@ pub async fn start_daemon_with_clipboard(
         clip_watch_state: Mutex::new(initial_watch_cfg),
         clip_watch_tx,
         clip_watch_filter: Mutex::new(ClipWatchFilter::new()),
+        clip_last_auto_applied_id: Mutex::new(None),
     });
 
     let app = build_router(state.clone());

@@ -1454,6 +1454,78 @@ async fn pairing_scope_isolation_and_cloud_ws_clip_wake_ephemeral_and_rotate_key
         ClipboardPayload::Text("b_before_sync".to_string())
     );
 
+    // Deterministic race regression: if a background `pull_cloud_clips(false)` ingests a new clip
+    // and advances `clip_cursor` BEFORE the live `ClipWake` task acquires `clip_sync_lock`,
+    // `pull_cloud_clips_with_wake_hint(true, Some(&cid))` MUST still auto-apply it exactly once!
+    let race_cid = store_a.next_clip_id(now_ms_test() as u64 + 5).unwrap();
+    let race_meta = ClipMetaV1 {
+        v: 1,
+        kind: ClipKind::Text,
+        mime: "text/plain".to_string(),
+        source_mode: ClipSourceMode::Explicit,
+        created_at_ms: now_ms_test(),
+        text: Some("RACE-WAKE-APPLIED".to_string()),
+        blob: None,
+    };
+    let race_env = encrypt_mnc1_meta(
+        ck,
+        &ck_key,
+        race_cid,
+        store_a.device_id(),
+        &race_meta,
+        false,
+        [0x29; 24],
+    )
+    .unwrap();
+    let race_cid_str = race_cid.to_string();
+    {
+        let mut g = relay_st.lock().unwrap();
+        let now = now_ms_test();
+        g.clips.insert(
+            race_cid_str.clone(),
+            MockClipRecord {
+                clip_id: race_cid_str.clone(),
+                clip_kid: ck.to_string(),
+                device_id: store_a.device_id().as_str().to_string(),
+                kind: "text".to_string(),
+                created_at_ms: now,
+                expires_at_ms: now + CLIP_DEFAULT_TTL_MS,
+                meta_envelope_b64: base64::engine::general_purpose::STANDARD.encode(&race_env),
+                has_blob: false,
+                blob_bytes: None,
+                blob_envelope: None,
+            },
+        );
+    }
+    clip_b.set_user_text("b_user_before_race");
+    daemon_b.state.pull_cloud_clips(false).await.unwrap();
+    assert_eq!(
+        clip_b.snapshot().unwrap().0,
+        ClipboardPayload::Text("b_user_before_race".to_string()),
+        "non-intrusive background pull must not auto-apply"
+    );
+    daemon_b
+        .state
+        .pull_cloud_clips_with_wake_hint(true, Some(&race_cid_str))
+        .await
+        .unwrap();
+    assert_eq!(
+        clip_b.snapshot().unwrap().0,
+        ClipboardPayload::Text("RACE-WAKE-APPLIED".to_string()),
+        "ClipWake hint must auto-apply even after concurrent pull_cloud_clips(false)"
+    );
+    assert!(daemon_b.state.undo_clipboard().unwrap());
+    daemon_b
+        .state
+        .pull_cloud_clips_with_wake_hint(true, Some(&race_cid_str))
+        .await
+        .unwrap();
+    assert_eq!(
+        clip_b.snapshot().unwrap().0,
+        ClipboardPayload::Text("b_user_before_race".to_string()),
+        "duplicate ClipWake for already auto-applied clip_id must be idempotent"
+    );
+
     // --- Test `clip_ephemeral`: zero DB / zero clip_cache + auto-clear timer ---
     let count_b_before = daemon_b
         .state

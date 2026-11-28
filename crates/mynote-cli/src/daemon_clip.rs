@@ -251,10 +251,10 @@ impl DaemonState {
                     "details": { "message": "this device token has been revoked" }
                 }));
             }
-            CloudWsEvent::ClipWake { .. } => {
+            CloudWsEvent::ClipWake { clip_id, .. } => {
                 let st = Arc::clone(self);
                 tokio::spawn(async move {
-                    let _ = st.pull_cloud_clips(true).await;
+                    let _ = st.pull_cloud_clips_with_wake_hint(true, Some(&clip_id)).await;
                     st.spawn_clip_blob_prefetch();
                 });
             }
@@ -284,6 +284,18 @@ impl DaemonState {
     /// upsert into the unbounded local desktop `clip_items` archive, broadcast `clip_changed`,
     /// and optionally auto-apply to OS clipboard.
     pub async fn pull_cloud_clips(&self, auto_apply: bool) -> Result<Vec<ClipItemDto>, CoreError> {
+        self.pull_cloud_clips_with_wake_hint(auto_apply, None).await
+    }
+
+    /// Same as `pull_cloud_clips`, plus an optional `wake_clip_id` from a live `CloudWsEvent::ClipWake`
+    /// frame so that if a concurrent non-intrusive background pull (`auto_apply = false`) raced ahead
+    /// and already advanced `clip_cursor` to `wake_clip_id`, the live `ClipWake` still auto-applies
+    /// that item exactly once.
+    pub async fn pull_cloud_clips_with_wake_hint(
+        &self,
+        auto_apply: bool,
+        wake_clip_id: Option<&str>,
+    ) -> Result<Vec<ClipItemDto>, CoreError> {
         let _guard = self.clip_sync_lock.lock().await;
         let (creds_opt, local_device_id, cursor) = {
             let store = self.store.lock().unwrap();
@@ -303,6 +315,23 @@ impl DaemonState {
             client.clip_list_all_since(cursor.as_deref()).await?;
         self.update_cloud_clip_quota(quota_opt);
         if remote_items.is_empty() {
+            if auto_apply {
+                if let Some(wake_id) = wake_clip_id {
+                    if cursor.as_deref() == Some(wake_id) {
+                        let target_opt = self
+                            .store
+                            .lock()
+                            .unwrap()
+                            .get_clip_item(wake_id)
+                            .ok()
+                            .flatten()
+                            .filter(|r| r.device_id != local_device_id);
+                        if let Some(target) = target_opt {
+                            self.maybe_auto_apply_remote_clip(&target).await;
+                        }
+                    }
+                }
+            }
             return Ok(Vec::new());
         }
         remote_items.sort_by(|a, b| a.clip_id.cmp(&b.clip_id));
@@ -403,39 +432,47 @@ impl DaemonState {
 
         if auto_apply {
             if let Some(target) = newest_remote {
-                let watch_cfg = self.clip_watch_snapshot();
-                let should_apply = target.source_mode == "explicit"
-                    || (target.source_mode == "auto"
-                        && watch_cfg.auto_apply_mirror == "auto-apply"
-                        && !watch_cfg.watch_paused);
-                if should_apply && self.apply_clip_row_to_clipboard(&target).await.is_ok() {
-                    let updated_dto = {
-                        let store = self.store.lock().unwrap();
-                        let cache = store.clip_cache();
-                        store
-                            .get_clip_item(&target.clip_id)
-                            .ok()
-                            .flatten()
-                            .map(|r| clip_row_to_dto(&r, &cache))
-                    };
-                    if let Some(dto) = updated_dto {
-                        self.broadcast_clip_changed(vec![dto], Vec::new(), false);
-                    }
-                    let notif = if target.kind == "image" {
-                        format!(
-                            "Image copied from another device ({}x{})",
-                            target.width.unwrap_or(0),
-                            target.height.unwrap_or(0)
-                        )
-                    } else {
-                        "Text copied from another device (run 'mynote clip undo' to revert)".to_string()
-                    };
-                    send_clip_notification("my-note clipboard", &notif);
-                }
+                self.maybe_auto_apply_remote_clip(&target).await;
             }
         }
 
         Ok(dtos)
+    }
+
+    async fn maybe_auto_apply_remote_clip(&self, target: &ClipItemRow) {
+        if self.clip_last_auto_applied_id.lock().unwrap().as_deref() == Some(target.clip_id.as_str()) {
+            return;
+        }
+        let watch_cfg = self.clip_watch_snapshot();
+        let should_apply = target.source_mode == "explicit"
+            || (target.source_mode == "auto"
+                && watch_cfg.auto_apply_mirror == "auto-apply"
+                && !watch_cfg.watch_paused);
+        if should_apply && self.apply_clip_row_to_clipboard(target).await.is_ok() {
+            *self.clip_last_auto_applied_id.lock().unwrap() = Some(target.clip_id.clone());
+            let updated_dto = {
+                let store = self.store.lock().unwrap();
+                let cache = store.clip_cache();
+                store
+                    .get_clip_item(&target.clip_id)
+                    .ok()
+                    .flatten()
+                    .map(|r| clip_row_to_dto(&r, &cache))
+            };
+            if let Some(dto) = updated_dto {
+                self.broadcast_clip_changed(vec![dto], Vec::new(), false);
+            }
+            let notif = if target.kind == "image" {
+                format!(
+                    "Image copied from another device ({}x{})",
+                    target.width.unwrap_or(0),
+                    target.height.unwrap_or(0)
+                )
+            } else {
+                "Text copied from another device (run 'mynote clip undo' to revert)".to_string()
+            };
+            send_clip_notification("my-note clipboard", &notif);
+        }
     }
 
     /// Handle zero-DB pure-memory `clip_ephemeral` WS direct push (`docs/sync-protocol.md` §11.3).
