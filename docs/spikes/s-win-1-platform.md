@@ -2,7 +2,7 @@
 
 - **状态**：通过（GitHub Actions `windows-latest` 真机 8/8 单测与集成测试 + Release 基准全部通过）
 - **实测环境**：`Microsoft Windows Server 2025 Datacenter`（`Version 10.0.26100, Build 26100` `[已测]`）/ `x86_64-pc-windows-msvc`（`AMD EPYC 9V74`, `2` 核 `4` 逻辑处理器 `[已测]`）/ `rustc 1.100.1 (20ddd0171 2026-11-25)` / `Python 3.12.10` / 当前会话 `User=runneradmin, IsElevatedAdmin=True` `[已测]`
-- **复现路径**：[`spikes/s-win-1-platform/`](../../spikes/s-win-1-platform/) 与 [`.github/workflows/spike-win.yml`](../../.github/workflows/spike-win.yml)（CI Run `46123187193`）
+- **复现路径**：[`spikes/s-win-1-platform/`](../../spikes/s-win-1-platform/) 与 `.github/workflows/spike-win.yml`（Spike 期临时工作流，CI Run `46123187193`；`windows-latest` 常驻门禁合入 `.github/workflows/ci.yml` 后已移除）
   - 静态门禁：`cargo clippy --manifest-path spikes/s-win-1-platform/Cargo.toml --all-targets -- -D warnings`
   - 集成测试：`cargo test --manifest-path spikes/s-win-1-platform/Cargo.toml -- --nocapture`
   - Release 体积与延迟基准：`cargo build --manifest-path spikes/s-win-1-platform/Cargo.toml --release` 与 `s-win-1-platform.exe --bench`

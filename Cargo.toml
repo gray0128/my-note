@@ -83,7 +83,9 @@ x25519-dalek = { version = "3.0.0", default-features = false, features = ["stati
 zeroize = { version = "1.9.2", features = ["derive"] }
 
 [profile.release]
-lto = "thin"
+opt-level = "z"
+lto = true
+codegen-units = 1
 strip = true
 
 [profile.wasm-release]
