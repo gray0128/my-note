@@ -302,7 +302,8 @@ mod imp {
     use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
     use windows_sys::Win32::Foundation::{
-        GetLastError, ERROR_CLASS_ALREADY_EXISTS, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
+        GetLastError, GlobalFree, ERROR_CLASS_ALREADY_EXISTS, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM,
+        LRESULT, WPARAM,
     };
     use windows_sys::Win32::System::DataExchange::{
         AddClipboardFormatListener, CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
@@ -311,7 +312,7 @@ mod imp {
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Memory::{
-        GlobalAlloc, GlobalFree, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
+        GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
     };
     use windows_sys::Win32::System::Ole::{CF_DIBV5, CF_UNICODETEXT};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -531,15 +532,17 @@ mod imp {
             return Ok((WinClipReadOutcome::Empty, trace));
         }
 
-        let has_fmt = |target: u32| trace.enumerated_formats.iter().any(|(id, _)| *id == target);
+        fn has_fmt(trace: &ClipboardReadTrace, target: u32) -> bool {
+            trace.enumerated_formats.iter().any(|(id, _)| *id == target)
+        }
 
         // 1. Echo guard marker check (zero user payload read)
-        if has_fmt(fmts.mynote_synced) {
+        if has_fmt(&trace, fmts.mynote_synced) {
             return Ok((WinClipReadOutcome::SkippedEchoMarker, trace));
         }
 
         // 2. Presence-based privacy hard filter (zero GetClipboardData calls!)
-        if has_fmt(fmts.exclude_monitor) {
+        if has_fmt(&trace, fmts.exclude_monitor) {
             return Ok((
                 WinClipReadOutcome::SkippedPrivacy("ExcludeClipboardContentFromMonitorProcessing"),
                 trace,
@@ -547,7 +550,7 @@ mod imp {
         }
 
         // 3. DWORD == 0 privacy hard filters (reads ONLY the 4-byte flag, never user text/image!)
-        if has_fmt(fmts.can_include_history) {
+        if has_fmt(&trace, fmts.can_include_history) {
             let raw = unsafe { get_raw_clipboard_bytes(fmts.can_include_history, &mut trace)? };
             if is_dword_flag_zero_or_malformed(&raw) {
                 return Ok((
@@ -556,7 +559,7 @@ mod imp {
                 ));
             }
         }
-        if has_fmt(fmts.can_upload_cloud) {
+        if has_fmt(&trace, fmts.can_upload_cloud) {
             let raw = unsafe { get_raw_clipboard_bytes(fmts.can_upload_cloud, &mut trace)? };
             if is_dword_flag_zero_or_malformed(&raw) {
                 return Ok((
@@ -567,7 +570,7 @@ mod imp {
         }
 
         // 4. Image channel: strict `"PNG"` priority -> `CF_DIBV5` fallback -> SVG rejection
-        if has_fmt(fmts.png) {
+        if has_fmt(&trace, fmts.png) {
             let png_bytes = unsafe { get_raw_clipboard_bytes(fmts.png, &mut trace)? };
             if is_svg_bytes(&png_bytes) {
                 return Ok((
@@ -588,7 +591,7 @@ mod imp {
             ));
         }
 
-        if has_fmt(CF_DIBV5 as u32) && !has_fmt(CF_UNICODETEXT as u32) {
+        if has_fmt(&trace, CF_DIBV5 as u32) && !has_fmt(&trace, CF_UNICODETEXT as u32) {
             let dib_bytes = unsafe { get_raw_clipboard_bytes(CF_DIBV5 as u32, &mut trace)? };
             let (png_bytes, width, height) =
                 dibv5_to_png(&dib_bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -603,12 +606,14 @@ mod imp {
             ));
         }
 
-        if (has_fmt(fmts.svg_mime) || has_fmt(fmts.svg_short)) && !has_fmt(CF_UNICODETEXT as u32) {
+        if (has_fmt(&trace, fmts.svg_mime) || has_fmt(&trace, fmts.svg_short))
+            && !has_fmt(&trace, CF_UNICODETEXT as u32)
+        {
             return Ok((WinClipReadOutcome::RejectedSvg("image/svg+xml"), trace));
         }
 
         // 5. Unicode text (`CF_UNICODETEXT`, UTF-16LE)
-        if has_fmt(CF_UNICODETEXT as u32) {
+        if has_fmt(&trace, CF_UNICODETEXT as u32) {
             let raw = unsafe { get_raw_clipboard_bytes(CF_UNICODETEXT as u32, &mut trace)? };
             let u16_len = raw.len() / 2;
             let mut u16_buf = Vec::with_capacity(u16_len);
