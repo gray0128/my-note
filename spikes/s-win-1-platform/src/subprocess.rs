@@ -771,6 +771,7 @@ mod tests {
             quote_windows_arg(r#"C:\dir with space\"#),
             r#""C:\dir with space\\""#
         );
+        assert_eq!(normalize_crlf("a\r\nb\r\r\nc\n"), "a\nb\nc\n");
     }
 
     #[cfg(windows)]

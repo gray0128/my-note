@@ -688,29 +688,43 @@ mod tests {
         // 3. Query kernel DACL back and prove Protected DACL + OW only + ZERO WD/Everyone
         let ow_sec = inspect_pipe_kernel_security(&srv1).expect("inspect OW pipe security");
         println!(
-            "[S-Win-1][PIPE] Hardened OW pipe kernel SDDL: full='{}' dacl='{}' owner_sid='{}' pipe_flags=0x{:x}",
-            ow_sec.owner_and_dacl_sddl, ow_sec.dacl_only_sddl, ow_sec.owner_sid, ow_sec.pipe_flags
+            "[S-Win-1][PIPE] Hardened OW pipe kernel SDDL: full='{}' dacl='{}' owner_sid='{}' pipe_flags=0x{:x} rejects_remote_clients={}",
+            ow_sec.owner_and_dacl_sddl,
+            ow_sec.dacl_only_sddl,
+            ow_sec.owner_sid,
+            ow_sec.pipe_flags,
+            ow_sec.rejects_remote_clients
         );
         assert!(ow_sec.is_server_end);
+        assert!(
+            ow_sec.rejects_remote_clients,
+            "GetNamedPipeInfo must report PIPE_REJECT_REMOTE_CLIENTS (0x8)"
+        );
         let parsed_ow = verify_strict_pipe_sddl(&ow_sec.owner_and_dacl_sddl, &["OW", &sids.token_user_sid])
             .expect("kernel SDDL must strictly match Protected OW/current-user only with zero Everyone");
         assert_eq!(parsed_ow.aces.len(), 1);
         drop(srv1);
 
         // 4. Side-by-side check with explicit TokenUser SID SDDL `D:P(A;;GA;;;<TokenUser SID>)`
-        //    (important on UAC-elevated processes where TokenOwner == BA `S-1-5-32-544` whereas
-        //    TokenUser == `S-1-5-21-...`)
+        //    Note: When TokenUser has RID -500 (built-in Local Administrator, as on GitHub Actions
+        //    `runneradmin`), `ConvertSecurityDescriptorToStringSecurityDescriptorW` abbreviates
+        //    `<MachineDomainSID>-500` to SDDL alias `"LA"`.
         let explicit_user_sddl = format!("D:P(A;;GA;;;{})", sids.token_user_sid);
         let user_pipe_name = unique_spike_pipe_name("token-user-sddl");
         let srv_user = create_hardened_pipe_server(&user_pipe_name, &explicit_user_sddl, true)
             .expect("explicit TokenUser SID pipe bind must succeed");
         let user_sec = inspect_pipe_kernel_security(&srv_user).expect("inspect TokenUser pipe security");
         println!(
-            "[S-Win-1][PIPE] Hardened TokenUser SID pipe kernel SDDL: full='{}' dacl='{}'",
-            user_sec.owner_and_dacl_sddl, user_sec.dacl_only_sddl
+            "[S-Win-1][PIPE] Hardened TokenUser SID pipe kernel SDDL: full='{}' dacl='{}' rejects_remote_clients={}",
+            user_sec.owner_and_dacl_sddl, user_sec.dacl_only_sddl, user_sec.rejects_remote_clients
         );
-        let parsed_user = verify_strict_pipe_sddl(&user_sec.owner_and_dacl_sddl, &[&sids.token_user_sid])
-            .expect("explicit TokenUser SDDL must contain only TokenUser SID");
+        assert!(user_sec.rejects_remote_clients);
+        let mut expected_user_trustees = vec![sids.token_user_sid.as_str()];
+        if sids.token_user_sid.ends_with("-500") {
+            expected_user_trustees.push("LA");
+        }
+        let parsed_user = verify_strict_pipe_sddl(&user_sec.owner_and_dacl_sddl, &expected_user_trustees)
+            .expect("explicit TokenUser SDDL must contain only TokenUser SID (or LA for RID -500)");
         assert_eq!(parsed_user.aces.len(), 1);
         drop(srv_user);
 
